@@ -228,7 +228,7 @@ describe('反应改数值', () => {
     expect(t.campaign().initiative!.pending!.rawDamage).toBeUndefined();
     t.rolls.push(5);
     const text = await t.call('dnd_apply', { target: '狼', declared_by: 'P4', reaction: { by: '刻德温', name: '导引打击', attack_mod: '+10', spend: '引导神力' } });
-    expect(text).toContain('改成命中了');
+    expect(text).toContain('现在命中');
     await t.call('dnd_apply', { target: '狼', settle: true });
     expect(t.hp('狼')).toBe(25);
     expect(t.campaign().initiative!.reacted).toBeUndefined();
@@ -341,7 +341,7 @@ describe('压缩和玩家视角', () => {
     t.rolls.push(15, 3);
     await t.biteKriv();
     const snapshot = t.service.stateSnapshot(t.key);
-    expect(snapshot).toContain('【待结算】狼→Kriv');
+    expect(snapshot).toContain('【待结算 #R1】狼→Kriv');
     expect(snapshot).toContain('伤害 7，还没扣血');
     expect(snapshot).toContain('还在等：Kriv');
     expect(new CampaignStore(t.service.store.root).load(t.key)!.initiative!.pending!.rawDamage).toBe(7);

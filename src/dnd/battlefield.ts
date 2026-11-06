@@ -270,14 +270,23 @@ export function turnPositionNote(c: Campaign, name: string): string {
   return `${where}。${hint}`;
 }
 
-/** 团况和 show 用的全场站位，按房间分行：压缩之后靠这几行恢复现场 */
-export function battleLines(c: Campaign, roomName: (id: string) => string): string[] {
+/** 玩家看站位时要藏起来的：隐形、躲着的怪。位置正是它们要瞒的东西 */
+const HIDDEN = ['隐形', '躲藏', '隐匿'];
+export function hiddenFromPlayers(ch: Character): boolean {
+  return ch.kind === 'monster' && ch.conditions.some((cond) => HIDDEN.includes(cond));
+}
+
+/**
+ * 团况和 show 用的全场站位，按房间分行：压缩之后靠这几行恢复现场。
+ * visible 给玩家视角用：不列的人也不算进贴身。
+ */
+export function battleLines(c: Campaign, roomName: (id: string) => string, visible: (ch: Character) => boolean = () => true): string[] {
   const state = c.initiative;
   if (state === undefined) return [];
   const rooms = new Map<string, Array<{ ch: Character; cell: BattleCell }>>();
   for (const entry of c.characters) {
     const cell = cellOf(c, entry);
-    if (cell === undefined || isOut(entry)) continue;
+    if (cell === undefined || isOut(entry) || !visible(entry)) continue;
     if (!rooms.has(cell.room)) rooms.set(cell.room, []);
     rooms.get(cell.room)!.push({ ch: entry, cell });
   }
@@ -289,7 +298,7 @@ export function battleLines(c: Campaign, roomName: (id: string) => string): stri
     const seen = new Set<string>();
     const pairs: string[] = [];
     for (const { ch, cell } of members) {
-      for (const foe of adjacentFoes(c, ch, cell)) {
+      for (const foe of adjacentFoes(c, ch, cell).filter((n) => members.some((m) => m.ch.name === n))) {
         const key = [ch.name, foe].sort().join('|');
         if (!seen.has(key)) {
           seen.add(key);
@@ -302,18 +311,21 @@ export function battleLines(c: Campaign, roomName: (id: string) => string): stri
       + `${pairs.length > 0 ? `；贴身：${pairs.join('、')}` : ''}`
       + `${roomMarks.length > 0 ? `；标记：${roomMarks.join('、')}` : ''}`);
   }
-  const missing = unplaced(c);
+  const missing = unplaced(c).filter((n) => {
+    const ch = findCharacter(c, n);
+    return ch !== undefined && visible(ch);
+  });
   if (missing.length > 0) lines.push(`未摆位：${missing.join('、')}`);
   return lines;
 }
 
 /** show from=某人：他到房间里其他人的距离 */
-export function distancesFrom(c: Campaign, name: string): string {
+export function distancesFrom(c: Campaign, name: string, visible: (ch: Character) => boolean = () => true): string {
   const ch = requireCharacter(c, name);
   const cell = cellOf(c, ch);
   if (cell === undefined) throw new Error(`${ch.name} 还没摆位，先 dnd_position set`);
   const others = placedIn(c, cell.room)
-    .filter(({ ch: other }) => other.name !== ch.name)
+    .filter(({ ch: other }) => other.name !== ch.name && visible(other))
     .map(({ ch: other, cell: at }) => ({ name: other.name, feet: distanceFeet(cell, at), foe: isHostile(ch, other) }))
     .sort((a, b) => a.feet - b.feet);
   const marks = Object.entries(c.initiative?.marks ?? {})

@@ -19,6 +19,10 @@ import {
   type ReactionDef,
   type CharacterKind,
   type HpChange,
+  type PendingAttack,
+  type PendingCheck,
+  type PendingD20,
+  type ReactorOption,
   addSummary,
   SUMMARY_MAX_CHARS,
   UNDEAD_FORTITUDE,
@@ -31,7 +35,9 @@ import {
   changeCondition,
   changeInventory,
   checkModifier,
+  crossesTurn,
   deathSave,
+  describePending,
   endInitiative,
   explored,
   findCharacter,
@@ -47,6 +53,7 @@ import {
   leaveInitiative,
   outsideRooms,
   moveParty,
+  nextRollId,
   nextTurn,
   partyPositions,
   pushLog,
@@ -59,6 +66,7 @@ import {
   restoreResource,
   roomOf,
   setResource,
+  snapshotRolls,
   spawnEncounter,
   spawnMonsters,
   startInitiative,
@@ -133,14 +141,27 @@ import {
   eligibleReactors,
   findReactor,
   holdNotice,
-  openPending,
+  manualReactors,
+  mergeReactors,
   pendingHit,
   pendingState,
   reactionsOf,
+  refreshReactors,
   requirePending,
+  rollPassed,
   waitingOn,
 } from './pending-attack.ts';
-import { DEFENSE_NAMES, type SaveTarget, parseDefense, parseSaveTargets, resolveSaveEffect, saveDamage } from './save-effect.ts';
+import {
+  DEFENSE_NAMES,
+  type RolledSave,
+  type SaveOutcome,
+  type SaveTarget,
+  applySaveEffect,
+  parseDefense,
+  parseSaveTargets,
+  rollSaveEffect,
+  saveDamage,
+} from './save-effect.ts';
 
 export const DND_TOOL_PREFIX = 'dnd_';
 
@@ -156,7 +177,7 @@ export interface DndToolDeps {
   sendImage(record: SessionRecord, path: string, caption?: string): Promise<void>;
   /** 先攻指针变了（start/next/goto）：轮到 PC 时由按钮模块在回复发完后发「结束回合」按钮 */
   onTurnChange?(record: SessionRecord): void;
-  /** 有一笔待结算的攻击：回复发完后发反应按钮并开始计时 */
+  /** 有一笔待结算（新开的，或重掷后有新的人能反应）：回复发完后发反应按钮并开始计时 */
   onPendingAttack?(record: SessionRecord): void;
   /** 群成员短别名（#U3）和 openid 互换；不传时 declared_by / player_id 按原样当 openid */
   members?: MemberIds;
@@ -170,7 +191,8 @@ export interface MemberIds {
   display(record: SessionRecord, openid: string): string | undefined;
 }
 
-type Exec = { agent?: unknown; label?: string };
+/** rolls：这次调用掷的 d20 编号，写进快照标签，dnd_undo roll= 靠它找 */
+type Exec = { agent?: unknown; label?: string; rolls?: number[] };
 
 /** declared_by 要和这段时间内真正发过消息的人对得上（覆盖一轮里插进来的消息） */
 const SENDER_WINDOW_MS = 10 * 60 * 1000;
@@ -415,7 +437,14 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
       for (const line of story) pushLog(c, line);
       recordChanges(before, c, adventure);
       return (story.length > 0 && typeof result === 'string' ? `${result}\n【剧情】${story.join('；')}` : result) as T;
-    }, exec.label);
+    }, () => `${exec.label ?? ''}${(exec.rolls ?? []).map((n) => ` #R${n}`).join('')}`);
+  };
+
+  /** 新的一骰：编号记到这次调用上，结果里给模型看 */
+  const rollId = (c: Campaign, exec: Exec): number => {
+    const id = nextRollId(c);
+    exec.rolls?.push(id);
+    return id;
   };
 
   const sendersOf = (exec: Exec): string[] => recentSenderIds(recordOf(exec), SENDER_WINDOW_MS);
@@ -435,16 +464,76 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
     return alias === undefined ? openid : `#${alias}`;
   };
 
-  /** dnd_apply 处理待结算攻击的部分：先改数值、记不用，最后才落账 */
-  const resolvePending = (c: Campaign, args: Record<string, unknown>, exec: Exec): string => {
+  /** 豁免结果的逐人行：立即结算和落账共用 */
+  const saveOutcomeLines = (outcomes: readonly SaveOutcome[]): string[] => outcomes.map((o) => {
+    if (o.skipped !== undefined) return `- ${o.name}：${o.skipped}，跳过`;
+    const verdict = o.saved === undefined ? '' : ` → ${o.saved ? '成功' : '失败'}`;
+    const nat = o.natural === 20 ? '（天然 20）' : (o.natural === 1 ? '（天然 1）' : '');
+    const dmg = o.damage === undefined
+      ? ''
+      : `，${o.defense !== undefined ? `${DEFENSE_NAMES[o.defense]} ` : ''}受 ${o.damage}${o.change !== undefined ? `；${hpLine(o.change)}` : ''}`;
+    const cond = o.conditions !== undefined ? `，得「${o.conditions.join('、')}」` : '';
+    return `- ${o.name} ${o.detail ?? ''}${verdict}${nat}${dmg}${cond}`;
+  });
+
+  /**
+   * reroll="d20"：只换那颗 d20（优劣势照旧再掷两颗），修正、祝福骰、已用的反应加减都保留；
+   * 旧结果作废、必须用新的，不提供保留选项。攻击的伤害跟着作废（重击与否可能变了），落账前按新结果重掷。
+   */
+  const rerollAttack = (c: Campaign, p: PendingAttack, exec: Exec): string => {
+    const modifier = p.modifier ?? p.total - p.natural;
+    const r = rollD20(modifier, p.advantage ?? 'none', service.roller);
+    const id = rollId(c, exec);
+    const old = p.rollDetail;
+    Object.assign(p, { natural: r.natural, total: r.total, rollDetail: r.detail, crit: r.natural === 20 });
+    delete p.rawDamage;
+    delete p.damageDetail;
+    return `重掷 #R${id}：${old} 作废 → ${r.detail}`;
+  };
+  const rerollCheck = (c: Campaign, entry: PendingD20, exec: Exec): string => {
+    const r = rollD20(entry.modifier, entry.advantage, service.roller);
+    const id = rollId(c, exec);
+    const old = entry.detail;
+    Object.assign(entry, { natural: r.natural, total: r.total, detail: r.detail });
+    return `${entry.name} 重掷 #R${id}：${old} 作废 → ${r.detail}`;
+  };
+
+  /** 豁免/检定落账：带伤害或失败状态的按效果结算，单纯检定只报最终成败 */
+  const settleCheck = (c: Campaign, p: PendingCheck): string[] => {
+    if (p.damage === undefined && (p.onFail?.length ?? 0) === 0) return [`落账：${pendingState(p)}。按这个结果演。`];
+    const saves: RolledSave[] = p.rolls.map((r) => ({
+      name: r.name,
+      natural: r.natural,
+      total: r.total + r.mod,
+      detail: r.mod !== 0 ? `${r.detail}，反应 ${r.mod > 0 ? '+' : ''}${r.mod} = ${r.total + r.mod}` : r.detail,
+      ...(r.defense !== undefined ? { defense: r.defense } : {}),
+    }));
+    const outcomes = applySaveEffect(c, saves, {
+      ...(p.dc !== undefined ? { dc: p.dc } : {}),
+      ...(p.damage !== undefined ? { damage: Math.max(0, p.damage.total + p.damageMod), onSave: p.damage.onSave } : {}),
+      ...(p.damage?.type !== undefined ? { damageType: p.damage.type } : {}),
+      ...(p.onFail !== undefined ? { onFail: p.onFail } : {}),
+      roller: service.roller,
+    });
+    return [`落账：${describePending(p)}`, ...saveOutcomeLines(outcomes)];
+  };
+
+  /** dnd_apply 处理待结算的部分：先改数值、记不用，最后才落账。reopened：重掷后有新的人能反应，要重发按钮 */
+  const resolvePending = (c: Campaign, args: Record<string, unknown>, exec: Exec): { text: string; reopened: boolean } => {
     const p = requirePending(c);
     const named = requireCharacter(c, String(args.target ?? ''));
-    if (named.name !== p.target) throw new Error(`待结算这笔打的是 ${p.target}，不是 ${named.name}`);
+    // 攻击按被打的人对账；豁免/检定按掷骰的人（群体豁免里改哪一骰靠它指定）
+    const entry = p.kind === 'roll' ? p.rolls.find((r) => r.name === named.name) : undefined;
+    if (p.kind === 'attack' && named.name !== p.target) throw new Error(`待结算这笔打的是 ${p.target}，不是 ${named.name}`);
+    if (p.kind === 'roll' && entry === undefined) {
+      throw new Error(`待结算这笔掷骰的是 ${p.rolls.map((r) => r.name).join('、')}，没有 ${named.name}：target 填被改的那个掷骰人`);
+    }
     if (args.cancel === true) {
       delete requireInitiative(c).pending;
-      pushLog(c, `${p.attacker}→${p.target} 的攻击作废`);
-      return `${p.attacker}→${p.target} 这笔作废，没有扣血。`;
+      pushLog(c, `${describePending(p)}作废`);
+      return { text: `${describePending(p)}作废，没有落账。已经花掉的资源不退：整件事不该发生的话用 dnd_undo roll=R${p.seq}。`, reopened: false };
     }
+    let reopened = false;
     const lines: string[] = [];
     for (const name of strList(args.decline) ?? []) declineReaction(p, requireCharacter(c, name).name);
 
@@ -457,25 +546,33 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
       const spendKey = str(reaction.spend);
       if (spendKey !== undefined) useResource(c, reactor.name, spendKey);
       const effects: string[] = [];
+      const reroll = str(reaction.reroll);
+      if (reroll !== undefined) {
+        if (reroll.toLowerCase() !== 'd20') throw new Error('reroll 只支持 "d20"：整颗 d20 重掷，必须用新结果');
+        effects.push(p.kind === 'attack' ? rerollAttack(c, p, exec) : rerollCheck(c, entry!, exec));
+      }
       const attackMod = str(reaction.attack_mod);
       if (attackMod !== undefined) {
         const r = signedRoll(attackMod, service.roller);
-        p.attackMod += r.total;
-        effects.push(`攻击 ${r.detail}`);
+        if (p.kind === 'attack') p.attackMod += r.total;
+        else entry!.mod += r.total;
+        effects.push(`${p.kind === 'attack' ? '攻击' : `${entry!.name} 的骰`} ${r.detail}`);
       }
       const acMod = int(reaction.ac_mod);
       if (acMod !== undefined) {
+        if (p.kind !== 'attack') throw new Error('ac_mod 只对攻击有用；豁免/检定用 attack_mod 加减那一骰');
         p.acMod += acMod;
         effects.push(`AC ${acMod >= 0 ? '+' : ''}${acMod}`);
       }
       const damageMod = str(reaction.damage_mod);
       if (damageMod !== undefined) {
+        if (p.kind === 'roll' && p.damage === undefined) throw new Error('这笔没有伤害，damage_mod 用不上');
         const r = signedRoll(damageMod, service.roller);
         p.damageMod += r.total;
         effects.push(`伤害 ${r.detail}`);
       }
       const def = reactionsOf(reactor).find((r) => r.name === name);
-      const counter = def?.counter === true;
+      const counter = def?.counter === true && p.kind === 'attack';
       const effect = effects.join('，') || (counter ? '反手打回去' : '无数值变化');
       p.used.push({ by: reactor.name, name, effect });
       p.claimed = p.claimed.filter((o) => o.character !== reactor.name);
@@ -489,18 +586,30 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
       if (counter) {
         lines.push(`${name} 是一次新的攻击，不改这笔的数字：这笔落账之后，用 dnd_check character=${reactor.name} type=attack target=${p.attacker} reaction=true 结算还击（还击不打中也不影响这笔）。`);
       }
+      // 重掷后成败变了：谁能反应要按新结果重算（没中了尖刻言语就用不上；变成命中了就有人能用）
+      if (reroll !== undefined && p.kind === 'attack') {
+        const fresh = refreshReactors(c, p);
+        if (fresh.length > 0) {
+          p.at = Date.now();
+          reopened = true;
+          lines.push(`按新结果 ${fresh.map((r) => `${r.character}·${r.reaction}`).join('、')} 也能反应了，窗口重开，先问他们。`);
+        }
+      }
     }
 
-    // 未命中被改成命中时，这时才有伤害可掷
-    if (pendingHit(p) && p.rawDamage === undefined) {
+    // 未命中被改成命中（或重掷作废了旧伤害）时，这时才有伤害可掷
+    if (p.kind === 'attack' && pendingHit(p) && p.rawDamage === undefined) {
       const attacker = requireCharacter(c, p.attacker);
       const weapon = p.weapon === undefined ? undefined : findWeapon(attacker, p.weapon);
       const expression = attackExpression(attacker, weapon, p.extraDamage);
-      if (expression === undefined) throw new Error(`${p.attacker} 没有伤害表达式，先 cancel 再重新结算`);
-      const dmg = rollAttackDamage(attacker, weapon, expression, p.crit, service.roller);
-      p.rawDamage = dmg.total;
-      p.damageDetail = dmg.detail;
-      lines.push(`改成命中了，伤害 ${dmg.detail}`);
+      if (expression === undefined) {
+        lines.push('命中，但没有伤害表达式：落账后用 dnd_roll 掷伤害（重击骰子翻倍）再 dnd_apply 扣血。');
+      } else {
+        const dmg = rollAttackDamage(attacker, weapon, expression, p.crit, service.roller);
+        p.rawDamage = dmg.total;
+        p.damageDetail = dmg.detail;
+        lines.push(`现在命中${p.crit ? '（重击）' : ''}，伤害 ${dmg.detail}`);
+      }
     }
 
     if (args.settle !== true) {
@@ -510,63 +619,106 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         ? `还没落账：还在等 ${waiting.join('、')}。`
         : `都答复了：报完结果就 dnd_apply target=${p.target} settle=true 落账。`);
       lines.push(SECRET_NOTE);
-      return lines.join('\n');
+      return { text: lines.join('\n'), reopened };
     }
 
     assertWindowClosed(p);
     delete requireInitiative(c).pending;
-    if (!pendingHit(p)) {
+    if (p.kind === 'roll') {
+      lines.push(...settleCheck(c, p));
+    } else if (!pendingHit(p)) {
       lines.push(`${p.attacker}→${p.target} 落账：未命中，没有扣血。`);
-    } else {
-      const raw = Math.max(0, (p.rawDamage ?? 0) + p.damageMod);
+    } else if (p.rawDamage !== undefined) {
+      const raw = Math.max(0, p.rawDamage + p.damageMod);
       const amount = saveDamage(raw, false, 'half', p.defense);
       lines.push(`${p.attacker}→${p.target} 落账：${p.defense !== undefined ? `${DEFENSE_NAMES[p.defense]} ` : ''}受 ${amount}`);
       lines.push(hpLine(applyAttackDamage(c, p.target, amount, p.crit, p.damageType, service.roller)));
+    } else {
+      lines.push(`${p.attacker}→${p.target} 落账：命中${p.crit ? '（重击）' : ''}，用 dnd_roll 掷伤害再 dnd_apply 扣血。`);
     }
     lines.push('继续结算这个回合；这一只行动完了再 next。');
     lines.push(SECRET_NOTE);
-    return lines.join('\n');
+    return { text: lines.join('\n'), reopened };
   };
 
   /**
-   * dnd_check type=save 的伤害/多目标结算。spendFrom：花资源的人（施法者，或没有 targets 时掷豁免的人）；
-   * 来源不是角色（陷阱）时不扣资源。
+   * dnd_check type=save 的伤害/状态/多目标结算。spendFrom：花资源的人（施法者，或没有 targets 时掷豁免的人）；
+   * 来源不是角色（陷阱）时不扣资源。hold：挂起等反应（时间变幻），不传就当场结算。
    */
-  const saveEffectText = (c: Campaign, args: Record<string, unknown>, targets: SaveTarget[], source: string | undefined, hasSheet: boolean): string => {
+  const saveEffectText = (
+    c: Campaign, args: Record<string, unknown>, targets: SaveTarget[], source: string | undefined, hasSheet: boolean,
+    exec: Exec, hold: ReactorOption[] | undefined,
+  ): string => {
     const ability = parseAbility(String(args.ability ?? ''));
     if (ability === undefined) throw new Error(`dnd_check: 豁免要给 ability（如 敏捷），收到 ${String(args.ability ?? '')}`);
     const spendKey = str(args.spend);
     const spender = source ?? targets[0]!.name;
     if (spendKey !== undefined && !hasSheet) throw new Error(`「${spender}」不是角色卡上的人，不能 spend`);
-    const spent = spendKey === undefined ? undefined : useResource(c, spender, spendKey);
     const dc = int(args.dc);
     const damage = str(args.damage);
-    const result = resolveSaveEffect(c, {
-      targets, ability, dc, damage, damageType: str(args.damage_type), onSave: args.on_save === 'none' ? 'none' : 'half',
+    const damageType = str(args.damage_type);
+    const onSave = args.on_save === 'none' ? 'none' : 'half';
+    const onFail = strList(args.on_fail_conditions);
+    const spent = spendKey === undefined ? undefined : useResource(c, spender, spendKey);
+    const rolled = rollSaveEffect(c, {
+      targets, ability, dc, damage, damageType, onSave, ...(onFail !== undefined ? { onFail } : {}),
       advantage: advantageOf(args.advantage), bonus: int(args.bonus), bonusDice: str(args.bonus_dice), roller: service.roller,
     });
+    const id = rollId(c, exec);
     const label = `${ABILITY_NAMES[ability]}豁免`;
     const head = [
       source !== undefined ? `${source} 的效果：` : '',
       `${label}${dc !== undefined ? ` DC ${dc}` : ''}`,
-      result.damageRoll !== undefined
-        ? `，伤害 ${result.damageRoll.detail}${str(args.damage_type) ? ` ${str(args.damage_type)}` : ''}（成功${args.on_save === 'none' ? '无伤' : '减半'}）`
+      rolled.damageRoll !== undefined
+        ? `，伤害 ${rolled.damageRoll.detail}${damageType ? ` ${damageType}` : ''}（成功${onSave === 'none' ? '无伤' : '减半'}）`
         : '',
+      onFail !== undefined && onFail.length > 0 ? `，失败得「${onFail.join('、')}」` : '',
+      ` #R${id}`,
     ].join('');
     const lines = [head];
-    for (const o of result.outcomes) {
-      if (o.skipped !== undefined) {
-        lines.push(`- ${o.name}：${o.skipped}，跳过`);
-        continue;
+    const spentLine = spent === undefined ? undefined : `用掉「${spent.key}」，剩 ${spent.resource.current}/${spent.resource.max}`;
+
+    if (hold !== undefined) {
+      const rolls: PendingD20[] = rolled.saves.flatMap((s) => (s.skipped !== undefined || s.total === undefined
+        ? []
+        : [{
+          name: s.name, natural: s.natural ?? 0, modifier: s.modifier ?? 0, advantage: s.advantage ?? 'none', total: s.total, detail: s.detail ?? '', mod: 0,
+          ...(s.defense !== undefined ? { defense: s.defense } : {}),
+        }]));
+      const first = rolls[0];
+      if (first === undefined) throw new Error('没有能掷豁免的目标，不用挂起');
+      const p: PendingCheck = {
+        kind: 'roll', seq: id, at: Date.now(), attacker: source ?? first.name, target: first.name, label, rolls,
+        ...(dc !== undefined ? { dc } : {}),
+        ...(rolled.damageRoll !== undefined
+          ? { damage: { total: rolled.damageRoll.total, detail: rolled.damageRoll.detail, onSave, ...(damageType !== undefined ? { type: damageType } : {}) } }
+          : {}),
+        ...(onFail !== undefined && onFail.length > 0 ? { onFail } : {}),
+        damageMod: 0, reactors: hold, declined: [], claimed: [], used: [],
+      };
+      requireInitiative(c).pending = p;
+      for (const r of rolls) {
+        const passed = rollPassed(p, r);
+        lines.push(`- ${r.name} ${r.detail}${passed === undefined ? '' : ` → ${passed ? '成功' : '失败'}`}（还没落账）`);
       }
-      const verdict = o.saved === undefined ? '' : ` → ${o.saved ? '成功' : '失败'}`;
-      const nat = o.natural === 20 ? '（天然 20）' : (o.natural === 1 ? '（天然 1）' : '');
-      const dmg = o.damage === undefined
-        ? ''
-        : `，${o.defense !== undefined ? `${DEFENSE_NAMES[o.defense]} ` : ''}受 ${o.damage}${o.change !== undefined ? `；${hpLine(o.change)}` : ''}`;
-      lines.push(`- ${o.name} ${o.detail}${verdict}${nat}${dmg}`);
+      for (const s of rolled.saves) if (s.skipped !== undefined) lines.push(`- ${s.name}：${s.skipped}，跳过`);
+      if (spentLine !== undefined) lines.push(spentLine);
+      lines.push(holdNotice(p));
+      lines.push(SECRET_NOTE);
+      deps.onPendingAttack?.(recordOf(exec));
+      return lines.join('\n');
     }
-    if (spent !== undefined) lines.push(`用掉「${spent.key}」，剩 ${spent.resource.current}/${spent.resource.max}`);
+
+    const outcomes = applySaveEffect(c, rolled.saves, {
+      ...(dc !== undefined ? { dc } : {}),
+      ...(rolled.damageRoll !== undefined ? { damage: rolled.damageRoll.total } : {}),
+      ...(damageType !== undefined ? { damageType } : {}),
+      onSave,
+      ...(onFail !== undefined ? { onFail } : {}),
+      roller: service.roller,
+    });
+    lines.push(...saveOutcomeLines(outcomes));
+    if (spentLine !== undefined) lines.push(spentLine);
     lines.push(args.secret === true ? HIDDEN_ROLL_NOTE : SECRET_NOTE);
     return lines.join('\n');
   };
@@ -591,7 +743,7 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
           .map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
           .join(' ')
           .slice(0, 120);
-        return { text: await run(input, { ...exec, label: `${name} ${brief}` }) };
+        return { text: await run(input, { ...exec, label: `${name} ${brief}`, rolls: [] }) };
       },
     });
   };
@@ -622,8 +774,10 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
     + 'damage is rolled (crits double the dice) and applied to the target automatically. '
     + 'Save effects (fireball, breath weapon, sacred flame, a trap on several PCs): ONE call with type=save, '
     + '`character` = the caster/source, `targets` = everyone who saves, plus dc, ability, damage; the tool rolls '
-    + 'damage once, rolls each save, halves on success (on_save), applies resistance/immunity and HP. Never loop '
-    + 'one call per target or pre-roll the damage.',
+    + 'damage once, rolls each save, halves on success (on_save), applies resistance/immunity and HP, and adds '
+    + 'on_fail_conditions to whoever fails. Never loop one call per target, pre-roll the damage, or add the failure '
+    + 'condition with a separate dnd_apply. Every result carries a roll id (#R12): dnd_undo roll=R12 reverts that roll '
+    + 'and everything after it.',
     {
       character: { type: 'string', description: 'Who rolls (character name or the player\'s nickname).' },
       type: { type: 'string', enum: ['skill', 'ability', 'save', 'attack', 'death'] },
@@ -653,6 +807,12 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         },
       },
       on_save: { type: 'string', enum: ['half', 'none'], description: 'For type=save with damage: what a successful save takes (default half).' },
+      on_fail_conditions: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'For type=save with dc: conditions each failing target gets, e.g. ["麻痹"] for hold person, ["倒地"] for '
+          + 'thunderwave. Applied in the same step as the damage, so one undo takes both back.',
+      },
       defense: {
         type: 'string',
         enum: ['resistant', 'immune', 'vulnerable'],
@@ -684,8 +844,21 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
       secret: { type: 'boolean', description: 'Hidden check (passive perception, insight): do not reveal the roll.' },
       hold: {
         type: 'boolean',
-        description: 'For type=attack in combat: roll but do not apply damage yet, leaving a reaction window. Automatic when a PC '
-          + 'with a registered reaction can respond; pass it yourself only for an NPC or monster reaction.',
+        description: 'In combat: roll but do not settle yet, leaving a reaction window (attack, save or check). Attacks hold '
+          + 'automatically when a PC with a registered reaction can respond. Pass it yourself for an NPC or monster reaction.',
+      },
+      hold_for: {
+        type: 'array',
+        description: 'In combat: hold this roll and ask these players, with buttons and the timer. For reactions decided after '
+          + 'seeing the result that the tool does not detect, e.g. a foe saving against 奇塔露\'s spell when she has 时间变幻: '
+          + '[{by:"奇塔露", name:"时间变幻"}]. Only when the rules let them react (in range, can see it, reaction unused): '
+          + 'you decide, the tool does not.',
+        items: {
+          type: 'object',
+          properties: { by: { type: 'string' }, name: { type: 'string' } },
+          required: ['by', 'name'],
+          additionalProperties: false,
+        },
       },
       declared_by: {
         type: 'string',
@@ -716,6 +889,15 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         dmOverride: args.dm_override === true,
         recentSenders: sendersOf(exec),
       });
+      // 挂起的条件在掷骰前查完：查不过就什么都没掷，不会「掷完报错、重来一次换个点数」
+      const wantHold = args.hold === true || args.hold_for !== undefined;
+      const holdFor = wantHold ? manualReactors(c, args.hold_for) : [];
+      if (wantHold) {
+        if (c.initiative === undefined) throw new Error('hold 只在战斗中用（待结算挂在先攻上）。战斗外直接问玩家；判错了用 dnd_undo roll= 连后果一起退');
+        if (args.secret === true) throw new Error('暗骰不能挂起：挂起要把成败告诉玩家，才好决定用不用反应');
+        if (type === 'death') throw new Error('死亡豁免不挂起');
+        assertNoPending(c, '再挂起一笔');
+      }
       const targets = type === 'save' ? parseSaveTargets(args.targets) : undefined;
       if (targets !== undefined && targets.length > 0) {
         assertNoPending(c, '结算豁免效果');
@@ -725,16 +907,16 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
           if (args.reaction === true && c.initiative !== undefined) c.initiative.rebrief = true;
           assertCanAct(c, source, actOptions());
         }
-        return saveEffectText(c, args, targets, source?.name ?? str(args.character) ?? '效果', source !== undefined);
+        return saveEffectText(c, args, targets, source?.name ?? str(args.character) ?? '效果', source !== undefined, exec, wantHold ? holdFor : undefined);
       }
       const ch = requireCharacter(c, String(args.character ?? ''));
       const adv = advantageOf(args.advantage);
       const secret = args.secret === true;
-      if (type === 'save' && str(args.damage) !== undefined) {
+      if (type === 'save' && (str(args.damage) !== undefined || (strList(args.on_fail_conditions)?.length ?? 0) > 0)) {
         assertNoPending(c, '结算豁免效果');
-        // 没有 targets 但带了伤害：掷豁免的人自己挨这一下（踩中陷阱），走同一套减半/抗性结算
+        // 没有 targets 但带了伤害或失败状态：掷豁免的人自己承受（踩中陷阱、被定身），走同一套结算
         const defense = parseDefense(args.defense);
-        return saveEffectText(c, args, [{ name: ch.name, ...(defense !== undefined ? { defense } : {}) }], undefined, true);
+        return saveEffectText(c, args, [{ name: ch.name, ...(defense !== undefined ? { defense } : {}) }], undefined, true, exec, wantHold ? holdFor : undefined);
       }
       // 豁免和死亡豁免是被动发生的，不需要宣告；攻击和检定是主动行动
       if (type !== 'save' && type !== 'death') {
@@ -751,8 +933,9 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
       const extraNote = extraRoll === undefined ? '' : `（含额外骰 ${extraRoll.detail}）`;
 
       if (type === 'death') {
+        const id = rollId(c, exec);
         const r = deathSave(c, ch.name, service.roller);
-        return `${r.name} 死亡豁免 ${r.detail}：${{ success: '成功', failure: '失败', stable: '三次成功，伤势稳定', dead: '死亡', revived: '天然 20，恢复 1 HP 醒来' }[r.outcome]}（成功 ${r.successes}/3，失败 ${r.failures}/3）`;
+        return `${r.name} 死亡豁免 ${r.detail}：${{ success: '成功', failure: '失败', stable: '三次成功，伤势稳定', dead: '死亡', revived: '天然 20，恢复 1 HP 醒来' }[r.outcome]}（成功 ${r.successes}/3，失败 ${r.failures}/3） #R${id}`;
       }
 
       if (type === 'attack') {
@@ -765,31 +948,36 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         const override = str(args.ability);
         const ability = override !== undefined ? parseAbility(override) : (weapon === undefined ? undefined : weapon.ability ?? 'str');
         const modifier = weapon !== undefined ? weaponAttackModifier(ch, weapon, ability) : attackModifier(ch, ability);
+        const id = rollId(c, exec);
         const roll = rollD20(modifier + bonus, adv, service.roller);
         const crit = roll.natural === 20;
         const hit = crit || (roll.natural !== 1 && roll.total >= target.ac);
-        const lines = [`${ch.name}${weapon !== undefined ? `（${weapon.name}）` : ''} 攻击 ${target.name}：${roll.detail}${extraNote} vs AC ${target.ac} → ${crit ? '重击！' : (hit ? '命中' : (roll.natural === 1 ? '天然 1，失手' : '未命中'))}${spentNote}`];
+        const lines = [`${ch.name}${weapon !== undefined ? `（${weapon.name}）` : ''} 攻击 ${target.name}：${roll.detail}${extraNote} vs AC ${target.ac} → ${crit ? '重击！' : (hit ? '命中' : (roll.natural === 1 ? '天然 1，失手' : '未命中'))} #R${id}${spentNote}`];
         const extra = str(args.damage);
         const expression = attackExpression(ch, weapon, extra);
         const defense = parseDefense(args.defense);
         const damageType = str(args.damage_type);
-        const reactors = c.initiative === undefined || expression === undefined
+        const auto = c.initiative === undefined || expression === undefined
           ? []
           : eligibleReactors(c, ch, target, { hit, crit, natural: roll.natural });
-        // 能反应的人在场就先不落账；hold=true 给 DM 手动挂起（NPC、怪物的反应工具不替它判断）
-        const hold = c.initiative !== undefined && expression !== undefined && roll.natural !== 1 && (reactors.length > 0 || args.hold === true);
+        const reactors = mergeReactors(auto, holdFor);
+        // 能反应的人在场就先不落账；DM 手动挂起（hold / hold_for）时天然 1 也挂：重掷能改掉它
+        const hold = c.initiative !== undefined && (wantHold || (expression !== undefined && roll.natural !== 1 && auto.length > 0));
         if (hold) {
-          const dmg = hit ? rollAttackDamage(ch, weapon, expression!, crit, service.roller) : undefined;
+          const dmg = hit && expression !== undefined ? rollAttackDamage(ch, weapon, expression, crit, service.roller) : undefined;
           if (dmg !== undefined) lines.push(`伤害（还没扣）${dmg.detail}`);
-          lines.push(holdNotice(openPending(c, {
-            at: Date.now(), attacker: ch.name, target: target.name, natural: roll.natural, rollDetail: roll.detail,
-            total: roll.total, ac: target.ac, crit, reactors,
+          const p: PendingAttack = {
+            kind: 'attack', seq: id, at: Date.now(), attacker: ch.name, target: target.name, natural: roll.natural, rollDetail: roll.detail,
+            total: roll.total, modifier: roll.modifier, advantage: adv, ac: target.ac, crit, reactors,
+            attackMod: 0, acMod: 0, damageMod: 0, declined: [], claimed: [], used: [],
             ...(weapon !== undefined ? { weapon: weapon.name } : {}),
             ...(extra !== undefined ? { extraDamage: extra } : {}),
             ...(dmg !== undefined ? { rawDamage: dmg.total, damageDetail: dmg.detail } : {}),
             ...(damageType !== undefined ? { damageType } : {}),
             ...(defense !== undefined ? { defense } : {}),
-          })));
+          };
+          requireInitiative(c).pending = p;
+          lines.push(holdNotice(p));
           deps.onPendingAttack?.(recordOf(exec));
         } else if (hit) {
           if (expression === undefined) {
@@ -820,21 +1008,35 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         throw new Error(`dnd_check: 未知类型 ${type}`);
       }
       const kind = type as 'skill' | 'ability' | 'save';
+      const id = rollId(c, exec);
       const roll = rollD20(checkModifier(ch, kind, ability, skill) + bonus, adv, service.roller);
       const label = skill !== undefined ? `${skillLabel(skill)}检定` : `${ABILITY_NAMES[ability]}${kind === 'save' ? '豁免' : '检定'}`;
       const dc = int(args.dc);
       const verdict = dc === undefined
         ? ''
         : ` vs DC ${dc} → ${roll.total >= dc ? '成功' : '失败'}${roll.natural === 20 ? '（天然 20）' : (roll.natural === 1 ? '（天然 1）' : '')}`;
-      return `${ch.name} ${label}：${roll.detail}${extraNote}${verdict}${spentNote}\n${secret ? HIDDEN_ROLL_NOTE : SECRET_NOTE}`;
+      const head = `${ch.name} ${label}：${roll.detail}${extraNote}${verdict} #R${id}${spentNote}`;
+      if (wantHold) {
+        const p: PendingCheck = {
+          kind: 'roll', seq: id, at: Date.now(), attacker: ch.name, target: ch.name, label,
+          rolls: [{ name: ch.name, natural: roll.natural, modifier: roll.modifier, advantage: adv, total: roll.total, detail: `${roll.detail}${extraNote}`, mod: 0 }],
+          ...(dc !== undefined ? { dc } : {}),
+          damageMod: 0, reactors: holdFor, declined: [], claimed: [], used: [],
+        };
+        requireInitiative(c).pending = p;
+        deps.onPendingAttack?.(recordOf(exec));
+        return `${head}\n${holdNotice(p)}\n${SECRET_NOTE}`;
+      }
+      return `${head}\n${secret ? HIDDEN_ROLL_NOTE : SECRET_NOTE}`;
     }),
   );
 
   register(
     'dnd_apply',
     'Change a character\'s state: damage, healing, temporary HP, conditions. This is the only way HP or conditions '
-    + 'change; roll the amount with dnd_roll first. Also resolves a pending attack left by dnd_check: `reaction` changes '
-    + 'the numbers (the tool rolls the dice), `decline` records who passed, `settle` applies the result, `cancel` drops it.',
+    + 'change; roll the amount with dnd_roll first. Also resolves a pending roll (attack, save or check) left by dnd_check: '
+    + '`reaction` changes the numbers or rerolls the d20 (the tool rolls the dice), `decline` records who passed, `settle` '
+    + 'applies the result, `cancel` drops it.',
     {
       target: { type: 'string' },
       damage: { type: 'integer' },
@@ -846,29 +1048,38 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
       remove_conditions: { type: 'array', items: { type: 'string' } },
       reaction: {
         type: 'object',
-        description: 'For a pending attack. e.g. cutting words {by:"Kriv",name:"尖刻言语",attack_mod:"-1d6",spend:"诗人激励"}; shield '
-          + '{by:"Kriv",name:"护盾术",ac_mod:5,spend:"防御法杖充能"}; guided strike {by:"刻德温",name:"导引打击",attack_mod:"+10",spend:"引导神力"}.',
+        description: 'For a pending roll. `target` names whose roll it changes (attack: the one attacked; save/check: the roller). '
+          + 'e.g. cutting words {by:"Kriv",name:"尖刻言语",attack_mod:"-1d6",spend:"诗人激励"}; shield '
+          + '{by:"Kriv",name:"护盾术",ac_mod:5,spend:"防御法杖充能"}; guided strike {by:"刻德温",name:"导引打击",attack_mod:"+10",spend:"引导神力"}; '
+          + 'chronal shift {by:"奇塔露",name:"时间变幻",reroll:"d20",spend:"时间变幻"}.',
         properties: {
           by: { type: 'string' },
           name: { type: 'string' },
-          attack_mod: { type: 'string', description: 'Added to the attack total, e.g. "-1d6" or "+10". The tool rolls it.' },
-          ac_mod: { type: 'integer', description: 'Added to the target AC, e.g. 5.' },
+          attack_mod: { type: 'string', description: 'Added to the pending d20 total (attack roll, or the `target`\'s save/check), e.g. "-1d6" or "+10". The tool rolls it.' },
+          ac_mod: { type: 'integer', description: 'Attacks only: added to the target AC, e.g. 5.' },
           damage_mod: { type: 'string', description: 'Added to the damage, e.g. "-1d6". The tool rolls it.' },
+          reroll: {
+            type: 'string',
+            enum: ['d20'],
+            description: 'Reroll the whole d20 (same advantage, same modifiers); the new result must be used and the old one is '
+              + 'void. Success, crit and damage are recomputed.',
+          },
           spend: { type: 'string', description: 'Resource the reactor spends.' },
         },
         required: ['by', 'name'],
         additionalProperties: false,
       },
-      decline: { type: 'array', items: { type: 'string' }, description: 'Characters whose player said they will not react to the pending attack.' },
-      settle: { type: 'boolean', description: 'Apply the pending attack. Refused while the reaction window is open and someone has not answered.' },
-      cancel: { type: 'boolean', description: 'Drop the pending attack without applying it (it should not have happened).' },
+      decline: { type: 'array', items: { type: 'string' }, description: 'Characters whose player said they will not react to the pending roll.' },
+      settle: { type: 'boolean', description: 'Apply the pending roll. Refused while the reaction window is open and someone has not answered.' },
+      cancel: { type: 'boolean', description: 'Drop the pending roll without applying it. Spent resources stay spent; if it should not have happened at all, use dnd_undo roll=.' },
       declared_by: { type: 'string', description: 'For reaction by a PC: member id of the player who said so (the #U number, pass "U3").' },
     },
     ['target'],
     (args, exec) => mutate(exec, (c) => {
       if (args.settle === true || args.cancel === true || args.reaction !== undefined || args.decline !== undefined) {
-        const text = resolvePending(c, args, exec);
+        const { text, reopened } = resolvePending(c, args, exec);
         if (c.initiative?.pending === undefined) deps.onTurnChange?.(recordOf(exec));
+        else if (reopened) deps.onPendingAttack?.(recordOf(exec));
         return text;
       }
       const ch = requireCharacter(c, String(args.target ?? ''));
@@ -1524,20 +1735,39 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
   register(
     'dnd_undo',
     'Roll back the game state when the table agrees an action was resolved wrongly ("卷回到…"). list: show recent '
-    + 'changes, newest first. undo: revert the newest `steps` changes in one go. Never fake a rollback by healing '
-    + 'dead monsters or restarting initiative. Also use it when a player takes back a choice that was already '
-    + 'resolved (e.g. "不用神恩了" after the boosted attack landed): undo the attack AND the resource together, then '
-    + 're-resolve; refunding only the slot while keeping its damage is wrong.',
+    + 'changes, newest first. undo: revert in one go, either to just before a roll (`roll`, preferred: the roll and '
+    + 'everything after it, its damage, conditions and spent resources included) or the newest `steps` changes. Never '
+    + 'fake a rollback by healing dead monsters or restarting initiative. Also use it when a player takes back a choice '
+    + 'that was already resolved, or a reaction was missed (e.g. "不用神恩了" after the boosted attack landed): undo the '
+    + 'roll, then re-resolve; refunding only the slot while keeping its damage is wrong.',
     {
       action: { type: 'string', enum: ['list', 'undo'] },
-      steps: { type: 'integer', description: 'For undo: how many changes to revert (see list).' },
+      roll: { type: 'string', description: 'For undo: the roll id from a dnd_check result, e.g. "R12". Reverts to just before it.' },
+      steps: { type: 'integer', description: 'For undo without roll: how many changes to revert (see list).' },
+      confirm: { type: 'boolean', description: 'For undo roll=: required when the rollback also crosses a turn change (next/goto/end).' },
     },
     ['action'],
     (args, exec) => {
       const key = recordOf(exec).sessionKey;
       service.require(key);
       if (args.action === 'undo') {
-        const undone = service.store.undo(key, int(args.steps) ?? 1);
+        let steps = int(args.steps) ?? 1;
+        const rollArg = str(args.roll);
+        if (rollArg !== undefined) {
+          const n = Number(/\d+/.exec(rollArg)?.[0] ?? NaN);
+          const list = service.store.snapshots(key);
+          const at = Number.isFinite(n) ? list.findIndex((s) => snapshotRolls(s.label).includes(n)) : -1;
+          if (at < 0) {
+            throw new Error(`撤销记录里找不到 #R${Number.isFinite(n) ? n : rollArg}：没有后果的检定不留记录（不用撤，按对的结果重新判），太早的已经被挤掉了。用 action=list 看能撤到哪。`);
+          }
+          steps = list.length - at;
+          // 存档只能整份往回退：这一骰之后的改动会一起退掉。越过回合推进时先让 DM 看清楚再确认
+          if (list.slice(at + 1).some((s) => crossesTurn(s.label)) && args.confirm !== true) {
+            const span = list.slice(at).reverse().map((s, i) => `${i + 1}. ${s.label}`).join('\n');
+            return `撤回 #R${n} 要连带退掉这 ${steps} 步，中间推进过回合：\n${span}\n确认整段都退，就再调一次 dnd_undo action=undo roll=R${n} confirm=true；只想改其中一步就别撤，用 dnd_apply 修。`;
+          }
+        }
+        const undone = service.store.undo(key, steps);
         const { campaign, adventure } = service.require(key);
         return `已撤销 ${undone.length} 步：\n${undone.map((l, i) => `${i + 1}. ${l}`).join('\n')}\n\n现在的团况：\n${summarize(campaign, adventure)}`;
       }

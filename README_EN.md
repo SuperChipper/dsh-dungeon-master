@@ -40,7 +40,7 @@ Send `/dnd start` in a group and the bot becomes that group's dungeon master (DM
 |---------|--------------|
 | `/dnd start [dungeon id]` | Start a campaign (an earlier campaign in the same dungeon resumes); in groups the message carries check-in buttons and the game opens once everyone is in |
 | `/dnd new [dungeon id] [blank]` | Archive the old campaign and start fresh (blank drops the old character sheets) |
-| `/dnd status` | Campaign state from the players' point of view |
+| `/dnd status` | Campaign state from the players' point of view; in combat, positions and distances from your character (hidden or invisible monsters are left out) |
 | `/dnd checkin` | Re-send the check-in buttons |
 | `/dnd end` | Pause (to get a story recap from the DM, just say you're stopping for tonight) |
 | `/dnd dungeons` | List available dungeons |
@@ -62,8 +62,8 @@ Send `/dnd start` in a group and the bot becomes that group's dungeon master (DM
 | Tool | Purpose |
 |------|---------|
 | `dnd_roll` | Any dice expression (`2d6+3`, `4d6kh3`…) |
-| `dnd_check` | Skill/ability checks, saves, attacks, death saves. Keeps DC/AC hidden. Supports weapons, spell attacks, extra dice (guidance, bardic inspiration) and spending resources; applies damage on a hit; when someone can react, an attack only rolls and stays pending, leaving a reaction window |
-| `dnd_apply` | Damage (with damage type and crits), healing, temp HP, conditions; changes the numbers on a pending attack (Cutting Words, Shield, Guided Strike) and settles it |
+| `dnd_check` | Skill/ability checks, saves, attacks, death saves. Keeps DC/AC hidden. Supports weapons, spell attacks, extra dice (guidance, bardic inspiration) and spending resources; applies damage on a hit and conditions on a failed save; when someone can react, an attack only rolls and stays pending, leaving a reaction window, and the DM can hold saves and checks for named players with hold_for; every roll carries a #R id |
+| `dnd_apply` | Damage (with damage type and crits), healing, temp HP, conditions; changes the numbers on a pending attack, save or check (Cutting Words, Shield, Guided Strike) or rerolls the whole d20 (Chronal Shift), then settles it |
 | `dnd_character` | Create and edit sheets: player binding, weapons, hit dice, items and gold. `srd=goblin count=3` adds improvised monsters with real SRD stats |
 | `dnd_resource` | Spell slots, lay on hands pool, bardic inspiration, class feature uses |
 | `dnd_rest` | Short rest (the tool rolls hit dice and heals) and long rest |
@@ -71,7 +71,7 @@ Send `/dnd start` in a group and the bot becomes that group's dungeon master (DM
 | `dnd_move` | Move between rooms (`who` for split parties, secret doors). Returns the player-facing description plus DM-only notes |
 | `dnd_position` | Battlefield positions in combat (5 ft cells): placement, on-turn movement, distance queries; flags opportunity attacks on moves and checks range on attacks; kept in the state snapshot so compaction cannot lose it |
 | `dnd_map` | Renders the explored part of the map with fog and sends it to the group (needs the optional `sharp` dependency) |
-| `dnd_undo` | List recent changes, or undo N of them at once |
+| `dnd_undo` | List recent changes, undo N of them at once, or roll back to before a given roll with everything it caused |
 | `dnd_end` | End the session with a story recap, injected next time the campaign starts |
 | `dnd_srd` | Look up 5e SRD monsters and spells (dnd5eapi.co) |
 

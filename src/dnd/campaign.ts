@@ -22,7 +22,7 @@ import {
   findRoom,
 } from './dungeon.ts';
 import { ABILITIES, type Ability, type Skill, abilityModifier, parseAbility, parseSkill, proficiencyBonus, SKILLS } from './rules.ts';
-import { battleLines } from './battlefield.ts';
+import { battleLines, cellOf, distancesFrom, hiddenFromPlayers } from './battlefield.ts';
 import { pendingSummaryLine } from './pending-attack.ts';
 import { type NpcState, afterChange, describeCondition, evalCondition, locationKnown, roomView, storySummaryLines } from './story.ts';
 
@@ -152,21 +152,38 @@ export function reactionsOf(ch: Character): ReactionDef[] {
 export interface ReactorOption {
   character: string;
   reaction: string;
+  /** DM 用 hold_for 点名问的（时间变幻这类不登记触发条件的反应）；重掷后重算名单时保留 */
+  manual?: boolean;
+}
+
+interface PendingBase {
+  /** 打开这笔的那一骰的编号（#R）；按钮靠它认出旧消息，撤销不会让它回退，所以不会和新的一笔撞号 */
+  seq: number;
+  /** 窗口开始的时间；重掷后有新的人能反应时会重开 */
+  at: number;
+  /** 攻击：攻击者。豁免：效果来源（施法者、陷阱）。检定：掷骰的人 */
+  attacker: string;
+  /** 攻击：被打的人。豁免/检定：第一个掷骰的人；dnd_apply target 用它对账 */
+  target: string;
+  reactors: ReactorOption[];
+  declined: string[];
+  /** 按钮上点了要用的（本人已确认），效果还没结算 */
+  claimed: ReactorOption[];
+  used: Array<{ by: string; name: string; effect: string }>;
 }
 
 /** 掷完骰、还没落账的一次攻击 */
-export interface PendingAttack {
-  /** 按钮靠它认出旧消息 */
-  seq: number;
-  at: number;
-  attacker: string;
-  target: string;
+export interface PendingAttack extends PendingBase {
+  kind: 'attack';
   weapon?: string;
   /** 额外伤害表达式；未命中转命中时落账才掷，要留着 */
   extraDamage?: string;
   natural: number;
   rollDetail: string;
   total: number;
+  /** 这一骰的修正和优劣势：重掷要按原样再掷一次（旧存档没有，按 total - natural 算） */
+  modifier?: number;
+  advantage?: 'none' | 'advantage' | 'disadvantage';
   ac: number;
   crit: boolean;
   /** 掷好的伤害（抗性之前）；没中时没有 */
@@ -177,11 +194,45 @@ export interface PendingAttack {
   attackMod: number;
   acMod: number;
   damageMod: number;
-  reactors: ReactorOption[];
-  declined: string[];
-  /** 按钮上点了要用的（本人已确认），效果还没结算 */
-  claimed: ReactorOption[];
-  used: Array<{ by: string; name: string; effect: string }>;
+}
+
+/** 豁免/检定里一个人的那一骰 */
+export interface PendingD20 {
+  name: string;
+  natural: number;
+  modifier: number;
+  advantage: 'none' | 'advantage' | 'disadvantage';
+  total: number;
+  detail: string;
+  /** 反应加减的（尖刻言语 -1d6），重掷后保留 */
+  mod: number;
+  defense?: 'resistant' | 'immune' | 'vulnerable';
+}
+
+/**
+ * 掷完、还没落账的豁免或检定。带伤害/失败状态的豁免效果由落账一起结算；
+ * 单纯的检定落账只报最终成败，后果由 DM 演。
+ */
+export interface PendingCheck extends PendingBase {
+  kind: 'roll';
+  /** 「感知豁免」「运动检定」 */
+  label: string;
+  dc?: number;
+  rolls: PendingD20[];
+  /** 豁免效果的伤害：所有目标共用一次掷骰 */
+  damage?: { total: number; detail: string; type?: string; onSave: 'half' | 'none' };
+  /** 豁免失败附带的状态 */
+  onFail?: string[];
+  damageMod: number;
+}
+
+export type PendingRoll = PendingAttack | PendingCheck;
+
+/** 这笔是什么，给提示和报错用 */
+export function describePending(p: PendingRoll): string {
+  if (p.kind === 'attack') return `${p.attacker}→${p.target} 的攻击`;
+  const who = p.rolls.map((r) => r.name).join('、');
+  return p.attacker === who ? `${who} 的${p.label}` : `${p.attacker} 的效果（${who} ${p.label}）`;
 }
 
 /** 战斗内坐标（一格 5 尺）。带上房间，角色换房间后旧坐标自动作废 */
@@ -207,8 +258,7 @@ export interface InitiativeState {
   /** 当前回合已走的尺数；指针一动就清 */
   moved?: Record<string, number>;
   /** 同一时间只有一笔：落账前不能推进，所以不需要队列 */
-  pending?: PendingAttack;
-  pendingSeq?: number;
+  pending?: PendingRoll;
   /** 本轮用过反应的人；到他自己的回合开始时恢复 */
   reacted?: string[];
 }
@@ -257,6 +307,11 @@ export interface Campaign {
   sessionStartedAt?: number;
   /** 剧情账本（chronicle.ts）；老团第一次改动时补记，新团从空开始 */
   chronicle?: ChronicleEntry[];
+  /**
+   * 骰子编号（#R）的计数。撤销时不跟着回退：退掉的编号不再复用，模型上下文里的旧编号才不会指到新的骰子上。
+   * 只有它变了不算改动，不存快照。
+   */
+  rollSeq?: number;
 }
 
 const MAX_LOG = 30;
@@ -318,7 +373,13 @@ export function reconcileKnownSites(c: Campaign, adv: Adventure): string[] {
  */
 export function parseCampaign(json: string): Campaign | undefined {
   const data = JSON.parse(json) as Record<string, unknown>;
-  if (data.version === 2) return data as unknown as Campaign;
+  if (data.version === 2) {
+    const c = data as unknown as Campaign;
+    // 待结算刚上线时只有攻击，存档里没有 kind
+    const pending = c.initiative?.pending as (PendingRoll & { kind?: string }) | undefined;
+    if (pending !== undefined && pending.kind === undefined) (pending as PendingAttack).kind = 'attack';
+    return c;
+  }
   if (data.version !== 1) return undefined;
   const { dungeonId, ...rest } = data;
   return {
@@ -784,11 +845,17 @@ export function requireInitiative(c: Campaign): InitiativeState {
   return c.initiative;
 }
 
-/** 有待结算的攻击时拒绝往下走：只靠提醒拦不住，模型常把一只怪的回合一口气结算完 */
+/** 有待结算的骰子时拒绝往下走：只靠提醒拦不住，模型常把一只怪的回合一口气结算完 */
 export function assertNoPending(c: Campaign, what: string): void {
   const p = c.initiative?.pending;
   if (p === undefined) return;
-  throw new Error(`还有一笔待结算（${p.attacker}→${p.target}），先不能${what}。玩家回应后 dnd_apply target=${p.target} settle=true 落账；判错了才用 cancel=true。`);
+  throw new Error(`还有一笔待结算（${describePending(p)}），先不能${what}。玩家回应后 dnd_apply target=${p.target} settle=true 落账；判错了才用 cancel=true。`);
+}
+
+/** 新的一骰：编号只增不减（见 Campaign.rollSeq） */
+export function nextRollId(c: Campaign): number {
+  c.rollSeq = (c.rollSeq ?? 0) + 1;
+  return c.rollSeq;
 }
 
 /** 推进到下一个还能行动的角色（跳过死亡的；昏迷的 PC 保留，要做死亡豁免） */
@@ -1498,8 +1565,11 @@ export function summarize(c: Campaign, adv: Adventure): string {
   return lines.join('\n');
 }
 
-/** 给玩家看的团况：PC 的 HP/资源、敌人只给伤势词、先攻顺序；不含 DM 笔记和怪物数值 */
-export function playerStatus(c: Campaign, adv: Adventure): string {
+/**
+ * 给玩家看的团况：PC 的 HP/资源、敌人只给伤势词、先攻顺序、站位；不含 DM 笔记和怪物数值。
+ * viewer 是看的人的 openid：战斗中多给一行他的角色到各人的距离。
+ */
+export function playerStatus(c: Campaign, adv: Adventure, viewer?: string): string {
   const lines: string[] = [];
   const graph = roomGraph(adv);
   const room = findRoom(graph, c.currentRoom);
@@ -1515,7 +1585,12 @@ export function playerStatus(c: Campaign, adv: Adventure): string {
   if (c.initiative !== undefined) {
     const s = c.initiative;
     lines.push(`⚔ 第 ${s.round} 轮：${s.order.map((e, i) => (i === s.turn ? `▶${e.name}` : e.name)).join(' → ')}`);
-    if (s.pending !== undefined) lines.push(`⏳ ${s.pending.attacker} 打 ${s.pending.target}，还没结算，等反应`);
+    // 藏起来的怪只是位置保密：名字已经在先攻表里了
+    const visible = (ch: Character): boolean => !hiddenFromPlayers(ch);
+    lines.push(...battleLines(c, (id) => findRoom(graph, id)?.name ?? id, visible));
+    const mine = viewer === undefined ? [] : c.characters.filter((ch) => ch.playerId === viewer && !isOut(ch) && cellOf(c, ch) !== undefined);
+    for (const ch of mine) lines.push(distancesFrom(c, ch.name, visible));
+    if (s.pending !== undefined) lines.push(`⏳ ${describePending(s.pending)}还没结算，等反应`);
   }
   return lines.join('\n');
 }
@@ -1578,14 +1653,20 @@ export class CampaignStore {
     return archived;
   }
 
-  /** 读取 → 修改 → 保存；fn 抛错时不保存。改动前的状态存一份快照，供 undo 回滚 */
-  public update<T>(key: string, fn: (c: Campaign) => T, label = '改动'): T {
+  /**
+   * 读取 → 修改 → 保存；fn 抛错时不保存。改动前的状态存一份快照，供 undo 回滚。
+   * label 可以是函数：骰子编号在 fn 里才分配，标签要等它跑完再取。
+   */
+  public update<T>(key: string, fn: (c: Campaign) => T, label: string | (() => string) = '改动'): T {
     const c = this.load(key);
     if (c === undefined || !c.active) throw new Error('这个群还没有进行中的团。让玩家发送 /dnd start 开团');
     const before = JSON.stringify(c);
+    const seqBefore = c.rollSeq;
     const result = fn(c);
     if (JSON.stringify(c) !== before) {
-      this.pushSnapshot(key, { at: Date.now(), label, state: before });
+      // 只多掷了一骰（没有后果的检定）不占快照：快照有上限，别让它挤掉真正能撤的改动
+      const onlyCounter = JSON.stringify({ ...c, rollSeq: seqBefore }) === before;
+      if (!onlyCounter) this.pushSnapshot(key, { at: Date.now(), label: typeof label === 'function' ? label() : label, state: before });
       this.save(c);
     }
     return result;
@@ -1626,8 +1707,21 @@ export class CampaignStore {
     const restored = parseCampaign(undone[0]!.state);
     if (restored === undefined) throw new Error('快照格式不认识，没法撤销');
     restored.active = true;
+    // 骰子编号不回退：退掉的 #R 不再复用（按钮序号也是它）
+    const seq = Math.max(this.load(key)?.rollSeq ?? 0, restored.rollSeq ?? 0);
+    if (seq > 0) restored.rollSeq = seq;
     this.save(restored);
     this.writeSnapshots(key, list);
     return undone.reverse().map((s) => s.label);
   }
+}
+
+/** 快照标签里带的骰子编号，如「dnd_check … #R12」 */
+export function snapshotRolls(label: string): number[] {
+  return [...label.matchAll(/#R(\d+)\b/g)].map((m) => Number(m[1]));
+}
+
+/** 这些改动推进过回合：按骰子撤销越过它们时要 DM 再确认一次 */
+export function crossesTurn(label: string): boolean {
+  return /^dnd_initiative .*action=(next|goto|end)\b|^按钮 结束回合/.test(label);
 }

@@ -5,7 +5,7 @@
  * 这里一次给出每个目标的豁免、伤害和 HP 变化，减半/抗性/免疫/易伤按 5e 顺序算（先减半再抗性，都向下取整）。
  */
 import { type Advantage, type DiceResult, type Roller, rollD20, rollExpression } from './dice.ts';
-import { type Campaign, type HpChange, applyDamage, checkModifier, requireCharacter } from './campaign.ts';
+import { type Campaign, type HpChange, applyDamage, changeCondition, checkModifier, requireCharacter } from './campaign.ts';
 import type { Ability } from './rules.ts';
 
 export type Defense = 'resistant' | 'immune' | 'vulnerable';
@@ -68,6 +68,8 @@ export interface SaveEffectInput {
   damage?: string;
   damageType?: string;
   onSave?: 'half' | 'none';
+  /** 豁免失败附带的状态（定身术的麻痹、雷鸣波的倒地）：和伤害同一步落账，撤销时也一起退 */
+  onFail?: string[];
   /** 所有目标默认的优劣势和加值；目标自己的设置优先 */
   advantage?: Advantage;
   bonus?: number;
@@ -76,9 +78,27 @@ export interface SaveEffectInput {
   roller: Roller;
 }
 
-export interface SaveOutcome {
+/** 一个目标掷完、还没结算的那一骰 */
+export interface RolledSave {
   name: string;
   /** 已死亡等原因跳过时的说明 */
+  skipped?: string;
+  natural?: number;
+  /** 含 bonus 和祝福骰：重掷时只换 d20，这些照旧 */
+  modifier?: number;
+  advantage?: Advantage;
+  total?: number;
+  detail?: string;
+  defense?: Defense;
+}
+
+export interface RolledSaveEffect {
+  damageRoll?: DiceResult;
+  saves: RolledSave[];
+}
+
+export interface SaveOutcome {
+  name: string;
   skipped?: string;
   detail?: string;
   saved?: boolean;
@@ -86,6 +106,8 @@ export interface SaveOutcome {
   damage?: number;
   defense?: Defense;
   change?: HpChange;
+  /** 豁免失败加上的状态 */
+  conditions?: string[];
 }
 
 export interface SaveEffectResult {
@@ -93,10 +115,11 @@ export interface SaveEffectResult {
   outcomes: SaveOutcome[];
 }
 
-/** 逐个目标豁免并扣血；任何一个目标找不到都在改动前抛错（mutate 不落盘） */
-export function resolveSaveEffect(c: Campaign, input: SaveEffectInput): SaveEffectResult {
+/** 只掷不结算：伤害骰一次，每个目标各一骰。任何一个目标找不到都在掷骰前抛错 */
+export function rollSaveEffect(c: Campaign, input: SaveEffectInput): RolledSaveEffect {
   if (input.targets.length === 0) throw new Error('targets 不能为空');
   if (input.damage !== undefined && input.dc === undefined) throw new Error('带伤害的豁免要给 dc，才能判定减半');
+  if ((input.onFail?.length ?? 0) > 0 && input.dc === undefined) throw new Error('on_fail_conditions 要给 dc，才能判定谁失败');
   const seen = new Set<string>();
   const resolved = input.targets.flatMap((t) => {
     const ch = requireCharacter(c, t.name);
@@ -105,21 +128,64 @@ export function resolveSaveEffect(c: Campaign, input: SaveEffectInput): SaveEffe
     return [{ t, ch }];
   });
   const damageRoll = input.damage === undefined ? undefined : rollExpression(input.damage, input.roller);
-  const outcomes = resolved.map(({ t, ch }): SaveOutcome => {
+  const saves = resolved.map(({ t, ch }): RolledSave => {
     if (ch.conditions.includes('死亡')) return { name: ch.name, skipped: '已死亡' };
     const extra = input.bonusDice === undefined ? undefined : rollExpression(input.bonusDice, input.roller);
     const modifier = checkModifier(ch, 'save', input.ability) + (t.bonus ?? input.bonus ?? 0) + (extra?.total ?? 0);
-    const roll = rollD20(modifier, t.advantage ?? input.advantage ?? 'none', input.roller);
-    const detail = `${roll.detail}${extra !== undefined ? `（含 ${extra.detail}）` : ''}`;
-    if (input.dc === undefined) return { name: ch.name, detail, natural: roll.natural };
-    const saved = roll.total >= input.dc;
-    const out: SaveOutcome = { name: ch.name, detail, saved, natural: roll.natural };
+    const advantage = t.advantage ?? input.advantage ?? 'none';
+    const roll = rollD20(modifier, advantage, input.roller);
+    const out: RolledSave = {
+      name: ch.name, natural: roll.natural, modifier, advantage, total: roll.total,
+      detail: `${roll.detail}${extra !== undefined ? `（含 ${extra.detail}）` : ''}`,
+    };
     if (t.defense !== undefined) out.defense = t.defense;
-    if (damageRoll !== undefined) {
-      out.damage = saveDamage(damageRoll.total, saved, input.onSave ?? 'half', t.defense);
-      if (out.damage > 0) out.change = applyDamage(c, ch.name, out.damage, { damageType: input.damageType, roller: input.roller });
+    return out;
+  });
+  return damageRoll === undefined ? { saves } : { damageRoll, saves };
+}
+
+export interface ApplySaveInput {
+  dc?: number;
+  /** 已经掷好的伤害总数（反应改过的） */
+  damage?: number;
+  damageType?: string;
+  onSave?: 'half' | 'none';
+  onFail?: string[];
+  roller: Roller;
+}
+
+/** 按掷好的骰子判成败、扣血、加状态 */
+export function applySaveEffect(c: Campaign, saves: readonly RolledSave[], input: ApplySaveInput): SaveOutcome[] {
+  return saves.map((s): SaveOutcome => {
+    if (s.skipped !== undefined || s.total === undefined) return { name: s.name, skipped: s.skipped ?? '没有掷骰' };
+    const base: SaveOutcome = { name: s.name, ...(s.detail !== undefined ? { detail: s.detail } : {}), ...(s.natural !== undefined ? { natural: s.natural } : {}) };
+    if (input.dc === undefined) return base;
+    const saved = s.total >= input.dc;
+    const out: SaveOutcome = { ...base, saved };
+    if (s.defense !== undefined) out.defense = s.defense;
+    if (input.damage !== undefined) {
+      out.damage = saveDamage(input.damage, saved, input.onSave ?? 'half', s.defense);
+      if (out.damage > 0) out.change = applyDamage(c, s.name, out.damage, { damageType: input.damageType, roller: input.roller });
+    }
+    const conditions = saved ? [] : (input.onFail ?? []);
+    if (conditions.length > 0 && !requireCharacter(c, s.name).conditions.includes('死亡')) {
+      for (const cond of conditions) changeCondition(c, s.name, cond, true);
+      out.conditions = [...conditions];
     }
     return out;
   });
-  return damageRoll === undefined ? { outcomes } : { damageRoll, outcomes };
+}
+
+/** 掷完立刻结算：没有人要反应时走这里 */
+export function resolveSaveEffect(c: Campaign, input: SaveEffectInput): SaveEffectResult {
+  const rolled = rollSaveEffect(c, input);
+  const outcomes = applySaveEffect(c, rolled.saves, {
+    ...(input.dc !== undefined ? { dc: input.dc } : {}),
+    ...(rolled.damageRoll !== undefined ? { damage: rolled.damageRoll.total } : {}),
+    ...(input.damageType !== undefined ? { damageType: input.damageType } : {}),
+    ...(input.onSave !== undefined ? { onSave: input.onSave } : {}),
+    ...(input.onFail !== undefined ? { onFail: input.onFail } : {}),
+    roller: input.roller,
+  });
+  return rolled.damageRoll === undefined ? { outcomes } : { damageRoll: rolled.damageRoll, outcomes };
 }

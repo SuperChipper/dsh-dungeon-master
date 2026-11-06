@@ -12,7 +12,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { SessionManager, SessionRecord } from '../session/index.ts';
 import type { Logger, ReplyTarget } from '../types.ts';
 import { BUTTONS_PER_ROW, buttonLabel, decodeButtonData, encodeButtonData } from '../features/button-utils.ts';
-import { type Campaign, type PendingAttack, findCharacter, nextTurn, playerStatus } from './campaign.ts';
+import { type Campaign, type PendingRoll, describePending, findCharacter, nextTurn, playerStatus } from './campaign.ts';
 import { REACTION_WINDOW_MS, waitingOn } from './pending-attack.ts';
 import { type CheckIn, arrivalNotice, checkInHint, createCheckIn, isComplete, kickoffMessage, markArrived, rosterOf, rosterText } from './check-in.ts';
 import type { DndService } from './dnd-service.ts';
@@ -86,7 +86,7 @@ function shortName(name: string): string {
  * 反应窗口：每个可用的反应一个按钮，再加一个「不用」。权限不靠 QQ 的 specify_user_ids，
  * 和「结束回合」一样在回调里比对点击者 openid：别人的按钮点了会被拒，提示也更明确。
  */
-export function buildReactionKeyboard(p: PendingAttack): InlineKeyboard {
+export function buildReactionKeyboard(p: PendingRoll): InlineKeyboard {
   const options = p.reactors.map((r, i) => callbackButton(`dnd-react-${i}`, buttonLabel(`${shortName(r.character)}·${r.reaction}`), 1, encodeButtonData({ t: 'dnd', a: 'react', r: p.seq, i })));
   // 挤在一行里名字会被截断 → 默认竖着排；QQ 键盘最多 5 行，选项太多才退回两列，宁可挤也别整条发不出去
   const perRow = options.length + 1 > MAX_KEYBOARD_ROWS ? BUTTONS_PER_ROW : 1;
@@ -184,7 +184,7 @@ export class DndTurnButtons {
     const p = this.service.active(record.sessionKey)?.campaign.initiative?.pending;
     if (p === undefined) return;
     if (!this.disabled && record.scope === 'group' && p.reactors.length > 0) {
-      const text = `⚡ ${p.attacker} 打 ${p.target}，还没结算。要用反应的点下面，只有本人点才算，也可以直接打字说。`
+      const text = `⚡ ${describePending(p)}还没结算。要用反应的点下面，只有本人点才算，也可以直接打字说。`
         + `约 ${Math.round(REACTION_WINDOW_MS / 1000)} 秒没回算不用。`;
       try {
         await this.sender.sendMarkdown(record.replyTarget, text, { keyboard: buildReactionKeyboard(p) });
@@ -193,13 +193,14 @@ export class DndTurnButtons {
         this.logger.warn(`im-qqbot: 反应按钮发送失败，本次运行不再发按钮: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    const timer = setTimeout(() => this.reactionTimeout(record, p.seq), REACTION_WINDOW_MS);
+    const timer = setTimeout(() => this.reactionTimeout(record, p.seq, p.at), REACTION_WINDOW_MS);
     timer.unref?.();
   }
 
-  private reactionTimeout(record: SessionRecord, seq: number): void {
+  private reactionTimeout(record: SessionRecord, seq: number, at: number): void {
     const p = this.service.active(record.sessionKey)?.campaign.initiative?.pending;
-    if (p === undefined || p.seq !== seq) return;
+    // at 变了 = 重掷后窗口重开过，新开的那个计时器会负责提醒
+    if (p === undefined || p.seq !== seq || p.at !== at) return;
     const waiting = waitingOn(p);
     if (waiting.length === 0) return;
     this.notifyDm(record, `[系统 · 反应窗口] 时间到，${waiting.join('、')} 没回，算不用。用 dnd_apply target=${p.target} settle=true 落账，再接着结算。`);
@@ -246,8 +247,8 @@ export class DndTurnButtons {
     }, `按钮 反应 ${option.character}·${option.reaction}`);
     this.logger.info(`im-qqbot: 跑团反应按钮 key=${key} ${option.character}·${option.reaction} by=${clicker ?? '?'}`);
     if (record !== undefined) {
-      this.notifyDm(record, `[系统 · 按钮] ${option.character} 的玩家本人点了用「${option.reaction}」。这是对「${p.attacker}→${p.target}」那笔的反应，不是新的回合行动：`
-        + `用 dnd_apply target=${p.target} reaction={by:"${option.character}", name:"${option.reaction}", ...} 改数值，不用 declared_by。`);
+      this.notifyDm(record, `[系统 · 按钮] ${option.character} 的玩家本人点了用「${option.reaction}」。这是对「${describePending(p)}」那笔的反应，不是新的回合行动：`
+        + `用 dnd_apply target=${p.target} reaction={by:"${option.character}", name:"${option.reaction}", ...} 改数值（重掷类传 reroll:"d20"；豁免/检定的 target 填被改的那个掷骰人），不用 declared_by。`);
     }
     return ACK.ok;
   }
@@ -389,7 +390,7 @@ export class DndTurnButtons {
 
     if (button.a === 'status') {
       if (record !== undefined) {
-        void this.sender.sendMarkdown(record.replyTarget, `🎲 ${found.adventure.name}\n${playerStatus(found.campaign, found.adventure)}`)
+        void this.sender.sendMarkdown(record.replyTarget, `🎲 ${found.adventure.name}\n${playerStatus(found.campaign, found.adventure, event.group_member_openid ?? event.user_openid)}`)
           .catch((err: unknown) => this.logger.warn(`im-qqbot: 跑团状态发送失败: ${err instanceof Error ? err.message : String(err)}`));
       }
       return ACK.ok;
