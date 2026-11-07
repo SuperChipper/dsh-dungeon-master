@@ -131,6 +131,20 @@ export interface Site {
   /** 从别的场景过来时进入的房间 */
   entry: string;
   rooms: DungeonRoom[];
+  /** 模组书里的地图（玩家版）。dnd_map 优先发它，没有才画方框示意图 */
+  maps?: SiteMap[];
+}
+
+/** 原图像素坐标：左上角 x、y，宽、高 */
+export type MapRect = [number, number, number, number];
+
+export interface SiteMap {
+  /** 图片路径，相对模组目录；只有目录形式的模组能用 */
+  image: string;
+  /** fog：只露出去过的房间并裁到那一片；full：整张给玩家看（城镇、区域图） */
+  reveal?: 'fog' | 'full';
+  /** 房间在图上的位置。一个房间可以给几块（房间本身 + 连着它的走廊）；full 图只用来标队伍位置 */
+  rooms: Record<string, MapRect | MapRect[]>;
 }
 
 export interface Npc {
@@ -225,6 +239,8 @@ export interface Adventure {
   flags: FlagDef[];
   routes?: Route[];
   milestones?: Milestone[];
+  /** 目录形式模组的所在目录，地图图片相对它；加载时填，不写在 JSON 里 */
+  dir?: string;
 }
 
 // ── 索引 ──
@@ -327,6 +343,28 @@ function walkCondition(cond: Condition, visit: (atom: Exclude<Condition, { all: 
 }
 
 /** 校验模组结构和所有引用；不合法时抛出带原因的错误 */
+function validateSiteMaps(site: Site): void {
+  if (site.maps === undefined) return;
+  if (!Array.isArray(site.maps)) throw new Error(`场景 ${site.id} 的 maps 要是数组`);
+  const own = new Set(site.rooms.map((r) => r.id));
+  for (const map of site.maps) {
+    if (typeof map.image !== 'string' || map.image.length === 0) throw new Error(`场景 ${site.id} 的地图缺少 image`);
+    if (map.reveal !== undefined && map.reveal !== 'fog' && map.reveal !== 'full') throw new Error(`场景 ${site.id} 的地图 reveal 只能是 fog 或 full`);
+    if (typeof map.rooms !== 'object' || map.rooms === null) throw new Error(`场景 ${site.id} 的地图缺少 rooms`);
+    for (const [roomId, value] of Object.entries(map.rooms)) {
+      if (!own.has(roomId)) throw new Error(`场景 ${site.id} 的地图 ${map.image} 标了不属于本场景的房间 ${roomId}`);
+      const rects = mapRects(value);
+      const bad = rects.length === 0 || rects.some((r) => !Array.isArray(r) || r.length !== 4 || r.some((n) => typeof n !== 'number' || n < 0) || r[2] === 0 || r[3] === 0);
+      if (bad) throw new Error(`场景 ${site.id} 的地图里房间 ${roomId} 的位置要写成 [x, y, 宽, 高]（或几个这样的数组）`);
+    }
+  }
+}
+
+/** 一个房间在地图上的全部矩形（单个矩形也统一成数组） */
+export function mapRects(value: MapRect | MapRect[]): MapRect[] {
+  return Array.isArray(value[0]) ? (value as MapRect[]) : [value as MapRect];
+}
+
 export function validateAdventure(input: unknown): Adventure {
   const raw = input as Partial<Adventure>;
   if (typeof raw !== 'object' || raw === null) throw new Error('模组必须是对象');
@@ -362,6 +400,7 @@ export function validateAdventure(input: unknown): Adventure {
     if (isHub(site)) layoutHub(site);
     validateRooms(`场景 ${site.id}`, site.rooms, roomIds);
     if (!site.rooms.some((r) => r.id === site.entry)) throw new Error(`场景 ${site.id} 的 entry 不是本场景的房间`);
+    validateSiteMaps(site);
   }
   if (!roomIds.has(adv.start)) throw new Error(`${where}：start 不是有效房间`);
   if (adv.opening !== undefined && (!Array.isArray(adv.opening) || adv.opening.some((s) => typeof s !== 'string'))) {
@@ -597,7 +636,14 @@ export class AdventureLibrary {
     const data = JSON.parse(readFileSync(main, 'utf8')) as Partial<Adventure>;
     const sites = [...(data.sites ?? []), ...siteFiles.map((f) => JSON.parse(readFileSync(f, 'utf8')) as Site)];
     const adventure = validateAdventure({ ...data, sites });
+    if (isDir) adventure.dir = path;
     for (const w of adventureWarnings(adventure)) this.logger?.warn(`im-qqbot: 模组 ${adventure.id}: ${w}`);
+    for (const site of adventure.sites) {
+      for (const map of site.maps ?? []) {
+        if (!isDir) this.logger?.warn(`im-qqbot: 模组 ${adventure.id}: 单文件模组用不了地图图片（${map.image}），要放进目录`);
+        else if (!existsSync(join(path, map.image))) this.logger?.warn(`im-qqbot: 模组 ${adventure.id}: 场景 ${site.id} 的地图图片不存在: ${map.image}`);
+      }
+    }
     this.cache.set(path, { mtime, adventure });
     return adventure;
   }

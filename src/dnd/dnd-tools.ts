@@ -94,6 +94,7 @@ import {
 import type { DndService } from './dnd-service.ts';
 import { exitsOf, findRoom, resolveRoom } from './dungeon.ts';
 import { renderMapPng } from './map-render.ts';
+import { renderBookMap } from './book-map.ts';
 import {
   type NpcState,
   afterChange,
@@ -1750,18 +1751,24 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
 
   register(
     'dnd_map',
-    'Render the explored part of the dungeon map (unexplored rooms stay in fog) and send it to the group as an image.',
-    { caption: { type: 'string', description: 'Optional short text sent with the map.' } },
+    'Send the map of where the party is to the group as an image. Uses the module book\'s player map when the site has one '
+    + '(rooms not yet visited are blacked out, cropped to the explored part); otherwise draws a schematic of the explored rooms.',
+    {
+      caption: { type: 'string', description: 'Optional short text sent with the map.' },
+      schematic: { type: 'boolean', description: 'Force the box-and-line schematic even when a book map exists.' },
+    },
     [],
     async (args, exec) => {
       const record = recordOf(exec);
       const { campaign, adventure } = service.require(record.sessionKey);
       const out = join(service.mapDir, `${record.sessionKey.replace(/[^a-zA-Z0-9_-]+/g, '_')}-${Date.now()}.png`);
-      const path = await renderMapPng(campaign, adventure, out);
+      const book = args.schematic === true ? undefined : await renderBookMap(campaign, adventure, out);
+      const path = book ?? await renderMapPng(campaign, adventure, out);
       if (path === undefined) throw new Error('dnd_map: 地图渲染需要 sharp，当前环境没装上');
       await deps.sendImage(record, path, str(args.caption));
       const { site, seen, total } = explored(campaign, adventure);
-      return `「${site?.name ?? adventure.name}」地图已发到群里（已探索 ${seen}/${total} 个房间）。不用再复述地图内容。`;
+      const kind = book !== undefined ? '模组地图' : '示意图';
+      return `「${site?.name ?? adventure.name}」${kind}已发到群里（已探索 ${seen}/${total} 个房间）。不用再复述地图内容。`;
     },
   );
 

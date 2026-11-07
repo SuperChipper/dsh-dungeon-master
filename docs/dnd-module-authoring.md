@@ -109,6 +109,7 @@
 |---|---|
 | `playerView` | 可以说给玩家的描述（短，3 句以内） |
 | `dmNotes` | DC、陷阱、宝物、怪物战术；工具结果和注入里都有 |
+| （场景）`maps` | 书里的玩家版地图：`[{ image, reveal?: "fog"\|"full", rooms: { 房间 id: [x,y,宽,高] 或几个矩形 } }]`，image 相对模组目录。fog 只露去过的房间并裁剪，full 整张发（城镇、区域图）；dnd_map 有它就不画示意图 |
 | `exits` | `[{ to, label, hidden?, check?, requires?, lockedText?, oneWay? }]`；只写一边就双向连通。传送阵、滑道、陷坑这种回不去的写 `oneWay: true`，否则玩家能从落点反着走回来 |
 | `encounter` | 首次进入时刷出的怪物，见下 |
 | `battlemap` | 战斗场地图（5 尺一格的墙、门、障碍），见第 5 节；不写就由 DM 开战时画 |
