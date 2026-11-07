@@ -9,7 +9,7 @@ export function modelCommand({ manager, config }: CommandDeps): CategorizedComma
   return {
     name: 'model',
     category: 'agent',
-    description: '查看或切换模型（用法: /model [provider/model]）',
+    description: '查看或切换模型（用法: /model [provider/model]｜/model reset 回到默认）',
     authorized: (ctx) => {
       // 无参数只是查看/列出模型，不限制；带参数才是修改
       const raw = (ctx.command?.raw ?? '').trim();
@@ -54,6 +54,14 @@ export function modelCommand({ manager, config }: CommandDeps): CategorizedComma
         return { kind: 'noop' as const };
       }
 
+      // /model reset：清掉这个会话的覆盖，回到配置默认路由。
+      // 没有这一步，/model 写进去的 per-chat 覆盖就是单向的，永远回不去。
+      if (args === 'reset' || args === 'clear' || args === '默认') {
+        const route = await manager.clearModelOverride(scope, peerId);
+        const label = route === undefined ? '宿主默认配置' : `${route.provider}/${route.model}`;
+        return `✅ 已清掉本会话的模型覆盖，回到默认：${label}
+立即生效，对话上下文保留。`;
+      }
       // 解析 provider/model 格式
       let provider: string;
       let model: string;
@@ -73,7 +81,10 @@ export function modelCommand({ manager, config }: CommandDeps): CategorizedComma
         return '用法: /model provider/model\n示例: /model deepseek-official/deepseek-v4-flash';
       }
 
-      await manager.setModelOverride(scope, peerId, { provider, model });
+      const applied = await manager.setModelOverride(scope, peerId, { provider, model });
+      if (!applied) {
+        return `✅ 已记下: ${provider}/${model}\n这一轮还在跑，下一句开口就用新模型（上下文不动）。`;
+      }
       return `✅ 模型已切换: ${provider}/${model}\n立即生效，对话上下文保留。`;
     },
   };

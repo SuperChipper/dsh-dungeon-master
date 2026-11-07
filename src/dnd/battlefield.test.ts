@@ -8,7 +8,7 @@ import { CampaignStore, applyDamage, changeCondition, createCampaign, findCharac
 import { SUNKEN_BELL } from './dungeons/sunken-bell.ts';
 import { DndService } from './dnd-service.ts';
 import { combatTurnPrompt, registerDndTools, srdMonsterInput } from './dnd-tools.ts';
-import { attackRangeNote, battleLines, cellOf, distanceFeet, distancesFrom, moveOnGrid, moveResultText, setPositions, turnPositionNote, unplaced } from './battlefield.ts';
+import { attackRangeNote, battleGridLines, battleLines, cellOf, distanceFeet, distancesFrom, moveOnGrid, moveResultText, setBattleMap, setPositions, turnPositionNote, unplaced } from './battlefield.ts';
 
 const BELL = adventureFromDungeon(SUNKEN_BELL);
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
@@ -224,6 +224,9 @@ describe('回合提示和团况', () => {
       { name: '狼', x: 1, y: 0 },
       { name: '大地精', x: 0, y: 3 },
     ]);
+    // 这间还没画场地图：回合提示里一直要，打到一半才有这功能的战斗也能补上
+    expect(turnPositionNote(c, '刻德温')).toBe('【站位】刻德温(0,0)，贴身：狼。这间还没有场地图：先 dnd_position terrain 照现有站位把墙、门、门外走廊、障碍画上。');
+    setBattleMap(c, c.currentRoom, { width: 10, height: 10 });
     expect(turnPositionNote(c, '刻德温')).toBe('【站位】刻德温(0,0)，贴身：狼。');
     expect(turnPositionNote(c, 'Kriv')).toBe('【站位】Kriv(0,6)，最近的敌人 大地精 15 尺。');
   });
@@ -397,5 +400,53 @@ describe('长柄大师：进入触及范围也吃借机', () => {
     const c = reachArena();
     ch(c, '刻德温').notes = '普通战士，手里只有长剑';
     expect(moveOnGrid(c, '狼', { x: 8, y: 10 }).enters).toEqual([]);
+  });
+});
+
+describe('站位示意图', () => {
+  it('画成等宽网格：坐标照实标、裁到有人的范围外一圈、图例在下面', () => {
+    const c = arena();
+    setPositions(c, [{ name: '刻德温', x: 3, y: 2 }, { name: 'Kriv', x: 4, y: 2 }, { name: '狼', x: 6, y: 4 }, { name: '大地精', x: 3, y: 4 }]);
+    const lines = battleGridLines(c, (id) => id)!;
+    expect(lines.slice(0, 7)).toEqual([
+      '```',
+      '     2  3  4  5  6  7',
+      '  1  .  .  .  .  .  .',
+      '  2  .  A  K  .  .  .',
+      '  3  .  .  .  .  .  .',
+      '  4  .  2  .  .  1  .',
+      '  5  .  .  .  .  .  .',
+    ]);
+    expect(lines[7]).toBe('```');
+    expect(lines[8]).toBe('A=刻德温　K=Kriv　1=狼　2=大地精');
+    expect(lines[9]).toContain('x 向东');
+    // 每一行一样宽，代码块里才对得齐
+    expect(new Set(lines.slice(1, 7).map((l) => l.length)).size).toBe(1);
+  });
+
+  it('标记用小写字母，同一格两个人用 @，藏起来的不画也不进图例', () => {
+    const c = arena();
+    setPositions(c, [{ name: '刻德温', x: 0, y: 0 }, { name: 'Kriv', x: 0, y: 0 }, { name: '狼', x: 2, y: 0 }, { name: '门', x: 1, y: 1, mark: true }]);
+    changeCondition(c, '狼', '隐形', true);
+    const lines = battleGridLines(c, (id) => id, (x) => !x.conditions.includes('隐形'))!;
+    const text = lines.join('\n');
+    expect(text).toContain('  0  @  .');
+    expect(text).toContain('  1  .  a');
+    expect(text).toContain('a=门');
+    expect(text).toContain('@=刻德温+Kriv');
+    expect(text).not.toContain('狼');
+  });
+
+  it('没人摆位时返回 undefined（调用方退回坐标列表）', () => {
+    expect(battleGridLines(arena(), (id) => id)).toBeUndefined();
+  });
+
+  it('范围太大不再整张放弃：截人最多的那一块，图外的人列出来', () => {
+    const c = arena();
+    setPositions(c, [{ name: '刻德温', x: 0, y: 0 }, { name: 'Kriv', x: 1, y: 0 }, { name: '狼', x: 30, y: 0 }]);
+    const grid = battleGridLines(c, (id) => id)!;
+    expect(grid).toContain('图外：狼(30,0)');
+    // 22 列一格 2 个字符
+    expect(grid.find((l) => l.startsWith('  0'))).toBe(`  0${['A', 'K'].map((g) => g.padStart(2)).join('')}${' .'.repeat(20)}`);
   });
 });

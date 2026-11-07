@@ -144,6 +144,19 @@ describe('模组校验', () => {
     expect(() => validateAdventure(badNpc)).toThrow(/home.room/);
   });
 
+  it('房间预写的场地图：越界报房间 id，门的 to 要指向真实房间', () => {
+    const base = fixture();
+    const ok = structuredClone(base);
+    ok.sites[1]!.rooms[0]!.battlemap = { width: 6, height: 4, areas: [{ kind: 'door', x: 5, y: 1, to: 'mine-shaft' }] };
+    expect(validateAdventure(ok).sites[1]!.rooms[0]!.battlemap?.width).toBe(6);
+    const outside = structuredClone(base);
+    outside.sites[1]!.rooms[0]!.battlemap = { width: 6, height: 4, areas: [{ kind: 'wall', x: 6, y: 0 }] };
+    expect(() => validateAdventure(outside)).toThrow(/mine-mouth 的 battlemap：areas\[0\]\.x/);
+    const badDoor = structuredClone(base);
+    badDoor.sites[1]!.rooms[0]!.battlemap = { width: 6, height: 4, areas: [{ kind: 'door', x: 5, y: 1, to: 'nowhere' }] };
+    expect(() => validateAdventure(badDoor)).toThrow(/不存在的房间 nowhere/);
+  });
+
   it('警告：没人设置的 flag、线索太少的场景', () => {
     const adv = fixture();
     expect(adventureWarnings(adv)).toEqual([]);
@@ -307,7 +320,8 @@ describe('剧情动作', () => {
     const shaft = adv.sites[1]!.rooms[1]!;
     expect(roomView(c, adv, shaft).playerView).toBe('一片寂静。');
     const lines = storyAction(c, adv, 'trigger', 'mouth-alarm', {});
-    expect(lines.join('\n')).toContain('巨鼠1 HP7');
+    expect(lines.join('\n')).toContain('巨鼠1');
+    expect(lines.join('\n')).not.toMatch(/HP\d|AC\d/);
     expect(c.characters.filter((ch) => ch.room === 'mine-mouth').map((ch) => ch.name)).toEqual(['巨鼠1', '巨鼠2']);
     expect(c.flags).toEqual(['alarm']);
     expect(roomView(c, adv, shaft).playerView).toBe('远处传来尖叫声。');

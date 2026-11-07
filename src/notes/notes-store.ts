@@ -462,11 +462,17 @@ const INJECT_MIN_MATCHED_TERMS = 2;
 /**
  * 把检索结果格式化成注入到用户消息前的提示块；没有足够相关的结果返回空串。
  */
-export function formatNotesHint(
+/**
+ * 从检索结果里挑出真正要注入的段。
+ *
+ * 单独拿出来是为了让调用方能拿到「到底注入了哪几段」——账本要记的是注入事实，
+ * 而不是检索候选；两件事差一位就会把统计做错。
+ */
+export function selectNotesForInjection(
   hits: readonly NoteHit[],
-  options: { topK: number; maxChars: number; minCoverage: number },
-): string {
-  const relevant = hits
+  options: { topK: number; minCoverage: number },
+): NoteHit[] {
+  return hits
     .filter((hit) =>
       (hit.coverage >= options.minCoverage && hit.matched >= INJECT_MIN_MATCHED_TERMS)
       // 引号原文/别名/编号这类强字面命中，即便查询里闲聊词多、覆盖率被拉低也值得注入
@@ -474,6 +480,13 @@ export function formatNotesHint(
       // 带 similarity 说明已过语义门槛：同义/换说法的段一个词都没撞上，覆盖率为 0，只能靠这一条进来
       || hit.similarity !== undefined)
     .slice(0, options.topK);
+}
+
+export function formatNotesHint(
+  hits: readonly NoteHit[],
+  options: { topK: number; maxChars: number; minCoverage: number },
+): string {
+  const relevant = selectNotesForInjection(hits, options);
   if (relevant.length === 0) return '';
 
   const perHit = Math.max(80, Math.floor(options.maxChars / relevant.length));

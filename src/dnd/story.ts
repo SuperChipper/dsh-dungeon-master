@@ -24,7 +24,7 @@ import {
   findSite,
   siteOfRoom,
 } from './adventure.ts';
-import type { Campaign, Character, CharacterInput } from './campaign.ts';
+import { type Campaign, type Character, type CharacterInput, woundLabel } from './campaign.ts';
 import type { DungeonMonster, DungeonRoom } from './dungeon.ts';
 
 export interface NpcState {
@@ -469,6 +469,10 @@ export function npcCard(c: Campaign, adv: Adventure, npc: Npc): string {
     }).join('；')}`);
   }
   if (npc.knows.length > 0) lines.push('知道的事（说之前先 dnd_story fact）：', ...npc.knows.map((f) => factLine(c, adv, f)));
+  // 维瑞丝的 knows 是空的，审问时 DM 替她编了个「断崖下的营地」，黑蜘蛛就死在了模组里没有的地方
+  lines.push(npc.knows.length > 0
+    ? '这几条之外他不知道别的：问到就说不知道。要让他撒谎，先 dnd_chronicle 记一笔「X 撒谎：…」，别让谎话变成真的。'
+    : '模组没写他知道什么：审问时只说他亲身经历、亲眼见过的事，不要替他编新的地点、人物、据点或计划。');
   return lines.filter(Boolean).join('\n');
 }
 
@@ -531,8 +535,9 @@ export function roomCard(c: Campaign, adv: Adventure, room: DungeonRoom): string
 
 // ── brief=true 的一行摘要：只回答「谁在、状态怎样、还有什么没做」，详情再查完整卡片 ──
 
+/** 怪物只给伤势词：数字给了就会被说出去（见 dnd-tools 的 SECRET_NOTE） */
 function statusTag(ch: Character): string {
-  return `${ch.name} HP${ch.hp}/${ch.maxHp}${ch.conditions.length > 0 ? `[${ch.conditions.join(',')}]` : ''}`;
+  return `${ch.name} ${ch.kind === 'monster' ? woundLabel(ch) : `HP${ch.hp}/${ch.maxHp}`}${ch.conditions.length > 0 ? `[${ch.conditions.join(',')}]` : ''}`;
 }
 
 export function roomBrief(c: Campaign, adv: Adventure, room: DungeonRoom): string {

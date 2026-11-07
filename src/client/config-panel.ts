@@ -137,6 +137,22 @@ interface ToolAccessWire {
   readRoots: string[];
 }
 
+/** 上游监测与主备切换（与 src/config.ts 的 ModelFailoverConfig 对应） */
+interface ModelFailoverWire {
+  enabled: boolean;
+  intervalMinutes: number;
+  failThreshold: number;
+  recoverThreshold: number;
+  primaryProvider: string;
+  primaryModel: string;
+  primaryApiKeyEnv: string;
+  backupProvider: string;
+  backupModel: string;
+  backupApiKeyEnv: string;
+  ttftThresholdMs: number;
+  notify: boolean;
+}
+
 /** 定期清理（rules 不在表单上，保存时由服务端保留旧值） */
 interface CleanupWire {
   dryRun: boolean;
@@ -215,6 +231,7 @@ type ConfigWire = {
   stickers?: StickersWire;
   notes?: NotesWire;
   toolAccess?: ToolAccessWire;
+  modelFailover?: ModelFailoverWire;
   media?: MediaWire;
   vision?: VisionWire;
   asr?: AsrWire;
@@ -563,6 +580,18 @@ export function ConfigPanel(): ReactNode {
         readRoots: t.readRoots.map((v) => v.trim()).filter(Boolean),
       };
     }
+    if (changed.modelFailover !== undefined) {
+      const f = changed.modelFailover as ModelFailoverWire;
+      changed.modelFailover = {
+        ...f,
+        primaryProvider: f.primaryProvider.trim(),
+        primaryModel: f.primaryModel.trim(),
+        backupProvider: f.backupProvider.trim(),
+        backupModel: f.backupModel.trim(),
+        primaryApiKeyEnv: f.primaryApiKeyEnv.trim(),
+        backupApiKeyEnv: f.backupApiKeyEnv.trim(),
+      };
+    }
     if (changed.sendFile !== undefined) {
       const s = changed.sendFile as SendFileWire;
       changed.sendFile = { ...s, extraRoots: s.extraRoots.map((v) => v.trim()).filter(Boolean) };
@@ -634,6 +663,20 @@ export function ConfigPanel(): ReactNode {
   };
   const toolAccess: ToolAccessWire = form.toolAccess ?? {
     enabled: true, fullAccessGroups: [], fullAccessUsers: [], readRoots: [],
+  };
+  const failover: ModelFailoverWire = form.modelFailover ?? {
+    enabled: false,
+    intervalMinutes: 10,
+    failThreshold: 1,
+    recoverThreshold: 3,
+    primaryProvider: '',
+    primaryModel: '',
+    primaryApiKeyEnv: '',
+    backupProvider: 'commandcode',
+    backupModel: 'deepseek/deepseek-v4.1-flash',
+    backupApiKeyEnv: 'COMMANDCODE_API_KEY',
+    ttftThresholdMs: 8000,
+    notify: true,
   };
   const cleanup: CleanupWire = form.cleanup ?? { dryRun: false };
   const fanart: FanartWire = form.fanart ?? { enabled: true, proxy: '', poolDir: '' };
@@ -1108,6 +1151,47 @@ export function ConfigPanel(): ReactNode {
       onChange: (v) => { patch('toolAccess', { ...toolAccess, readRoots: v }); },
     }),
 
+    createElement('div', { className: 'imqb2-group-title' }, '上游监测'),
+    createElement(SwitchRow, {
+      label: '监测 upstream 状态并自动切模型', checked: failover.enabled,
+      help: '走 opencode 时每几分钟查一次状态接口；主用降级就切到备用，恢复后再切回',
+      onChange: (v) => { patch('modelFailover', { ...failover, enabled: v }); },
+    }),
+    createElement(NumberRow, {
+      label: '轮询间隔（分钟）', value: failover.intervalMinutes, min: 1, max: 60,
+      onChange: (v) => { patch('modelFailover', { ...failover, intervalMinutes: v }); },
+    }),
+    createElement(NumberRow, {
+      label: '连续几次异常才切换', value: failover.failThreshold, min: 1, max: 10,
+      onChange: (v) => { patch('modelFailover', { ...failover, failThreshold: v }); },
+    }),
+    createElement(NumberRow, {
+      label: '连续几次正常才切回', value: failover.recoverThreshold, min: 1, max: 20,
+      onChange: (v) => { patch('modelFailover', { ...failover, recoverThreshold: v }); },
+    }),
+    createElement(FieldRow, {
+      label: '备用 provider', help: '留空则不启用；切换后所有活跃会话都走这里',
+      value: failover.backupProvider,
+      onChange: (v) => { patch('modelFailover', { ...failover, backupProvider: v }); },
+    }),
+    createElement(FieldRow, {
+      label: '备用模型 id', value: failover.backupModel,
+      onChange: (v) => { patch('modelFailover', { ...failover, backupModel: v }); },
+    }),
+    createElement(NumberRow, {
+      label: '首 token 时延阈值（毫秒）', value: failover.ttftThresholdMs, min: 1000, max: 60000,
+      help: '没有状态接口的 provider 靠发小请求测时延；超过阈值判降级',
+      onChange: (v) => { patch('modelFailover', { ...failover, ttftThresholdMs: v }); },
+    }),
+    createElement(FieldRow, {
+      label: '备用凭据环境变量', value: failover.backupApiKeyEnv,
+      help: '如 COMMANDCODE_API_KEY；从 ~/.dsh/.env 或凭证库读取，不填则只认环境里已有的',
+      onChange: (v) => { patch('modelFailover', { ...failover, backupApiKeyEnv: v }); },
+    }),
+    createElement(SwitchRow, {
+      label: '切换时通知主人', checked: failover.notify,
+      onChange: (v) => { patch('modelFailover', { ...failover, notify: v }); },
+    }),
     createElement('div', { className: 'imqb2-group-title' }, '文件发送'),
     createElement(SwitchRow, {
       label: '启用路径白名单', checked: sendFile.restrictPaths,

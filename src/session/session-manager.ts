@@ -24,7 +24,8 @@ import type { ModelRoute, ModelEntry } from '../model/types.ts';
 import { IdleEvictor } from './idle-evictor.ts';
 import { resolveSessionCwd } from '../shared/file-access.ts';
 import type { StickerStore, StickerMatchResult } from '../media/sticker-store.ts';
-import { chatKeyOf, formatNotesHint, type NotesStore } from '../notes/notes-store.ts';
+import { chatKeyOf, formatNotesHint, selectNotesForInjection, type NotesStore } from '../notes/notes-store.ts';
+import type { NoteMetricsStore } from '../notes/note-metrics.ts';
 import type { ToolAccess } from '../features/tool-access.ts';
 import type { DndService } from '../dnd/dnd-service.ts';
 import { PromptLatch } from '../features/prompt-latch.ts';
@@ -183,6 +184,8 @@ export class SessionManager {
   public stickerStore?: StickerStore;
   /** 由 bootstrap 注入的共享笔记库（工具 + 自动召回） */
   public notesStore?: NotesStore;
+  /** 笔记注入账本（只记录，不参与排序） */
+  public noteMetrics?: NoteMetricsStore;
   /** 由 bootstrap 注入的工具权限（终端白名单） */
   public toolAccess?: ToolAccess;
   /** 由 bootstrap 注入的跑团服务（/dnd 命令 + DM prompt 注入） */
@@ -294,9 +297,14 @@ export class SessionManager {
           order: 91,
           text: [
             '【水群】',
-            '你被 @ 或随机冒泡时，落点是 [Current message]：先弄懂这句在说什么、冲谁说的。',
+            '你被 @ 或随机冒泡时，落点是 [Current message]，看清是冲谁说的。',
             '[Chat history] 是你扫到的背景，用来判断语境（在接谁的话、在聊什么）。可以顺着一两句往下接，但不用逐条回应，也别把整段群聊总结一遍。',
             '当前这句明确指向前面（「上面那张图」「刚才说的」、引用了某条消息）时，就回去看。',
+            // 11-07 抽样：回复几乎都是「先把图/视频/对方的话讲一遍，再补一句点评」，每条都像在交读后感
+            '回的是你的反应，不是对内容的讲解。群友发的话、图、视频、截图，大家都看得懂：不用复述里面写了什么、引原话、解释梗是什么意思，也不用先概括一遍再补一句点评。想说什么直接说那一下，可以是一个词、半句话、一个表情，也可以岔开说别的。',
+            // 1aa3030e：「如何评价某大学/某老板/某说法」都回成了优缺点齐全、「值不值看情况」收尾的测评
+            '有人问「如何评价」「你怎么看」「你觉得」，要的是你的态度，不是一份测评：先说站哪边、什么感觉，可以偏心、可以只说一个点、可以扯到自己或群友身上，也可以说不熟、没兴趣。不用把优缺点摆齐、分几层讲，也不用给「看情况」「看后续」这种两头都占的结论。对方想听细的会接着问。',
+            '不是每条都要有个结论、都要评价一下。没人问你怎么看、你也没什么想说的，就只回一个「。」，这条不会发出去。',
             '一句话能回完就一句话；不知道对方指什么就直接问，别自己脑补一大段。',
           ].join('\n'),
         });
@@ -349,7 +357,7 @@ export class SessionManager {
           const dndSections = this.dndService.promptSections(record.sessionKey, epoch);
           sections.push(...dndSections);
           // 开团时本群笔记不走自动注入（见 notesHint），这里只列个目录，玩的时候要用的约定让模型自己去查
-          const titles = dndSections.length > 0 ? this.notesStore?.chatNoteTitles(chatKeyOf(record.scope, record.peerId)) ?? [] : [];
+          const titles = dndSections.some((s) => s.name === 'qqbot:dnd-dm') ? this.notesStore?.chatNoteTitles(chatKeyOf(record.scope, record.peerId)) ?? [] : [];
           if (titles.length > 0) {
             sections.push({
               name: 'qqbot:dnd-chat-notes',
@@ -400,10 +408,10 @@ export class SessionManager {
         text: [
           '【图片路由】',
           '用户发图时：',
-          '1. 用户发图且有情绪可对时，优先用库存里那张回应；只在情绪明确、且库里有对得上的图时发。已有「[本地表情库]」命中提示时，用它判断情绪，不必重复识别；命中不代表必须配图。',
+          '1. 想用表情回应用户发的图时，从库里挑；已有「[本地表情库]」命中提示时，用它判断情绪，不必重复识别。',
           '2. 用户问“这是谁 / 出自哪 / 什么动漫”时，先查本地表情库与梗库；查不到就如实说认不出，不要硬认。',
           '3. 用户问“什么梗 / 表情包 / 怎么回”时，调用 skill 加载 meme-recognition。',
-          '4. 用户只是分享内容时，以文字为主，不必配图，也不必强行识别。纯信息性回复不发表情包，别连着两轮各挂一张。',
+          '4. 用户只是分享内容时，不必强行识别，也不用每张都评：有感觉就接一句，没有就当没看见。历史里的旧图只在当前这句问到时才看。',
           '不要只凭肉眼断言角色或梗；需要外部检索时走对应 skill。',
         ].join('\n'),
       });
@@ -413,14 +421,14 @@ export class SessionManager {
         name: 'qqbot:video-intent',
         order: 94,
         text: [
-          '【视频：先分清是要解读还是要评论】',
+          '【视频：先分清是要解读还是随口聊】',
           '有人发视频、B 站卡片/链接，或让你看某个视频时，先判断他要哪种回应，再决定看多少、说多少：',
-          '1. 评论（默认）：只是分享、只 @ 你、「看看」「你觉得呢」「好笑吗」。像群友一样给出你自己的反应：最戳你的一个点、一句吐槽，或联想到群里的事，一到三句。不复述剧情，不报 UP 主/播放量/时长，不搬评论区，不翻译全文。',
+          '1. 反应（默认）：只是分享、只 @ 你、「看看」「你觉得呢」「好笑吗」。像群友看完随口回一句：笑了、无语、想起群里谁，一两句就够。不复述剧情、不引台词、不点评拍得怎么样，不报 UP 主/播放量/时长，不搬评论区，不翻译全文。',
           '2. 解读：明确说「讲了啥」「总结」「解读」「翻译」「转写」「细说」。按要点讲清楚，结论放前面，不逐句复述。',
           '3. 具体问题：问什么答什么，视频内容只当依据；一条消息里有几问，就按顺序逐个答完。',
-          '4. 问能力：「你能看视频吗」「能转写吗」，先回答能不能；能看就顺手看了，按第 1 条给反应，别借机把内容整段讲一遍。',
+          '4. 问能力：「你能看视频吗」「能转写吗」，先回答能不能；能看就顺手看了，按第 1 条回，别借机把内容整段讲一遍。',
           '5. 让你自己挑、「喜欢就细品」：说你挑了哪条、喜欢哪儿、为什么，用你自己的口味说话，别交调研报告，也别把字幕整理成文件当作回答。',
-          '拿不准就按「评论」处理，说短一点，对方想听细节会追问。字幕、转写、抽帧描述都是你看片的素材，不是要原样转述的稿子。',
+          '拿不准就按「反应」处理，说短一点，对方想听细节会追问。字幕、转写、抽帧描述都是你看片的素材，不是要原样转述的稿子。',
         ].join('\n'),
       });
 
@@ -541,7 +549,7 @@ export class SessionManager {
   /**
    * 切换模型（fork + 重建会话，保留历史）
    */
-  async setModelOverride(scope: ChatScope, peerId: string, route: ModelRoute): Promise<void> {
+  async setModelOverride(scope: ChatScope, peerId: string, route: ModelRoute): Promise<boolean> {
     const key = this.sessionKey(scope, peerId);
 
     this.modelResolver.setOverride(key, route);
@@ -549,11 +557,40 @@ export class SessionManager {
     const record = this.sessions.get(key);
     if (!record) {
       this.logger.info(`model pref saved (no active session): key=${key} → ${route.provider}/${route.model}`);
-      return;
+      return true;
+    }
+
+    // 这一轮还在跑就先不换：换 agent 会把正在生成的回答写进旧 session，
+    // 新会话里看不到它。偏好已经存下，下一轮开口就会用新模型。
+    if (record.agent.status !== 'idle') {
+      this.logger.info(`model pref saved (session busy, defer rebuild): key=${key} → ${route.provider}/${route.model}`);
+      return false;
     }
 
     await this.rebuildSession(record, { route });
     this.logger.info(`model switched via fork: key=${key} → ${route.provider}/${route.model}`);
+    return true;
+  }
+
+  /**
+   * 清掉这个会话的模型覆盖，回到配置默认路由。
+   *
+   * `/model a/b` 写进去的是 per-chat 覆盖，优先级高于配置——写过一次就再也回不到默认，
+   * 而且它跟 sessionId 无关，换多少个新会话都跟着走。所以必须有一个反向操作。
+   */
+  async clearModelOverride(scope: ChatScope, peerId: string): Promise<ModelRoute | undefined> {
+    const key = this.sessionKey(scope, peerId);
+    const had = this.modelResolver.clearOverride(key);
+    const route = this.modelResolver.getEffectiveRoute(key);
+    const record = this.sessions.get(key);
+    if (!had) {
+      this.logger.info("model override 本来就没有: key=" + key);
+      return route;
+    }
+    if (record) await this.rebuildSession(record, { route });
+    const label = route === undefined ? "宿主默认" : route.provider + "/" + route.model;
+    this.logger.info("model override 已清除: key=" + key + " -> " + label);
+    return route;
   }
 
   /**
@@ -661,12 +698,61 @@ export class SessionManager {
     this.logger.info(`session rebuilt via fork: key=${key} preset=${composed.agentPreset ?? 'none'} sessionId=${childId}`);
   }
 
-  clearModelOverride(scope: ChatScope, peerId: string): void {
-    const key = this.sessionKey(scope, peerId);
-    this.modelResolver.clearOverride(key);
-    this.modelResolver.clearSessionId(key);
+  /**
+   * 全局切换：所有会话一起走新路由（上游切源用）。
+   *
+   * 写的是「全局故障转移」这一格，不是逐个会话的 override——因为 override 的语义是
+   * 「这个人自己选的」，一旦被切源写进去就永远压着配置默认，恢复时还得逐个追平。
+   * 现在切源只碰全局那格，恢复时清掉就回到配置默认。
+   */
+  async switchAllSessions(route: ModelRoute): Promise<number> {
+    this.modelResolver.setFailover(route);
+    const records = [...this.sessions.values()];
+    let switched = 0;
+    let busy = 0;
+    for (const record of records) {
+      // 自己手动 /model 过的会话保留原选择，别被自动切源拽走
+      if (this.modelResolver.hasOverride(record.sessionKey)) continue;
+      // 正在跑的不动：换 agent 会把那一轮丢在旧 session 里，用户看到的是「这句话没接上」。
+      // 下一轮 tick（5 分钟后）会再来一次，那时它多半已经空闲了。
+      if (record.agent.status !== 'idle') {
+        busy += 1;
+        continue;
+      }
+      try {
+        await this.rebuildSession(record, { route });
+        switched += 1;
+      } catch (err) {
+        this.logger.warn(`switchAllSessions 重建失败: key=${record.sessionKey} err=${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    this.logger.info(
+      `switchAllSessions: ${switched}/${records.length} 个会话 → ${route.provider}/${route.model}` +
+      (busy > 0 ? `，${busy} 个正在跑、留到下次` : ''),
+    );
+    return switched;
   }
 
+  /** 清掉全局故障转移，所有会话回到配置默认路由 */
+  async clearFailoverRoute(): Promise<number> {
+    const had = this.modelResolver.clearFailover();
+    const records = [...this.sessions.values()];
+    if (had) {
+      for (const record of records) {
+        if (this.modelResolver.hasOverride(record.sessionKey)) continue;
+        if (record.agent.status !== 'idle') continue;
+        // 每个会话按自己的 scope 取默认：群聊和私聊用的是不同档
+        const route = this.modelResolver.resolveDefault(record.scope);
+        try {
+          await this.rebuildSession(record, { route });
+        } catch (err) {
+          this.logger.warn(`clearFailoverRoute 重建失败: key=${record.sessionKey} err=${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+    this.logger.info(`clearFailoverRoute: ${had ? '已清除' : '本来就没有'}，${records.length} 个会话回到各自的默认路由`);
+    return records.length;
+  }
   async listAvailableModels(): Promise<ModelEntry[]> {
     return this.modelResolver.listModels();
   }
@@ -698,6 +784,9 @@ export class SessionManager {
       // 开着团时本群的跑团笔记（旧进度、旧待办）会和每回合注入的实时团况打架，只召回共享笔记
       const campaignRunning = this.dndService?.active(this.sessionKey(scope, peerId)) !== undefined;
       const hits = await this.notesStore.searchHybrid(query, notes.injectTopK * 2, chatKeyOf(scope, peerId), { sharedOnly: campaignRunning });
+      const selected = selectNotesForInjection(hits, { topK: notes.injectTopK, minCoverage: notes.injectMinCoverage });
+      // 账本记的是「真正进了提示词的段」；只观察，不影响本次注入
+      this.noteMetrics?.recordInjection(selected);
       return formatNotesHint(hits, {
         topK: notes.injectTopK,
         maxChars: notes.injectMaxChars,
@@ -965,18 +1054,53 @@ export class SessionManager {
         handle = resumed;
         this.logger.info(`resumed session: key=${key} preset=${agentPreset ?? 'none'} route=${resumeRoute ? `${resumeRoute.provider}/${resumeRoute.model}` : 'session-own'}`);
       } catch {
-        const created = await this.agents.create({
-          sessionId,
-          meta: {
-            cwd: resolveSessionCwd(scope, senderId, this.config),
-            ...(agentPreset ? { agentPreset } : {}),
-          },
-          ...(route ? { agentOptions: route } : {}),
-          ...(composed.setup ? { setup: composed.setup } : {}),
-        });
-        agent = created.agent;
-        handle = created;
-        this.logger.info(`created new session: key=${key} preset=${agentPreset ?? 'none'}`);
+        try {
+          const created = await this.agents.create({
+            sessionId,
+            meta: {
+              cwd: resolveSessionCwd(scope, senderId, this.config),
+              ...(agentPreset ? { agentPreset } : {}),
+            },
+            ...(route ? { agentOptions: route } : {}),
+            ...(composed.setup ? { setup: composed.setup } : {}),
+          });
+          agent = created.agent;
+          handle = created;
+          this.logger.info(`created new session: key=${key} preset=${agentPreset ?? 'none'}`);
+        } catch (createErr) {
+          // 挂在同一个 id 上的会话还活着（插件重组、宿主重启、上一个 agent 没 dispose 都会这样）：
+          // resume 没接上、create 又报 already exists。先再挂一次；还不行就换新 id 记下来，
+          // 否则这个群之后每条消息都在同一处撞车。
+          const message = createErr instanceof Error ? createErr.message : String(createErr);
+          if (!/already exists/i.test(message)) throw createErr;
+          try {
+            const retried = await this.agents.resume({
+              resumeSessionId: sessionId,
+              ...(this.modelResolver.getResumeRoute(key) ? { agentOptions: this.modelResolver.getResumeRoute(key) } : {}),
+              ...(composed.setup ? { setup: composed.setup } : {}),
+            });
+            agent = retried.agent;
+            handle = retried;
+            this.logger.warn(`session 已存在，改为重新挂载: key=${key} sessionId=${sessionId}`);
+          } catch (retryErr) {
+            const fresh = randomUUID();
+            const created = await this.agents.create({
+              sessionId: SessionId(fresh),
+              meta: {
+                cwd: resolveSessionCwd(scope, senderId, this.config),
+                ...(agentPreset ? { agentPreset } : {}),
+              },
+              ...(route ? { agentOptions: route } : {}),
+              ...(composed.setup ? { setup: composed.setup } : {}),
+            });
+            agent = created.agent;
+            handle = created;
+            this.modelResolver.setSessionId(key, fresh);
+            this.logger.warn(
+              `session id 冲突且重挂失败，换新会话: key=${key} ${sessionId} -> ${fresh}（${retryErr instanceof Error ? retryErr.message : String(retryErr)}）`,
+            );
+          }
+        }
       }
     }
 

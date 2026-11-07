@@ -52,7 +52,32 @@ export class ModelResolver {
    * 优先级：per-peer 偏好 > config 显式指定 > settings.yaml > 宿主服务
    */
   getEffectiveRoute(sessionKey: string): ModelRoute | undefined {
-    return this.prefs.getOverride(sessionKey) ?? this.resolveDefault();
+    return this.prefs.getOverride(sessionKey) ?? this.prefs.getFailover() ?? this.resolveDefault(this.scopeOf(sessionKey));
+  }
+
+
+  /** 从 sessionKey 推断 scope（qqbot:<appId>:<group|c2c>:<peerId>） */
+  private scopeOf(sessionKey: string): "group" | "c2c" {
+    return sessionKey.includes(":group:") ? "group" : "c2c";
+  }
+
+  /**
+   * 全局故障转移：写一次，所有没被单独指定过模型的会话都跟着走。
+   *
+   * 之前切源是给每个会话逐个写 override，结果是「切过就回不来了」——
+   * 那些 override 会永久压住配置默认，恢复时还得再写一遍才追得平。
+   * 单独存一份之后，恢复只需要清掉它。
+   */
+  setFailover(route: ModelRoute): void {
+    this.prefs.setFailover(route);
+  }
+
+  getFailover(): ModelRoute | undefined {
+    return this.prefs.getFailover();
+  }
+
+  clearFailover(): boolean {
+    return this.prefs.clearFailover();
   }
 
   /**
@@ -68,6 +93,8 @@ export class ModelResolver {
   getResumeRoute(sessionKey: string): ModelRoute | undefined {
     const override = this.prefs.getOverride(sessionKey);
     if (override) return override;
+    const failover = this.prefs.getFailover();
+    if (failover) return failover;
 
     if (this.config.provider && this.config.model) {
       return { provider: this.config.provider, model: this.config.model };
@@ -86,8 +113,8 @@ export class ModelResolver {
   /**
    * 清除 per-peer 模型偏好并持久化
    */
-  clearOverride(sessionKey: string): void {
-    this.prefs.clearOverride(sessionKey);
+  clearOverride(sessionKey: string): boolean {
+    return this.prefs.clearOverride(sessionKey);
   }
 
   /**
@@ -145,7 +172,12 @@ export class ModelResolver {
    * 优先级：config 显式指定 > settings.yaml（只读） > 宿主 agentDefaultModel
    * 最终兜底 deepseek-official/deepseek-v4-flash，确保 {{model}} 变量始终有值。
    */
-  resolveDefault(): ModelRoute {
+  resolveDefault(scope?: "group" | "c2c"): ModelRoute {
+    // 群聊可以单独指定一档更快的模型：群聊量大、回复短、对首字延迟敏感，
+    // 私聊和长任务继续用配置里的默认档。
+    if (scope === "group" && this.config.groupProvider && this.config.groupModel) {
+      return { provider: this.config.groupProvider, model: this.config.groupModel };
+    }
     if (this.config.provider && this.config.model) {
       return { provider: this.config.provider, model: this.config.model };
     }

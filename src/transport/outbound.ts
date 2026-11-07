@@ -11,7 +11,7 @@ import type { StickerStore } from '../media/sticker-store.ts';
 import { extractPseudoStickerCalls, sanitizePseudoToolText } from '../media/pseudo-sticker-call.ts';
 import { SEND_FILE_TOOL_NAME } from '../media/send-file-tool.ts';
 import { captionFromArgs, stripCaptionEcho } from './caption-echo.ts';
-import { isBlankReply } from './text-guard.ts';
+import { dropTrailingPeriod, isBlankReply } from './text-guard.ts';
 import { chunkMarkdownText } from './chunker.ts';
 import { OutboundBuffer, type QQBotSender } from './outbound-buffer.ts';
 import { SelfSentIndex } from './self-sent.ts';
@@ -173,7 +173,7 @@ class OutboundRouter {
         this.config.textChunkLimit,
         this.logger,
         this.shouldStream(record),
-        (raw) => this.salvage(raw, captions),
+        (raw) => this.casualTone(record, this.salvage(raw, captions)),
         (raw) => stripCaptionEcho(sanitizePseudoToolText(raw), captions),
         (raw) => this.markUnsent(record, raw),
       );
@@ -336,9 +336,16 @@ class OutboundRouter {
     return visible;
   }
 
+  /** 群聊里模型自己说的短句去掉句末「。」 */
+  private casualTone(record: SessionRecord, text: string): string {
+    return record.scope === 'group' ? dropTrailingPeriod(text) : text;
+  }
+
   /** 统一发送：切分 + 逐 chunk 发送 + 错误记录 */
   private async send(record: SessionRecord, text: string, tag: string, captions: readonly string[] = []): Promise<void> {
-    const visible = this.salvage(text, captions);
+    const salvaged = this.salvage(text, captions);
+    // 工具结果、报错是系统文字，不改
+    const visible = tag === 'sendMarkdown' ? this.casualTone(record, salvaged) : salvaged;
     if (!visible.trim() || isBlankReply(visible)) {
       if (visible.trim()) this.logger.debug(`im-qqbot: 只有标点的空回复，丢弃: ${JSON.stringify(visible)}`);
       return;

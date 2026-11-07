@@ -96,6 +96,9 @@ describe('qqbot_transcribe', () => {
     expect(out.segments).toBe(1);
     expect(out.chunks).toBe(1);
     expect(out.message).toContain('SPEAKER_01');
+    // 给模型看的结果末尾提醒别引台词；text 字段保持纯转写
+    expect(out.message).toContain('别引台词');
+    expect(out.text).not.toContain('别引台词');
   });
 
   it('正文为 null 时报「思考吃掉额度」而不是回显空串', async () => {

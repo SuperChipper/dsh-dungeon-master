@@ -168,7 +168,10 @@ describe.runIf(hasFfmpeg())('qqbot_describe_video with real ffmpeg', () => {
     expect(saved[0].data.subarray(0, 3)).toEqual(new Uint8Array([0xff, 0xd8, 0xff]));
     expect(prompts[0]).toContain('3x1 grid of 3 frames');
     const form = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as FormData;
-    expect((form.get('file') as Blob).size).toBeGreaterThan(6 * 16000 * 2 * 0.9);
+    const audio = form.get('file') as File;
+    expect(audio.name).toBe('audio.mp3');
+    // 整段 6 秒 48kbps 约 36KB；明显偏小说明音轨被截断了
+    expect(audio.size).toBeGreaterThan(6 * (48000 / 8) * 0.9);
   });
 
   it('tells the model to refuse when the ASR server is offline', async () => {
@@ -176,8 +179,8 @@ describe.runIf(hasFfmpeg())('qqbot_describe_video with real ffmpeg', () => {
     const out = await tool!.execute({ video: clip }, { signal: new AbortController().signal });
     expect(out.transcribed).toBe(false);
     expect(out.text).toContain('[Visual] a color test pattern');
-    expect(out.text).toContain('[Speech] (speech recognition is unavailable: the ASR server is offline.');
-    expect(out.text).toContain('Do not try to transcribe the audio any other way');
+    expect(out.text).toContain('[Speech] (speech recognition is unavailable right now.');
+    expect(out.text).toContain('do not try to transcribe the audio any other way');
   });
 
   it('rejects a missing file', async () => {

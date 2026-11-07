@@ -14,7 +14,7 @@ import { isVoiceFile } from '../media/voice-reply.ts';
 const NARRATION_MAX_CHARS = 80;
 
 /** 「发出去了 / 已发送 / 附了一句 / 配了张图」等描述发送动作的说法 */
-const NARRATION_PATTERN = /发(出去|过去|送|好|了)|已发|附(了|上|带)|配(了|上)|caption|\bsent\b|attached/i;
+const NARRATION_PATTERN = /发(出去|过去|送|好|了|完)|已发|附(了|上|带)|配(了|上)|caption|\bsent\b|attached/i;
 
 /** 去掉空白、标点、符号与 emoji 后比较，容忍模型改了标点或多带一个表情 */
 function normalizeForEcho(text: string): string {

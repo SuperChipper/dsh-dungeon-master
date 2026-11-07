@@ -33,6 +33,8 @@ describe('stripCaptionEcho', () => {
     expect(stripCaptionEcho('表情和图都已经发出去了，还附了一句话：写这段话确实烧了不少token。', sent)).toBe('');
     expect(stripCaptionEcho('已发送～', sent)).toBe('');
     expect(stripCaptionEcho('图配好了，附了一句吐槽', sent)).toBe('');
+    // 11-05 群里发完表情后又冒出来的那一句
+    expect(stripCaptionEcho('发完了', sent)).toBe('');
   });
 
   it('没发过 caption 时，汇报式文本不受影响', () => {

@@ -208,7 +208,7 @@ describe('反应改数值', () => {
     t.rolls.push(12, 3); // 18 vs 16
     await t.biteKriv();
     const text = await t.call('dnd_apply', { target: 'Kriv', declared_by: 'P2', reaction: { by: 'Kriv', name: '护盾术', ac_mod: 5, spend: '防御法杖充能' } });
-    expect(text).toContain('vs AC 21');
+    expect(text).not.toContain('AC 21');
     expect(text).toContain('未命中');
     await t.call('dnd_apply', { target: 'Kriv', settle: true });
     expect(t.hp('Kriv')).toBe(20);

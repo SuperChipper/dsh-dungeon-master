@@ -137,10 +137,10 @@ function optionsText(p: PendingRoll): string {
 function rollLine(p: PendingCheck, r: PendingD20): string {
   const passed = rollPassed(p, r);
   const total = `${r.total + r.mod}${r.mod !== 0 ? `（原 ${r.total}）` : ''}`;
-  return `${r.name} ${p.label} ${total}${p.dc !== undefined ? ` vs DC ${p.dc} → ${passed === true ? '成功' : '失败'}` : ''}`;
+  return `${r.name} ${p.label} ${total}${p.dc !== undefined ? ` → ${passed === true ? '成功' : '失败'}` : ''}`;
 }
 
-/** 这笔现在的局面，给模型看：含 DC/AC，和其他工具结果一样是 DM 机密 */
+/** 这笔现在的局面，给模型看：只给成败，DC/AC 的数字不给（会被照抄进群里） */
 export function pendingState(p: PendingRoll): string {
   if (p.kind === 'roll') {
     const damage = p.damage === undefined
@@ -150,7 +150,7 @@ export function pendingState(p: PendingRoll): string {
     return `${p.attacker !== p.target || p.rolls.length > 1 ? `${p.attacker} 的效果：` : ''}${p.rolls.map((r) => rollLine(p, r)).join('；')}${damage}${onFail}`;
   }
   const hit = pendingHit(p);
-  const attack = `攻击 ${p.total + p.attackMod}${p.attackMod !== 0 ? `（原 ${p.total}）` : ''} vs AC ${p.ac + p.acMod}`;
+  const attack = `攻击 ${p.total + p.attackMod}${p.attackMod !== 0 ? `（原 ${p.total}）` : ''}`;
   const damage = !hit
     ? '未命中，落账时不扣血'
     : p.rawDamage === undefined

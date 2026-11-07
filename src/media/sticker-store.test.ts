@@ -84,6 +84,15 @@ describe('StickerStore', () => {
     expect(index[1]?.look).toHaveLength(40);
   });
 
+  it('清单只讲用法，什么时候发留给人设', () => {
+    const { media, store } = setup();
+    store.save({ source: writeImage(media, 'a.png', 'bytes-a'), emotion: '开心' });
+    const text = store.promptSections().map((section) => section.text).join('\n');
+    expect(text).toContain('一次最多发 1 张');
+    expect(text).not.toContain('连着两轮');
+    expect(text).not.toContain('才用 qqbot_send_file');
+  });
+
   it('给旧条目补 look 后，不会被 catalogAdditions 当成新收藏', () => {
     const { media, root, store } = setup();
     store.save({ source: writeImage(media, 'a.png', 'bytes-a'), emotion: '开心' });

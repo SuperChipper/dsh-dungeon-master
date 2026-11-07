@@ -214,6 +214,7 @@ export async function handleInbound(
     // 忽略真正触发它的那句话。没附上的仍在历史文本里留路径，需要时自己看。
     const attachHistory = wantsHistoryImages(
       [msg.content ?? '', mwState.quote?.text ?? mwState.quote?.entry?.content ?? ''].join('\n'),
+      [...(mwState.downloadedFiles ?? []), ...(mwState.downloadedQuoteFiles ?? [])].some((file) => file.contentType === 'image'),
     );
     const hasNativeImage = (attachHistory && historyImages.some((image) => image.localPath !== undefined))
       || forwardImages.some((image) => image.localPath !== undefined)
@@ -222,7 +223,7 @@ export async function handleInbound(
     if (hasNativeImage) {
       content.push({
         type: 'text' as const,
-        text: '[图片已原生注入：直接看图，不要调用 qqbot_describe_image。]',
+        text: '[图片已原生附上，不用调用 qqbot_describe_image。]',
       });
     }
 
@@ -571,13 +572,19 @@ function renderMediaLine(
 /** 当前消息（含引用原文）里指向图片/前文的说法 */
 const HISTORY_IMAGE_CUE = /图|照片|截图|表情|这张|那张|上面|上边|楼上|前面|刚才|刚刚|之前发|meme|pic|image/i;
 
+/** 图片/表情消息自带的占位文字：「[图片]」「【表情: …】」本身就含「图」「表情」，不能算在说前面的图 */
+const IMAGE_PLACEHOLDER = /<@!?[^>]*>|<faceType=[^>]*>|【表情[^】]*】|\[(图片|表情|动画表情)\]/g;
+
 /**
  * 是否要把历史图片原生附给模型：当前消息像是在说前面的图，或者只 @ 了 bot 没说话
  * （常见于「@bot」让它对刚才的内容做反应）。其余情况只留文本标记，避免模型点评一屏历史图。
+ * 只发了一张图（ownImages）说的就是这张图：以前占位文字会命中「图」，每张单发的图都捎上
+ * 三四张旧图，模型就把旧图也挨个评一遍。
  */
-export function wantsHistoryImages(currentText: string): boolean {
-  const text = currentText.replace(/<@!?[^>]*>/g, '').trim();
-  return text.length === 0 || HISTORY_IMAGE_CUE.test(text);
+export function wantsHistoryImages(currentText: string, ownImages = false): boolean {
+  const text = currentText.replace(IMAGE_PLACEHOLDER, '').trim();
+  if (text.length === 0) return !ownImages;
+  return HISTORY_IMAGE_CUE.test(text);
 }
 
 /**

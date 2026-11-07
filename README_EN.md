@@ -29,7 +29,7 @@ Send `/dnd start` in a group and the bot becomes that group's dungeon master (DM
 ### Design principles
 
 - **Every ruling goes through a tool.** Dice, checks, damage, HP, conditions, positions and resources only change through `dnd_*` tools; the model cannot make up numbers.
-- **Secrets stay in tool results.** DCs, monster AC/HP, DM notes and secret doors only appear in tool results, and `dnd_*` results are never shown in the group. Players only hear a wound word for monsters (unhurt / lightly hurt / badly hurt / barely standing).
+- **Secrets stay out of reach.** DM notes and secret doors only appear in tool results, and `dnd_*` results are never shown in the group. Monster AC/HP and DCs are left out of routine tool results and the state snapshot altogether: the DM gets hit/miss, pass/fail and a wound word (unhurt / lightly hurt / badly hurt / barely standing), and looks up exact numbers with `dnd_character show` when it needs them. While a campaign is paused, a short rule block keeps chat about it spoiler-free and makes the DM check the ledger before answering.
 - **Only a PC's own player can act for it.** PCs are bound to their player's openid and only that player can declare their actions. The tool also checks that the player actually sent a message recently, so copying the openid off the sheet doesn't work.
 - **Strict turn order.** In combat only the creature whose turn it is can act, and only a PC's own player can end that PC's turn (their bonus action or movement may still be unused).
 - **Only a compact state goes into the prompt.** The full state lives in JSON; each turn gets a short summary, which keeps context costs down.
@@ -40,7 +40,7 @@ Send `/dnd start` in a group and the bot becomes that group's dungeon master (DM
 |---------|--------------|
 | `/dnd start [dungeon id]` | Start a campaign (an earlier campaign in the same dungeon resumes); in groups the message carries check-in buttons and the game opens once everyone is in |
 | `/dnd new [dungeon id] [blank]` | Archive the old campaign and start fresh (blank drops the old character sheets) |
-| `/dnd status` | Campaign state from the players' point of view; in combat, positions and distances from your character (hidden or invisible monsters are left out) |
+| `/dnd status` | Campaign state from the players' point of view; in combat, a character-grid sketch of positions, with walls `#`, doors `+`, the corridor outside `:`, difficult terrain `~` and obstacles when the room has a battle map (a coordinate list when markdown cannot be sent), plus distances from your character (hidden or invisible monsters are left out) |
 | `/dnd checkin` | Re-send the check-in buttons |
 | `/dnd end` | Pause (to get a story recap from the DM, just say you're stopping for tonight) |
 | `/dnd dungeons` | List available dungeons |
@@ -69,7 +69,7 @@ Send `/dnd start` in a group and the bot becomes that group's dungeon master (DM
 | `dnd_rest` | Short rest (the tool rolls hit dice and heals) and long rest |
 | `dnd_initiative` | Initiative start / next / goto / end / status; only creatures present join |
 | `dnd_move` | Move between rooms (`who` for split parties, secret doors). Returns the player-facing description plus DM-only notes |
-| `dnd_position` | Battlefield positions in combat (5 ft cells): placement, on-turn movement, distance queries; flags opportunity attacks on moves and checks range on attacks; kept in the state snapshot so compaction cannot lose it |
+| `dnd_position` | Battlefield positions in combat (5 ft cells): a per-room battle map (walls, doors, the corridor outside, obstacles, difficult terrain; kept in the save, or pre-written as `battlemap` on a module room), placement (`near` a door), on-turn movement, distance queries; moves take intent (`to` a creature/door/outside, `keep_adjacent`, `away_from`, dash, drag, disengage), route around walls and pay double in difficult terrain; flags opportunity attacks on moves and checks range and walls on attacks; kept in the state snapshot so compaction cannot lose it |
 | `dnd_map` | Renders the explored part of the map with fog and sends it to the group (needs the optional `sharp` dependency) |
 | `dnd_undo` | List recent changes, undo N of them at once, or roll back to before a given roll with everything it caused |
 | `dnd_end` | End the session with a story recap, injected next time the campaign starts |
@@ -124,6 +124,7 @@ The Markdown files under `notes.root` (default `cwd/notes`) are the bot's long-t
 
 ## 🔧 Tools
 
+- **Reverse image search.** `qqbot_reverse_image` looks up where a local image comes from, filling the gap `qqbot_match_sticker` (library-only) cannot. Two sources: `trace.moe` recognises anime screenshots and returns title, episode and timestamp (free, no key); `SauceNAO` traces fan art back to the author and original post (needs a free `QQBOT_SAUCENAO_KEY`; anonymous API access was shut off in Nov 2026). **The image is uploaded to both third-party services**, so it should only be called when the user explicitly asks who or where an image is from, never automatically for every image.
 - **Read-only Bilibili tools.** `bili_search`, `bili_video`, `bili_comments` and `bili_subtitle`, plus QR login via `bili_login` / `bili_login_check`.
   - Read-only: no tools for posting comments, uploading or messaging.
   - Credentials stay on this machine in `~/.dsh/bili-read/`.

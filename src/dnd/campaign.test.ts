@@ -452,7 +452,9 @@ describe('摘要与地图', () => {
     const text = summarize(c, BELL);
     expect(text).toContain('钟楼残殿');
     expect(text).toContain('艾琳 9/9 AC14〈小鱼〉');
-    expect(text).toContain('巨鼠1 7/7');
+    // 怪物只给伤势词，血量和 AC 不进团况
+    expect(text).toContain('巨鼠1 毫发无伤');
+    expect(text).not.toMatch(/巨鼠1[^；\n]*(\d+\/\d+|AC\d)/);
     expect(text).toContain('战斗第 1 轮');
   });
 
@@ -484,7 +486,8 @@ describe('CampaignStore / DndService', () => {
     expect(service.promptSections('group:abc')[0]!.name).toBe('qqbot:dnd-dm');
     expect(service.stateSnapshot('group:abc')).toContain('【团况 · DM 视角】');
     service.stop('group:abc');
-    expect(service.promptSections('group:abc')).toEqual([]);
+    // 停团后只剩一小段停团守则
+    expect(service.promptSections('group:abc').map((s) => s.name)).toEqual(['qqbot:dnd-paused']);
     expect(service.stateSnapshot('group:abc')).toBe('');
     expect(() => service.store.update('group:abc', () => 0)).toThrow(/\/dnd start/);
 

@@ -113,7 +113,7 @@ describe('豁免效果一次结算', () => {
   it('旧用法不变：没有 targets、没有 damage 的豁免只报点数', async () => {
     const { call, campaign } = setup(fixed(12));
     const text = await call('dnd_check', { character: '地精1', type: 'save', ability: '敏捷', dc: 13 });
-    expect(text).toContain('地精1 敏捷豁免：d20[12] + 2 = 14 vs DC 13 → 成功');
+    expect(text).toContain('地精1 敏捷豁免：d20[12] + 2 = 14 → 成功 #R1');
     expect(findCharacter(campaign(), '地精1')!.hp).toBe(7);
   });
 
@@ -177,7 +177,7 @@ describe('回合提示去重', () => {
 });
 
 describe('卡片摘要', () => {
-  it('roomBrief 一行列出在场角色的 HP 和状态', () => {
+  it('roomBrief 一行列出在场角色的状态：PC 给 HP，怪物只给伤势词', () => {
     const c = createCampaign('k', BELL);
     upsertCharacter(c, { name: '卡厄斯', maxHp: 12 });
     upsertCharacter(c, { name: '巨鼠1', kind: 'monster', maxHp: 7, room: c.currentRoom });
@@ -186,7 +186,7 @@ describe('卡片摘要', () => {
     const line = roomBrief(c, BELL, room);
     expect(line).not.toContain('\n');
     expect(line).toContain('卡厄斯 HP12/12');
-    expect(line).toContain('巨鼠1 HP7/7[倒地]');
+    expect(line).toContain('巨鼠1 毫发无伤[倒地]');
   });
 
   it('npcBrief 给态度、位置和没说的信息 id', () => {
@@ -205,7 +205,7 @@ describe('卡片摘要', () => {
     const full = await call('dnd_lookup', { kind: 'room' });
     const brief = await call('dnd_lookup', { kind: 'room', brief: true });
     expect(brief.length).toBeLessThan(full.length);
-    expect(brief).toContain('地精1 HP7/7');
+    expect(brief).toContain('地精1 毫发无伤');
     expect(await call('dnd_character', { action: 'show', name: '地精2', brief: true })).toMatch(/^地精2 HP 20\/20 AC \d+/);
   });
 });

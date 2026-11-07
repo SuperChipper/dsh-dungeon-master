@@ -159,6 +159,34 @@ export interface FileAccessConfig {
   sensitivePaths: string[];
 }
 
+/** 上游监测与主备切换 */
+export interface ModelFailoverConfig {
+  /** 启用上游状态监测 */
+  enabled: boolean;
+  /** 轮询间隔（分钟） */
+  intervalMinutes: number;
+  /** 连续几次异常才切换 */
+  failThreshold: number;
+  /** 连续几次正常才切回 */
+  recoverThreshold: number;
+  /** 主用 provider（空=跟随当前配置） */
+  primaryProvider: string;
+  /** 主用模型 id */
+  primaryModel: string;
+  /** 主用探测用的凭据环境变量（状态接口方式不需要） */
+  primaryApiKeyEnv: string;
+  /** 备用 provider */
+  backupProvider: string;
+  /** 备用模型 id */
+  backupModel: string;
+  /** 备用探测用的凭据环境变量 */
+  backupApiKeyEnv: string;
+  /** 首 token 时延阈值（毫秒），超过判降级 */
+  ttftThresholdMs: number;
+  /** 切换时是否在群里说一句 */
+  notify: boolean;
+}
+
 export interface ToolAccessConfig {
   /** 是否按会话限制工具（关闭 = 所有 QQ 会话都能用终端、读任意路径） */
   enabled: boolean;
@@ -316,6 +344,10 @@ export interface ImQQBotConfig {
   groupPrompt?: string;
   /** 私聊额外 system prompt */
   directPrompt?: string;
+  /** 群聊默认 provider（留空=跟随全局 provider） */
+  groupProvider?: string;
+  /** 群聊默认模型（留空=跟随全局 model） */
+  groupModel?: string;
   /** 单条消息最大长度（QQ 限制约 5000 字符） */
   textChunkLimit: number;
   /** 是否启用流式输出（群聊始终不启用） */
@@ -362,6 +394,9 @@ export interface ImQQBotConfig {
   fileAccess: FileAccessConfig;
   /** 工具权限：哪些会话能用终端、文件工具能碰哪些目录 */
   toolAccess: ToolAccessConfig;
+
+  /** 上游状态监测与主备模型切换（走 opencode 时才有意义） */
+  modelFailover: ModelFailoverConfig;
   /** 表情自动收藏（qqbot_save_sticker + 动态表情清单） */
   stickers: StickersConfig;
   /** 共享笔记库（qqbot_notes_search / qqbot_notes_save + 自动召回） */
@@ -405,6 +440,22 @@ export const ToolAccessSchema: Schema<ToolAccessConfig> = Schema.object({
   fullAccessGroups: Schema.array(Schema.string()).default([]).description('能用终端、读写任意路径的群 openid'),
   fullAccessUsers: Schema.array(Schema.string()).default([]).description('除主人外能用终端的私聊 openid'),
   readRoots: Schema.array(Schema.string()).default([]).description('受限会话额外允许访问的目录'),
+});
+
+/** 上游监测与主备切换子 Schema */
+export const ModelFailoverSchema: Schema<ModelFailoverConfig> = Schema.object({
+  enabled: Schema.boolean().default(false).description('启用上游状态监测'),
+  intervalMinutes: Schema.number().default(10).description('轮询间隔（分钟）'),
+  failThreshold: Schema.number().default(1).description('连续几次异常才切换'),
+  recoverThreshold: Schema.number().default(3).description('连续几次正常才切回'),
+  primaryProvider: Schema.string().default('').description('主用 provider（空=跟随当前配置）'),
+  primaryModel: Schema.string().default('').description('主用模型 id'),
+  primaryApiKeyEnv: Schema.string().default('').description('主用探测凭据的环境变量名（状态接口方式不需要）'),
+  backupProvider: Schema.string().default('commandcode').description('备用 provider'),
+  backupModel: Schema.string().default('deepseek/deepseek-v4.1-flash').description('备用模型 id'),
+  backupApiKeyEnv: Schema.string().default('COMMANDCODE_API_KEY').description('备用探测凭据的环境变量名'),
+  ttftThresholdMs: Schema.number().default(8000).description('首 token 时延阈值（毫秒），超过判降级'),
+  notify: Schema.boolean().default(true).description('切换时在群里说一句'),
 });
 
 /** 文件访问白名单子 Schema（独立导出：config 路由的服务端校验复用） */
@@ -645,6 +696,8 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   }).description('群聊回复欲望门控'),
   groupPrompt: Schema.string().description('群聊额外system prompt'),
   directPrompt: Schema.string().description('私聊额外system prompt'),
+  groupProvider: Schema.string().default('').description('群聊默认 provider（空=跟随全局）'),
+  groupModel: Schema.string().default('').description('群聊默认模型（空=跟随全局）'),
   textChunkLimit: Schema.number().default(4500).description('单条消息最大字符数'),
   streaming: Schema.boolean().default(true).description('是否启用流式输出（群聊始终不启用）'),
   sessionIdleTimeout: Schema.number().default(30 * 60 * 1000).description('会话闲置超时(ms)'),
@@ -684,6 +737,20 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
     fullAccessUsers: [],
     readRoots: [],
   }).description('工具权限（终端白名单群、受限会话可访问的目录）'),
+  modelFailover: ModelFailoverSchema.default({
+    enabled: false,
+    intervalMinutes: 10,
+    failThreshold: 1,
+    recoverThreshold: 3,
+    primaryProvider: '',
+    primaryModel: '',
+    primaryApiKeyEnv: '',
+    backupProvider: 'commandcode',
+    backupModel: 'deepseek/deepseek-v4.1-flash',
+    backupApiKeyEnv: 'COMMANDCODE_API_KEY',
+    ttftThresholdMs: 8000,
+    notify: true,
+  }).description('上游状态监测：走 opencode 时按状态接口自动切到备用模型'),
   stickers: StickersSchema.default({
     enabled: true,
     root: '',

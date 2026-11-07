@@ -28,6 +28,7 @@ import {
   BrowserSchema,
   FileAccessSchema,
   MediaSchema,
+  ModelFailoverSchema,
   NotesSchema,
   ReplyDesireSchema,
   SendFileSchema,
@@ -119,7 +120,7 @@ const EDITABLE_CONFIG_KEYS = new Set([
   'adminOpenids', 'autoCompactTokens', 'autoCompactPrivateRatio', 'autoCompactDeferOnTools', 'textChunkLimit', 'maxQueue',
   'processingTimeoutMs', 'askTimeoutMs',
   'tmpDir', 'tmpTtlHours', 'tmpMaxTotalMB',
-  'access', 'fileAccess', 'stickers', 'notes', 'toolAccess',
+  'access', 'fileAccess', 'stickers', 'notes', 'toolAccess', 'modelFailover',
   'media', 'vision', 'asr', 'video', 'sendFile', 'speak', 'cleanup', 'fanart', 'dnd', 'browser',
 ]);
 
@@ -154,6 +155,7 @@ const EDITABLE_CONFIG_SCHEMAS: Record<string, (value: unknown) => unknown> = {
   stickers: (v) => StickersSchema(v as never),
   notes: (v) => NotesSchema(v as never),
   toolAccess: (v) => ToolAccessSchema(v as never),
+  modelFailover: (v) => ModelFailoverSchema(v as never),
   media: (v) => MediaSchema(v as never),
   vision: (v) => VisionSchema(v as never),
   asr: (v) => AsrSchema(v as never),

@@ -104,7 +104,7 @@ describe('怪物特性与伤势', () => {
     applyDamage(c, '溺尸', 15);
     const saved = applyDamage(c, '溺尸', 7, { roller: fixed(20) }); // DC 5+7=12，d20 20 + 体质 3
     expect(saved.after).toBe(1);
-    expect(saved.events.join()).toMatch(/不死坚韧.*DC 12 成功/);
+    expect(saved.events.join()).toMatch(/不死坚韧.* 成功，撑住了$/);
     // 伤害太高时 DC 也高：一下 30 点就是 DC 35，必然失败
     const c3 = trio();
     zombie(c3);

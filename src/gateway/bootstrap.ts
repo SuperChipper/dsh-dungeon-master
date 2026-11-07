@@ -36,13 +36,18 @@ import { ensureVisionInputModal, registerDescribeImageTool } from '../media/visi
 import { locateFfmpeg, registerDescribeVideoTool } from '../media/video-tool.ts';
 import { registerTranscribeTool } from '../media/transcribe-tool.ts';
 import { registerSendFileTool, withFreshReplyTarget, type MediaSenderLike } from '../media/send-file-tool.ts';
+import { registerVideoFetchTool } from '../media/video-fetch-tool.ts';
+import { registerSingTool } from '../media/sing-tool.ts';
+import { ModelWatch, isWatchedProvider } from '../model/status-watch.ts';
 import { registerSpeakTool } from '../media/speak-tool.ts';
 import { StickerStore } from '../media/sticker-store.ts';
 import { registerSaveStickerTool } from '../media/save-sticker-tool.ts';
 import { registerMatchStickerTool } from '../media/match-sticker-tool.ts';
+import { registerReverseImageTool } from '../media/reverse-image-tool.ts';
 import { registerHistorySearchTool } from '../features/history-tool.ts';
 import { registerPetNativeBalance } from '../pet/native-balance.ts';
 import { NotesStore } from '../notes/notes-store.ts';
+import { NoteMetricsStore } from '../notes/note-metrics.ts';
 import { EmbeddingCache, createOpenAIEmbedder, resolveEmbeddingApiKey } from '../notes/embedding.ts';
 import { ensureTmpDir, resolveTmpDir } from '../media/tmp-dir.ts';
 import { registerNotesTools } from '../notes/notes-tools.ts';
@@ -191,6 +196,8 @@ export async function bootstrapGateway(
   const notesStore = createNotesStore(config, logger);
   manager.notesStore = notesStore;
 
+  // 注入账本：只观察「哪几段真的进了提示词」，先跑一周看分布再谈调权
+  if (notesStore !== undefined) manager.noteMetrics = new NoteMetricsStore(undefined, logger);
   // ── 跑团（/dnd 命令、DM prompt 注入、dnd_* 工具共用） ──
   const dndService = createDndService(config, logger);
   manager.dndService = dndService;
@@ -478,13 +485,76 @@ export async function bootstrapGateway(
         return true;
       },
     });
+    // 群聊没有终端之后，取片这一步只能靠固定动作：给 bvid，拿回本地 mp4
+    registerVideoFetchTool(biliTools, {
+      client: biliClient,
+      logger,
+      ffmpegPath: ffmpegBins !== undefined && isAbsolute(ffmpegBins.ffmpeg) ? ffmpegBins.ffmpeg : undefined,
+    });
   }
 
+  // ── 点歌（qqbot_sing）：走本地唱歌服务的 HTTP，不再需要命令行 ──
+  registerSingTool(ctx, mediaSender, manager, logger);
+  // ── 上游健康监测：opencode 与 commandcode 互为主备，降级就换边 ──
+  const failover = config.modelFailover;
+  let modelWatch: ModelWatch | undefined;
+  if (failover?.enabled === true) {
+    const primary = {
+      provider: failover.primaryProvider.trim() === "" ? (config.provider ?? "") : failover.primaryProvider.trim(),
+      model: failover.primaryModel.trim() === "" ? (config.model ?? "") : failover.primaryModel.trim(),
+      apiKeyEnv: failover.primaryApiKeyEnv.trim() || undefined,
+    };
+    const backup = {
+      provider: failover.backupProvider.trim(),
+      model: failover.backupModel.trim(),
+      apiKeyEnv: failover.backupApiKeyEnv.trim() || undefined,
+    };
+    const ready = primary.provider !== "" && primary.model !== "" && backup.provider !== "" && backup.model !== "";
+    if (ready && isWatchedProvider(primary.provider) && isWatchedProvider(backup.provider)) {
+      const notify = async (line: string): Promise<void> => {
+        if (!failover.notify) return;
+        const owner = config.ownerOpenid?.trim();
+        if (owner === undefined || owner === "") return;
+        try {
+          await bot.sendMarkdown({ scope: "c2c", targetId: owner }, line);
+        } catch (err) {
+          logger.warn(`model-watch: 通知失败 ${err instanceof Error ? err.message : String(err)}`);
+        }
+      };
+      modelWatch = new ModelWatch({
+        primary,
+        backup,
+        intervalMs: Math.max(1, failover.intervalMinutes) * 60_000,
+        failThreshold: Math.max(1, failover.failThreshold),
+        recoverThreshold: Math.max(1, failover.recoverThreshold),
+        ttftThresholdMs: Math.max(1000, failover.ttftThresholdMs),
+        switchTo: async (target, health) => {
+          const count = await manager.switchAllSessions(target);
+          await notify(`⚠️ ${health.detail}\n已把 ${count} 个会话切到 ${target.provider}/${target.model}`);
+        },
+        switchBack: async (_target, health) => {
+          // 切回默认：清掉全局故障转移那一格，而不是再写一遍 override。
+          // 写 override 的问题是它会永久压住配置默认，下次再切又要追平一次。
+          const count = await manager.clearFailoverRoute();
+          await notify(`✅ ${health.detail}\n已把 ${count} 个会话切回配置默认`);
+        },
+        log: (message) => logger.info(`im-qqbot: ${message}`),
+      });
+      modelWatch.start();
+    } else if (ready) {
+      logger.warn(`model-watch: ${primary.provider} 或 ${backup.provider} 不在可监测名单（opencode / commandcode），跳过`);
+    } else {
+      logger.warn("model-watch: 主用或备用的 provider/model 没配全，跳过");
+    }
+  }
   // ── 表情收藏工具注册（qqbot_save_sticker） ──
   if (stickerStore !== undefined) {
     registerSaveStickerTool(ctx, stickerStore, logger);
     registerMatchStickerTool(ctx, stickerStore, logger);
   }
+
+  // ── 以图搜图（trace.moe + SauceNAO）：本地库没命中时查出处 ──
+  registerReverseImageTool(ctx, logger);
 
   // ── 共享笔记工具注册（qqbot_notes_search / qqbot_notes_save） ──
   if (notesStore !== undefined) {
@@ -527,6 +597,7 @@ export async function bootstrapGateway(
       return async () => {
         logger.info('Shutting down');
         sendQueue.dispose();
+        modelWatch?.stop();
         // 待答问题挂在旧实例上，重载后没人能答：先让它们以 ASK_ABORTED 结束
         questionChannel.uninstall();
         await manager.disposeAll();

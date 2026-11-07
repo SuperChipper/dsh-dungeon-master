@@ -220,8 +220,9 @@ export function scoreReplyDesire(input: DesireInput): DesireResult {
 
   let score = 0;
   const reasons: string[] = [];
+  // 被叫名字本身就要过线：阈值调到 0.78 后，0.7 会让「肥鱼」这种直接叫人的话也去等模型打分
   if (named) {
-    score += 0.7;
+    score += 0.8;
     reasons.push('name');
   }
   score += engagementBonus(input, reasons);

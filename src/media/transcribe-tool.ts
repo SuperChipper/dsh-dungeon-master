@@ -25,7 +25,16 @@ const DESCRIPTION =
   'Transcribe speech from a local audio or video file into timestamped text (speaker-labelled). '
   + 'Use it when you must know what was SAID: voice notes, video dialogue, meeting clips. '
   + 'It runs ffmpeg locally to extract audio, then a multimodal model that accepts audio input. '
-  + 'Returns segments like "12.50-18.20 | SPEAKER_01: ...". Read-only, no uploads beyond the model call.';
+  + 'Returns segments like "12.50-18.20 | SPEAKER_01: ...". Read-only, no uploads beyond the model call. '
+  + 'The transcript is material for your own reply, not something to relay: unless the user asked for a '
+  + 'transcript, translation or summary, do not quote lines or retell what was said; react the way a friend '
+  + 'who just watched it would.';
+
+/**
+ * 跟在转写后面的提醒。模型拿到逐字稿就爱引台词（「最狠的是那句『…』」），
+ * 写在工具说明里不够，结果末尾是它写回复前最后看到的地方。
+ */
+const MATERIAL_NOTE = '（以上是听写素材。没要求转写、翻译或总结时，别引台词、别复述内容，回你自己的反应。）';
 
 /** 单次请求的音频上限；mp3 48kbps 下约 20 分钟，超了就切片 */
 const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
@@ -150,7 +159,7 @@ export function registerTranscribeTool(ctx: Context, logger: Logger): void {
         const text = parts.join('\n\n');
         const segments = text.split('\n').filter((line) => /\d+\.\d+\s*-\s*\d+\.\d+/.test(line)).length;
         logger.info(`im-qqbot: qqbot_transcribe ${path} → ${chunks} 块 / ${text.length} 字`);
-        return { text, segments, chunks, model, message: text };
+        return { text, segments, chunks, model, message: `${text}\n\n${MATERIAL_NOTE}` };
       } finally {
         rmSync(work, { recursive: true, force: true });
       }

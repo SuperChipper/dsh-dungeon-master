@@ -112,4 +112,15 @@ describe('wantsHistoryImages', () => {
     expect(wantsHistoryImages('区区')).toBe(false);
     expect(wantsHistoryImages('你今天吃了吗')).toBe(false);
   });
+
+  it('只发了一张图或表情 → 不附历史图（占位文字里的「图」「表情」不算）', () => {
+    expect(wantsHistoryImages('[图片]', true)).toBe(false);
+    expect(wantsHistoryImages('【表情: 未知表情】\n[图片]', true)).toBe(false);
+    expect(wantsHistoryImages('<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">', true)).toBe(false);
+    expect(wantsHistoryImages('', true)).toBe(false);
+  });
+
+  it('发图时文字明确提到前面的图 → 照样附', () => {
+    expect(wantsHistoryImages('[图片] 跟上面那张比呢', true)).toBe(true);
+  });
 });

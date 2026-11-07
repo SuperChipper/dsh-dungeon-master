@@ -36,6 +36,8 @@ describe('scoreReplyDesire 文字', () => {
 
   it('点名昵称（忽略大小写）过默认阈值', () => {
     expect(scoreReplyDesire({ ...base, content: 'dsh 在吗' }).score).toBeGreaterThanOrEqual(0.6);
+    // 线上阈值 0.78：光叫名字也要过线，不能落到模型打分那边
+    expect(scoreReplyDesire({ ...base, content: '哈哈小d' }).score).toBeGreaterThanOrEqual(0.78);
     expect(scoreReplyDesire({ ...base, content: '哈哈小d' }).reasons).toContain('name');
   });
 

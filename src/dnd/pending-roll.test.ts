@@ -66,7 +66,7 @@ function setup() {
   const chronal = (target: string) => call('dnd_apply', {
     target, declared_by: 'P5', reaction: { by: '奇塔露', name: '时间变幻', reroll: 'd20', spend: '时间变幻' },
   });
-  return { rolls, service, key, call, campaign, ch, castOnGoblin, chronal, buttons, followup, record, onPendingAttack };
+  return { rolls, service, key, call, campaign, ch, castOnGoblin, chronal, buttons, followup, record, onPendingAttack, sender };
 }
 
 afterEach(() => {
@@ -142,7 +142,7 @@ describe('豁免和检定也能挂起', () => {
     await expect(t.call('dnd_apply', { target: '地精', declared_by: 'P5', reaction: { by: '奇塔露', name: '时间变幻', ac_mod: 5 } })).rejects.toThrow(/ac_mod 只对攻击有用/);
     t.rolls.push(3);
     const text = await t.call('dnd_apply', { target: '地精', declared_by: 'P5', reaction: { by: '奇塔露', name: '时间变幻', attack_mod: '+1d4' } });
-    expect(text).toMatch(/地精 感知豁免 16（原 13） vs DC 15 → 成功/);
+    expect(text).toMatch(/地精 感知豁免 16（原 13） → 成功/);
   });
 
   it('reroll 只认 d20', async () => {
@@ -332,6 +332,43 @@ describe('存档和玩家视角', () => {
     expect(view).not.toContain('地精(5,0)');
     expect(view).not.toContain('地精 10 尺');
     expect(playerStatus(c, t.service.library.get(c.adventureId)!)).not.toContain('到：');
+  });
+
+  it('markdown 版把站位画成代码块网格，不重复 /dnd map 已有的探索进度', async () => {
+    const t = setup();
+    await t.call('dnd_position', { action: 'set', placements: [{ name: '狼', x: 0, y: 0 }, { name: 'Kriv', x: 3, y: 0 }] });
+    const c = t.campaign();
+    const view = playerStatus(c, t.service.library.get(c.adventureId)!, 'P2', 'markdown');
+    expect(view).toContain('```\n     0  1  2  3  4\n  0  1  .  .  K  .');
+    expect(view).toContain('K=Kriv　1=狼');
+    expect(view).toContain('Kriv(3,0) 到：');
+    expect(view).not.toContain('已探索');
+    expect(view).not.toContain('站位｜');
+  });
+
+  it('「查看状态」按钮和 /dnd status 发的是 markdown 网格', async () => {
+    const t = setup();
+    await t.call('dnd_position', { action: 'set', placements: [{ name: '狼', x: 0, y: 0 }, { name: 'Kriv', x: 3, y: 0 }] });
+    t.buttons.handleInteraction({
+      id: 'e1', type: 11, version: 1, group_openid: 'G1', group_member_openid: 'P2',
+      data: { type: 11, resolved: { button_data: JSON.stringify({ t: 'dnd', a: 'status' }) } },
+    } as never);
+    await vi.waitFor(() => expect(t.sender.sendMarkdown).toHaveBeenCalled());
+    expect(String((t.sender.sendMarkdown.mock.calls[0] as unknown[])[1])).toContain('K=Kriv');
+    expect(await t.buttons.sendStatus(t.key, { scope: 'group', targetId: 'G1' } as never, 'P2')).toBe(true);
+    t.sender.sendMarkdown.mockRejectedValueOnce(new Error('markdown not allowed'));
+    expect(await t.buttons.sendStatus(t.key, { scope: 'group', targetId: 'G1' } as never, 'P2')).toBe(false);
+  });
+
+  it('dnd_position show 给 DM 一张能原样贴的玩家视角图', async () => {
+    const t = setup();
+    await t.call('dnd_position', { action: 'set', placements: [{ name: '狼', x: 0, y: 0 }, { name: 'Kriv', x: 3, y: 0 }, { name: '地精', x: 5, y: 0 }] });
+    t.service.store.update(t.key, (c) => { c.characters.find((x) => x.name === '地精')!.conditions.push('隐形'); });
+    const text = await t.call('dnd_position', { action: 'show' });
+    expect(text).toContain('地精(5,0)');
+    const grid = text.slice(text.indexOf('玩家视角示意图'));
+    expect(grid).toContain('```');
+    expect(grid).not.toContain('地精');
   });
 
   it('inbound 认得 DM 点名的反应名（不在角色卡上）', async () => {

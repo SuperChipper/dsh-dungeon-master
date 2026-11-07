@@ -1,9 +1,9 @@
 /**
- * 内置 qqbot_describe_video 视频理解工具（路线：抽帧宫格 + 视觉模型 + 音轨 ASR）。
+ * 内置 qqbot_describe_video 视频理解工具（路线：整段直传或抽帧宫格 + 音轨 ASR）。
  *
  *   1. ffprobe 取时长 / 是否有音轨
- *   2. ffmpeg 在前 maxSeconds 秒内均匀抽 N 帧，tile 拼成一张宫格 JPEG → 一次视觉调用
- *   3. 有音轨且 asr 已启用：抽 16k 单声道 WAV → `requestTranscription`
+ *   2. 画面优先整段直传给模型，太大先压一版；压完还超或直传失败，才在前 maxSeconds 秒内均匀抽 N 帧，tile 成宫格 JPEG → 一次视觉调用
+ *   3. 有音轨且 asr 已启用：抽 16k 单声道 48kbps MP3 → `requestTranscription`
  *      （默认 chat 协议走订阅网关，见 asr.ts / chat-gateway.ts）
  *   4. 合成「画面 + 语音」文本返回给主模型
  *

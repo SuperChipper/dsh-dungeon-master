@@ -13,6 +13,7 @@ import type { Logger } from '../types.ts';
 import type { Condition, KnowledgeBlock, Trigger, Variant } from './adventure.ts';
 import type { Ability } from './rules.ts';
 import { BUILTIN_DUNGEONS } from './dungeons/index.ts';
+import { type BattleMap, parseBattleMap } from './terrain.ts';
 
 export interface DungeonExit {
   to: string;
@@ -26,6 +27,8 @@ export interface DungeonExit {
   requires?: Condition;
   /** 过不去时给模型的说明，如「铁门锁着，钥匙在头目身上」 */
   lockedText?: string;
+  /** 只能从声明它的房间走过去，不能反着走回来（传送阵、滑道、陷坑）；默认双向 */
+  oneWay?: boolean;
 }
 
 export interface ExitCheck {
@@ -71,6 +74,8 @@ export interface DungeonRoom {
   /** 只有 DM 能看：陷阱、暗门、怪物动机、宝物 */
   dmNotes: string;
   exits: DungeonExit[];
+  /** 战斗场地图（5 尺一格的墙、门、障碍，见 terrain.ts）；写了就不用 DM 开战时现画 */
+  battlemap?: BattleMap;
   encounter?: DungeonMonster[];
   /** 条件触发的剧情变化（模组里的 Developments） */
   triggers?: Trigger[];
@@ -131,8 +136,21 @@ export function validateRooms(owner: string, rooms: readonly DungeonRoom[], seen
       if (typeof room[key] !== 'number') throw new Error(`房间 ${room.id} 缺少坐标 ${key}`);
     }
     if (!Array.isArray(room.exits)) throw new Error(`房间 ${room.id} 缺少 exits`);
+    if (room.battlemap !== undefined) {
+      try {
+        room.battlemap = parseBattleMap(room.battlemap);
+      } catch (err) {
+        throw new Error(`房间 ${room.id} 的 battlemap：${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
   for (const room of rooms) {
+    // 场地图上的门和出口一样要指向真实的房间；写错了 DM 开战时的「从哪扇门进来」就对不上
+    for (const area of room.battlemap?.areas ?? []) {
+      if (area.to !== undefined && !ids.has(area.to) && !seen.has(area.to)) {
+        throw new Error(`房间 ${room.id} 的 battlemap：${area.name ?? area.kind} 的 to 指向不存在的房间 ${area.to}`);
+      }
+    }
     for (const exit of room.exits) {
       if (!ids.has(exit.to)) throw new Error(`房间 ${room.id} 的出口指向不存在的房间 ${exit.to}`);
       if (exit.check !== undefined && (typeof exit.check.dc !== 'number' || (exit.check.skill === undefined && exit.check.ability === undefined))) {
@@ -157,7 +175,7 @@ export function resolveRoom(dungeon: RoomGraph, query: string): DungeonRoom | un
 export function exitBetween(dungeon: RoomGraph, from: string, to: string): DungeonExit | undefined {
   const a = findRoom(dungeon, from)?.exits.find((e) => e.to === to);
   if (a !== undefined) return a;
-  const back = findRoom(dungeon, to)?.exits.find((e) => e.to === from);
+  const back = findRoom(dungeon, to)?.exits.find((e) => e.to === from && e.oneWay !== true);
   return back === undefined ? undefined : { ...back, to, label: back.label };
 }
 
@@ -168,7 +186,7 @@ export function exitsOf(dungeon: RoomGraph, roomId: string): DungeonExit[] {
   for (const room of dungeon.rooms) {
     if (room.id === roomId) continue;
     for (const exit of room.exits) {
-      if (exit.to === roomId && !result.some((e) => e.to === room.id)) {
+      if (exit.to === roomId && exit.oneWay !== true && !result.some((e) => e.to === room.id)) {
         result.push({ ...exit, to: room.id, label: `通往${room.name}` });
       }
     }

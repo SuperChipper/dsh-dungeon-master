@@ -140,6 +140,8 @@ export function dndCommand({ manager }: CommandDeps): CategorizedCommand {
       if (sub === 'status') {
         const found = service.active(key);
         if (found === undefined) return '现在没有进行中的团。';
+        // markdown 发得出去就画站位图；发不出去退回纯文字的坐标列表
+        if (await manager.dndButtons?.sendStatus(key, target, cmdCtx.message.senderId) === true) return { kind: 'noop' as const };
         return `🎲 ${found.adventure.name}\n${playerStatus(found.campaign, found.adventure, cmdCtx.message.senderId)}`;
       }
 

@@ -254,6 +254,22 @@ export class DndTurnButtons {
   }
 
   /**
+   * 团况走 markdown：站位图要放进代码块才等宽。发不出去返回 false，调用方退回纯文字（坐标列表）。
+   * 失败不关按钮：这里没带键盘，失败多半是 markdown 本身的问题，和按钮权限无关。
+   */
+  public async sendStatus(key: string, target: ReplyTarget, viewer: string | undefined): Promise<boolean> {
+    const found = this.service.active(key);
+    if (found === undefined) return false;
+    try {
+      await this.sender.sendMarkdown(target, `🎲 ${found.adventure.name}\n${playerStatus(found.campaign, found.adventure, viewer, 'markdown')}`);
+      return true;
+    } catch (err) {
+      this.logger.warn(`im-qqbot: 跑团状态 markdown 发送失败，退回纯文字: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  }
+
+  /**
    * 开团消息即签到表：intro（开团文字）+ 名单 + 签到/开始/名单按钮，合成一条发出。
    * reset=false 时沿用已有的签到表（/dnd checkin 只是把按钮再发一次）。
    * 按钮关着或发送失败返回 false，调用方退回纯文字回复。
@@ -389,10 +405,7 @@ export class DndTurnButtons {
     if (button.a === 'react' || button.a === 'pass') return this.reactionClick(event, key, record, button);
 
     if (button.a === 'status') {
-      if (record !== undefined) {
-        void this.sender.sendMarkdown(record.replyTarget, `🎲 ${found.adventure.name}\n${playerStatus(found.campaign, found.adventure, event.group_member_openid ?? event.user_openid)}`)
-          .catch((err: unknown) => this.logger.warn(`im-qqbot: 跑团状态发送失败: ${err instanceof Error ? err.message : String(err)}`));
-      }
+      if (record !== undefined) void this.sendStatus(key, record.replyTarget, event.group_member_openid ?? event.user_openid);
       return ACK.ok;
     }
 

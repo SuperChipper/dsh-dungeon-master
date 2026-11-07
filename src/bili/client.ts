@@ -44,6 +44,14 @@ export interface BiliSearchItem {
   description: string;
 }
 
+/** 免登录直链：durl 可能是多段（老视频按 10 分钟切），调用方按顺序下载再拼接 */
+export interface BiliPlayUrl {
+  quality: number;
+  acceptQuality: number[];
+  segments: Array<{ url: string; size: number }>;
+  lengthMs: number;
+}
+
 export interface BiliVideoInfo {
   bvid: string;
   aid: number;
@@ -280,6 +288,39 @@ export class BiliClient {
         part: String(page.part ?? ''),
         duration: Number(page.duration ?? 0),
       })),
+    };
+  }
+
+  /**
+   * 取播放直链（免登录 durl 版）。
+   *
+   * 只有一个用途：给 qqbot_video_fetch 一段能直接下的 mp4。实测免登录能拿到 720P
+   * （qn=64）的整段 mp4；带 platform=html5 时反而被压到 360P，所以这里不带它。
+   * 请求的 qn 超出免登录档位时 B 站会自己降到能给的档，返回的 quality 才是实际值。
+   * 拿不到 durl（付费/大会员专享、纯 DASH）就抛出，调用方别猜。
+   */
+  public async playUrl(bvid: string, cid: number, qn = 64): Promise<BiliPlayUrl> {
+    const query = new URLSearchParams({
+      bvid,
+      cid: String(cid),
+      qn: String(qn),
+      fnval: '1',
+      fnver: '0',
+      fourk: '1',
+    }).toString();
+    const data = (await this.getJson(`https://api.bilibili.com/x/player/playurl?${query}`, {
+      allowNonZero: true,
+    })) as Record<string, unknown> | null;
+    const durl = Array.isArray(data?.durl) ? (data?.durl as Array<Record<string, unknown>>) : [];
+    const segments = durl
+      .map((item) => ({ url: String(item.url ?? ''), size: Number(item.size ?? 0) }))
+      .filter((item) => item.url !== '');
+    if (segments.length === 0) throw new Error(`${bvid} 没有免登录直链（付费/大会员专享，或接口只给了 DASH）`);
+    return {
+      quality: Number(data?.quality ?? 0),
+      acceptQuality: Array.isArray(data?.accept_quality) ? (data?.accept_quality as unknown[]).map(Number) : [],
+      segments,
+      lengthMs: Number(data?.timelength ?? 0),
     };
   }
 

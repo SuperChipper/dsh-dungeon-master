@@ -22,8 +22,9 @@ import {
   findRoom,
 } from './dungeon.ts';
 import { ABILITIES, type Ability, type Skill, abilityModifier, parseAbility, parseSkill, proficiencyBonus, SKILLS } from './rules.ts';
-import { battleLines, cellOf, distancesFrom, hiddenFromPlayers } from './battlefield.ts';
+import { battleGridLines, battleLines, cellOf, distancesFrom, hiddenFromPlayers } from './battlefield.ts';
 import { pendingSummaryLine } from './pending-attack.ts';
+import type { BattleMap } from './terrain.ts';
 import { type NpcState, afterChange, describeCondition, evalCondition, locationKnown, roomView, storySummaryLines } from './story.ts';
 
 export type CharacterKind = 'pc' | 'npc' | 'monster';
@@ -257,6 +258,8 @@ export interface InitiativeState {
   marks?: Record<string, BattleCell>;
   /** 当前回合已走的尺数；指针一动就清 */
   moved?: Record<string, number>;
+  /** 当前回合冲刺过的人（移动力翻倍）；和 moved 一起清 */
+  dashed?: string[];
   /** 同一时间只有一笔：落账前不能推进，所以不需要队列 */
   pending?: PendingRoll;
   /** 本轮用过反应的人；到他自己的回合开始时恢复 */
@@ -312,6 +315,10 @@ export interface Campaign {
    * 只有它变了不算改动，不存快照。
    */
   rollSeq?: number;
+  /** 战斗场地图，按房间 id（terrain.ts）；打完仗也留着，再进这间沿用 */
+  battlemaps?: Record<string, BattleMap>;
+  /** 每个房间最近一次是从哪个房间进来的：开战时队伍默认站在那扇门边 */
+  enteredFrom?: Record<string, string>;
 }
 
 const MAX_LOG = 30;
@@ -516,6 +523,7 @@ export function upsertCharacter(c: Campaign, input: CharacterInput): { character
 
 export function removeCharacter(c: Campaign, name: string): Character {
   const ch = requireCharacter(c, name);
+  if (isOut(ch)) recordNpcDeath(c, ch);
   c.characters = c.characters.filter((x) => x !== ch);
   if (c.initiative !== undefined) removeFromInitiative(c.initiative, ch.name);
   return ch;
@@ -593,9 +601,9 @@ export function applyDamage(c: Campaign, name: string, amount: number, options: 
     const save = rollD20(abilityModifier(ch.abilities.con), 'none', options.roller ?? cryptoRoller);
     if (save.total >= dc) {
       ch.hp = 1;
-      events.push(`${UNDEAD_FORTITUDE}：体质豁免 ${save.detail} vs DC ${dc} 成功，撑住剩 1 HP`);
+      events.push(`${UNDEAD_FORTITUDE}：体质豁免 ${save.detail} 成功，撑住了`);
     } else {
-      events.push(`${UNDEAD_FORTITUDE}：体质豁免 ${save.detail} vs DC ${dc} 失败`);
+      events.push(`${UNDEAD_FORTITUDE}：体质豁免 ${save.detail} 失败`);
     }
   }
   if (ch.hp === 0 && rest > 0) {
@@ -610,8 +618,13 @@ export function applyDamage(c: Campaign, name: string, amount: number, options: 
       events.push(...addDeathFailures(ch, 1));
     }
   }
-  pushLog(c, `${ch.name} 受到 ${dmg} 点伤害（${before}→${ch.hp}/${ch.maxHp}）${events.length > 0 ? `，${events.join('、')}` : ''}`);
+  pushLog(c, `${ch.name} 受到 ${dmg} 点伤害（${hpTrail(ch, before)}）${events.length > 0 ? `，${events.join('、')}` : ''}`);
   return { name: ch.name, before, after: ch.hp, maxHp: ch.maxHp, tempHp: ch.tempHp, absorbed, events, ...woundOf(ch) };
+}
+
+/** 日志里的血量变化：日志会进团况的「最近」，怪物只写伤势词，免得数字被说出去 */
+function hpTrail(ch: Character, before: number): string {
+  return ch.kind === 'monster' ? woundLabel(ch) : `${before}→${ch.hp}/${ch.maxHp}`;
 }
 
 /** 治疗：不超过最大 HP；从 0 恢复时清掉昏迷/稳定 */
@@ -627,7 +640,7 @@ export function heal(c: Campaign, name: string, amount: number): HpChange {
     delete ch.deathSaves;
     events.push('苏醒');
   }
-  pushLog(c, `${ch.name} 恢复 ${ch.hp - before} 点 HP（${before}→${ch.hp}/${ch.maxHp}）`);
+  pushLog(c, `${ch.name} 恢复 ${ch.hp - before} 点 HP（${hpTrail(ch, before)}）`);
   return { name: ch.name, before, after: ch.hp, maxHp: ch.maxHp, tempHp: ch.tempHp, absorbed: 0, events, ...woundOf(ch) };
 }
 
@@ -726,6 +739,15 @@ export function deathSave(c: Campaign, name: string, roller: Roller = cryptoRoll
 
 export function isOut(ch: Character): boolean {
   return ch.conditions.includes('死亡');
+}
+
+/**
+ * 具名 NPC 的卡一删，npcAlive 就退回去看 campaign.npcs，默认算活着：格罗尔和维瑞丝死后都被当成活人，
+ * 房间照旧列出他们。删卡前把死讯记下来。
+ */
+function recordNpcDeath(c: Campaign, ch: Character): void {
+  if (ch.npcId === undefined) return;
+  c.npcs[ch.npcId] = { ...c.npcs[ch.npcId], alive: false };
 }
 
 /** 角色所在房间：怪物看自己的 room；PC/NPC 没单独移动过时跟着队伍主位置 */
@@ -869,6 +891,7 @@ export function nextTurn(c: Campaign): { round: number; current: InitiativeEntry
   if (state.order.length === 0) throw new Error('先攻表里已经没有能行动的角色，用 dnd_initiative end 结束战斗');
   let newRound = false;
   delete state.moved;
+  delete state.dashed;
   state.turn++;
   if (state.turn >= state.order.length) {
     state.turn = 0;
@@ -888,7 +911,9 @@ export function nextTurn(c: Campaign): { round: number; current: InitiativeEntry
 export function endInitiative(c: Campaign): { rounds: number; defeated: string[] } {
   const rounds = c.initiative?.round ?? 0;
   c.initiative = undefined;
-  const defeated = c.characters.filter((ch) => ch.kind === 'monster' && isOut(ch)).map((ch) => ch.name);
+  const dead = c.characters.filter((ch) => ch.kind === 'monster' && isOut(ch));
+  const defeated = dead.map((ch) => ch.name);
+  for (const ch of dead) recordNpcDeath(c, ch);
   c.characters = c.characters.filter((ch) => !(ch.kind === 'monster' && isOut(ch)));
   pushLog(c, `战斗结束（${rounds} 轮）${defeated.length > 0 ? `，击败 ${defeated.join('、')}` : ''}`);
   return { rounds, defeated };
@@ -1129,6 +1154,7 @@ export function moveParty(
       if (ch.kind !== 'monster' && ch.room === undefined && !movers.includes(ch)) ch.room = c.currentRoom;
     }
     for (const ch of movers) ch.room = room.id;
+    (c.enteredFrom ??= {})[room.id] = from;
     // 有人检定没过留在原地时，队伍主位置按人数多的一边算
     c.currentRoom = everyone ? room.id : mainRoom(c, room.id);
     if (firstVisit) c.revealed.push(room.id);
@@ -1252,6 +1278,7 @@ export function gotoTurn(c: Campaign, name: string, round?: number): InitiativeE
   if (idx === -1) throw new Error(`${ch.name} 不在先攻表里`);
   state.turn = idx;
   delete state.moved;
+  delete state.dashed;
   if (round !== undefined && round >= 1) state.round = Math.trunc(round);
   pushLog(c, `先攻指针调整到第 ${state.round} 轮 ${ch.name}`);
   return state.order[idx]!;
@@ -1549,7 +1576,7 @@ export function summarize(c: Campaign, adv: Adventure): string {
     const foes = c.characters.filter((ch) => ch.kind === 'monster' && ch.room === room && !isOut(ch));
     if (foes.length > 0) {
       const at = room === c.currentRoom ? '本房间' : `「${findRoom(graph, room)?.name ?? room}」`;
-      lines.push(`${at}敌人（对玩家只说伤势词）：${foes.map((ch) => `${hpTag(ch)} ${woundLabel(ch)}`).join('；')}`);
+      lines.push(`${at}敌人：${foes.map((ch) => `${ch.name}${ch.conditions.length > 0 ? ` [${ch.conditions.join(',')}]` : ''} ${woundLabel(ch)}`).join('；')}`);
     }
   }
 
@@ -1568,13 +1595,15 @@ export function summarize(c: Campaign, adv: Adventure): string {
 /**
  * 给玩家看的团况：PC 的 HP/资源、敌人只给伤势词、先攻顺序、站位；不含 DM 笔记和怪物数值。
  * viewer 是看的人的 openid：战斗中多给一行他的角色到各人的距离。
+ * markdown：站位画成代码块里的字符网格（只有 markdown 消息等宽）；纯文本消息退回坐标列表。
+ * 探索进度、出口这些 /dnd map 已经有的不在这里重复。
  */
-export function playerStatus(c: Campaign, adv: Adventure, viewer?: string): string {
+export function playerStatus(c: Campaign, adv: Adventure, viewer?: string, format: 'text' | 'markdown' = 'text'): string {
   const lines: string[] = [];
   const graph = roomGraph(adv);
   const room = findRoom(graph, c.currentRoom);
-  const { site, seen, total } = explored(c, adv);
-  lines.push(`📍 ${adv.sites.length > 1 && site !== undefined ? `${site.name} · ` : ''}${room?.name ?? c.currentRoom}｜已探索 ${seen}/${total}`);
+  const site = siteOfRoom(adv, c.currentRoom);
+  lines.push(`📍 ${adv.sites.length > 1 && site !== undefined ? `${site.name} · ` : ''}${room?.name ?? c.currentRoom}`);
   const positions = partyPositions(c);
   for (const [roomId, members] of positions) {
     const where = positions.size > 1 ? `${findRoom(graph, roomId)?.name ?? roomId}：` : '';
@@ -1587,7 +1616,9 @@ export function playerStatus(c: Campaign, adv: Adventure, viewer?: string): stri
     lines.push(`⚔ 第 ${s.round} 轮：${s.order.map((e, i) => (i === s.turn ? `▶${e.name}` : e.name)).join(' → ')}`);
     // 藏起来的怪只是位置保密：名字已经在先攻表里了
     const visible = (ch: Character): boolean => !hiddenFromPlayers(ch);
-    lines.push(...battleLines(c, (id) => findRoom(graph, id)?.name ?? id, visible));
+    const roomName = (id: string): string => findRoom(graph, id)?.name ?? id;
+    const grid = format === 'markdown' ? battleGridLines(c, roomName, visible) : undefined;
+    lines.push(...(grid ?? battleLines(c, roomName, visible)));
     const mine = viewer === undefined ? [] : c.characters.filter((ch) => ch.playerId === viewer && !isOut(ch) && cellOf(c, ch) !== undefined);
     for (const ch of mine) lines.push(distancesFrom(c, ch.name, visible));
     if (s.pending !== undefined) lines.push(`⏳ ${describePending(s.pending)}还没结算，等反应`);
