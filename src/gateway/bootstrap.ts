@@ -74,7 +74,6 @@ import { resolveProfileDir } from '../shared/utils.ts';
 import { updateProfileConfig } from '../setup/persist.ts';
 import type { JudgeLlm } from '../features/reply-judge.ts';
 import { NoteJudge } from '../features/note-judge.ts';
-import { HandoffWriter } from '../features/session-handoff.ts';
 
 /**
  * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
@@ -231,7 +230,6 @@ export async function bootstrapGateway(
   if (manager.noteMetrics !== undefined && llm?.stream !== undefined) {
     manager.noteJudge = new NoteJudge(llm, () => config.notes?.judge ?? NOTE_JUDGE_DEFAULTS, logger);
   }
-  if (llm?.stream !== undefined) manager.handoffWriter = new HandoffWriter(llm, logger);
   // 自己发出去的消息不进 SDK 的 ref 索引，这里单独记一份，引用解析时才能认出「你自己」
   const selfSent = new SelfSentIndex();
   // 所有文字发送（回复、DnD 卡片、审批、提问……）都经 messageApi，在这里统一按 ref_idx 记

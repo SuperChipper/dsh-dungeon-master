@@ -19,7 +19,7 @@ export function newCommand({ manager }: CommandDeps): CategorizedCommand {
       const { scope, peerId } = getScopePeer(cmdCtx);
       const blank = /^(blank|clean|空白)$/i.test((cmdCtx.command?.raw ?? '').trim());
       const handoff = manager.startNewSession(scope, peerId, { handoff: !blank });
-      return handoff ? '已开启新会话 ✓（之前的要点会带过来；/new blank 完全从头）' : '已开启新会话 ✓';
+      return handoff ? '已开启新会话 ✓（正在整理之前的内容，会带进新会话；/new blank 完全从头）' : '已开启新会话 ✓';
     },
   };
 }

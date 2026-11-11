@@ -27,7 +27,7 @@ import type { StickerStore, StickerMatchResult } from '../media/sticker-store.ts
 import { chatKeyOf, formatNotesHint, selectNotesForInjection, type NoteHit, type NotesStore } from '../notes/notes-store.ts';
 import type { NoteMetricsStore } from '../notes/note-metrics.ts';
 import type { NoteJudge } from '../features/note-judge.ts';
-import { buildHandoffTranscript, formatHandoffHint, type HandoffTurn, type HandoffWriter } from '../features/session-handoff.ts';
+import { formatHandoffHint, latestCompactionSummary } from '../features/session-handoff.ts';
 import type { ToolAccess } from '../features/tool-access.ts';
 import type { DndService } from '../dnd/dnd-service.ts';
 import type { DndToolScope } from '../dnd/tool-scope.ts';
@@ -77,6 +77,9 @@ const COMPACTION_ERROR_HINTS: Record<string, string> = {
 };
 
 /** ctx.llm 查模型窗口的最小接口 */
+/** 新会话的第一条消息最多等旧会话压缩这么久，再久就不带交接了（一次压缩通常十几秒） */
+const HANDOFF_WAIT_MS = 60_000;
+
 /** 登记了注入却迟迟没等到轮次结束时，多久之后作废 */
 const NOTE_INJECTION_TTL_MS = 30 * 60_000;
 
@@ -209,9 +212,7 @@ export class SessionManager {
   /** 笔记相关性打分（llm 服务不可用时缺省，只记账不打分） */
   public noteJudge?: NoteJudge;
   private readonly pendingNoteInjections = new Map<string, PendingNoteInjection>();
-  /** /new 时写会话交接（llm 服务不可用时缺省，/new 照常只是不带交接） */
-  public handoffWriter?: HandoffWriter;
-  /** 会话 key → 正在写或已写好的交接；新会话的第一条消息取走 */
+  /** 会话 key → /new 时旧会话的压缩摘要（可能还在压缩）；新会话的第一条消息取走 */
   private readonly pendingHandoffs = new Map<string, Promise<string | undefined>>();
   /** 由 bootstrap 注入的工具权限（终端白名单） */
   public toolAccess?: ToolAccess;
@@ -1273,47 +1274,57 @@ export class SessionManager {
   }
 
   /**
-   * /new：换新会话，并在后台把旧会话写成交接留给新会话的第一条消息。
-   * 不等交接写完就返回：/new 的回执不该被一次模型调用拖住，等待放在 takeHandoff 里。
-   * 返回是否在写交接（命令回执用）。
+   * /new：换新会话，并把旧会话的压缩摘要留给新会话的第一条消息。
+   *
+   * 旧会话先从表里摘掉再压缩：压缩要十几秒，期间进来的消息应该落到新会话（在 takeHandoff 里等摘要），
+   * 而不是继续写进马上要丢的旧会话。不等压缩完就返回，/new 的回执不该被拖住。
+   * 返回是否在准备交接（命令回执用）。
    */
   startNewSession(scope: ChatScope, peerId: string, options: { handoff: boolean }): boolean {
     const key = this.sessionKey(scope, peerId);
-    const handoff = options.handoff ? this.beginHandoff(key) : undefined;
-    if (handoff === undefined) this.pendingHandoffs.delete(key);
-    else this.pendingHandoffs.set(key, handoff);
-    void this.remove(scope, peerId);
-    return handoff !== undefined;
-  }
-
-  /** 旧会话还在内存里、聊过几句、没在跑团时才写；否则返回 undefined */
-  private beginHandoff(key: string): Promise<string | undefined> | undefined {
     const record = this.sessions.get(key);
-    const route = this.modelResolver.getEffectiveRoute(key);
-    if (this.handoffWriter === undefined || record === undefined || route?.provider === undefined || route.model === undefined) return undefined;
-    // 团档有自己的停团交接，而且旧会话里全是 DM 机密
-    if (this.dndService?.active(key) !== undefined) return undefined;
-    const turns: HandoffTurn[] = [];
-    for (const event of record.agent.session.events ?? []) {
-      if (event.type === 'user/message' && !isRuntimeContextEvent(event)) turns.push({ role: 'user', text: extractMessageText(event.message) });
-      else if (event.type === 'assistant/message') turns.push({ role: 'assistant', text: extractMessageText(event.message) });
+    // 正在生成的会话压缩不了；团档有自己的停团交接，而且旧会话里全是 DM 机密
+    const carry = options.handoff && record !== undefined && record.agent.status === 'idle'
+      && this.dndService?.active(key) === undefined;
+    if (!carry) {
+      this.pendingHandoffs.delete(key);
+      void this.remove(scope, peerId);
+      return false;
     }
-    const transcript = buildHandoffTranscript(turns);
-    if (transcript === undefined) return undefined;
-    return this.handoffWriter.write({ provider: route.provider, model: route.model, transcript });
+    let settle!: (summary: string | undefined) => void;
+    this.pendingHandoffs.set(key, new Promise<string | undefined>((resolve) => { settle = resolve; }));
+    void this.remove(scope, peerId, undefined, async (old) => {
+      // 压缩被拒（历史太短、服务没挂）也照样往下读：会话以前压缩过的话还有旧摘要可用
+      const outcome = await this.compactRecord(key, old);
+      const summary = latestCompactionSummary(old.agent.session.snapshotEvents?.() ?? old.agent.session.events);
+      this.logger.info(`session handoff: key=${key} compact=${outcome.ok ? `ok(${outcome.shadowed ?? 0})` : outcome.reason} summary=${summary?.length ?? 0} chars`);
+      settle(summary);
+    }).finally(() => settle(undefined));
+    return true;
   }
 
-  /** 取走会话交接（只给新会话的第一条消息一次）；还在写就等它写完 */
+  /** 取走会话交接（只给新会话的第一条消息一次）；还在压缩就等它，等太久就不带了 */
   async takeHandoff(scope: ChatScope, peerId: string): Promise<string | undefined> {
     const key = this.sessionKey(scope, peerId);
     const pending = this.pendingHandoffs.get(key);
     if (pending === undefined) return undefined;
     this.pendingHandoffs.delete(key);
-    const summary = await pending;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), HANDOFF_WAIT_MS); });
+    const summary = await Promise.race([pending, timeout]);
+    clearTimeout(timer);
     return summary === undefined ? undefined : formatHandoffHint(summary);
   }
 
-  async remove(scope: ChatScope, peerId: string, nextSessionId: string = randomUUID()): Promise<void> {
+  /**
+   * beforeDispose：旧会话已经从表里摘掉、还没销毁时跑（/new 用它压缩旧会话取摘要）。
+   */
+  async remove(
+    scope: ChatScope,
+    peerId: string,
+    nextSessionId: string = randomUUID(),
+    beforeDispose?: (record: SessionRecord) => Promise<void>,
+  ): Promise<void> {
     const key = this.sessionKey(scope, peerId);
     const record = this.sessions.get(key);
     // 默认派生 ID 未必写进偏好存储；插件重载/空闲回收后仍要捕获旧人设的任务。
@@ -1337,6 +1348,7 @@ export class SessionManager {
     if (!record) return;
     this.sessions.delete(key);
     this.modelSelections.delete(record.agent);
+    if (beforeDispose !== undefined) await beforeDispose(record).catch(() => {});
     record.agent.cancel({ kind: 'user' });
     await record.handle.dispose().catch(() => {});
     this.logger.info(`session removed: key=${key}`);
@@ -1352,6 +1364,11 @@ export class SessionManager {
     const key = this.sessionKey(scope, peerId);
     const record = this.sessions.get(key);
     if (!record) return { ok: false, reason: 'no-session' };
+    return this.compactRecord(key, record);
+  }
+
+  /** 压缩一条会话记录；/new 交接时这条记录已经不在会话表里了，所以不按 key 查 */
+  private async compactRecord(key: string, record: SessionRecord): Promise<CompactOutcome> {
     if (record.agent.status !== 'idle') return { ok: false, reason: 'busy' };
 
     let compaction: CompactionServiceLike | undefined;
