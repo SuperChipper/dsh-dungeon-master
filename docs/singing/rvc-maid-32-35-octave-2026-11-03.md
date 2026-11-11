@@ -21,7 +21,7 @@
 - 工作目录：`tmp/rvc-maid-32-35/`；诊断 `source-pitch.csv`、`before-pitch.csv`、`diagnosis.json`。
 - `narrow-plan.json` 记录 22 帧目标修改；实际推理 F0 转储验证改动数恰为 22，无清浊变化。
 - 音频仅拼接 33.62–34.64 秒，80 ms 交叉淡化。区间外混音在 WAV 写出前后与已验收 E 母带逐样本相同；115–117 秒目标及混音均保持不变。
-- 候选整曲视频：`D:/Downloads/魔法大肥鱼_B_RoFormer_修正版v2试听.mp4`。视频直接复制用户原画面；1080p、AAC 320k、双声道，时长校验通过。
+- 候选整曲视频：`<downloads>/魔法大肥鱼_B_RoFormer_修正版v2试听.mp4`。视频直接复制用户原画面；1080p、AAC 320k、双声道，时长校验通过。
 - 完整候选目标：`full-target-candidate.csv`；母带：`magic-maid-v2-candidate.wav`；记录：`result.json`。
 - 试听为原曲 31.7–37.7 秒，重点在试听第 2–3 秒；提供原版、控制组及候选混音/干声。
 

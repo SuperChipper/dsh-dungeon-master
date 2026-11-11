@@ -42,4 +42,4 @@ E 使用与控制组相同的原始 RoFormer 分轨、B、检索 0.6、随机种
 
 用户确认：“这次修好了”。E 是本轮唯一明确获听感验收的方案。有效改动为 115–117 秒内的 58 帧目标 F0 八度选择；不能再把此次问题直接定性为“电子音效导致，清理音效即可解决”。不据此将连续性假设变成全局修正规则。
 
-正式文件：`D:/Downloads/魔法大肥鱼_B_RoFormer_修正版.mp4`，从验收通过的 E 视频直接复制，未再编码。完整修正目标曲线：`tmp/rvc-maid-fx/magic-maid-accepted-full-target.csv`；高质量混音母带：`tmp/rvc-maid-fx/magic-maid-octave-trial.wav`；校验与状态：`tmp/rvc-maid-fx/accepted-result.json`。原视频与各轮实验文件保留。
+正式文件：`<downloads>/魔法大肥鱼_B_RoFormer_修正版.mp4`，从验收通过的 E 视频直接复制，未再编码。完整修正目标曲线：`tmp/rvc-maid-fx/magic-maid-accepted-full-target.csv`；高质量混音母带：`tmp/rvc-maid-fx/magic-maid-octave-trial.wav`；校验与状态：`tmp/rvc-maid-fx/accepted-result.json`。原视频与各轮实验文件保留。

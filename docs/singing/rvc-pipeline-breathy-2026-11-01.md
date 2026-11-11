@@ -3,7 +3,7 @@
 素材：https://b23.tv/QhBsxpt ，BV1aUaY6hE95 的开头 0–40 秒。
 保持原调、同一 Demucs 分轨、同一 feiyu40k_hi 权重与 index；没有修改训练或模型。
 
-变更细节与部署方法见 [推理源码说明](../scripts/singing-service/pipeline/README.md)。
+变更细节与部署方法见 [推理源码说明](../../scripts/singing-service/pipeline/README.md)。
 旧版使用 presence 8、旧换气回填、无新增降噪；新版使用 presence 4、安全回填、noise_reduce .5。
 因此本轮比较整个后处理方案，不能把差异归因于单个滤镜。
 

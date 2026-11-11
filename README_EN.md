@@ -1,4 +1,4 @@
-# DSH-qqBot
+# DSH Dungeon Master
 
 **[简体中文](./README.md) | English**
 
@@ -98,6 +98,7 @@ The tool layer also handles some rules automatically: PCs dropping to 0 HP and d
 ### Data and configuration
 
 - Each group has one save file, `<dnd.root>/campaigns/<chat>.json`, with change snapshots in `campaigns/history/` (the last 40 steps). Saves can only be changed through `dnd_*` tools; file tools cannot write to them.
+- `dnd_*` tools are only visible to QQ chats that have a campaign. Chats without one don't carry them (saving roughly ten thousand tokens of tool definitions), a paused campaign keeps only the ledger, prep and handoff tools, and `/dnd start` makes all of them available.
 - How state survives compaction and pauses, and the incidents that shaped it, is written up in the **[long-lived campaign state notes](./docs/dnd-long-lived-state.md)** (Chinese).
 
 | Option | Default | Description |
@@ -115,7 +116,7 @@ Besides campaigns, this fork adds the following on top of upstream. Every option
 
 | Area | Contents |
 |------|----------|
-| 💬 Group chat | Joins in without an @ by probability or a reply-desire score; group messages are persisted and survive restarts; sees earlier images; merged messages keep each sender; automatic compaction when context grows too large; `/new` writes a short handoff of the old session into the new one (`/new blank` starts from nothing) |
+| 💬 Group chat | Joins in without an @ by probability or a reply-desire score; group messages are persisted and survive restarts; sees earlier images; merged messages keep each sender; automatic compaction when context grows too large; `/new` compacts the old session first and carries the summary into the new one (`/new blank` starts from nothing) |
 | 🧠 Memory | A Markdown notes library under `notes/`, shared by every session and recalled by content; `chat`-scoped notes are visible only in their own group. The owner can send `/bot-notes` in a private chat to see what gets injected |
 | 😺 Stickers | Saves stickers based on the bot's mood (`qqbot_save_sticker`), matches by hash (`qqbot_match_sticker`), a meme-recognition skill |
 | 🖼 Media | Text and media in one message (`caption`), native image input via `deepseek-native`, voice recognition, whole-video understanding with keyframe review, audio transcription, images inside forwarded chat records |
@@ -138,7 +139,7 @@ Besides campaigns, this fork adds the following on top of upstream. Every option
 
 ```bash
 pnpm install && pnpm build
-npx @deepseek-ai/dsh plugin --profile qqbot add /path/to/dsh-qqbot
+npx @deepseek-ai/dsh plugin --profile qqbot add /path/to/dsh-dungeon-master
 npx @deepseek-ai/dsh --profile qqbot
 ```
 

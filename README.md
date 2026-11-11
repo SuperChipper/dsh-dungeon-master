@@ -1,4 +1,4 @@
-# DSH-qqBot
+# DSH Dungeon Master
 
 **[English](./README_EN.md) | 简体中文**
 
@@ -98,6 +98,7 @@
 ### 数据与配置
 
 - 每个群一份团档 `<dnd.root>/campaigns/<会话>.json`，改动快照存在 `campaigns/history/`（最近 40 步）。团档只能经 `dnd_*` 工具修改，文件工具写不进去。
+- `dnd_*` 工具只对有团的 QQ 会话可见：没开团的群和私聊不带这些工具（省下约一万 token 的工具说明），停团时只留查账本、备团和补写交接用的几个，`/dnd start` 后全部可用。
 - 状态怎么跨压缩、跨停团保留，以及踩过的坑，见 **[跑团状态长期化的开发记录](./docs/dnd-long-lived-state.md)**。
 
 | 配置 | 默认值 | 说明 |
@@ -115,7 +116,7 @@
 
 | 方向 | 内容 |
 |------|------|
-| 💬 群聊 | 未 @ 时按概率或「回复欲望」打分接话；群消息落盘，重启后接得上；能看历史图片；合并消息保留各自发送者；上下文超限自动压缩；`/new` 时把旧会话的要点写成交接带进新会话（`/new blank` 完全从头） |
+| 💬 群聊 | 未 @ 时按概率或「回复欲望」打分接话；群消息落盘，重启后接得上；能看历史图片；合并消息保留各自发送者；上下文超限自动压缩；`/new` 时先压缩旧会话，把压缩摘要带进新会话（`/new blank` 完全从头） |
 | 🧠 记忆 | `notes/` 下的 Markdown 笔记库，所有会话共用、按内容自动召回；`chat` 范围的笔记只在本群可见。主人私聊发 `/bot-notes` 查看注入情况 |
 | 😺 表情 | 按情绪自动收藏（`qqbot_save_sticker`）、按哈希匹配（`qqbot_match_sticker`）、梗图识别 skill |
 | 🖼 媒体 | 图文同发（`caption`）、`deepseek-native` 原生读图、语音识别、整段视频理解与关键帧复查、音频转写、合并转发里的图片 |
@@ -138,7 +139,7 @@
 
 ```bash
 pnpm install && pnpm build
-npx @deepseek-ai/dsh plugin --profile qqbot add /path/to/dsh-qqbot
+npx @deepseek-ai/dsh plugin --profile qqbot add /path/to/dsh-dungeon-master
 npx @deepseek-ai/dsh --profile qqbot
 ```
 
