@@ -36,6 +36,7 @@ npx vitest run --pool=threads   # 默认沙箱里 video-tool 的真实 ffmpeg �
 
 ## 约定
 
+- 作为仓库所有者审视代码：改动要对之后的维护负责，不只是让眼前的任务通过。
 - 提交信息：`feat(scope): ...` / `fix(scope): ...`，scope 如 `settings` `media` `dnd` `notes`。
 - 注释写「为什么」；不写复述代码的注释。
 - 写回 `cordis.patch.yml` 遵守最小写入：只写用户提交的顶层键，不固化默认值。
@@ -58,7 +59,7 @@ npx vitest run --pool=threads   # 默认沙箱里 video-tool 的真实 ffmpeg �
 - 停团后不注入 DM 守则，只注入一小段 `PAUSED_RULES`；玩家收团后最爱聊团，那段要管住剧透和凭印象答。
 - 战斗中要跨压缩保留的状态必须进 `summarize()`（团况每次变化都重发）。压缩摘要是转述，
   站位这类细节走样过：格罗尔走开时漏算借机、狼咬完人又被报成「离你十来尺」。
-- 新增 `dnd_*` 工具时同步：DM 守则、`README.md` / `README_EN.md` 的工具表、测试。
+- 新增 `dnd_*` 工具时同步：DM 守则、`README.md` / `README_EN.md` 的工具表、测试。工具放进 `src/dnd/tools/` 下对应类别的文件；停团后也要能用的，加进 `src/dnd/tool-scope.ts` 的 `PAUSED_DND_TOOLS`（没开团的会话看不到任何 `dnd_*` 工具，停团的只看得到这份名单）。
 
 查问题时：
 

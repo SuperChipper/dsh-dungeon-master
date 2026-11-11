@@ -12,7 +12,7 @@ const AREA_TOP = 30;
 /** 人气未知时按这个收藏数算权重（略低于 pixiv 同人图的中位水平，有人气数据的优先） */
 const UNKNOWN_BOOKMARKS = 50;
 
-function shuffle<T>(list: readonly T[], random: () => number): T[] {
+export function shuffle<T>(list: readonly T[], random: () => number): T[] {
   const out = [...list];
   for (let i = out.length - 1; i > 0; i--) {
     const j = Math.floor(random() * (i + 1));

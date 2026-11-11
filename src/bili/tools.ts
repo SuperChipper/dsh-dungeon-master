@@ -52,7 +52,8 @@ const TEXT_OUTPUT = {
 
 const BVID_PATTERN = /BV[0-9A-Za-z]{10}/;
 
-function bvidOf(value: string): string {
+/** 从链接或文字里取 BV 号；取不到就原样返回（去空白） */
+export function bvidOf(value: string): string {
   const match = BVID_PATTERN.exec(value);
   return match?.[0] ?? value.trim();
 }

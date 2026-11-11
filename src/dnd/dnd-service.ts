@@ -48,6 +48,7 @@ const DM_RULES = [
   '- 时限说在前面：限时增益当场讲截止时间，花时间的事先报总耗时。',
   '- 记住玩家给过的长期约定（「时间充裕就默认上引导术」），之后自动算进去；当场做的临场裁定用 dnd_progress append 记到【待办】。',
   '- dm_override 只用于玩家明确委托和被推被拖这类强制位移，用了要在回复里写明是谁委托、被什么推动的。',
+  '- 战利品按模组发；自制或替换魔法物品严格卡当前等级对应的 DMG 稀有度（1-4级普通/非普通，5-6级非普通最高+1，7-10级珍稀）并先核对全队现有魔法装备，不随意叠加高加值与法术特效。',
   '',
   '【骰子、状态与机密】',
   '- 怪物的 AC、HP 和所有 DC 不进群消息（工具结果里也不给，成败工具已判好）。群里只说命中没命中、过没过和伤势词（毫发无伤/受了点伤/伤得不轻/摇摇欲坠）；「命中 AC 13」「36/40」「还剩 7 点」「过了 DC 15」都不说。知识检定成功也只讲习性和弱点，不报数值。',
@@ -113,6 +114,8 @@ export class DndService {
   public sendImage?: (target: ReplyTarget, path: string, caption?: string) => Promise<void>;
   /** 这一次开团的签到表（会话 key → 签到）；只在内存里，见 check-in.ts */
   public readonly checkIns = new Map<string, CheckIn>();
+  /** 团开始、暂停时通知（会话可见的 dnd_* 工具要跟着变，见 tool-scope.ts） */
+  public onStateChange?: (key: string) => void;
   /** 这段对话 system prompt 里锁住的背景，见 promptSections */
   private readonly background = new PromptLatch();
 
@@ -171,6 +174,7 @@ export class DndService {
       existing.sessionStartedAt = Date.now();
       reconcileKnownSites(existing, adventure);
       this.store.save(existing);
+      this.onStateChange?.(key);
       return { campaign: existing, adventure, resumed: true, carried: [] };
     }
     if (existing !== undefined) this.store.archive(key);
@@ -184,6 +188,7 @@ export class DndService {
       }
     }
     this.store.save(campaign);
+    this.onStateChange?.(key);
     return { campaign, adventure, resumed: false, carried: campaign.characters.map((ch) => ch.name) };
   }
 
@@ -200,6 +205,7 @@ export class DndService {
     this.store.save(campaign);
     this.background.forget(key);
     this.checkIns.delete(key);
+    this.onStateChange?.(key);
     return campaign;
   }
 

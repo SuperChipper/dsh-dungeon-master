@@ -424,7 +424,7 @@ export function shopLine(shop: NonNullable<DungeonRoom['shop']>): string {
   return `卖 ${shop.sells}${shop.maxPrice !== undefined ? `（单价超过 ${shop.maxPrice} gp 的不卖）` : ''}`;
 }
 
-function short(text: string, max: number): string {
+export function short(text: string, max = 200): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 

@@ -9,7 +9,7 @@
 import { allFacts, findLead, findNpc, findQuest, type Adventure, roomGraph } from './adventure.ts';
 import type { Campaign, Character } from './campaign.ts';
 import { findRoom } from './dungeon.ts';
-import { ATTITUDE_NAMES, STATUS_NAMES } from './story.ts';
+import { ATTITUDE_NAMES, STATUS_NAMES, short } from './story.ts';
 
 export const CHRONICLE_KINDS = ['event', 'npc', 'promise', 'captive', 'thread', 'backstory', 'ruling'] as const;
 export type ChronicleKind = (typeof CHRONICLE_KINDS)[number];
@@ -152,10 +152,6 @@ export function markChronicle(c: Campaign): ChronicleMark {
     dead: c.characters.filter(isDead).map((ch) => ch.name),
     items: Object.fromEntries(c.characters.filter((ch) => ch.kind === 'pc').map((ch) => [ch.name, [...(ch.inventory ?? [])]])),
   };
-}
-
-function short(text: string, max = 200): string {
-  return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 function roomLine(adv: Adventure, id: string): string {

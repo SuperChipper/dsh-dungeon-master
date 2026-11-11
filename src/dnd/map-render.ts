@@ -19,7 +19,8 @@ const PAD = 1;
 const TITLE_H = 44;
 const FONT = "'Microsoft YaHei','PingFang SC','Noto Sans CJK SC','Source Han Sans SC',sans-serif";
 
-function esc(text: string): string {
+/** SVG 文本转义 */
+export function esc(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 

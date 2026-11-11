@@ -17,6 +17,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ContentBlock } from '@deepseek-ai/dsh-llm';
 import type { BiliClient } from '../bili/client.ts';
+import { bvidOf } from '../bili/tools.ts';
 import { MEDIA_ROOT } from './media-cleaner.ts';
 
 const run = promisify(execFile);
@@ -25,7 +26,6 @@ export const VIDEO_FETCH_TOOL_NAME = 'qqbot_video_fetch';
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-const BVID_PATTERN = /BV[0-9A-Za-z]{10}/;
 const DEFAULT_MAX_MB = 200;
 
 interface ToolsRegistryLike {
@@ -49,10 +49,6 @@ interface FetchArgs {
   page?: number;
   quality?: number;
   max_mb?: number;
-}
-
-function bvidOf(value: string): string {
-  return BVID_PATTERN.exec(value)?.[0] ?? value.trim();
 }
 
 function qualityLabel(qn: number): string {

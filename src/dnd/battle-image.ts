@@ -12,6 +12,7 @@ import { cellOf, mapOf } from './battlefield.ts';
 import { type Campaign, type Character, isOut } from './campaign.ts';
 import { type BattleMap, areaName } from './terrain.ts';
 import { loadSharp } from '../shared/sharp.ts';
+import { esc } from './map-render.ts';
 
 /** 输出图上一格的像素：手机上一格放得下一个字 */
 const CELL = 48;
@@ -19,10 +20,6 @@ const CELL = 48;
 const MARGIN = 24;
 const TITLE_H = 40;
 const FONT = "'Microsoft YaHei','PingFang SC','Noto Sans CJK SC','Source Han Sans SC',sans-serif";
-
-function esc(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
 
 export interface Token {
   name: string;

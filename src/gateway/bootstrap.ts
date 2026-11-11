@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { QQBot } from '@tencent-connect/qqbot-nodejs';
 import type { GatewayDisconnect, InteractionEvent, MiddlewareContext } from '@tencent-connect/qqbot-nodejs';
-import { SessionManager, type DshAgentRegistry } from '../session/index.ts';
+import { SessionManager, type DshAgent, type DshAgentRegistry } from '../session/index.ts';
 import { handleInbound, createOutboundHandler } from '../transport/index.ts';
 import { SelfSentIndex, mediaQuoteText, mediaRefIdx } from '../transport/self-sent.ts';
 import { renderOutboundMentions } from '../features/member-mention.ts';
@@ -61,6 +61,7 @@ import { CampaignStore } from '../dnd/campaign.ts';
 import { AdventureLibrary } from '../dnd/adventure.ts';
 import { DndService } from '../dnd/dnd-service.ts';
 import { registerDndTools } from '../dnd/dnd-tools.ts';
+import { DndToolScope } from '../dnd/tool-scope.ts';
 import { ACK, DndTurnButtons } from '../dnd/turn-buttons.ts';
 import { PersonaStore } from '../features/persona-store.ts';
 import { PersonaSwitch } from '../features/persona-switch.ts';
@@ -579,7 +580,7 @@ export async function bootstrapGateway(
     dndService.sendImage = async (target, path, caption) => {
       await mediaSender.sendImage(target, { localPath: path }, caption !== undefined ? { content: caption } : undefined);
     };
-    registerDndTools(ctx, {
+    const dndToolNames = registerDndTools(ctx, {
       service: dndService,
       manager,
       logger,
@@ -594,6 +595,23 @@ export async function bootstrapGateway(
       onPendingAttack: (record) => dndButtons?.scheduleReaction(record),
       members: memberIdsFor(getSenderAliases(), config.appId),
     });
+    // 没开团的会话不带跑团工具：开团、停团时跟着换
+    if (dndToolNames.length > 0) {
+      const toolScope = new DndToolScope(dndService, dndToolNames, logger);
+      manager.dndToolScope = toolScope;
+      dndService.onStateChange = (key) => manager.syncDndTools(key);
+      // 不是 QQ 会话的 agent 也不带跑团工具：每个 agent 出现时先全藏，QQ 会话建好记录后再按团的状态放开。
+      // 这两个事件按 agent 作用域派发，根作用域监听要带 global（同 agent/assistant-stream）
+      const events = ctx as unknown as { on(event: string, handler: (payload: { agent?: DshAgent }) => void, options?: { global?: boolean }): void };
+      events.on('agent/created', ({ agent }) => { if (agent !== undefined) toolScope.hideAll(agent); }, { global: true });
+      events.on('agent/disposed', ({ agent }) => { if (agent !== undefined) toolScope.release(agent); }, { global: true });
+      // 插件加载前就活着的 agent 收不到 created
+      try {
+        for (const agent of (agents as { list?(): DshAgent[] }).list?.() ?? []) toolScope.hideAll(agent);
+      } catch (err) {
+        logger.debug(`im-qqbot: 列不出现有 agent，跑团工具只对之后新建的隐藏: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   // ── 桌宠余额：自定义 deepseek-native 不在 dsh-pet 内置表里，补一个同接口 provider ──
@@ -613,6 +631,7 @@ export async function bootstrapGateway(
         modelWatch?.stop();
         // 待答问题挂在旧实例上，重载后没人能答：先让它们以 ASK_ABORTED 结束
         questionChannel.uninstall();
+        manager.dndToolScope?.disposeAll();
         await manager.disposeAll();
         // 停掉账本的定时器并把最后一分钟刷盘，否则每次重组都留下一个还在写同一个文件的旧实例
         manager.noteMetrics?.dispose();

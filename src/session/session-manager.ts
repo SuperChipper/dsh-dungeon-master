@@ -30,6 +30,7 @@ import type { NoteJudge } from '../features/note-judge.ts';
 import { buildHandoffTranscript, formatHandoffHint, type HandoffTurn, type HandoffWriter } from '../features/session-handoff.ts';
 import type { ToolAccess } from '../features/tool-access.ts';
 import type { DndService } from '../dnd/dnd-service.ts';
+import type { DndToolScope } from '../dnd/tool-scope.ts';
 import { PromptLatch } from '../features/prompt-latch.ts';
 import type { DndTurnButtons } from '../dnd/turn-buttons.ts';
 import { resolveTmpDir } from '../media/tmp-dir.ts';
@@ -216,6 +217,8 @@ export class SessionManager {
   public toolAccess?: ToolAccess;
   /** 由 bootstrap 注入的跑团服务（/dnd 命令 + DM prompt 注入） */
   public dndService?: DndService;
+  /** 按团的状态隐藏用不上的 dnd_* 工具（由 bootstrap 注入） */
+  public dndToolScope?: DndToolScope;
   /** 一段对话内锁住的 system prompt 文字（表情清单、本群笔记目录），见 PromptLatch */
   private readonly promptLatch = new PromptLatch();
   /** 由 bootstrap 注入的跑团按钮（/dnd start 发签到）；按钮关闭时为空 */
@@ -1221,10 +1224,18 @@ export class SessionManager {
     noteSender(record, senderId);
 
     this.sessions.set(key, record);
+    // 在第一条消息交给 agent 之前定好它看得到哪些跑团工具
+    this.dndToolScope?.sync(record);
     // 活会话的 Web 选择已经在宿主生效。旧 per-chat 偏好只用于 resume/create，
     // 不在插件重组后重新安装竞争选择器、也不把旧偏好当成一次新的切换。
     if (!live) this.syncExplicitRoute(record);
     return record;
+  }
+
+  /** 团开始或暂停后，让这个会话看得到的跑团工具跟上；会话不在内存里时等它下次创建再定 */
+  syncDndTools(sessionKey: string): void {
+    const record = this.sessions.get(sessionKey);
+    if (record !== undefined) this.dndToolScope?.sync(record);
   }
 
   findBySessionId(sessionId: string): SessionRecord | undefined {

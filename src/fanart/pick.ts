@@ -10,7 +10,7 @@ import { extname, join } from 'node:path';
 import { searchBooru } from './booru.ts';
 import { buildContactSheet } from './contact-sheet.ts';
 import type { HttpGet } from './http.ts';
-import { pickDiverse, trimForEnrichment } from './picker.ts';
+import { pickDiverse, shuffle, trimForEnrichment } from './picker.ts';
 import { fetchPixivDetail, searchPixivCp } from './pixiv.ts';
 import { candidateFileName, type FanartSeenStore } from './seen.ts';
 import type { BooruPoolEntry, FanartCandidate, PixivPoolEntry } from './types.ts';
@@ -71,15 +71,6 @@ export function loadPool<T>(file: string, valid: (e: T) => boolean): T[] {
   } catch {
     return [];
   }
-}
-
-function shuffle<T>(list: readonly T[], random: () => number): T[] {
-  const out = [...list];
-  for (let i = out.length - 1; i > 0; i--) {
-    const j = Math.floor(random() * (i + 1));
-    [out[i], out[j]] = [out[j]!, out[i]!];
-  }
-  return out;
 }
 
 async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
