@@ -12,7 +12,8 @@ import { QQBot } from '@tencent-connect/qqbot-nodejs';
 import type { GatewayDisconnect, InteractionEvent, MiddlewareContext } from '@tencent-connect/qqbot-nodejs';
 import { SessionManager, type DshAgentRegistry } from '../session/index.ts';
 import { handleInbound, createOutboundHandler } from '../transport/index.ts';
-import { SelfSentIndex } from '../transport/self-sent.ts';
+import { SelfSentIndex, mediaQuoteText, mediaRefIdx } from '../transport/self-sent.ts';
+import { renderOutboundMentions } from '../features/member-mention.ts';
 import { parseStreamFrame } from '../transport/events.ts';
 import { ReplyLimiter } from '../transport/reply-limiter.ts';
 import { PeerSendQueue } from '../transport/peer-send-queue.ts';
@@ -232,6 +233,10 @@ export async function bootstrapGateway(
   if (llm?.stream !== undefined) manager.handoffWriter = new HandoffWriter(llm, logger);
   // 自己发出去的消息不进 SDK 的 ref 索引，这里单独记一份，引用解析时才能认出「你自己」
   const selfSent = new SelfSentIndex();
+  // 所有文字发送（回复、DnD 卡片、审批、提问……）都经 messageApi，在这里统一按 ref_idx 记
+  bot.messageApi.onMessageSent((refIdx, meta) => {
+    selfSent.record(refIdx, meta.text ?? meta.ttsText ?? '');
+  });
   setupMiddlewares(bot, config, manager, logger, llm, selfSent);
 
   // ── 入站：经过中间件链后的消息交给 dsh agent ──
@@ -258,9 +263,14 @@ export async function bootstrapGateway(
   // sendMarkdown 统一做被动回复限额管控：同一 msgId 超限/过期时降级主动推送。
   const replyLimiter = new ReplyLimiter({ limit: 4 });
   const sendQueue = new PeerSendQueue();
+  // 群里模型写的 @#U3 在这里换成真正的 @（编号 → openid 用同一张别名表）
+  const withMentions = (target: { scope: string; targetId: string }, content: string): string =>
+    target.scope === 'group'
+      ? renderOutboundMentions(content, (alias) => getSenderAliases().resolve(config.appId, target.targetId, alias))
+      : content;
   const sender: QQBotSender = {
     sendMarkdown: (target, content, opts) => sendQueue.run(target,
-      () => sendResolvedMarkdown(bot, resolveReplyTarget(target, replyLimiter, true), content, opts)),
+      () => sendResolvedMarkdown(bot, resolveReplyTarget(target, replyLimiter, true), withMentions(target, content), opts)),
     openStream: (target) => sendQueue.stream(target, () => bot.openStream({
       target: {
         scope: target.scope,
@@ -270,7 +280,7 @@ export async function bootstrapGateway(
     })),
   };
 
-  const outbound = createOutboundHandler(manager, sender, config, logger, toolsRegistry, stickerStore, selfSent);
+  const outbound = createOutboundHandler(manager, sender, config, logger, toolsRegistry, stickerStore);
   (ctx as unknown as { on(event: string, handler: (...args: unknown[]) => void): void })
     .on('session/event', outbound.routeSessionEvent as (...args: unknown[]) => void);
 
@@ -417,11 +427,20 @@ export async function bootstrapGateway(
   // ── 附件发送工具注册（qqbot_send_file） ──
   // 包装 bot：让文件发送也走 msgId 兜底 + 被动回复限额管控。
   // 注意：SDK 文件发送暂不支持 event_id，故 allowEvent=false，跳过 event 候选。
+  // 媒体发送不走 onMessageSent，结果里的 ref_idx 自己记，群友引用表情/配图时才认得出是 bot 发的
+  const rememberMedia = <T,>(kind: Parameters<typeof mediaQuoteText>[0], caption: string | undefined) => (result: T): T => {
+    selfSent.record(mediaRefIdx(result), mediaQuoteText(kind, caption));
+    return result;
+  };
   const mediaSender: MediaSenderLike = {
-    sendImage: (target, source, opts) => sendQueue.run(target, () => bot.sendImage(resolveReplyTarget(target, replyLimiter, false), source, opts)),
-    sendVideo: (target, source, opts) => sendQueue.run(target, () => bot.sendVideo(resolveReplyTarget(target, replyLimiter, false), source, opts)),
-    sendVoice: (target, source) => sendQueue.run(target, () => bot.sendVoice(resolveReplyTarget(target, replyLimiter, false), source), true),
-    sendFile: (target, source, opts) => sendQueue.run(target, () => bot.sendFile(resolveReplyTarget(target, replyLimiter, false), source, opts)),
+    sendImage: (target, source, opts) => sendQueue.run(target, () => bot.sendImage(resolveReplyTarget(target, replyLimiter, false), source, opts))
+      .then(rememberMedia('图片', opts?.content)),
+    sendVideo: (target, source, opts) => sendQueue.run(target, () => bot.sendVideo(resolveReplyTarget(target, replyLimiter, false), source, opts))
+      .then(rememberMedia('视频', opts?.content)),
+    sendVoice: (target, source) => sendQueue.run(target, () => bot.sendVoice(resolveReplyTarget(target, replyLimiter, false), source), true)
+      .then(rememberMedia('语音', undefined)),
+    sendFile: (target, source, opts) => sendQueue.run(target, () => bot.sendFile(resolveReplyTarget(target, replyLimiter, false), source, opts))
+      .then(rememberMedia('文件', opts?.content)),
   };
   // ── 搜图工具（qqbot_fanart_pick）：候选落在 tmp/fanart，发出去的那张才记进 media/fanart 的 seen ──
   const fanartCandidatesDir = join(resolveTmpDir(config), 'fanart');

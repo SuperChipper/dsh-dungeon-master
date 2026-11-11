@@ -8,13 +8,12 @@ import type { SessionManager, SessionRecord } from '../session/index.ts';
 import type { ImQQBotConfig } from '../config.ts';
 import type { Logger } from '../types.ts';
 import type { StickerStore } from '../media/sticker-store.ts';
-import { extractPseudoStickerCalls, sanitizePseudoToolText } from '../media/pseudo-sticker-call.ts';
+import { extractBracketToolCalls, extractPseudoStickerCalls, sanitizePseudoToolText } from '../media/pseudo-sticker-call.ts';
 import { SEND_FILE_TOOL_NAME } from '../media/send-file-tool.ts';
 import { captionFromArgs, stripCaptionEcho } from './caption-echo.ts';
 import { dropTrailingPeriod, isBlankReply } from './text-guard.ts';
 import { chunkMarkdownText } from './chunker.ts';
 import { OutboundBuffer, type QQBotSender } from './outbound-buffer.ts';
-import { SelfSentIndex } from './self-sent.ts';
 import { formatToolResult, type ToolsRegistryLike, type ToolResultData } from './tool-presenter.ts';
 import { DND_TOOL_PREFIX } from '../dnd/dnd-tools.ts';
 import { getEngagementTracker } from '../features/reply-desire.ts';
@@ -63,6 +62,9 @@ interface ToolCallRecord {
 /** 不展示给用户的轮次错误码（底层传输/网络错误，对用户无意义，且常被重试兜住） */
 const SILENT_TURN_ERROR_CODES = new Set(['STREAM_CLOSED']);
 
+/** 宿主对「正常结束但零内容」的回复给的错误码（@deepseek-ai/dsh-llm 的 EMPTY_RESPONSE_CODE） */
+const EMPTY_RESPONSE_CODE = 'EMPTY_RESPONSE';
+
 /**
  * 出站路由器：持有会话级状态，按事件类型分发到处理器
  */
@@ -79,7 +81,6 @@ class OutboundRouter {
   private readonly logger: Logger;
   private readonly toolsRegistry: ToolsRegistryLike | undefined;
   private readonly stickerStore: StickerStore | undefined;
-  private readonly selfSent: SelfSentIndex;
 
   public constructor(
     manager: SessionManager,
@@ -88,7 +89,6 @@ class OutboundRouter {
     logger: Logger,
     toolsRegistry: ToolsRegistryLike | undefined,
     stickerStore?: StickerStore,
-    selfSent: SelfSentIndex = new SelfSentIndex(),
   ) {
     this.manager = manager;
     this.bot = bot;
@@ -96,7 +96,6 @@ class OutboundRouter {
     this.logger = logger;
     this.toolsRegistry = toolsRegistry;
     this.stickerStore = stickerStore;
-    this.selfSent = selfSent;
   }
 
   /** 事件分发入口 */
@@ -175,7 +174,7 @@ class OutboundRouter {
         this.shouldStream(record),
         (raw) => this.casualTone(record, this.salvage(raw, captions)),
         (raw) => stripCaptionEcho(sanitizePseudoToolText(raw), captions),
-        (raw) => this.markUnsent(record, raw),
+        (raw) => this.markUnsent(record, stripCaptionEcho(sanitizePseudoToolText(raw), captions)),
       );
       this.buffers.set(sessionId, buffer);
     }
@@ -199,8 +198,16 @@ class OutboundRouter {
       record.contextTokens = contextTokensOf(event.usage);
     }
 
+    const hasToolCall = event.content.some((b) => b.type === 'tool-call');
+    this.noteSkippedCalls(record, event.content);
     const buffer = this.buffers.get(sessionId);
     if (buffer !== undefined && buffer.text.trim()) {
+      // 调工具同一跳若模型以 💭 开头，整段都是上游漏进 content 的调工具前思考，直接丢弃
+      if (hasToolCall && buffer.text.trimStart().startsWith('💭')) {
+        buffer.cancel();
+        this.buffers.delete(sessionId);
+        return;
+      }
       this.noteBotSaid(record, buffer.text);
       void buffer.flush();
       this.buffers.delete(sessionId);
@@ -213,10 +220,24 @@ class OutboundRouter {
     }
     const fullText = textParts.join('\n');
     if (!fullText.trim()) return;
+    if (hasToolCall && fullText.trimStart().startsWith('💭')) {
+      this.buffers.delete(sessionId);
+      return;
+    }
     this.noteBotSaid(record, fullText);
 
     void this.send(record, fullText, 'sendMarkdown', this.captionsOf(sessionId));
     this.buffers.delete(sessionId);
+  }
+
+  /** 正文里写成 `[::tool::]{…}` 的调用不会执行；记下工具名，下一条用户消息时告诉模型 */
+  private noteSkippedCalls(record: SessionRecord, content: MessageEvent['content']): void {
+    const text = content.filter((b) => b.type === 'text').map((b) => (b as { text?: string }).text ?? '').join('\n');
+    if (!text.includes('[::')) return;
+    const { names } = extractBracketToolCalls(text.replace(/^\s*💭/, ''));
+    if (names.length === 0) return;
+    this.manager.addSkippedCalls(record.sessionKey, names);
+    this.logger.warn(`im-qqbot: 模型把工具调用写成了正文文字，未执行: ${names.join(', ')} session=${record.sessionKey}`);
   }
 
   /** 模型打分要知道 bot 刚说过什么（群记忆里没有 bot 自己的话） */
@@ -286,6 +307,7 @@ class OutboundRouter {
       this.buffers.delete(sessionId);
     }
     this.streamAttempts.delete(sessionId);
+    const captionSent = (this.captions.get(sessionId)?.length ?? 0) > 0;
     this.captions.delete(sessionId);
     if (record.sessionId === sessionId) delete record.voiceReplySentAt;
 
@@ -298,7 +320,10 @@ class OutboundRouter {
     const failure = extractTurnError(event.reason);
     // 笔记注入等这一轮正常结束才算数：异常结束时模型未必看到了它
     this.manager.settleNoteInjection(record, failure === undefined);
-    if (failure !== undefined && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
+    // 带配文的图已经发出去了，模型没话要补才交了白卷：对群里来说这一轮是正常结束的，不报错
+    const saidItInCaption = failure?.code === EMPTY_RESPONSE_CODE && captionSent;
+    if (saidItInCaption) this.logger.info(`im-qqbot: 配文已发出后的空回复，不报错 sessionId=${sessionId}`);
+    if (failure !== undefined && !saidItInCaption && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
       void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError');
     }
 
@@ -356,15 +381,16 @@ class OutboundRouter {
     let failed = false;
     for (const chunk of chunks) {
       try {
-        const sent = await this.bot.sendMarkdown(record.replyTarget, chunk);
-        this.selfSent.record((sent as { id?: string } | undefined)?.id, chunk);
+        // 发出去的话由 bootstrap 的 onMessageSent 按 ref_idx 记进自发索引
+        await this.bot.sendMarkdown(record.replyTarget, chunk);
       } catch (err) {
         failed = true;
         this.logger.error(`im-qqbot: ${tag} failed: ${err instanceof Error ? err.message : String(err)}`);
         break;
       }
     }
-    if (failed) this.markUnsent(record, text);
+    // 补发队列里放清洗后的文字：原文带着 💭 思考和伪工具块，会作为用户消息原样回灌给模型，让它接着学这个格式
+    if (failed) this.markUnsent(record, visible);
   }
 
   /** 群主动消息无权限/被动窗口过期时，内容不能丢：等用户下次说话时注入提示补发 */
@@ -388,9 +414,8 @@ export function createOutboundHandler(
   logger: Logger,
   toolsRegistry?: ToolsRegistryLike,
   stickerStore?: StickerStore,
-  selfSent?: SelfSentIndex,
 ): OutboundHandlers {
-  const router = new OutboundRouter(manager, bot, config, logger, toolsRegistry, stickerStore, selfSent);
+  const router = new OutboundRouter(manager, bot, config, logger, toolsRegistry, stickerStore);
   return {
     routeSessionEvent: (session, event) => router.route(session, event),
     routeStreamFrame: (agentId, delta) => router.routeStreamFrame(agentId, delta),

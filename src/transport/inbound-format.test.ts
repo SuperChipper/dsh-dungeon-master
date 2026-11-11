@@ -4,6 +4,7 @@ import type { ResolvedQuote } from '@tencent-connect/qqbot-nodejs';
 import { buildAgentBody, buildQuotePart, buildUserMessage } from './inbound.ts';
 import { quoteSenderFill } from '../gateway/middleware-setup.ts';
 import { makeSenderLabeler } from '../features/message-format.ts';
+import { SELF_SENDER_ID, SelfSentIndex } from './self-sent.ts';
 
 const ALIASES: Record<string, string> = { u1: 'U1', u2: 'U2', u3: 'U3' };
 const label = makeSenderLabeler((id) => ALIASES[id] ?? 'U9');
@@ -71,6 +72,16 @@ describe('quoteSenderFill', () => {
     await quoteSenderFill({ get: () => entry, set: () => {} })(ctx as never, async () => {});
     expect(ctx.state.quote.entry).toEqual(entry);
     expect(ctx.state.quote.text).toBe('完整原话');
+  });
+
+  it('引用 bot 自己发的话：按 ref_idx 认回来，标「你自己」', async () => {
+    const selfSent = new SelfSentIndex();
+    selfSent.record('REFIDX_bot', '💭 给我也批发一把');
+    const ctx = { state: { quote: { refKey: 'REFIDX_bot', source: 'msg_elements', text: '💭 给我也批发一把' } as ResolvedQuote } };
+    await quoteSenderFill({ get: () => undefined, set: () => {} }, selfSent)(ctx as never, async () => {});
+    expect(ctx.state.quote.entry?.senderId).toBe(SELF_SENDER_ID);
+    expect(buildQuotePart(ctx.state.quote, makeSenderLabeler(() => undefined)))
+      .toBe('[Quoted message from 你自己]\n💭 给我也批发一把\n[Quoted message ends]\n');
   });
 
   it('store 里没有时保持原样', async () => {

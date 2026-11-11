@@ -172,6 +172,56 @@ describe('OutboundRouter.routeStreamFrame', () => {
     expect(manager.addUnsent).toHaveBeenCalledWith('k', 'late reply');
   });
 
+  it('发送失败挂起的是清洗后的文字，不把 💭 思考和伪工具块回灌给模型', async () => {
+    const { outbound, bot, manager } = setup({ record: createRecord(groupTarget) });
+    vi.mocked(bot.sendMarkdown).mockRejectedValue(new Error('msg_id expired'));
+
+    outbound.routeSessionEvent({ header: { id: 'sess-qq' } }, {
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'text', text: '💭[::dnd_move::]{"room":"r1"}[::/dnd_move::]走到浴场了' }] } },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(manager.addUnsent).toHaveBeenCalledWith('k', '走到浴场了');
+  });
+
+  it('正文里写成文字的工具调用：记下工具名，留给下一条用户消息提醒模型', async () => {
+    const { outbound, bot, manager } = setup({ record: createRecord(groupTarget) });
+
+    outbound.routeSessionEvent({ header: { id: 'sess-qq' } }, {
+      type: 'assistant/message',
+      data: { message: { content: [{
+        type: 'text',
+        text: '💭[::call:default_api:dnd_move::]{"room":"r1"}[::/call:default_api:dnd_move::]已经挪过去了',
+      }] } },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(manager.addSkippedCalls).toHaveBeenCalledWith('k', ['dnd_move']);
+    expect(bot.sendMarkdown).toHaveBeenCalledWith(groupTarget, '已经挪过去了');
+  });
+
+  it('真正的工具调用和代码示例里的标记不算', async () => {
+    const { outbound, manager } = setup({ record: createRecord(groupTarget) });
+
+    outbound.routeSessionEvent({ header: { id: 'sess-qq' } }, {
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'text', text: '格式长这样：`[::dnd_move::]{"room":"r1"}[::/dnd_move::]`' }] } },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(manager.addSkippedCalls).not.toHaveBeenCalled();
+  });
+
+  it('轮次结束时结算笔记注入：正常结束算数，异常结束不算', () => {
+    const { outbound, manager } = setup();
+    const sess = { header: { id: 'sess-qq' } };
+    outbound.routeSessionEvent(sess, { type: 'turn/end', data: { reason: { kind: 'completed' } } });
+    expect(manager.settleNoteInjection).toHaveBeenLastCalledWith(expect.objectContaining({ sessionKey: expect.any(String) }), true);
+    outbound.routeSessionEvent(sess, { type: 'turn/end', data: { reason: { kind: 'error', code: 'UPSTREAM', message: 'boom' } } });
+    expect(manager.settleNoteInjection).toHaveBeenLastCalledWith(expect.anything(), false);
+  });
+
   it('语音后的模型文字完整另发一条，间隔内不抢发；下一轮恢复流式', async () => {
     const record = createRecord(c2cTarget), session = createSession(), bot = createBot(session);
     const queue = new PeerSendQueue();
@@ -273,6 +323,31 @@ describe('OutboundRouter.routeStreamFrame', () => {
       await vi.advanceTimersByTimeAsync(0);
 
       expect(bot.sendMarkdown).toHaveBeenCalledWith(groupTarget, '顺便说下明天放假');
+    });
+
+    it('配文发出后模型交白卷（EMPTY_RESPONSE）不报错；没发过配文的照常报', async () => {
+      const { outbound, bot } = setup({ record: createRecord(groupTarget) });
+      const emptyEnd = { type: 'turn/end', data: { reason: { kind: 'error', error: { code: 'EMPTY_RESPONSE', message: 'empty' } } } };
+      const errors = () => vi.mocked(bot.sendMarkdown).mock.calls.filter(([, text]) => String(text).includes('本轮异常结束')).length;
+
+      sendWithCaption(outbound);
+      outbound.routeSessionEvent(sess, emptyEnd);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(errors()).toBe(0);
+
+      // 上一轮的配文不算数
+      outbound.routeSessionEvent(sess, emptyEnd);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(errors()).toBe(1);
+    });
+
+    it('发完图只回一个句号收尾：不发出去', async () => {
+      const { outbound, bot } = setup({ record: createRecord(groupTarget) });
+      sendWithCaption(outbound);
+      outbound.routeSessionEvent(sess, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '。' }] } } });
+      outbound.routeSessionEvent(sess, { type: 'turn/end', data: { reason: { kind: 'completed' } } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.mocked(bot.sendMarkdown)).not.toHaveBeenCalled();
     });
 
     it('发送失败的 caption 不参与去重；turn/end 后清空', async () => {

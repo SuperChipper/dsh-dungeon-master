@@ -179,6 +179,7 @@ export class SessionManager {
   private sessions = new Map<string, SessionRecord>();
   /** 发送失败（常见于群主动消息无权限）的文本，等下一次用户消息时补发 */
   private unsent = new Map<string, string[]>();
+  private skippedCalls = new Map<string, Set<string>>();
   /** /new 或 fork 后的旧 sessionId → 当前会话 key，用于旧定时任务/旧审批卡片继续路由 */
   private retiredSessionIds = new Map<string, string>();
   /** /new 或人设切换后待目标会话重建的定时任务（会话 key → 各旧 session 的任务批次） */
@@ -425,6 +426,7 @@ export class SessionManager {
         text: [
           '【发图配文】',
           '用 qqbot_send_file 发图片/视频/文件并配文字时，整段配文放进 caption，但不超过两句、不换行、不放列表；要讲道理另发一条纯文字。caption 会和媒体同一条消息发出，不要再单独复述这段配文。',
+          '发完没别的要说，就只回一个「。」收尾：只有标点的回复不会发出去。不要什么都不输出，完全空的回复会被当成出错。',
           '没有媒体要发时正常文字回复。语音不支持 caption，按下面的语音发送规则处理。',
           '【语音单独发送】',
           '通过 qqbot_speak 或 qqbot_send_file 发送语音时：' + VOICE_REPLY_REMINDER,
@@ -915,6 +917,26 @@ export class SessionManager {
     list.push(trimmed.slice(0, 8000));
     while (list.length > 3) list.shift();
     this.unsent.set(sessionKey, list);
+  }
+
+  /**
+   * 记下模型写成正文文字、没有真正执行的工具（`[::dnd_move::]{…}` 这类）。
+   * 文字已经从群消息里剥掉，但模型以为调过了，会接着说「已经写好/已经挪过去」；下一条用户消息时提醒它。
+   */
+  addSkippedCalls(sessionKey: string, names: readonly string[]): void {
+    if (names.length === 0) return;
+    const set = this.skippedCalls.get(sessionKey) ?? new Set<string>();
+    for (const name of names) if (name) set.add(name);
+    this.skippedCalls.set(sessionKey, set);
+  }
+
+  /** 取出并清空该会话没执行的伪工具调用名 */
+  takeSkippedCalls(scope: ChatScope, peerId: string): string[] | undefined {
+    const key = this.sessionKey(scope, peerId);
+    const set = this.skippedCalls.get(key);
+    if (set === undefined || set.size === 0) return undefined;
+    this.skippedCalls.delete(key);
+    return [...set];
   }
 
   /** 取出并清空该会话的未送达文本 */

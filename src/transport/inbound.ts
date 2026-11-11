@@ -40,6 +40,7 @@ import { formatMessageTime, makeSenderLabeler, MENTION_MARK, quoteHeader, type S
 import { SELF_SENDER_ID } from './self-sent.ts';
 import { QUOTE_MISSING_NOTE, renderChatRecord, splitQuote } from '../features/chat-record.ts';
 import { getSenderAliases } from '../features/sender-alias.ts';
+import { isSelfMention, rememberSelfMentions, renderInboundMentions } from '../features/member-mention.ts';
 import type { MiddlewareContext } from '@tencent-connect/qqbot-nodejs';
 import { runInboundTurn } from './agent-turn.ts';
 
@@ -160,10 +161,14 @@ export async function handleInbound(
 
   // ── 组装 agentBody（下载结果经 mwState.downloadedFiles 提供） ──
   // 群里给模型看的发送者标签用群内短别名（#U3）；私聊只有一个对话者，引用块里称「对方」
-  const label: SenderLabeler = scope === 'group'
-    ? makeSenderLabeler((id) => getSenderAliases().aliasFor(config.appId, peerId, id))
-    : () => '对方';
-  const agentBody = await assembleAgentBody(bodyMsg, bodyState, scope, manager, history, historyImages, forwardImages, label);
+  const aliasOf = (id: string): string => getSenderAliases().aliasFor(config.appId, peerId, id);
+  const label: SenderLabeler = scope === 'group' ? makeSenderLabeler(aliasOf) : () => '对方';
+  const assembled = await assembleAgentBody(bodyMsg, bodyState, scope, manager, history, historyImages, forwardImages, label);
+  // 正文、历史、引用里的 <@openid> 统一换成 #U 编号，模型才认得出 @ 的是谁，也能照着 @ 回去
+  if (scope === 'group') rememberSelfMentions((msg as { mentions?: unknown }).mentions);
+  const agentBody = scope === 'group' && assembled
+    ? renderInboundMentions(assembled, aliasOf, (id) => isSelfMention(id, config.appId))
+    : assembled;
 
   if (!agentBody) return;
 
@@ -337,6 +342,11 @@ async function assembleAgentBody(
   const unsentHint = unsent === undefined
     ? ''
     : `[上次未送达]\n上一次发给本会话的消息因平台限制失败，内容如下。现在用户重新说话了，可以把它作为回复补发（太长就发摘要）：\n${unsent}`;
+  const skipped = manager.takeSkippedCalls(scope, peerId);
+  const skippedHint = skipped === undefined
+    ? ''
+    : `[上次的工具调用没有执行]\n你上一条回复里把 ${skipped.join('、')} 写成了正文文字（[::…::] 格式），它们没有执行，群里也没看到这段文字。`
+      + '你在那条里说「已经写好 / 已经记下 / 已经移动」的事都没有发生。需要的话现在用真正的工具调用重做，并在回复里如实更正；工具调用不要写进正文。';
   const migrationHint = manager.takeScheduleMigration(scope, peerId);
   const handoffHint = await manager.takeHandoff(scope, peerId);
   // 共享笔记自动召回：用当前消息（含引用原文）检索，命中才注入
@@ -345,7 +355,7 @@ async function assembleAgentBody(
   const forwardHint = buildForwardHint(forwardImages);
   const replyStyleHint = buildReplyStyleHint(state.replyDesire as { mode?: string } | undefined);
 
-  const base = [dynamicCtx, stickerHints, forwardHint, notesHint, unsentHint, handoffHint, migrationHint, replyStyleHint, userMessage].filter(Boolean).join('\n');
+  const base = [dynamicCtx, stickerHints, forwardHint, notesHint, unsentHint, skippedHint, handoffHint, migrationHint, replyStyleHint, userMessage].filter(Boolean).join('\n');
   const agentBody = buildAgentBody(base, history, isGroup, wasMentioned || implicit, label, historyImages);
 
   return agentBody;

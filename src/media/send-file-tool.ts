@@ -43,7 +43,11 @@ const DESCRIPTION =
   + 'For an image/video/file, put the entire short companion reply in `caption`: at most two sentences, '
   + 'no line breaks and no lists. Send any longer explanation as a separate text message. Do not repeat '
   + 'the caption as a separate reply; QQ sends it in the same rich-media message. '
-  + 'After a captioned send, an empty final reply is fine: end the turn unless you have something new to say. '
+  // 以前写「空回复就行」：听话的模型真的什么都不输出，宿主把零内容的回复判成 EMPTY_RESPONSE，
+  // 重试几次后整轮报错。纯标点的回复会在出站时丢掉（text-guard 的 isBlankReply），拿它当收尾。
+  + 'After a captioned send, if you have nothing new to say, reply with a single `。` to end the turn: '
+  + 'a punctuation-only reply is dropped and never shown to anyone. Never end with a completely empty reply: '
+  + 'the runtime rejects it as a failed response and the turn errors out. '
   + 'For audio files sent as voice messages: ' + VOICE_REPLY_TOOL_HINT;
 
 /** 发送器最小接口（QQBot 实例满足） */
