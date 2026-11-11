@@ -296,6 +296,8 @@ class OutboundRouter {
     }
 
     const failure = extractTurnError(event.reason);
+    // 笔记注入等这一轮正常结束才算数：异常结束时模型未必看到了它
+    this.manager.settleNoteInjection(record, failure === undefined);
     if (failure !== undefined && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
       void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError');
     }

@@ -115,6 +115,16 @@ interface NotesWire {
   injectMinCoverage: number;
   /** 密钥不上表单（GET 回显为空，POST 由服务端回填） */
   semantic?: NotesSemanticWire;
+  judge?: NoteJudgeWire;
+}
+
+/** 笔记注入相关性打分（与 src/config.ts 的 NoteJudgeConfig 对应） */
+interface NoteJudgeWire {
+  enabled: boolean;
+  timeoutMs: number;
+  sampleRate: number;
+  minSamples: number;
+  muteBelow: number;
 }
 
 /** 笔记语义检索（与 src/config.ts 的 NotesSemanticConfig 对应，不含 apiKey） */
@@ -653,6 +663,10 @@ export function ConfigPanel(): ReactNode {
   const semantic: NotesSemanticWire = notes.semantic ?? {
     enabled: false, baseUrl: 'https://api.siliconflow.cn/v1', model: 'BAAI/bge-m3', minSimilarity: 0.5, minMargin: 0.16, timeoutMs: 3000,
   };
+  // 旧配置没有 judge 组时按默认值显示
+  const noteJudge: NoteJudgeWire = notes.judge ?? {
+    enabled: false, timeoutMs: 15000, sampleRate: 1, minSamples: 8, muteBelow: 0,
+  };
   const stickers: StickersWire = form.stickers ?? {
     enabled: true, root: '', extraRoots: [], maxBytes: 8 * 1024 * 1024, maxAutoEntries: 200,
   };
@@ -1134,6 +1148,29 @@ export function ConfigPanel(): ReactNode {
       label: '向量请求超时（毫秒）', value: semantic.timeoutMs, min: 500, max: 30000, step: 500,
       help: '超时的那条消息只用关键词检索，不会卡住回复',
       onChange: (v) => { patch('notes', { ...notes, semantic: { ...semantic, timeoutMs: v } }); },
+    }),
+    createElement(SwitchRow, {
+      label: '注入相关性打分', checked: noteJudge.enabled,
+      help: '每轮回复结束后，让模型评这轮自动注入的笔记和用户消息相不相关（0/1/2 三档），分数记进注入账本；不拖慢回复。用的是「回复欲望」里配的打分模型，那边没填就用会话的主模型',
+      onChange: (v) => { patch('notes', { ...notes, judge: { ...noteJudge, enabled: v } }); },
+    }),
+    createElement(NumberRow, {
+      label: '打分抽样比例', value: noteJudge.sampleRate, min: 0, max: 1, step: 0.05,
+      help: '1 = 每轮注入都评；调低可以省调用',
+      onChange: (v) => { patch('notes', { ...notes, judge: { ...noteJudge, sampleRate: v } }); },
+    }),
+    createElement(NumberRow, {
+      label: '静音阈值（平均相关分）', value: noteJudge.muteBelow, min: 0, max: 1, step: 0.05,
+      help: '0 = 只打分、不改变注入。大于 0 时，评够次数且平均分低于它的片段不再自动注入（qqbot_notes_search 仍查得到；笔记文件改过会自动恢复）',
+      onChange: (v) => { patch('notes', { ...notes, judge: { ...noteJudge, muteBelow: v } }); },
+    }),
+    createElement(NumberRow, {
+      label: '静音前至少评几次', value: noteJudge.minSamples, min: 1, max: 1000, step: 1,
+      onChange: (v) => { patch('notes', { ...notes, judge: { ...noteJudge, minSamples: v } }); },
+    }),
+    createElement(NumberRow, {
+      label: '打分超时（毫秒）', value: noteJudge.timeoutMs, min: 1000, max: 120000, step: 1000,
+      onChange: (v) => { patch('notes', { ...notes, judge: { ...noteJudge, timeoutMs: v } }); },
     }),
 
     createElement('div', { className: 'imqb2-group-title' }, '工具权限'),

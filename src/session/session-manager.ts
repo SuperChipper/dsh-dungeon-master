@@ -24,8 +24,9 @@ import { ModelResolver } from '../model/model-resolver.ts';
 import type { ModelRoute, ModelEntry } from '../model/types.ts';
 import { IdleEvictor } from './idle-evictor.ts';
 import type { StickerStore, StickerMatchResult } from '../media/sticker-store.ts';
-import { chatKeyOf, formatNotesHint, selectNotesForInjection, type NotesStore } from '../notes/notes-store.ts';
+import { chatKeyOf, formatNotesHint, selectNotesForInjection, type NoteHit, type NotesStore } from '../notes/notes-store.ts';
 import type { NoteMetricsStore } from '../notes/note-metrics.ts';
+import type { NoteJudge } from '../features/note-judge.ts';
 import { buildHandoffTranscript, formatHandoffHint, type HandoffTurn, type HandoffWriter } from '../features/session-handoff.ts';
 import type { ToolAccess } from '../features/tool-access.ts';
 import type { DndService } from '../dnd/dnd-service.ts';
@@ -34,6 +35,7 @@ import type { DndTurnButtons } from '../dnd/turn-buttons.ts';
 import { resolveTmpDir } from '../media/tmp-dir.ts';
 import { isVoiceFile, VOICE_REPLY_REMINDER } from '../media/voice-reply.ts';
 import { join } from 'node:path';
+import { statSync } from 'node:fs';
 import {
   formatScheduleMigrationHint,
   readScheduleMigrations,
@@ -74,6 +76,19 @@ const COMPACTION_ERROR_HINTS: Record<string, string> = {
 };
 
 /** ctx.llm 查模型窗口的最小接口 */
+/** 登记了注入却迟迟没等到轮次结束时，多久之后作废 */
+const NOTE_INJECTION_TTL_MS = 30 * 60_000;
+
+/** 已经拼进消息、还没等到轮次结束的一次笔记注入 */
+interface PendingNoteInjection {
+  query: string;
+  at: number;
+  campaignRunning: boolean;
+  hits: NoteHit[];
+  /** 每段实际注入的正文（截断后），与 hits 一一对应 */
+  snippets: string[];
+}
+
 interface ModelInfoLlm {
   resolveModelInfo?(provider: string, model: string): Promise<{ context?: { contextWindow?: number } } | undefined>;
 }
@@ -189,6 +204,9 @@ export class SessionManager {
   public notesStore?: NotesStore;
   /** 笔记注入账本（只记录，不参与排序） */
   public noteMetrics?: NoteMetricsStore;
+  /** 笔记相关性打分（llm 服务不可用时缺省，只记账不打分） */
+  public noteJudge?: NoteJudge;
+  private readonly pendingNoteInjections = new Map<string, PendingNoteInjection>();
   /** /new 时写会话交接（llm 服务不可用时缺省，/new 照常只是不带交接） */
   public handoffWriter?: HandoffWriter;
   /** 会话 key → 正在写或已写好的交接；新会话的第一条消息取走 */
@@ -770,10 +788,24 @@ export class SessionManager {
     try {
       // 开着团时本群的跑团笔记（旧进度、旧待办）会和每回合注入的实时团况打架，只召回共享笔记
       const campaignRunning = this.dndService?.active(this.sessionKey(scope, peerId)) !== undefined;
-      const hits = await this.notesStore.searchHybrid(query, notes.injectTopK * 2, chatKeyOf(scope, peerId), { sharedOnly: campaignRunning });
+      const found = await this.notesStore.searchHybrid(query, notes.injectTopK * 2, chatKeyOf(scope, peerId), { sharedOnly: campaignRunning });
+      const hits = found.filter((hit) => !this.noteMuted(hit.file, hit.heading));
       const selected = selectNotesForInjection(hits, { topK: notes.injectTopK, minCoverage: notes.injectMinCoverage });
-      // 账本记的是「真正进了提示词的段」；只观察，不影响本次注入
-      this.noteMetrics?.recordInjection(selected);
+      // 这里只登记：消息还在组装，模型未必收得到。等这一轮正常结束再记账、打分（见 settleNoteInjection）
+      const key = this.sessionKey(scope, peerId);
+      if (selected.length === 0) {
+        this.pendingNoteInjections.delete(key);
+      } else {
+        const perHit = Math.max(80, Math.floor(notes.injectMaxChars / selected.length));
+        this.pendingNoteInjections.set(key, {
+          query,
+          at: Date.now(),
+          campaignRunning,
+          hits: selected,
+          // 打分要看模型实际看到的那段，和 formatNotesHint 的截断保持一致
+          snippets: selected.map((hit) => hit.text.replace(/\s+/g, ' ').trim().slice(0, perHit)),
+        });
+      }
       return formatNotesHint(hits, {
         topK: notes.injectTopK,
         maxChars: notes.injectMaxChars,
@@ -783,6 +815,66 @@ export class SessionManager {
       this.logger.warn(`im-qqbot: 笔记检索失败: ${err instanceof Error ? err.message : String(err)}`);
       return '';
     }
+  }
+
+  /** 这段笔记是否被静音（相关性打分长期偏低）。笔记文件在静音之后改过就解除：旧分数评的不是现在的内容 */
+  private noteMuted(file: string, heading: string): boolean {
+    if (this.noteMetrics === undefined || this.notesStore === undefined) return false;
+    // 主人手动静音的不看打分开关，也不因为文件改过就自动恢复：那是明确说过「别再注入」
+    if (this.noteMetrics.mutedManually(file, heading)) return true;
+    const judge = this.config.notes?.judge;
+    // muteBelow 调回 0 就是打分静音的总开关：已静音的段立刻恢复注入，不用去改账本
+    if (judge?.enabled !== true || judge.muteBelow <= 0) return false;
+    const mutedAt = this.noteMetrics.mutedAt(file, heading);
+    if (mutedAt === undefined) return false;
+    try {
+      if (statSync(join(this.notesStore.root, file)).mtimeMs > mutedAt) {
+        this.noteMetrics.unmute(file, heading);
+        return false;
+      }
+    } catch {
+      /* 文件刚被删掉：检索下一次刷新就不会再出现它 */
+    }
+    return true;
+  }
+
+  /**
+   * 一轮结束时结算这轮注入的笔记：正常结束才记账并排队打分，异常结束的丢掉。
+   * 打分异步进行，不等结果。
+   */
+  settleNoteInjection(record: SessionRecord, ok: boolean): void {
+    const pending = this.pendingNoteInjections.get(record.sessionKey);
+    if (pending === undefined) return;
+    this.pendingNoteInjections.delete(record.sessionKey);
+    // 登记后一直没等到自己那一轮（消息被丢弃、会话创建失败），别让后来不相干的一轮替它结算
+    if (!ok || Date.now() - pending.at > NOTE_INJECTION_TTL_MS) return;
+    const metrics = this.noteMetrics;
+    if (metrics === undefined) return;
+    metrics.recordInjection(pending.hits);
+
+    const judge = this.config.notes?.judge;
+    // 开团时用户消息多是行动宣告，和共享笔记天然对不上，评出来的低分不说明笔记没用
+    if (this.noteJudge === undefined || judge?.enabled !== true || pending.campaignRunning) return;
+    if (Math.random() >= judge.sampleRate) return;
+    const route = this.getEffectiveModel(record.scope, record.peerId);
+    // 和接话打分用同一个模型：那边通常已经配了便宜的小模型，没配就退回会话主模型
+    const replyJudge = this.config.replyDesire?.judge;
+    const provider = replyJudge?.provider || route?.provider || this.config.provider;
+    const model = replyJudge?.model || route?.model || this.config.model;
+    if (!provider || !model) return;
+    const policy = { minSamples: judge.minSamples, muteBelow: judge.muteBelow };
+    void this.noteJudge.enqueue({
+      provider,
+      model,
+      reasoningEffort: replyJudge?.reasoningEffort ?? '',
+      query: pending.query,
+      notes: pending.hits.map((hit, i) => ({ file: hit.file, heading: hit.heading, text: pending.snippets[i] ?? '' })),
+    }).then((scores) => {
+      if (scores === undefined) return;
+      const muted = metrics.recordJudgement(pending.hits, scores, policy);
+      this.logger.debug(`note-judge: ${pending.hits.map((hit, i) => `${hit.file}=${scores[i]}`).join(' ')}`);
+      for (const key of muted) this.logger.info(`im-qqbot: 笔记相关性长期偏低，已停止自动注入: ${key}`);
+    }).catch(() => undefined);
   }
 
   /** 原生读图：把本地图片提交为 attachment，返回可直接放进 user message 的 ImageBlock */

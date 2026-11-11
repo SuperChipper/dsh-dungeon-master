@@ -11,9 +11,11 @@ import type { DshAgent, SessionManager } from '../session/index.ts';
 import type { Logger } from '../types.ts';
 import { chatKeyOf, type NoteHit, type NotesStore, type SaveNoteResult } from './notes-store.ts';
 import { findDmSecret } from '../features/campaign-secrets.ts';
+import { NOTE_STATS_VIEWS, renderNoteStats, type NoteStatsView } from '../features/note-stats.ts';
 
 export const NOTES_SEARCH_TOOL_NAME = 'qqbot_notes_search';
 export const NOTES_SAVE_TOOL_NAME = 'qqbot_notes_save';
+export const NOTES_MANAGE_TOOL_NAME = 'qqbot_notes_manage';
 
 /** 检索结果里每段正文的最大字数 */
 const SEARCH_SNIPPET_CHARS = 800;
@@ -36,6 +38,34 @@ const SAVE_DESCRIPTION =
   + 'jokes): progress, loot, open threads and to-dos go into the campaign via dnd_progress, and DM secrets (DCs, '
   + 'monster stats, DM-only room notes, unrevealed things) never go into notes. '
   + 'A new title creates a new note file; pass `file` of an existing note to append a section to it.';
+
+const MANAGE_DESCRIPTION =
+  'Owner-only housekeeping for the shared notes library; works only in a private chat with the owner. Use it when the '
+  + 'owner asks how the notes are doing or tells you to stop injecting / archive / restore a note. '
+  + 'action="stats": the injection ledger — how often each section was auto-injected and its average relevance '
+  + 'score (0-1, judged after each reply; "未评" = not judged yet). view="low" lists the least relevant sections, '
+  + '"top" the most injected, "muted" the muted ones. '
+  + 'action="mute": stop auto-injecting one section (it stays searchable); "unmute" reverses it. '
+  + 'action="archive": move a whole note file, or one section of it, into the .archive/ directory of the notes folder, '
+  + 'which is not indexed — nothing is deleted. Archive only what the owner named or clearly agreed to; when the '
+  + 'owner asks for a cleanup in general terms, show the candidates from stats first and let them choose. '
+  + 'To rewrite or merge note text, edit the Markdown files under the notes root directly.';
+
+interface ManageArgs {
+  action: 'stats' | 'mute' | 'unmute' | 'archive';
+  view?: NoteStatsView;
+  limit?: number;
+  file?: string;
+  heading?: string;
+  occurrence?: number;
+}
+
+export interface NotesToolsOptions {
+  /** bot 主人的 openid；空 = 管理工具只有本机会话能用 */
+  ownerOpenid?: string;
+  /** 相关性打分开没开（只用来在 stats 里提示） */
+  judgeEnabled: () => boolean;
+}
 
 /** 看起来像跑团存档/约定的内容：没指定 scope 时默认只记到本会话，免得串到别的群 */
 const CAMPAIGN_NOTE_PATTERN = /跑团|开团|结团|带团|模组|\/dnd|\bDM\b|\bKP\b|先攻|检定|角色卡|法术位|环位|\bHP\b/;
@@ -73,6 +103,7 @@ export function registerNotesTools(
   store: NotesStore,
   manager: SessionManager,
   logger: Logger,
+  options: NotesToolsOptions = { judgeEnabled: () => false },
 ): void {
   const tools = ctx.get('tools') as ToolsRegistryLike | undefined;
   if (!tools?.register) {
@@ -204,6 +235,74 @@ export function registerNotesTools(
         ...(chatOnly ? { chatKey: chatKeyOf(record.scope, record.peerId) } : {}),
         ...(typeof file === 'string' && file.trim().length > 0 ? { file } : {}),
       });
+    },
+  });
+
+  tools.register({
+    name: NOTES_MANAGE_TOOL_NAME,
+    description: MANAGE_DESCRIPTION,
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['stats', 'mute', 'unmute', 'archive'], description: 'What to do.' },
+        view: { type: 'string', enum: ['low', 'top', 'muted'], description: 'stats only: low = lowest relevance (default), top = most injected, muted = muted sections.' },
+        limit: { type: 'integer', description: 'stats only: how many rows (1-30, default 10).' },
+        file: { type: 'string', description: 'mute/unmute/archive: note path relative to the notes root, exactly as shown by stats or search (e.g. "人类观察日记.md", "chats/group_XXX/点歌.md").' },
+        heading: { type: 'string', description: 'mute/unmute: full heading path of the section as shown by stats ("一级 › 二级"). archive: the section to archive; omit to archive the whole file.' },
+        occurrence: { type: 'integer', description: 'archive only: which one (1-based) when several sections share the same heading path.' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: { message: { type: 'string' } },
+        required: ['message'],
+        additionalProperties: false,
+      },
+      render: (_args: unknown, value: unknown): ContentBlock[] => [{ type: 'text', text: (value as { message: string }).message }],
+    },
+    async execute(args: unknown, exec: { agent?: unknown }): Promise<{ message: string }> {
+      const { action, view, limit, file, heading, occurrence } = args as ManageArgs;
+      const record = exec.agent !== undefined ? manager.findByAgent(exec.agent as DshAgent) : undefined;
+      // 清单里有每个群的私有笔记标题，静音和归档又会影响所有会话：只给主人私聊和本机会话
+      const owner = options.ownerOpenid?.trim() ?? '';
+      const ownerChat = record === undefined || (owner !== '' && record.scope === 'c2c' && record.peerId === owner);
+      if (!ownerChat) throw new Error('qqbot_notes_manage: 只能在主人私聊里用');
+      const metrics = manager.noteMetrics;
+      if (metrics === undefined) throw new Error('qqbot_notes_manage: 笔记账本不可用');
+
+      if (action === 'stats') {
+        const picked: NoteStatsView = view !== undefined && NOTE_STATS_VIEWS.includes(view) ? view : 'low';
+        const n = typeof limit === 'number' && Number.isFinite(limit) ? Math.min(30, Math.max(1, Math.floor(limit))) : 10;
+        return { message: renderNoteStats(metrics.summary(Number.POSITIVE_INFINITY), picked, n, options.judgeEnabled()) };
+      }
+      if (typeof file !== 'string' || file.trim() === '') throw new Error(`qqbot_notes_manage: ${action} 需要 file`);
+      const path = file.trim().split('\\').join('/');
+      const section = typeof heading === 'string' ? heading.trim() : '';
+
+      if (action === 'archive') {
+        const result = store.archive({
+          file: path,
+          ...(section !== '' ? { heading: section } : {}),
+          ...(typeof occurrence === 'number' && Number.isFinite(occurrence) ? { occurrence: Math.floor(occurrence) } : {}),
+        });
+        return { message: `${result.message}要恢复就把它从归档目录搬回原处。` };
+      }
+      if (action === 'mute' || action === 'unmute') {
+        if (section === '') throw new Error(`qqbot_notes_manage: ${action} 需要 heading（完整标题路径，stats 里「›」后面那一串）`);
+        if (action === 'unmute') {
+          if (metrics.mutedAt(path, section) === undefined) return { message: `${path} › ${section} 本来就没有静音。` };
+          metrics.unmute(path, section);
+          return { message: `已恢复自动注入：${path} › ${section}（之前的相关性分数已清零，重新累计）。` };
+        }
+        // 标题路径写错的话静音会落到一个不存在的键上，什么也不会发生还以为生效了
+        if (!store.hasSection(path, section)) throw new Error(`qqbot_notes_manage: 笔记库里没有 ${path} › ${section}，先用 stats 或 qqbot_notes_search 确认路径`);
+        metrics.mute(path, section);
+        return { message: `已静音：${path} › ${section}。之后不再自动注入，qqbot_notes_search 仍然查得到；要恢复用 unmute。` };
+      }
+      throw new Error(`qqbot_notes_manage: 不认识的 action「${String(action)}」`);
     },
   });
 

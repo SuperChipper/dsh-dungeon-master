@@ -53,6 +53,8 @@ function setup(opts?: { record?: SessionRecord | undefined; config?: ImQQBotConf
   const manager = {
     findBySessionId: vi.fn((id: string) => (id === 'sess-qq' ? record : undefined)),
     addUnsent: vi.fn(),
+    addSkippedCalls: vi.fn(),
+    settleNoteInjection: vi.fn(),
   } as unknown as SessionManager;
   const logger = createLogger();
   const outbound = createOutboundHandler(manager, bot, opts?.config ?? createConfig(), logger);
@@ -173,7 +175,7 @@ describe('OutboundRouter.routeStreamFrame', () => {
   it('语音后的模型文字完整另发一条，间隔内不抢发；下一轮恢复流式', async () => {
     const record = createRecord(c2cTarget), session = createSession(), bot = createBot(session);
     const queue = new PeerSendQueue();
-    const manager = { findBySessionId: () => record, addUnsent: vi.fn() } as unknown as SessionManager;
+    const manager = { findBySessionId: () => record, addUnsent: vi.fn(), settleNoteInjection: vi.fn() } as unknown as SessionManager;
     const sender: QQBotSender = {
       sendMarkdown: (target, text) => queue.run(target, () => bot.sendMarkdown(target, text)),
       openStream: (target) => queue.stream(target, () => bot.openStream(target)),

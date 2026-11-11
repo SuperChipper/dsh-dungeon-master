@@ -292,6 +292,23 @@ export interface NotesSemanticConfig {
   timeoutMs: number;
 }
 
+/**
+ * 笔记注入的相关性打分：回复结束后让模型评这轮注入的笔记和用户消息相不相关。
+ * 模型不单独配：用接话打分（replyDesire.judge）的 provider/model，那边没填就用会话的主模型。
+ */
+export interface NoteJudgeConfig {
+  /** 是否打分；关闭时账本只记注入次数 */
+  enabled: boolean;
+  /** 单次打分超时(ms) */
+  timeoutMs: number;
+  /** 抽样比例（0-1）：1 = 每轮注入都评 */
+  sampleRate: number;
+  /** 一段笔记至少评过几次才可能被静音 */
+  minSamples: number;
+  /** 平均相关分（0-1）低于它就停止自动注入这一段；0 = 只打分不静音 */
+  muteBelow: number;
+}
+
 export interface NotesConfig {
   /** 是否启用共享笔记库（检索/记录工具 + 自动召回） */
   enabled: boolean;
@@ -307,6 +324,8 @@ export interface NotesConfig {
   injectMinCoverage: number;
   /** 语义检索 */
   semantic: NotesSemanticConfig;
+  /** 注入相关性打分 */
+  judge: NoteJudgeConfig;
 }
 
 export interface ImQQBotConfig {
@@ -485,6 +504,23 @@ export const NotesSemanticSchema: Schema<NotesSemanticConfig> = Schema.object({
   timeoutMs: Schema.number().min(500).max(30000).default(3000).description('查询向量超时(ms)'),
 });
 
+export const NOTE_JUDGE_DEFAULTS: NoteJudgeConfig = {
+  enabled: false,
+  timeoutMs: 15000,
+  sampleRate: 1,
+  minSamples: 8,
+  muteBelow: 0,
+};
+
+/** 笔记注入相关性打分子 Schema */
+export const NoteJudgeSchema: Schema<NoteJudgeConfig> = Schema.object({
+  enabled: Schema.boolean().default(false).description('回复结束后让模型评这轮注入的笔记相不相关（模型同接话打分）'),
+  timeoutMs: Schema.number().min(1000).max(120000).default(15000).description('单次打分超时(ms)'),
+  sampleRate: Schema.number().min(0).max(1).default(1).description('抽样比例(0-1)，1=每轮都评'),
+  minSamples: Schema.number().min(1).max(1000).default(8).description('至少评过几次才可能静音'),
+  muteBelow: Schema.number().min(0).max(1).default(0).description('平均相关分低于它就停止自动注入(0-1)，0=只打分不静音'),
+}).default(NOTE_JUDGE_DEFAULTS);
+
 /** 共享笔记库子 Schema */
 export const NotesSchema: Schema<NotesConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('是否启用共享笔记库'),
@@ -494,6 +530,7 @@ export const NotesSchema: Schema<NotesConfig> = Schema.object({
   injectMaxChars: Schema.number().default(600).description('自动注入总字数上限'),
   injectMinCoverage: Schema.number().default(0.4).description('自动注入最低查询词覆盖率(0-1)'),
   semantic: NotesSemanticSchema.description('向量语义检索'),
+  judge: NoteJudgeSchema.description('注入相关性打分'),
 });
 
 /** 浏览器子 Schema */
@@ -777,6 +814,7 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
       minMargin: 0.16,
       timeoutMs: 3000,
     },
+    judge: NOTE_JUDGE_DEFAULTS,
   }).description('共享笔记库配置'),
   browser: BrowserSchema.description('Playwright 浏览器（CDP 地址用 QQBOT_BROWSER_CDP_ENDPOINT 环境变量）'),
   fanart: FanartSchema.default({

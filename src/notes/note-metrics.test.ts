@@ -83,4 +83,50 @@ describe('NoteMetricsStore', () => {
     broken.dispose();
     rmSync(path, { force: true });
   });
+
+  it('旧账本没有打分字段也能读，打分后累计并在 summary 给出均分', () => {
+    const path = tempPath();
+    const store = new NoteMetricsStore(path);
+    store.recordInjection([hit('a.md', 'H', 4), hit('b.md', 'H', 2)]);
+    expect(store.summary()[0]?.avgRelevance).toBeUndefined();
+    const policy = { minSamples: 8, muteBelow: 0 };
+    store.recordJudgement([hit('a.md', 'H', 0), hit('b.md', 'H', 0)], [1, 0], policy);
+    store.recordJudgement([hit('a.md', 'H', 0)], [0.5], policy);
+    store.flush();
+    store.dispose();
+    const reloaded = new NoteMetricsStore(path);
+    const a = reloaded.summary().find((s) => s.file === 'a.md')!;
+    expect(a.judged).toBe(2);
+    expect(a.avgRelevance).toBeCloseTo(0.75, 5);
+    expect(reloaded.summary().find((s) => s.file === 'b.md')!.avgRelevance).toBe(0);
+    reloaded.dispose();
+    rmSync(path, { force: true });
+  });
+
+  it('没有注入记录的段不凭打分建条目', () => {
+    const store = new NoteMetricsStore(tempPath());
+    store.recordJudgement([hit('ghost.md', 'H', 0)], [1], { minSamples: 1, muteBelow: 0.5 });
+    expect(store.summary()).toEqual([]);
+    store.dispose();
+  });
+
+  it('评够次数且均分偏低时静音，只报告一次；unmute 清零分数', () => {
+    const store = new NoteMetricsStore(tempPath());
+    const policy = { minSamples: 3, muteBelow: 0.4 };
+    store.recordInjection([hit('a.md', 'H', 4)]);
+    expect(store.recordJudgement([hit('a.md', 'H', 0)], [0], policy, 100)).toEqual([]);
+    expect(store.recordJudgement([hit('a.md', 'H', 0)], [0], policy, 200)).toEqual([]);
+    expect(store.mutedAt('a.md', 'H')).toBeUndefined();
+    expect(store.recordJudgement([hit('a.md', 'H', 0)], [0], policy, 300)).toEqual(['a.md::H']);
+    expect(store.mutedAt('a.md', 'H')).toBe(300);
+    expect(store.recordJudgement([hit('a.md', 'H', 0)], [0], policy, 400)).toEqual([]);
+    expect(store.mutedAt('a.md', 'H')).toBe(300);
+
+    store.unmute('a.md', 'H');
+    expect(store.mutedAt('a.md', 'H')).toBeUndefined();
+    const a = store.summary()[0]!;
+    expect(a.judged).toBeUndefined();
+    expect(a.injected).toBe(1);
+    store.dispose();
+  });
 });

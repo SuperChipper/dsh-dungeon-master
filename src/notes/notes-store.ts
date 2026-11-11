@@ -10,8 +10,8 @@
  *   - `chats/<会话键>/` 下是只属于某个群/私聊的笔记（如某个群的跑团进度），只有那个会话检索得到，
  *     避免别的群的存档混进来。
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
-import { basename, extname, join, relative } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, appendFileSync } from 'node:fs';
+import { basename, dirname, extname, join, relative } from 'node:path';
 import type { Logger } from '../types.ts';
 import { EXACT_STRONG_SCORE, scoreExact, type ExactScore } from '../features/exact-match.ts';
 import { fuseRankings, gateSimilarities, type SemanticGate } from '../features/rank-fusion.ts';
@@ -172,6 +172,56 @@ export function chunkMarkdown(file: string, markdown: string): NoteChunk[] {
   return chunks;
 }
 
+/** 归档目录：点开头，不进检索索引 */
+const ARCHIVE_DIR = '.archive';
+
+export interface ArchiveNoteResult {
+  /** 归档到哪（相对笔记根目录） */
+  archivedTo: string;
+  chars: number;
+  /** 原文件是否整个移走了 */
+  fileRemoved: boolean;
+  message: string;
+}
+
+/**
+ * 从一篇 Markdown 里切出标题路径为 heading 的那一节（标题行 + 到下一个 #/##/### 之前的正文）。
+ * 同一路径出现多次时用 occurrence（从 1 起）指定；不指定且不唯一时只返回 matches，让调用方去问。
+ * 这一节下面还挂着更深的小节时只切正文、保留标题行，否则那些小节会被并到上一个标题下面。
+ */
+export function cutSection(
+  file: string,
+  markdown: string,
+  heading: string,
+  occurrence?: number,
+): { matches: number; removed?: string; rest?: string } {
+  const fallbackTitle = basename(file, extname(file));
+  const lines = markdown.split(/\r?\n/);
+  const stack: string[] = [];
+  const sections: Array<{ path: string; level: number; start: number; end: number }> = [];
+  lines.forEach((line, index) => {
+    const match = /^(#{1,3})\s+(.+?)\s*#*\s*$/.exec(line);
+    if (match === null) return;
+    const level = match[1]!.length;
+    stack.length = Math.min(stack.length, level - 1);
+    stack[level - 1] = match[2]!;
+    for (let i = 0; i < level - 1; i++) stack[i] ??= fallbackTitle;
+    const last = sections[sections.length - 1];
+    if (last !== undefined) last.end = index;
+    sections.push({ path: stack.join(' › '), level, start: index, end: lines.length });
+  });
+  const found = sections.filter((section) => section.path === heading);
+  if (found.length === 0 || (found.length > 1 && occurrence === undefined)) return { matches: found.length };
+  const target = found[(occurrence ?? 1) - 1];
+  if (target === undefined) return { matches: found.length };
+  const next = sections[sections.indexOf(target) + 1];
+  const keepHeading = next !== undefined && next.level > target.level;
+  const from = keepHeading ? target.start + 1 : target.start;
+  const removed = lines.slice(target.start, target.end).join('\n').trim();
+  const rest = [...lines.slice(0, from), ...lines.slice(target.end)].join('\n').replace(/\n{3,}/g, '\n\n');
+  return { matches: found.length, removed, rest };
+}
+
 /** 文件名净化：去路径与非法字符，补 .md 扩展名 */
 function sanitizeNoteFileName(name: string): string {
   const base = basename(name.replace(/\\/g, '/'))
@@ -276,6 +326,12 @@ export class NotesStore {
       if (vector !== undefined) vectors.push({ id: String(index), vector });
     });
     return this.rank(query, limit, visible, gateSimilarities(queryVector, vectors, semantic.gate));
+  }
+
+  /** 索引里有没有这一段（file + 完整标题路径） */
+  public hasSection(file: string, heading: string): boolean {
+    this.refresh();
+    return this.chunks.some((chunk) => chunk.file === file && chunk.heading === heading);
   }
 
   /** 会话私有笔记的标题（每个文件的一级标题，没有就用文件名），给团况注入列个目录 */
@@ -383,6 +439,77 @@ export class NotesStore {
       chars: content.length,
       message: `${created ? '已新建笔记' : '已追加到笔记'} ${fileName}「${title}」（${content.length} 字），${audience}下次检索即可用。`,
     };
+  }
+
+  /**
+   * 把一篇笔记或其中一节移进 .archive/<日期>/（不进索引，原文留着可以搬回来）。
+   * 只认索引里有的文件：路径由模型给出，不能让它指到笔记目录外面去。
+   */
+  public archive(input: { file: string; heading?: string; occurrence?: number }): ArchiveNoteResult {
+    this.lastScan = 0;
+    this.refresh();
+    const file = input.file.split('\\').join('/').replace(/^\.?\//, '');
+    if (!this.chunks.some((chunk) => chunk.file === file)) {
+      throw new Error(`笔记库里没有 ${file}（要写相对笔记根目录的路径，会话私有笔记形如 chats/<会话>/xxx.md）`);
+    }
+    const source = join(this.root, file);
+    const target = this.archivePath(file);
+    mkdirSync(dirname(target.abs), { recursive: true });
+    const heading = input.heading?.trim() ?? '';
+
+    if (heading === '') {
+      const chars = readFileSync(source, 'utf8').length;
+      this.moveWhole(source, target.abs);
+      this.lastScan = 0;
+      this.logger?.info(`im-qqbot: 笔记归档 ${file} → ${target.rel}`);
+      return { archivedTo: target.rel, chars, fileRemoved: true, message: `已把 ${file} 整篇归档到 ${target.rel}（${chars} 字）。` };
+    }
+
+    const markdown = readFileSync(source, 'utf8');
+    const cut = cutSection(file, markdown, heading, input.occurrence);
+    if (cut.matches === 0) throw new Error(`${file} 里没有标题路径为「${heading}」的小节（要写完整路径，如「一级 › 二级」）`);
+    if (cut.removed === undefined || cut.rest === undefined) {
+      throw new Error(`${file} 里「${heading}」有 ${cut.matches} 节，用 occurrence（1-${cut.matches}）指定第几节`);
+    }
+    // 切完没有任何可检索的内容了，就整篇移走，免得留一个空标题在索引里
+    if (chunkMarkdown(file, cut.rest).length === 0) {
+      this.moveWhole(source, target.abs);
+      this.lastScan = 0;
+      this.logger?.info(`im-qqbot: 笔记归档 ${file} → ${target.rel}（最后一节）`);
+      return {
+        archivedTo: target.rel,
+        chars: cut.removed.length,
+        fileRemoved: true,
+        message: `「${heading}」是 ${file} 里最后一节有内容的小节，已把整篇归档到 ${target.rel}。`,
+      };
+    }
+    appendFileSync(target.abs, `<!-- 归档自 ${file} › ${heading}，${today()} -->\n${cut.removed}\n\n`, 'utf8');
+    writeFileSync(source, cut.rest, 'utf8');
+    this.lastScan = 0;
+    this.logger?.info(`im-qqbot: 笔记小节归档 ${file} › ${heading} → ${target.rel}`);
+    return {
+      archivedTo: target.rel,
+      chars: cut.removed.length,
+      fileRemoved: false,
+      message: `已把 ${file}「${heading}」归档到 ${target.rel}（${cut.removed.length} 字）。`,
+    };
+  }
+
+  /** 整篇移进归档；当天已经归档过它的小节时接在后面，不覆盖 */
+  private moveWhole(source: string, target: string): void {
+    if (!existsSync(target)) {
+      renameSync(source, target);
+      return;
+    }
+    appendFileSync(target, `<!-- 以下是原文件剩余部分，${today()} -->
+${readFileSync(source, 'utf8')}
+`, 'utf8');
+    unlinkSync(source);
+  }
+
+  /** 归档目标路径：.archive/<日期>/<原相对路径>；整篇归档遇到同名时加序号，小节归档往同一个文件里追加 */
+  private archivePath(file: string): { abs: string; rel: string } {
+    return { abs: join(this.root, ARCHIVE_DIR, today().replace(/-/g, ''), file), rel: `${ARCHIVE_DIR}/${today().replace(/-/g, '')}/${file}` };
   }
 
   /** 目录有变化时重建索引（节流） */

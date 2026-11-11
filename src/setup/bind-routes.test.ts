@@ -719,6 +719,33 @@ describe('bind-routes', () => {
     }
   });
 
+  it('POST config：notes.judge 合法值通过', async () => {
+    const updates: Array<Record<string, unknown>> = [];
+    const { routes } = createHarness({ onUpdateConfig: (config) => { updates.push(config); return true; } });
+    const res = fakeRes();
+    const judge = { enabled: true, timeoutMs: 8000, sampleRate: 0.5, minSamples: 5, muteBelow: 0.3 };
+    await invoke(
+      routes.get(BIND_CONFIG_PATH),
+      fakeReq('POST', { host: '127.0.0.1:3080', 'content-type': 'application/json' }, JSON.stringify({ notes: { judge } })),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect((updates[0]?.notes as { judge: unknown }).judge).toEqual(judge);
+  });
+
+  it('POST config：notes.judge 越界或类型错误被拒绝', async () => {
+    for (const judge of [{ sampleRate: 1.5 }, { muteBelow: -0.1 }, { muteBelow: 2 }, { minSamples: 0 }, { timeoutMs: 100 }, { enabled: 'yes' }]) {
+      const { routes } = createHarness({ onUpdateConfig: () => true });
+      const res = fakeRes();
+      await invoke(
+        routes.get(BIND_CONFIG_PATH),
+        fakeReq('POST', { host: '127.0.0.1:3080', 'content-type': 'application/json' }, JSON.stringify({ notes: { judge } })),
+        res,
+      );
+      expect(res.statusCode, JSON.stringify(judge)).toBe(400);
+    }
+  });
+
   it('POST config：cleanup 只改 dryRun 时保留自定义规则', async () => {
     const rules = [{ name: 'x', dir: 'C:/x', unit: 'file', ttlHours: 1, recursive: false, keep: [], match: [], maxTotalMB: 0 }];
     const updates: Array<Record<string, unknown>> = [];

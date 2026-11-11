@@ -28,7 +28,7 @@ import { registerBiliTools } from '../bili/tools.ts';
 import { biliPermission } from '../bili/permissions.ts';
 import { decodeButtonData } from '../features/button-utils.ts';
 import { PLUGIN_ROOT, buildUserAgent, isPrivilegedSender, privilegedOpenids } from '../shared/index.ts';
-import type { ImQQBotConfig } from '../config.ts';
+import { NOTE_JUDGE_DEFAULTS, type ImQQBotConfig } from '../config.ts';
 import type { ChatScope, Logger } from '../types.ts';
 import { setupMiddlewares } from './middleware-setup.ts';
 import { MEDIA_ROOT } from '../media/media-cleaner.ts';
@@ -71,6 +71,7 @@ import { BrowserAccess } from '../browser/browser-access.ts';
 import { resolveProfileDir } from '../shared/utils.ts';
 import { updateProfileConfig } from '../setup/persist.ts';
 import type { JudgeLlm } from '../features/reply-judge.ts';
+import { NoteJudge } from '../features/note-judge.ts';
 import { HandoffWriter } from '../features/session-handoff.ts';
 
 /**
@@ -223,6 +224,10 @@ export async function bootstrapGateway(
     llm = ctx.get('llm') as JudgeLlm | undefined;
   } catch {
     llm = undefined;
+  }
+  // 笔记相关性打分和回复欲望打分共用同一个 llm 服务；开关在 notes.judge.enabled，每轮结算时读
+  if (manager.noteMetrics !== undefined && llm?.stream !== undefined) {
+    manager.noteJudge = new NoteJudge(llm, () => config.notes?.judge ?? NOTE_JUDGE_DEFAULTS, logger);
   }
   if (llm?.stream !== undefined) manager.handoffWriter = new HandoffWriter(llm, logger);
   // 自己发出去的消息不进 SDK 的 ref 索引，这里单独记一份，引用解析时才能认出「你自己」
@@ -540,7 +545,10 @@ export async function bootstrapGateway(
 
   // ── 共享笔记工具注册（qqbot_notes_search / qqbot_notes_save） ──
   if (notesStore !== undefined) {
-    registerNotesTools(ctx, notesStore, manager, logger);
+    registerNotesTools(ctx, notesStore, manager, logger, {
+      ownerOpenid: config.ownerOpenid,
+      judgeEnabled: () => config.notes?.judge?.enabled === true,
+    });
   }
 
   // ── 历史归档检索（qqbot_history_search）：归档写得多、读得少，这里补一个查询口 ──
@@ -583,6 +591,8 @@ export async function bootstrapGateway(
         // 待答问题挂在旧实例上，重载后没人能答：先让它们以 ASK_ABORTED 结束
         questionChannel.uninstall();
         await manager.disposeAll();
+        // 停掉账本的定时器并把最后一分钟刷盘，否则每次重组都留下一个还在写同一个文件的旧实例
+        manager.noteMetrics?.dispose();
         bot.stop();
       };
     }, 'im-qqbot.lifecycle');

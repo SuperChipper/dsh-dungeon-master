@@ -15,17 +15,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import type { Logger } from '../types.ts';
-
-export interface InjectionEntry {
-  /** 归一化后的 file::heading，作为账本键 */
-  key: string;
-  file: string;
-  heading: string;
-  /** 本轮排名第一者为 1，其余为 本次分 / 首名分，用来区分"压过一切"和"勉强挤进来" */
-  strength: number;
-  /** 命中手段，用于按来源统计：bm25 / exact / semantic 的组合 */
-  via: string;
-}
+import { shouldMute } from '../features/note-judge.ts';
 
 interface EntryStats {
   file: string;
@@ -35,7 +25,17 @@ interface EntryStats {
   firstAt: number;
   lastAt: number;
   via: Record<string, number>;
+  /** 被模型评过相关性的次数；没评过时缺省（旧账本没有这三个字段） */
+  judged?: number;
+  /** 相关分累计，每次 0-1 */
+  relevanceSum?: number;
+  /** 被静音的时刻：之后不再自动注入，主动检索不受影响 */
+  mutedAt?: number;
+  /** 主人手动静音的：不受打分开关和阈值影响，只能手动解除 */
+  mutedManually?: boolean;
 }
+
+export type NoteStatRow = EntryStats & { avgStrength: number; avgRelevance?: number };
 
 export interface MetricsFile {
   version: 1;
@@ -136,6 +136,66 @@ export class NoteMetricsStore {
     this.dirty = true;
   }
 
+  /**
+   * 记下一轮打分。scores 与 items 一一对应（0-1）；返回这次新被静音的键。
+   * 只更新已有注入记录的段：没注入过却有分数说明两边对不上，不该凭空建条目。
+   */
+  public recordJudgement(
+    items: readonly { file: string; heading: string }[],
+    scores: readonly number[],
+    policy: { minSamples: number; muteBelow: number },
+    now = Date.now(),
+  ): string[] {
+    const muted: string[] = [];
+    items.forEach((item, index) => {
+      const score = scores[index];
+      const key = `${item.file}::${item.heading}`;
+      const stat = this.data.entries[key];
+      if (stat === undefined || score === undefined) return;
+      stat.judged = (stat.judged ?? 0) + 1;
+      stat.relevanceSum = (stat.relevanceSum ?? 0) + score;
+      if (stat.mutedAt === undefined && shouldMute({ judged: stat.judged, relevanceSum: stat.relevanceSum }, policy)) {
+        stat.mutedAt = now;
+        muted.push(key);
+      }
+      this.dirty = true;
+    });
+    if (this.dirty) this.data.updatedAt = now;
+    return muted;
+  }
+
+  /** 这段被静音的时刻；没静音返回 undefined */
+  public mutedAt(file: string, heading: string): number | undefined {
+    return this.data.entries[`${file}::${heading}`]?.mutedAt;
+  }
+
+  /** 是不是主人手动静音的 */
+  public mutedManually(file: string, heading: string): boolean {
+    return this.data.entries[`${file}::${heading}`]?.mutedManually === true;
+  }
+
+  /** 手动静音。没注入过的段也能静音，所以这里会建条目 */
+  public mute(file: string, heading: string, now = Date.now()): void {
+    const key = `${file}::${heading}`;
+    const stat = this.data.entries[key] ?? { file, heading, injected: 0, strengthSum: 0, firstAt: now, lastAt: now, via: {} };
+    stat.mutedAt = now;
+    stat.mutedManually = true;
+    this.data.entries[key] = stat;
+    this.data.updatedAt = now;
+    this.dirty = true;
+  }
+
+  /** 解除静音并清零分数：笔记内容改过了，旧分数评的不是现在这段 */
+  public unmute(file: string, heading: string): void {
+    const stat = this.data.entries[`${file}::${heading}`];
+    if (stat === undefined || stat.mutedAt === undefined) return;
+    delete stat.mutedAt;
+    delete stat.mutedManually;
+    delete stat.judged;
+    delete stat.relevanceSum;
+    this.dirty = true;
+  }
+
   public flush(): void {
     if (!this.dirty) return;
     try {
@@ -150,9 +210,13 @@ export class NoteMetricsStore {
   }
 
   /** 汇总：给「哪些段注入最多、强度最高」这类问题一个现成入口 */
-  public summary(limit = 20): Array<EntryStats & { avgStrength: number }> {
+  public summary(limit = 20): NoteStatRow[] {
     return Object.values(this.data.entries)
-      .map((stat) => ({ ...stat, avgStrength: stat.injected === 0 ? 0 : stat.strengthSum / stat.injected }))
+      .map((stat) => ({
+        ...stat,
+        avgStrength: stat.injected === 0 ? 0 : stat.strengthSum / stat.injected,
+        ...((stat.judged ?? 0) > 0 ? { avgRelevance: (stat.relevanceSum ?? 0) / stat.judged! } : {}),
+      }))
       .sort((a, b) => b.injected - a.injected)
       .slice(0, limit);
   }
