@@ -111,3 +111,80 @@ describe('SessionManager.maybeAutoCompact', () => {
     expect(compact).not.toHaveBeenCalled();
   });
 });
+
+describe('SessionManager.checkIdleCompact', () => {
+  const NOW = 10_000_000;
+  const MIN = 60_000;
+
+  function idleHarness(
+    config: Record<string, unknown> = {},
+    provider = 'google',
+    outcome: CompactOutcome = { ok: true, shadowed: 40, tokens: 90000 },
+  ) {
+    const compact = vi.fn(async () => outcome);
+    const sessions = new Map<string, SessionRecord>();
+    const self = {
+      config: { idleCompactMinutes: 20, idleCompactTokens: 100000, idleCompactProviders: 'google', ...config },
+      logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      sessions,
+      compact,
+      routeOf: () => ({ provider, model: 'm' }),
+    };
+    const add = (r: SessionRecord) => { sessions.set(`${r.scope}:${r.peerId}`, r); return r; };
+    const run = (now = NOW) => SessionManager.prototype.checkIdleCompact.call(self as never, now);
+    return { add, run, compact };
+  }
+
+  it('空闲够久、上下文过下限、provider 在名单 → 压一次，同一段空闲不重试', async () => {
+    const { add, run, compact } = idleHarness();
+    const r = add(record({ contextTokens: 190000, lastActivity: NOW - 21 * MIN }));
+    run();
+    await vi.waitFor(() => expect(r.compacting).toBe(false));
+    expect(compact).toHaveBeenCalledWith('group', 'g1');
+    expect(r.contextTokens).toBeUndefined();
+    run(NOW + MIN);
+    expect(compact).toHaveBeenCalledTimes(1);
+  });
+
+  it('上下文低于下限、空闲不够、正忙、provider 不在名单 → 都不压', () => {
+    const { add, run, compact } = idleHarness();
+    add(record({ peerId: 'small', contextTokens: 99999, lastActivity: NOW - 60 * MIN }));
+    add(record({ peerId: 'fresh', contextTokens: 190000, lastActivity: NOW - 19 * MIN }));
+    add(record({
+      peerId: 'busy', contextTokens: 190000, lastActivity: NOW - 60 * MIN,
+      agent: { status: 'running', session: { events: [] } } as never,
+    }));
+    run();
+    expect(compact).not.toHaveBeenCalled();
+
+    const other = idleHarness({}, 'opencode-go');
+    other.add(record({ contextTokens: 190000, lastActivity: NOW - 60 * MIN }));
+    other.run();
+    expect(other.compact).not.toHaveBeenCalled();
+  });
+
+  it('provider 名单留空 = 全部；分钟数为 0 = 关闭', async () => {
+    const all = idleHarness({ idleCompactProviders: '' }, 'opencode-go');
+    const r = all.add(record({ contextTokens: 190000, lastActivity: NOW - 60 * MIN }));
+    all.run();
+    await vi.waitFor(() => expect(r.compacting).toBe(false));
+    expect(all.compact).toHaveBeenCalledTimes(1);
+
+    const off = idleHarness({ idleCompactMinutes: 0 });
+    off.add(record({ contextTokens: 190000, lastActivity: NOW - 60 * MIN }));
+    off.run();
+    expect(off.compact).not.toHaveBeenCalled();
+  });
+
+  it('压缩失败后同一段空闲不重试，有新消息后可以再试', async () => {
+    const { add, run, compact } = idleHarness({}, 'google', { ok: false, reason: 'unavailable' });
+    const r = add(record({ contextTokens: 190000, lastActivity: NOW - 30 * MIN }));
+    run();
+    await vi.waitFor(() => expect(r.compacting).toBe(false));
+    run(NOW + MIN);
+    expect(compact).toHaveBeenCalledTimes(1);
+    r.lastActivity = NOW + 2 * MIN;
+    run(NOW + 40 * MIN);
+    await vi.waitFor(() => expect(compact).toHaveBeenCalledTimes(2));
+  });
+});

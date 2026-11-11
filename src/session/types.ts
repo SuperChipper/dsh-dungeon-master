@@ -25,10 +25,14 @@ export interface DshAgent {
   readonly ctx: Context;
   /** 当前生命周期状态（用于判断是否正在生成） */
   readonly status: 'idle' | 'running';
-  /** 底层 session（fork 时作为 source，events 用于统计/导出） */
+  /** 底层 session（events / snapshotEvents 用于统计/导出） */
   readonly session: {
     readonly id: string;
     readonly events?: readonly SessionEventLike[];
+    /** 0.2.x 的 Session 只有 snapshotEvents()，没有 events 字段 */
+    snapshotEvents?(): readonly SessionEventLike[];
+    /** 追加一条会话事件（换模型时写 model/selection） */
+    append?(type: string, payload: unknown): unknown;
     /** 压缩、替换历史时 contentGeneration 会变，普通追加不变 */
     readonly surface?: { readonly contentGeneration?: number };
     /** 最近一次请求头（取实际路由的 provider/model，用于查上下文窗口） */
@@ -76,11 +80,6 @@ export interface PresetSwitchOutcome {
 export interface DshAgentHandle {
   agent: DshAgent;
   dispose(): Promise<void>;
-}
-
-/** sessions 服务（fork 能力） */
-export interface SessionsService {
-  fork(source: unknown, boundary?: number): { events: readonly unknown[] };
 }
 
 export interface DshAgentRegistry {
@@ -142,6 +141,8 @@ export interface SessionRecord {
   contextTokens?: number;
   /** 自动压缩进行中（防重入） */
   compacting?: boolean;
+  /** 已经为哪一次空闲（以当时的 lastActivity 标记）试过空闲压缩，失败也不在同一段空闲里重试 */
+  idleCompactTriedAt?: number;
   /** 本轮发过语音：后续文字走独立静态消息，turn/end 清除。 */
   voiceReplySentAt?: number;
   /** 最近把消息送进这个会话的发送者（新→旧追加在末尾），跑团工具据此核对「谁宣告的行动」 */

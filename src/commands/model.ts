@@ -60,9 +60,11 @@ export function modelCommand({ manager, config }: CommandDeps): CategorizedComma
         const route = await manager.clearModelOverride(scope, peerId);
         const label = route === undefined ? '宿主默认配置' : `${route.provider}/${route.model}`;
         return `✅ 已清掉本会话的模型覆盖，回到默认：${label}
-立即生效，对话上下文保留。`;
+下一条消息起生效，会话和上下文都不动。`;
       }
       // 解析 provider/model 格式
+      const tokens = args.split(/\s+/).filter(Boolean);
+      const knownProviders = manager.listProviders();
       let provider: string;
       let model: string;
 
@@ -70,6 +72,12 @@ export function modelCommand({ manager, config }: CommandDeps): CategorizedComma
         const parts = args.split('/');
         provider = parts[0] ?? '';
         model = parts.slice(1).join('/');
+      } else if (tokens.length >= 2 && knownProviders.includes(tokens[0]!)) {
+        // `/model hapi gpt-6.1-sol` 这种空格写法也认。以前它整串被当成模型名存下去，
+        // 于是 model 变成 "hapi gpt-6.1-sol"：请求还发得出去（中转站会兜底），但 web 端
+        // 拿它去对目录永远对不上，模型标签一直显示「请选择模型」。
+        provider = tokens[0]!;
+        model = tokens.slice(1).join(' ');
       } else {
         // 仅指定 model 名，provider 从当前路由继承
         const current = manager.getEffectiveModel(scope, peerId);
@@ -81,11 +89,21 @@ export function modelCommand({ manager, config }: CommandDeps): CategorizedComma
         return '用法: /model provider/model\n示例: /model deepseek-official/deepseek-v4-flash';
       }
 
-      const applied = await manager.setModelOverride(scope, peerId, { provider, model });
-      if (!applied) {
-        return `✅ 已记下: ${provider}/${model}\n这一轮还在跑，下一句开口就用新模型（上下文不动）。`;
+      // 对不上目录就不写进去：写进去也只会变成一个谁也解析不了的字符串
+      const models = await manager.listAvailableModels();
+      if (models.length > 0 && !models.some((m) => m.provider === provider && m.id === model)) {
+        const sameProvider = models.filter((m) => m.provider === provider);
+        const near = (sameProvider.length > 0 ? sameProvider : models)
+          .slice(0, 8)
+          .map((m) => `\`${m.provider}/${m.id}\``)
+          .join(' · ');
+        return `❌ 没有这个模型: ${provider}/${model}
+${sameProvider.length > 0 ? `${provider} 下可选` : '全部可选'}: ${near || '（无）'}`;
       }
-      return `✅ 模型已切换: ${provider}/${model}\n立即生效，对话上下文保留。`;
+
+      await manager.setModelOverride(scope, peerId, { provider, model });
+      return `✅ 模型已切换: ${provider}/${model}
+下一条消息起生效，会话和上下文都不动。`;
     },
   };
 }

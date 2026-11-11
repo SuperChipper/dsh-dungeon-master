@@ -52,7 +52,18 @@ export class ModelResolver {
    * 优先级：per-peer 偏好 > config 显式指定 > settings.yaml > 宿主服务
    */
   getEffectiveRoute(sessionKey: string): ModelRoute | undefined {
-    return this.prefs.getOverride(sessionKey) ?? this.prefs.getFailover() ?? this.resolveDefault(this.scopeOf(sessionKey));
+    return this.getExplicitRoute(sessionKey) ?? this.resolveDefault(this.scopeOf(sessionKey));
+  }
+
+  /**
+   * 只取「用户显式指定过」的路由：per-chat 覆盖 或 全局故障转移。
+   *
+   * 和 getEffectiveRoute 的区别是它不会回落到配置/宿主默认。会话是宿主里已有的活对象
+   * （比如 web GUI 先 resume 过）时，只有显式偏好才该盖住它自己的路由——没有偏好就
+   * 别去动用户在 GUI 里手选的模型。
+   */
+  getExplicitRoute(sessionKey: string): ModelRoute | undefined {
+    return this.prefs.getOverride(sessionKey) ?? this.prefs.getFailover();
   }
 
 

@@ -338,13 +338,14 @@ async function assembleAgentBody(
     ? ''
     : `[上次未送达]\n上一次发给本会话的消息因平台限制失败，内容如下。现在用户重新说话了，可以把它作为回复补发（太长就发摘要）：\n${unsent}`;
   const migrationHint = manager.takeScheduleMigration(scope, peerId);
+  const handoffHint = await manager.takeHandoff(scope, peerId);
   // 共享笔记自动召回：用当前消息（含引用原文）检索，命中才注入
   const notesHint = await manager.notesHint([userContent, state.quote?.text ?? state.quote?.entry?.content ?? ''].join('\n'), scope, peerId);
 
   const forwardHint = buildForwardHint(forwardImages);
   const replyStyleHint = buildReplyStyleHint(state.replyDesire as { mode?: string } | undefined);
 
-  const base = [dynamicCtx, stickerHints, forwardHint, notesHint, unsentHint, migrationHint, replyStyleHint, userMessage].filter(Boolean).join('\n');
+  const base = [dynamicCtx, stickerHints, forwardHint, notesHint, unsentHint, handoffHint, migrationHint, replyStyleHint, userMessage].filter(Boolean).join('\n');
   const agentBody = buildAgentBody(base, history, isGroup, wasMentioned || implicit, label, historyImages);
 
   return agentBody;

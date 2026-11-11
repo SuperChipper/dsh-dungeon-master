@@ -14,6 +14,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { SessionId } from '@deepseek-ai/dsh-session';
+import { installModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent';
 import type { Context } from '@deepseek-ai/cordis';
 import type { ImageBlock } from '@deepseek-ai/dsh-llm';
 import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
@@ -26,6 +27,7 @@ import { resolveSessionCwd } from '../shared/file-access.ts';
 import type { StickerStore, StickerMatchResult } from '../media/sticker-store.ts';
 import { chatKeyOf, formatNotesHint, selectNotesForInjection, type NotesStore } from '../notes/notes-store.ts';
 import type { NoteMetricsStore } from '../notes/note-metrics.ts';
+import { buildHandoffTranscript, formatHandoffHint, type HandoffTurn, type HandoffWriter } from '../features/session-handoff.ts';
 import type { ToolAccess } from '../features/tool-access.ts';
 import type { DndService } from '../dnd/dnd-service.ts';
 import { PromptLatch } from '../features/prompt-latch.ts';
@@ -46,12 +48,11 @@ import type { ApprovalChannel } from '../features/approval-channel.ts';
 import { GROUP_MESSAGE_FORMAT_PROMPT } from '../features/message-format.ts';
 import type { PersonaStore } from '../features/persona-store.ts';
 import type { PersonaSwitch, SwitchPersonaOutcome } from '../features/persona-switch.ts';
-import { compactThreshold, decideAutoCompact, deferCeiling, lastTurnUsedTools } from '../features/compact-policy.ts';
+import { compactThreshold, decideAutoCompact, deferCeiling, lastTurnUsedTools, shouldIdleCompact } from '../features/compact-policy.ts';
 import type {
   SessionEventLike,
   DshAgent,
   DshAgentHandle,
-  SessionsService,
   DshAgentRegistry,
   AgentPresetsLike,
   PresetComposition,
@@ -166,11 +167,14 @@ export class SessionManager {
   private unsent = new Map<string, string[]>();
   /** /new 或 fork 后的旧 sessionId → 当前会话 key，用于旧定时任务/旧审批卡片继续路由 */
   private retiredSessionIds = new Map<string, string>();
-  /** /new 后待新会话重建的定时任务（会话 key → 各旧 session 的任务批次） */
+  /** /new 或人设切换后待目标会话重建的定时任务（会话 key → 各旧 session 的任务批次） */
   private pendingScheduleMigrations = new Map<string, Array<{ oldSessionId: string; tasks: ScheduleMigrationTask[] }>>();
+  /** 活动 agent → 宿主那套就地换模型的 selection（一个 agent 只装一次监听） */
+  private readonly modelSelections = new Map<DshAgent, ModelSelectionRef>();
   /** provider/model → 上下文窗口（自动压缩阈值用；undefined = 查过但宿主没给） */
   private readonly contextWindows = new Map<string, number | undefined>();
   private readonly evictor: IdleEvictor;
+  private readonly idleCompactTimer: ReturnType<typeof setInterval>;
   private readonly modelResolver: ModelResolver;
   private readonly ctx: Context;
   private readonly agents: DshAgentRegistry;
@@ -186,6 +190,10 @@ export class SessionManager {
   public notesStore?: NotesStore;
   /** 笔记注入账本（只记录，不参与排序） */
   public noteMetrics?: NoteMetricsStore;
+  /** /new 时写会话交接（llm 服务不可用时缺省，/new 照常只是不带交接） */
+  public handoffWriter?: HandoffWriter;
+  /** 会话 key → 正在写或已写好的交接；新会话的第一条消息取走 */
+  private readonly pendingHandoffs = new Map<string, Promise<string | undefined>>();
   /** 由 bootstrap 注入的工具权限（终端白名单） */
   public toolAccess?: ToolAccess;
   /** 由 bootstrap 注入的跑团服务（/dnd 命令 + DM prompt 注入） */
@@ -217,6 +225,7 @@ export class SessionManager {
       (key, record) => {
         this.logger.info(`evicting idle session: key=${key}`);
         this.sessions.delete(key);
+        this.modelSelections.delete(record.agent);
         record.agent.cancel({ kind: 'user' });
         void record.handle.dispose().catch(() => {});
         // 回收会话时统一清理其待答问题/待批审批，避免 pending 悬挂泄漏
@@ -224,6 +233,9 @@ export class SessionManager {
         this.approvalChannel?.cancelPending(key);
       },
     );
+
+    this.idleCompactTimer = setInterval(() => this.checkIdleCompact(), 60_000);
+    this.idleCompactTimer.unref?.();
 
     this.registerScopePromptInjection();
     this.registerRuntimeContexts();
@@ -472,17 +484,6 @@ export class SessionManager {
   }
 
   /**
-   * 动态获取 sessions 服务（fork 能力，可选）
-   */
-  private getSessionsService(): SessionsService | undefined {
-    try {
-      return this.ctx.get('sessions') as SessionsService | undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
    * 动态获取 agentPresets 服务（可选，未注入时返回 undefined）
    */
   private getPresetsService(): AgentPresetsLike | undefined {
@@ -547,7 +548,15 @@ export class SessionManager {
   }
 
   /**
-   * 切换模型（fork + 重建会话，保留历史）
+   * 切换模型（就地换路由，不重建会话，历史/定时任务都不动）
+   *
+   * 原来走的是 fork 一个新会话再切过去的办法：0.2.x 的 sessions.fork() 语义变了，
+   * 它直接创建子会话、返回 Session，而这里按老签名取 `.events` 拿到 undefined，
+   * 于是每次都在 `seed.length` 上抛 TypeError（日志里那句
+   * `handler "model" threw: Cannot read properties of undefined (reading 'length')`）。
+   * 现在改用宿主 GUI 同一套机制：installModelSelection + model/selection 事件，
+   * 宿主在 prompt 组装时快照选择、在 agent/request 里替换 provider/model，
+   * 所以下一条请求生效，跑到一半的那一步不受影响。
    */
   async setModelOverride(scope: ChatScope, peerId: string, route: ModelRoute): Promise<boolean> {
     const key = this.sessionKey(scope, peerId);
@@ -560,16 +569,56 @@ export class SessionManager {
       return true;
     }
 
-    // 这一轮还在跑就先不换：换 agent 会把正在生成的回答写进旧 session，
-    // 新会话里看不到它。偏好已经存下，下一轮开口就会用新模型。
-    if (record.agent.status !== 'idle') {
-      this.logger.info(`model pref saved (session busy, defer rebuild): key=${key} → ${route.provider}/${route.model}`);
-      return false;
-    }
-
-    await this.rebuildSession(record, { route });
-    this.logger.info(`model switched via fork: key=${key} → ${route.provider}/${route.model}`);
+    this.applyModelSelection(record, route);
+    this.logger.info(
+      `model switched in place: key=${key} → ${route.provider}/${route.model}`
+      + (record.agent.status === 'idle' ? '' : '（这一轮跑完生效）'),
+    );
     return true;
+  }
+
+  /**
+   * 和 Web 共用活动 agent 的 selection；无 Web 控制器时才安装本地选择器。
+   * 兼容旧宿主的本地选择器在 agent dispose 时随 ctx 一起销毁。
+   */
+  private applyModelSelection(record: SessionRecord, route: ModelRoute | undefined): void {
+    // Web 已为同一个 agent 安装选择器；再安装一套会让 notice 与最终路由分离。
+    // 不调用 selectModel：它还会保存全局默认，QQ 的 per-chat 切换不应改全局。
+    const controller = this.ctx?.get('sessionController') as {
+      agents?: { selectionFor?: (agent: DshAgent) => ModelSelectionRef };
+    } | undefined;
+    let selection = controller?.agents?.selectionFor?.(record.agent)
+      ?? this.modelSelections.get(record.agent);
+    if (selection === undefined) {
+      selection = { current: undefined, assembled: undefined };
+      this.modelSelections.set(record.agent, selection);
+      installModelSelection(record.agent.ctx, selection);
+    }
+    selection.current = route;
+    if (route !== undefined) {
+      // 记进会话日志：重启 resume / web GUI 打开同一个会话时据此显示当前路由
+      record.agent.session.append?.('model/selection', { ...route });
+    }
+  }
+
+  /**
+   * 把 per-chat 的显式模型偏好装到刚拿到手的会话上。
+   *
+   * 为什么需要：会话已经在宿主里活着时（web GUI 先打开、或别的路径 resume 过），
+   * getOrCreate 走的是「reusing live agent」，那条路既不装 selection 也不看偏好，
+   * 于是 `/model hapi gpt-6.1-sol` 明明存进了 model-prefs.json，请求还在跑宿主默认。
+   * 只在有显式偏好（/model 写过 或 全局故障转移）时同步：没有偏好就别去盖
+   * 用户在 GUI 里手选的模型；当前头部已经是这条路由时也不重复写事件。
+   */
+  private syncExplicitRoute(record: SessionRecord): void {
+    const explicit = this.modelResolver.getExplicitRoute(record.sessionKey);
+    if (!explicit) return;
+    const current = record.agent.session.requestHeader?.()?.config;
+    if (current?.provider === explicit.provider && current.model === explicit.model) return;
+    this.applyModelSelection(record, explicit);
+    this.logger.info(
+      `model route synced from prefs: key=${record.sessionKey} → ${explicit.provider}/${explicit.model}`,
+    );
   }
 
   /**
@@ -587,7 +636,9 @@ export class SessionManager {
       this.logger.info("model override 本来就没有: key=" + key);
       return route;
     }
-    if (record) await this.rebuildSession(record, { route });
+    // route 是清掉覆盖之后的生效路由（下一步的默认/故障转移）；undefined 只会出现在
+    // 配置和宿主都没给默认路由的情况下，那就保持 agent 现有的路由不动。
+    if (record) this.applyModelSelection(record, route);
     const label = route === undefined ? "宿主默认" : route.provider + "/" + route.model;
     this.logger.info("model override 已清除: key=" + key + " -> " + label);
     return route;
@@ -636,69 +687,6 @@ export class SessionManager {
   }
 
   /**
-   * fork + 重建会话（保留历史，换 model）
-   *
-   * options.route 缺省时沿用当前生效值。preset 沿用当前生效 preset（getEffectivePresetByKey）。
-   * fork 不可用或失败时降级为 dispose（下次消息重建）。
-   */
-  private async rebuildSession(
-    record: SessionRecord,
-    options: { route?: ModelRoute },
-  ): Promise<void> {
-    const key = record.sessionKey;
-
-    const sessionsService = this.getSessionsService();
-    if (!sessionsService) {
-      this.logger.warn(`fork unavailable, fallback to dispose: key=${key}`);
-      this.sessions.delete(key);
-      record.agent.cancel({ kind: 'user' });
-      await record.handle.dispose().catch(() => {});
-      return;
-    }
-
-    let seed: readonly unknown[];
-    try {
-      seed = sessionsService.fork(record.agent.session).events;
-    } catch (err) {
-      this.logger.warn(`fork failed, fallback to dispose: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
-      this.sessions.delete(key);
-      record.agent.cancel({ kind: 'user' });
-      await record.handle.dispose().catch(() => {});
-      return;
-    }
-
-    const childId = SessionId(randomUUID());
-    const effectiveRoute = options.route ?? this.modelResolver.getEffectiveRoute(key);
-    const composed = await this.composePreset(this.getEffectivePresetByKey(key));
-    const created = await this.agents.create({
-      sessionId: childId,
-      seed,
-      meta: {
-        cwd: resolveSessionCwd(record.scope, record.senderId, this.config),
-        parentSession: record.sessionId,
-        seedLength: seed.length,
-        ...(composed.agentPreset ? { agentPreset: composed.agentPreset } : {}),
-      },
-      ...(effectiveRoute ? { agentOptions: effectiveRoute } : {}),
-      ...(composed.setup ? { setup: composed.setup } : {}),
-    });
-
-    this.modelResolver.setSessionId(key, childId);
-    this.captureScheduleMigrations(key, record.sessionId);
-    this.retiredSessionIds.set(record.sessionId, key);
-
-    const oldHandle = record.handle;
-    record.sessionId = childId;
-    record.agent = created.agent;
-    record.handle = created;
-    record.agentPreset = composed.agentPreset;
-    record.lastActivity = Date.now();
-
-    void oldHandle.dispose().catch(() => {});
-    this.logger.info(`session rebuilt via fork: key=${key} preset=${composed.agentPreset ?? 'none'} sessionId=${childId}`);
-  }
-
-  /**
    * 全局切换：所有会话一起走新路由（上游切源用）。
    *
    * 写的是「全局故障转移」这一格，不是逐个会话的 override——因为 override 的语义是
@@ -713,17 +701,17 @@ export class SessionManager {
     for (const record of records) {
       // 自己手动 /model 过的会话保留原选择，别被自动切源拽走
       if (this.modelResolver.hasOverride(record.sessionKey)) continue;
-      // 正在跑的不动：换 agent 会把那一轮丢在旧 session 里，用户看到的是「这句话没接上」。
-      // 下一轮 tick（5 分钟后）会再来一次，那时它多半已经空闲了。
+      // 正在跑的这一轮别中途换：主用降级时通常是「请求卡住」，这时换路由会把
+      // 半截回答搅在一起。下一轮 tick（5 分钟后）会再来一次，那时多半已经空闲。
       if (record.agent.status !== 'idle') {
         busy += 1;
         continue;
       }
       try {
-        await this.rebuildSession(record, { route });
+        this.applyModelSelection(record, route);
         switched += 1;
       } catch (err) {
-        this.logger.warn(`switchAllSessions 重建失败: key=${record.sessionKey} err=${err instanceof Error ? err.message : String(err)}`);
+        this.logger.warn(`switchAllSessions 换路由失败: key=${record.sessionKey} err=${err instanceof Error ? err.message : String(err)}`);
       }
     }
     this.logger.info(
@@ -744,9 +732,9 @@ export class SessionManager {
         // 每个会话按自己的 scope 取默认：群聊和私聊用的是不同档
         const route = this.modelResolver.resolveDefault(record.scope);
         try {
-          await this.rebuildSession(record, { route });
+          this.applyModelSelection(record, route);
         } catch (err) {
-          this.logger.warn(`clearFailoverRoute 重建失败: key=${record.sessionKey} err=${err instanceof Error ? err.message : String(err)}`);
+          this.logger.warn(`clearFailoverRoute 换路由失败: key=${record.sessionKey} err=${err instanceof Error ? err.message : String(err)}`);
         }
       }
     }
@@ -847,17 +835,18 @@ export class SessionManager {
     return list.join('\n\n---\n\n').slice(0, 8000);
   }
 
-  /** /new 时捕获旧会话的 active 定时任务，等新会话第一条消息注入重建指令 */
+  /** /new 或人设切换时捕获旧会话的 active 定时任务，等目标会话第一条消息注入重建指令 */
   private captureScheduleMigrations(sessionKey: string, oldSessionId: string): void {
     try {
       const tasks = readScheduleMigrations(scheduleStorageHome(), oldSessionId);
-      if (tasks.length === 0) return;
-      // 连续 /new 时保留之前还没交出去的批次，每批记住自己的旧 sessionId
-      const pending = this.pendingScheduleMigrations.get(sessionKey) ?? [];
-      pending.push({ oldSessionId, tasks });
-      this.pendingScheduleMigrations.set(sessionKey, pending);
+      // 连续切换时保留其他来源；同一会话再次离开时刷新快照，避免重复重建或复活已删任务。
+      const pending = (this.pendingScheduleMigrations.get(sessionKey) ?? [])
+        .filter((batch) => batch.oldSessionId !== oldSessionId);
+      if (tasks.length > 0) pending.push({ oldSessionId, tasks });
+      if (pending.length > 0) this.pendingScheduleMigrations.set(sessionKey, pending);
+      else this.pendingScheduleMigrations.delete(sessionKey);
     } catch {
-      // 调度存储不可读时不阻塞 /new；用户仍可手动重建
+      // 调度存储不可读时不阻塞换会话；用户仍可手动重建
     }
   }
 
@@ -1119,6 +1108,9 @@ export class SessionManager {
     noteSender(record, senderId);
 
     this.sessions.set(key, record);
+    // 活会话的 Web 选择已经在宿主生效。旧 per-chat 偏好只用于 resume/create，
+    // 不在插件重组后重新安装竞争选择器、也不把旧偏好当成一次新的切换。
+    if (!live) this.syncExplicitRoute(record);
     return record;
   }
 
@@ -1156,11 +1148,53 @@ export class SessionManager {
     return 'ok';
   }
 
+  /**
+   * /new：换新会话，并在后台把旧会话写成交接留给新会话的第一条消息。
+   * 不等交接写完就返回：/new 的回执不该被一次模型调用拖住，等待放在 takeHandoff 里。
+   * 返回是否在写交接（命令回执用）。
+   */
+  startNewSession(scope: ChatScope, peerId: string, options: { handoff: boolean }): boolean {
+    const key = this.sessionKey(scope, peerId);
+    const handoff = options.handoff ? this.beginHandoff(key) : undefined;
+    if (handoff === undefined) this.pendingHandoffs.delete(key);
+    else this.pendingHandoffs.set(key, handoff);
+    void this.remove(scope, peerId);
+    return handoff !== undefined;
+  }
+
+  /** 旧会话还在内存里、聊过几句、没在跑团时才写；否则返回 undefined */
+  private beginHandoff(key: string): Promise<string | undefined> | undefined {
+    const record = this.sessions.get(key);
+    const route = this.modelResolver.getEffectiveRoute(key);
+    if (this.handoffWriter === undefined || record === undefined || route?.provider === undefined || route.model === undefined) return undefined;
+    // 团档有自己的停团交接，而且旧会话里全是 DM 机密
+    if (this.dndService?.active(key) !== undefined) return undefined;
+    const turns: HandoffTurn[] = [];
+    for (const event of record.agent.session.events ?? []) {
+      if (event.type === 'user/message' && !isRuntimeContextEvent(event)) turns.push({ role: 'user', text: extractMessageText(event.message) });
+      else if (event.type === 'assistant/message') turns.push({ role: 'assistant', text: extractMessageText(event.message) });
+    }
+    const transcript = buildHandoffTranscript(turns);
+    if (transcript === undefined) return undefined;
+    return this.handoffWriter.write({ provider: route.provider, model: route.model, transcript });
+  }
+
+  /** 取走会话交接（只给新会话的第一条消息一次）；还在写就等它写完 */
+  async takeHandoff(scope: ChatScope, peerId: string): Promise<string | undefined> {
+    const key = this.sessionKey(scope, peerId);
+    const pending = this.pendingHandoffs.get(key);
+    if (pending === undefined) return undefined;
+    this.pendingHandoffs.delete(key);
+    const summary = await pending;
+    return summary === undefined ? undefined : formatHandoffHint(summary);
+  }
+
   async remove(scope: ChatScope, peerId: string, nextSessionId: string = randomUUID()): Promise<void> {
     const key = this.sessionKey(scope, peerId);
     const record = this.sessions.get(key);
-    const oldSessionId = record?.sessionId ?? this.modelResolver.getSessionId(key);
-    if (oldSessionId !== undefined) {
+    // 默认派生 ID 未必写进偏好存储；插件重载/空闲回收后仍要捕获旧人设的任务。
+    const oldSessionId = record?.sessionId ?? this.currentSessionId(key);
+    if (oldSessionId !== nextSessionId) {
       this.captureScheduleMigrations(key, oldSessionId);
       this.retiredSessionIds.set(oldSessionId, key);
       while (this.retiredSessionIds.size > 100) {
@@ -1169,12 +1203,16 @@ export class SessionManager {
         this.retiredSessionIds.delete(first);
       }
     }
-    // 切回用过的人设时，这个会话不再算退役
+    // 切回用过的人设时，目标会话自己的任务仍在那里，不应再删除并重建。
+    const pending = this.pendingScheduleMigrations.get(key)?.filter((batch) => batch.oldSessionId !== nextSessionId);
+    if (pending?.length) this.pendingScheduleMigrations.set(key, pending);
+    else this.pendingScheduleMigrations.delete(key);
     this.retiredSessionIds.delete(nextSessionId);
     this.modelResolver.setSessionId(key, nextSessionId);
 
     if (!record) return;
     this.sessions.delete(key);
+    this.modelSelections.delete(record.agent);
     record.agent.cancel({ kind: 'user' });
     await record.handle.dispose().catch(() => {});
     this.logger.info(`session removed: key=${key}`);
@@ -1288,12 +1326,63 @@ export class SessionManager {
     }
   }
 
-  /** 按会话实际路由的模型查上下文窗口（按 provider/model 缓存）；查不到返回 undefined，私聊退回固定阈值 */
-  private async contextWindowOf(record: SessionRecord): Promise<number | undefined> {
+  /**
+   * 空闲压缩：每分钟扫一遍，空闲够久、上下文够大、上游在名单里的会话压一次（规则见 features/compact-policy）。
+   * 每段空闲只试一次：成功后 contextTokens 清空，失败则靠 idleCompactTriedAt 挡住，免得每分钟重试。
+   */
+  checkIdleCompact(now: number = Date.now()): void {
+    const minIdleMs = (this.config.idleCompactMinutes ?? 0) * 60_000;
+    const minTokens = this.config.idleCompactTokens ?? 0;
+    if (minIdleMs <= 0 || minTokens <= 0) return;
+
+    for (const record of this.sessions.values()) {
+      if (record.compacting || record.idleCompactTriedAt === record.lastActivity) continue;
+      if (record.agent.status !== 'idle') continue;
+      const eligible = shouldIdleCompact({
+        contextTokens: record.contextTokens,
+        minTokens,
+        idleMs: now - record.lastActivity,
+        minIdleMs,
+        provider: this.routeOf(record)?.provider,
+        providers: this.config.idleCompactProviders ?? '',
+      });
+      if (!eligible) continue;
+
+      const before = record.contextTokens;
+      const idleMinutes = Math.round((now - record.lastActivity) / 60_000);
+      record.compacting = true;
+      record.idleCompactTriedAt = record.lastActivity;
+      void this.compact(record.scope, record.peerId)
+        .then((outcome) => {
+          if (outcome.ok) {
+            record.contextTokens = undefined; // 下一次请求后重新测量
+            this.logger.info(
+              `im-qqbot: 空闲压缩 key=${record.sessionKey} 空闲 ${idleMinutes} 分钟，上下文≈${before} tokens → 摘要替换 ${outcome.shadowed ?? 0} 条（约 ${outcome.tokens ?? 0} tokens）`,
+            );
+          } else {
+            this.logger.warn(`im-qqbot: 空闲压缩跳过 key=${record.sessionKey} reason=${outcome.reason}${outcome.message ? ` ${outcome.message}` : ''}`);
+          }
+        })
+        .catch((err: unknown) => {
+          this.logger.warn(`im-qqbot: 空闲压缩失败 key=${record.sessionKey}: ${err instanceof Error ? err.message : String(err)}`);
+        })
+        .finally(() => {
+          record.compacting = false;
+        });
+    }
+  }
+
+  /** 会话最近一次请求实际用的 provider/model；还没发过请求时退回解析出的路由 */
+  private routeOf(record: SessionRecord): { provider?: string; model?: string } | undefined {
     const header = record.agent.session.requestHeader?.()?.config;
-    const route = header?.provider && header.model
+    return header?.provider && header.model
       ? { provider: header.provider, model: header.model }
       : this.modelResolver.getEffectiveRoute(record.sessionKey);
+  }
+
+  /** 按会话实际路由的模型查上下文窗口（按 provider/model 缓存）；查不到返回 undefined，私聊退回固定阈值 */
+  private async contextWindowOf(record: SessionRecord): Promise<number | undefined> {
+    const route = this.routeOf(record);
     if (!route?.provider || !route.model) return undefined;
     const key = `${route.provider}/${route.model}`;
     if (this.contextWindows.has(key)) return this.contextWindows.get(key);
@@ -1313,6 +1402,7 @@ export class SessionManager {
 
   async disposeAll(): Promise<void> {
     this.evictor.dispose();
+    clearInterval(this.idleCompactTimer);
     const records = [...this.sessions.values()];
     this.sessions.clear();
     for (const record of records) {

@@ -41,7 +41,38 @@ export function deferCeiling(threshold: number, contextWindow: number | undefine
   return Math.max(threshold, Math.min(ceiling, Math.floor(contextWindow * DEFER_CEILING_WINDOW_RATIO)));
 }
 
-export type CompactDecision = 'compact' | 'defer' | 'skip';
+/**
+ * 空闲压缩：上游的隐式提示缓存只活几分钟（Gemini 实测约 5 分钟），群里安静一阵之后每条消息都要
+ * 全价重读整段上下文。空闲够久（话题多半已经换了）且上下文够大时先压成摘要：压缩请求本身也是
+ * 全价读一遍，和下一条消息冷启动花的一样，省的是之后每一次冷启动。
+ * 只对列出的 provider 生效——缓存活得久、命中稳定的上游不需要。
+ */
+export interface IdleCompactInput {
+  contextTokens: number | undefined;
+  /** 上下文不到这么多不压（冷启动本来就便宜）；0 = 关闭 */
+  minTokens: number;
+  idleMs: number;
+  /** 空闲不到这么久不压；0 = 关闭 */
+  minIdleMs: number;
+  provider: string | undefined;
+  /** 逗号分隔的 provider 名；空 = 所有 provider */
+  providers: string;
+}
+
+export function parseProviderList(raw: string): string[] {
+  return raw.split(/[,，\s]+/).map((item) => item.toLowerCase()).filter(Boolean);
+}
+
+export function shouldIdleCompact(input: IdleCompactInput): boolean {
+  if (input.minIdleMs <= 0 || input.minTokens <= 0) return false;
+  if (input.idleMs < input.minIdleMs) return false;
+  if (input.contextTokens === undefined || input.contextTokens < input.minTokens) return false;
+  const providers = parseProviderList(input.providers);
+  if (providers.length === 0) return true;
+  return input.provider !== undefined && providers.includes(input.provider.toLowerCase());
+}
+
+export type CompactDecision ='compact' | 'defer' | 'skip';
 
 export interface CompactInput {
   contextTokens: number | undefined;

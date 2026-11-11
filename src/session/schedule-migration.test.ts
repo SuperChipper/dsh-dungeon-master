@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +10,7 @@ import {
   type ScheduleServiceLike,
 } from './schedule-migration.ts';
 import { SessionManager } from './session-manager.ts';
+import { DEFAULT_PERSONA_ID } from '../features/persona-store.ts';
 
 const dirs: string[] = [];
 function homeWith(tasks: Record<string, unknown>): string {
@@ -74,6 +76,7 @@ describe('schedule migration', () => {
     ]);
     expect(hint).toContain('schedule_list');
     expect(hint).toContain('schedule_create');
+    expect(hint).toContain('/new 或人设切换');
     expect(hint).toContain('"daily": {');
     expect(hint).toContain('"prompt": "读 RSS"');
   });
@@ -108,6 +111,116 @@ describe('schedule migration', () => {
     expect(count).toBe(1);
     expect(remove).toHaveBeenCalledTimes(1);
     expect(remove).toHaveBeenCalledWith({ sessionId: oldSession, id: 'schedule-a' });
+  });
+});
+
+describe('人设切换复用真实会话重建与定时任务迁移', () => {
+  const key = 'qqbot:app:group:g1';
+  const hash = createHash('sha256').update(key).digest('hex');
+  const derivedSession = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
+  const cronTask = (id: string, sessionId: string) => ({
+    sessionId,
+    status: 'active',
+    record: { id, kind: 'cron', title: id, prompt: '取一张', expression: '0 8 * * *', timeZone: 'Asia/Shanghai' },
+  });
+
+  function harness(options: { live?: boolean; stored?: boolean; targetSession?: string } = {}) {
+    let current = DEFAULT_PERSONA_ID;
+    const personaSessions = new Map<string, string>();
+    if (options.targetSession !== undefined) personaSessions.set('maid', options.targetSession);
+    const ids = new Map(options.stored ? [[key, oldSession]] : []);
+    const removeTask = vi.fn(async () => ({ deleted: true }));
+    const cancel = vi.fn();
+    const dispose = vi.fn(async () => {});
+    const record = { sessionId: oldSession, agent: { status: 'idle', cancel }, handle: { dispose } };
+    const manager = Object.assign(Object.create(SessionManager.prototype) as SessionManager, {
+      config: { appId: 'app' },
+      sessions: new Map(options.live ? [[key, record]] : []),
+      modelSelections: new Map(),
+      pendingScheduleMigrations: new Map(),
+      retiredSessionIds: new Map(),
+      personaStore: {
+        currentId: () => current,
+        rememberSession: (_group: string, persona: string, session: string) => { personaSessions.set(persona, session); },
+        select: (_group: string, persona: string) => { current = persona; },
+        sessionFor: (_group: string, persona: string) => personaSessions.get(persona),
+      },
+      modelResolver: {
+        getSessionId: (sessionKey: string) => ids.get(sessionKey),
+        setSessionId: (sessionKey: string, id: string) => { ids.set(sessionKey, id); },
+      },
+      ctx: { get: (name: string) => name === 'schedule' ? { delete: removeTask } : undefined },
+      logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    });
+    return { manager, removeTask, cancel, dispose, personaSessions };
+  }
+
+  it.each([
+    { live: true, stored: false, source: oldSession },
+    { live: false, stored: true, source: oldSession },
+    { live: false, stored: false, source: derivedSession },
+  ])('切换新人人设捕获 cron，首条消息注入一次：%j', async ({ live, stored, source }) => {
+    vi.stubEnv('DSH_HOME', homeWith({ 'source-cron': cronTask('source-cron', source) }));
+    const { manager, removeTask, personaSessions } = harness({ live, stored });
+    expect(manager.switchPersona('g1', 'maid')).toBe('ok');
+    expect(personaSessions.get(DEFAULT_PERSONA_ID)).toBe(source);
+    expect(manager.sessionIdFor('group', 'g1')).not.toBe(source);
+    expect(removeTask).not.toHaveBeenCalled();
+    const hint = manager.takeScheduleMigration('group', 'g1');
+    expect(hint).toContain('"title": "source-cron"');
+    expect(hint).toContain('"cron": {');
+    expect(hint).toContain('"expression": "0 8 * * *"');
+    await vi.waitFor(() => expect(removeTask).toHaveBeenCalledExactlyOnceWith({ sessionId: source, id: 'source-cron' }));
+    expect(manager.takeScheduleMigration('group', 'g1')).toBeUndefined();
+  });
+
+  it('切回旧人设会话也注入离开会话的任务，不删除目标会话已有任务', async () => {
+    vi.stubEnv('DSH_HOME', homeWith({
+      'source-cron': cronTask('source-cron', oldSession),
+      'target-cron': cronTask('target-cron', 'maid-session'),
+    }));
+    const { manager, removeTask } = harness({ live: true, targetSession: 'maid-session' });
+    expect(manager.switchPersona('g1', 'maid')).toBe('ok');
+    expect(manager.sessionIdFor('group', 'g1')).toBe('maid-session');
+    const hint = manager.takeScheduleMigration('group', 'g1');
+    expect(hint).toContain('source-cron');
+    expect(hint).not.toContain('target-cron');
+    await vi.waitFor(() => expect(removeTask).toHaveBeenCalledTimes(1));
+    expect(removeTask).toHaveBeenCalledWith({ sessionId: oldSession, id: 'source-cron' });
+  });
+
+  it('未注入前 A→B→A 时保留 A 自己的 cron，只迁移 B 的任务', async () => {
+    vi.stubEnv('DSH_HOME', homeWith({
+      'source-cron': cronTask('source-cron', oldSession),
+      'target-cron': cronTask('target-cron', 'maid-session'),
+    }));
+    const { manager, removeTask } = harness({ live: true, targetSession: 'maid-session' });
+    manager.switchPersona('g1', 'maid');
+    manager.switchPersona('g1', DEFAULT_PERSONA_ID);
+    expect(manager.sessionIdFor('group', 'g1')).toBe(oldSession);
+    const hint = manager.takeScheduleMigration('group', 'g1');
+    expect(hint).toContain('target-cron');
+    expect(hint).not.toContain('source-cron');
+    await vi.waitFor(() => expect(removeTask).toHaveBeenCalledExactlyOnceWith({ sessionId: 'maid-session', id: 'target-cron' }));
+  });
+
+  it('连续往返后再次切走，同一个 cron 只注入一次', async () => {
+    vi.stubEnv('DSH_HOME', homeWith({ 'source-cron': cronTask('source-cron', oldSession) }));
+    const { manager, removeTask } = harness({ live: true, targetSession: 'maid-session' });
+    manager.switchPersona('g1', 'maid');
+    manager.switchPersona('g1', DEFAULT_PERSONA_ID);
+    manager.switchPersona('g1', 'maid');
+    const hint = manager.takeScheduleMigration('group', 'g1');
+    expect(hint?.match(/"title": "source-cron"/g)).toHaveLength(1);
+    await vi.waitFor(() => expect(removeTask).toHaveBeenCalledTimes(1));
+  });
+
+  it('/new 在默认派生会话不在内存时同样捕获 cron', async () => {
+    vi.stubEnv('DSH_HOME', homeWith({ 'source-cron': cronTask('source-cron', derivedSession) }));
+    const { manager, removeTask } = harness();
+    await manager.remove('group', 'g1', 'new-session');
+    expect(manager.takeScheduleMigration('group', 'g1')).toContain('source-cron');
+    await vi.waitFor(() => expect(removeTask).toHaveBeenCalledExactlyOnceWith({ sessionId: derivedSession, id: 'source-cron' }));
   });
 });
 
@@ -171,6 +284,24 @@ describe('SessionManager schedule migration', () => {
     capture('middle-session-without-tasks');
     expect(take()).toContain('早报-schedule-a');
     await vi.waitFor(() => expect(remove).toHaveBeenCalledWith({ sessionId: oldSession, id: 'schedule-a' }));
+  });
+
+  it('同一来源被反复捕获时只保留一批任务', () => {
+    vi.stubEnv('DSH_HOME', homeWith({ 'schedule-a': dailyTask('schedule-a', oldSession) }));
+    const { capture, take } = harness(undefined);
+    capture(oldSession);
+    capture(oldSession);
+    expect(take()?.match(/"title": "早报-schedule-a"/g)).toHaveLength(1);
+  });
+
+  it('重复捕获刷新来源快照，不复活已经删掉的任务', () => {
+    const home = homeWith({ 'schedule-a': dailyTask('schedule-a', oldSession) });
+    vi.stubEnv('DSH_HOME', home);
+    const { capture, take } = harness(undefined);
+    capture(oldSession);
+    writeFileSync(join(home, 'storages', 'schedule.json'), JSON.stringify({ tables: { tasks: {} } }), 'utf8');
+    capture(oldSession);
+    expect(take()).toBeUndefined();
   });
 
   it('没有 schedule 服务时仍给出 hint 并告警', () => {

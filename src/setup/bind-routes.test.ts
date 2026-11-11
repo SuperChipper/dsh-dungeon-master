@@ -553,7 +553,19 @@ describe('bind-routes', () => {
     expect(updates[0]).toEqual({ autoCompactPrivateRatio: 0.6, autoCompactDeferOnTools: false });
   });
 
+  it('POST config：空闲压缩三个键通过校验并写入', async () => {
+    const updates: Array<Record<string, unknown>> = [];
+    const { routes } = createHarness({ onUpdateConfig: (value) => { updates.push(value); return true; } });
+    const res = fakeRes();
+    await invoke(routes.get(BIND_CONFIG_PATH), fakeReq('POST', { host: '127.0.0.1:3080' },
+      '{"idleCompactMinutes":30,"idleCompactTokens":100000,"idleCompactProviders":"google, google-vertex"}'), res);
+    expect(res.statusCode).toBe(200);
+    expect(updates[0]).toEqual({ idleCompactMinutes: 30, idleCompactTokens: 100000, idleCompactProviders: 'google, google-vertex' });
+  });
+
   it.each([
+    { idleCompactMinutes: -1 }, { idleCompactMinutes: 1441 }, { idleCompactMinutes: '20' },
+    { idleCompactTokens: 1.5 }, { idleCompactTokens: 1_000_001 }, { idleCompactProviders: 5 },
     { autoCompactPrivateRatio: -0.1 }, { autoCompactPrivateRatio: 0.95 }, { autoCompactPrivateRatio: '0.5' },
     { autoCompactDeferOnTools: 'yes' },
   ])('POST config：压缩配置非法值被拒 %j', async (body) => {

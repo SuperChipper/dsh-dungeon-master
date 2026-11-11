@@ -221,6 +221,9 @@ type ConfigWire = {
   autoCompactTokens?: number;
   autoCompactPrivateRatio?: number;
   autoCompactDeferOnTools?: boolean;
+  idleCompactMinutes?: number;
+  idleCompactTokens?: number;
+  idleCompactProviders?: string;
   tmpDir?: string;
   tmpTtlHours?: number;
   tmpMaxTotalMB?: number;
@@ -821,6 +824,24 @@ export function ConfigPanel(): ReactNode {
       label: '工具链进行中推迟压缩', checked: form.autoCompactDeferOnTools ?? true,
       help: '上一轮还在调工具时先不压，等一轮没调工具的收尾轮再压；上下文到阈值 1.5 倍时仍会强制压缩',
       onChange: (v) => { patch('autoCompactDeferOnTools', v); },
+    }),
+    createElement(NumberRow, {
+      label: '空闲压缩：空闲分钟数', value: form.idleCompactMinutes ?? 20,
+      min: 0, max: 1440, step: 5,
+      help: '会话空闲这么久后压缩一次，之后的冷启动只读摘要；需小于会话闲置超时；0 = 关闭',
+      onChange: (v) => { patch('idleCompactMinutes', v); },
+    }),
+    createElement(NumberRow, {
+      label: '空闲压缩：上下文下限（token）', value: form.idleCompactTokens ?? 100000,
+      min: 0, max: 1000000, step: 10000,
+      help: '上下文低于该值不做空闲压缩；应低于上面的自动压缩阈值',
+      onChange: (v) => { patch('idleCompactTokens', v); },
+    }),
+    createElement(FieldRow, {
+      label: '空闲压缩：生效的 provider', value: form.idleCompactProviders ?? 'google',
+      placeholder: 'google',
+      help: '逗号分隔；留空 = 所有 provider。只有提示缓存几分钟就过期的上游（如 Gemini）才需要',
+      onChange: (v) => { patch('idleCompactProviders', v); },
     }),
     createElement(SwitchRow, {
       label: '调试模式', checked: form.debug ?? false,

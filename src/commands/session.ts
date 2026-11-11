@@ -1,7 +1,7 @@
 /**
  * 会话相关命令
  *
- * - /new（别名 /reset /clear）：开始新会话（换新 sessionId）
+ * - /new（别名 /reset /clear）：开始新会话（换新 sessionId），旧会话的要点自动交接；/new blank 不带
  * - /compact：原地压缩会话历史（保留 sessionId，摘要替换旧历史）
  *
  * 两者都对应底层 dsh agent 能力，分类为 agent（通用能力）。
@@ -14,11 +14,12 @@ export function newCommand({ manager }: CommandDeps): CategorizedCommand {
   return {
     name: ['new', 'reset', 'clear'],
     category: 'agent',
-    description: '开始新会话（清空上下文）',
+    description: '开始新会话（清空上下文，之前的要点会带过来；/new blank 完全从头）',
     handler: (cmdCtx) => {
       const { scope, peerId } = getScopePeer(cmdCtx);
-      void manager.remove(scope, peerId);
-      return '已开启新会话 ✓';
+      const blank = /^(blank|clean|空白)$/i.test((cmdCtx.command?.raw ?? '').trim());
+      const handoff = manager.startNewSession(scope, peerId, { handoff: !blank });
+      return handoff ? '已开启新会话 ✓（之前的要点会带过来；/new blank 完全从头）' : '已开启新会话 ✓';
     },
   };
 }

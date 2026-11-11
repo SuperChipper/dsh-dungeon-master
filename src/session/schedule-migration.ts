@@ -1,5 +1,5 @@
 /**
- * /new 定时任务迁移：从 DSH 的 schedule 存储里读出旧 session 的 active 任务，
+ * /new 与人设切换的定时任务迁移：从 DSH 的 schedule 存储里读出旧 session 的 active 任务，
  * 生成给模型的重建指令（模型在新会话里调用 schedule_create）。
  *
  * 不直接改 schedule 存储：schedule 是 session-local 的，迁移由新会话的
@@ -133,8 +133,8 @@ export function readScheduleMigrations(dshHome: string, sessionId: string): Sche
 export function formatScheduleMigrationHint(tasks: readonly ScheduleMigrationTask[]): string | undefined {
   if (tasks.length === 0) return undefined;
   return [
-    '[SCHEDULE MIGRATION AFTER /new]',
-    `旧会话有 ${tasks.length} 个 active 定时任务，已随 /new 失联。请在回答用户前，先调用 schedule_list 查看当前会话已有任务；`,
+    '[SCHEDULE MIGRATION AFTER SESSION SWITCH]',
+    `会话已因 /new 或人设切换而更换，旧会话有 ${tasks.length} 个 active 定时任务需要迁移到当前会话。请在回答用户前，先调用 schedule_list 查看当前会话已有任务；`,
     '然后对下面每条调用 schedule_create（保留 title/prompt/时间；已存在的不要重复创建）：',
     '```json',
     JSON.stringify(tasks.map(({ sourceId: _sourceId, ...task }) => task), null, 2),
@@ -150,7 +150,7 @@ export function formatScheduleMigrationHint(tasks: readonly ScheduleMigrationTas
 
 /**
  * 删除旧 session 中已交给新会话重建的任务，避免同一任务在新旧会话重复触发。
- * 只删被迁移的任务（cron/一次性等未迁移的保留在旧 session 继续生效）。
+ * 只删被迁移的任务（一次性等未迁移的保留在旧 session 继续生效）。
  * @returns 实际删除的任务数
  */
 export async function retireMigratedSchedules(

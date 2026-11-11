@@ -368,6 +368,12 @@ export interface ImQQBotConfig {
   autoCompactPrivateRatio: number;
   /** 上一轮调用过工具（多步任务进行中）时推迟自动压缩，直到收尾轮或阈值 1.5 倍 */
   autoCompactDeferOnTools: boolean;
+  /** 会话空闲这么多分钟后压缩一次（需小于 sessionIdleTimeout，否则会话先被回收）；0=关闭 */
+  idleCompactMinutes: number;
+  /** 空闲压缩的上下文下限：低于这么多 token 不压 */
+  idleCompactTokens: number;
+  /** 空闲压缩生效的 provider（逗号分隔；空=全部） */
+  idleCompactProviders: string;
   /** 访问控制 */
   access: AccessControlConfig;
   /** 是否展示工具调用成功结果（工具错误始终展示） */
@@ -710,6 +716,11 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
     .description('私聊自动压缩阈值占模型上下文窗口的比例（不低于 autoCompactTokens；0=私聊也用固定阈值）'),
   autoCompactDeferOnTools: Schema.boolean().default(true)
     .description('上一轮还在调工具时推迟自动压缩，等收尾轮或上下文到阈值 1.5 倍再压'),
+  idleCompactMinutes: Schema.number().min(0).max(1440).default(20)
+    .description('会话空闲这么多分钟后压缩一次，需小于会话闲置超时；0=关闭'),
+  idleCompactTokens: Schema.number().min(0).default(100000).description('空闲压缩的上下文下限（token），低于它不压'),
+  idleCompactProviders: Schema.string().default('google')
+    .description('空闲压缩生效的 provider，逗号分隔；留空=全部（只有提示缓存几分钟就过期的上游才需要）'),
   access: AccessControlSchema.default({
     c2cMode: 'open',
     c2cAllow: [],
