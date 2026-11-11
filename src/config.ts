@@ -151,11 +151,7 @@ export interface SpeakConfig {
 }
 
 export interface FileAccessConfig {
-  /** 是否只有主人私聊能访问文件（ownerOpenid 未设置时不生效） */
-  ownerOnly: boolean;
-  /** 额外允许访问文件的 openid */
-  extraAllow: string[];
-  /** 敏感路径（拦截名单）：这些目录下的文件禁止访问/发送 */
+  /** 敏感路径（拦截名单）：受限会话禁止访问/发送这些目录下的文件；白名单会话有终端，不拦 */
   sensitivePaths: string[];
 }
 
@@ -466,8 +462,6 @@ export const ModelFailoverSchema: Schema<ModelFailoverConfig> = Schema.object({
 
 /** 文件访问白名单子 Schema（独立导出：config 路由的服务端校验复用） */
 export const FileAccessSchema: Schema<FileAccessConfig> = Schema.object({
-  ownerOnly: Schema.boolean().default(true).description('是否只有主人私聊能访问文件'),
-  extraAllow: Schema.array(Schema.string()).default([]).description('额外允许访问文件的 openid'),
   sensitivePaths: Schema.array(Schema.string()).default([]).description('敏感路径（拦截访问）'),
 });
 
@@ -738,8 +732,6 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   ownerOpenid: Schema.string().description('bot 主人 QQ openid（私聊识别，文件访问白名单）'),
   adminOpenids: Schema.array(Schema.string()).default([]).description('额外的配置管理员 openid（可修改模型/preset、点击审批）'),
   fileAccess: FileAccessSchema.default({
-    ownerOnly: true,
-    extraAllow: [],
     sensitivePaths: [],
   }).description('文件访问白名单'),
   toolAccess: ToolAccessSchema.default({

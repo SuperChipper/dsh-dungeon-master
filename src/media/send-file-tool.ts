@@ -16,7 +16,7 @@ import type { DshAgent, SessionManager } from '../session/index.ts';
 import type { Logger, ReplyTarget } from '../types.ts';
 import { MEDIA_ROOT } from './media-cleaner.ts';
 import { isSensitivePath } from '../shared/file-access.ts';
-import { canonical } from '../shared/tool-guard.ts';
+import { canonical, sensitivePathsApply } from '../shared/tool-guard.ts';
 import { replyWindowMs } from '../transport/msgid-cache.ts';
 import { isVoiceFile, VOICE_REPLY_REMINDER, VOICE_REPLY_TOOL_HINT } from './voice-reply.ts';
 
@@ -233,7 +233,11 @@ export function registerSendFileTool(
       if (!isPathAllowed(absPath, config.sendFile, cwd)) {
         throw new Error(`qqbot_send_file: file_path 不在允许的目录内: ${absPath}`);
       }
-      if (isSensitivePath(absPath, config) || isSensitivePath(canonical(absPath), config)) {
+      // 白名单会话不拦，和 tools.guard 一致；本机会话和显式 target 的调用查不到 QQ 会话，照拦
+      const caller = exec.agent === undefined ? undefined : manager.findByAgent(exec.agent as DshAgent);
+      const trusted = caller !== undefined
+        && manager.toolAccess?.isFullAccess({ scope: caller.scope, peerId: caller.peerId }) === true;
+      if (sensitivePathsApply(config, trusted) && (isSensitivePath(absPath, config) || isSensitivePath(canonical(absPath), config))) {
         throw new Error(`qqbot_send_file: file_path 位于敏感目录，禁止访问: ${absPath}`);
       }
       if (!existsSync(absPath)) {

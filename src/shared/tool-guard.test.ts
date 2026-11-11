@@ -12,7 +12,7 @@ const WHITE_GROUP = 'GROUP_W';
 function makeConfig(over: Partial<ImQQBotConfig['toolAccess']> = {}, sensitivePaths: string[] = []): ImQQBotConfig {
   return {
     ownerOpenid: OWNER,
-    fileAccess: { ownerOnly: true, extraAllow: [], sensitivePaths },
+    fileAccess: { sensitivePaths },
     toolAccess: { enabled: true, fullAccessGroups: [WHITE_GROUP], fullAccessUsers: [], readRoots: [], ...over },
   } as unknown as ImQQBotConfig;
 }
@@ -81,6 +81,8 @@ describe('createToolGuard', () => {
     expect(guard({ name: 'read', arguments: { file_path: 'media/../.env' }, agent })).toMatch(/不在允许范围/);
     expect(guard({ name: 'write', arguments: { file_path: join(cwd, 'x.txt'), content: '' }, agent })).toMatch(/不在允许范围/);
     expect(guard({ name: 'qqbot_send_file', arguments: { file_path: join(cwd, '.env') }, agent })).toMatch(/不在允许范围/);
+    expect(guard({ name: 'qqbot_video_frames', arguments: { video: join(media, 'clip.mp4'), timestamps: [0] }, agent })).toBeUndefined();
+    expect(guard({ name: 'qqbot_video_frames', arguments: { video: join(cwd, 'private.mp4'), timestamps: [0] }, agent })).toMatch(/不在允许范围/);
   });
 
   it('非白名单群：grep/glob 必须给 path，通配不能跳出', () => {
@@ -93,7 +95,7 @@ describe('createToolGuard', () => {
     expect(guard({ name: 'glob', arguments: { pattern: '**/*.png', path: media }, agent })).toBeUndefined();
   });
 
-  it('白名单群和主人私聊放行任意路径和终端，但敏感路径对所有 QQ 会话都拦', () => {
+  it('白名单群和主人私聊放行任意路径和终端，敏感路径也不拦', () => {
     const base = setup();
     const config = makeConfig({}, [join(base.cwd, '.env')]);
     const { guard, agentFor, cwd } = setup(config);
@@ -104,7 +106,20 @@ describe('createToolGuard', () => {
 
     const sensitive = setup(makeConfig({}, ['.env']));
     const ownerAgent = sensitive.agentFor({ scope: 'c2c', peerId: OWNER });
-    expect(sensitive.guard({ name: 'read', arguments: { file_path: join(sensitive.cwd, '.env') }, agent: ownerAgent })).toMatch(/敏感路径/);
+    expect(sensitive.guard({ name: 'read', arguments: { file_path: join(sensitive.cwd, '.env') }, agent: ownerAgent })).toBeUndefined();
+  });
+
+  it('敏感路径：受限会话照拦（哪怕在 readRoots 里）；toolAccess 关掉时对所有会话都拦', () => {
+    const inRoots = setup(makeConfig({}, [join('media', 'a.png')]));
+    const restricted = inRoots.agentFor({ scope: 'group', peerId: GROUP });
+    expect(inRoots.guard({ name: 'read', arguments: { file_path: join(inRoots.media, 'a.png') }, agent: restricted })).toMatch(/敏感路径/);
+
+    const off = setup(makeConfig({ enabled: false }, ['.env']));
+    const owner = off.agentFor({ scope: 'c2c', peerId: OWNER });
+    const anyone = off.agentFor({ scope: 'group', peerId: GROUP });
+    expect(off.guard({ name: 'read', arguments: { file_path: join(off.cwd, '.env') }, agent: owner })).toMatch(/敏感路径/);
+    expect(off.guard({ name: 'read', arguments: { file_path: join(off.cwd, '.env') }, agent: anyone })).toMatch(/敏感路径/);
+    expect(off.guard({ name: 'pwsh', arguments: { command: 'dir' }, agent: anyone })).toBeUndefined();
   });
 
   it('跑团存档目录：白名单会话也不能用 write/edit 改，读照常', () => {

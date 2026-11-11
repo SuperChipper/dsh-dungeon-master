@@ -25,6 +25,7 @@ import { ApprovalChannel, type ApprovalChannelContext } from '../features/approv
 import { singingWaitGuard } from '../features/singing-wait-guard.ts';
 import { BiliClient } from '../bili/client.ts';
 import { registerBiliTools } from '../bili/tools.ts';
+import { biliPermission } from '../bili/permissions.ts';
 import { decodeButtonData } from '../features/button-utils.ts';
 import { PLUGIN_ROOT, buildUserAgent, isPrivilegedSender, privilegedOpenids } from '../shared/index.ts';
 import type { ImQQBotConfig } from '../config.ts';
@@ -455,31 +456,9 @@ export async function bootstrapGateway(
     registerBiliTools(biliTools, {
       client: biliClient,
       logger,
-      permission: (agent, kind = 'login') => {
-        const record = manager.findByAgent(agent as never);
-        // 本地 Web/Desktop 会话没有 QQ 记录：视为本机可信，只返回二维码路径
-        if (record === undefined) return { allowed: true };
-        const hasOwners = privilegedOpenids(config).length > 0;
-        // 群里 peerId 是群 openid，判断是不是主人得看这条消息的发送者
-        const senderPrivileged = hasOwners && isPrivilegedSender(record.senderId, config);
-        if (record.scope !== 'c2c') {
-          // 群里只把字幕放开给主人/管理员；扫码登录留在私聊，二维码不进群
-          if (kind === 'subtitle' && senderPrivileged) return { allowed: true };
-          return {
-            allowed: false,
-            reason: kind === 'login'
-              ? '扫码登录只能在私聊里做：二维码发进群等于让所有人都有机会绑账号。群聊可以用 bili_search / bili_video / bili_comments'
-              : 'B 站字幕在群里只对 bot 主人或管理员开放；其他人可以用 bili_search / bili_video / bili_comments',
-          };
-        }
-        if (!hasOwners) {
-          return { allowed: false, reason: '请先在插件配置里设置 ownerOpenid 或 adminOpenids，再登录 B 站' };
-        }
-        if (!isPrivilegedSender(record.peerId, config)) {
-          return { allowed: false, reason: '只有 bot 主人或管理员可以登录 B 站/使用登录态字幕' };
-        }
-        return { allowed: true };
-      },
+      permission: (agent, kind = 'login') => biliPermission(
+        manager.findByAgent(agent as never), kind, config,
+      ),
       sendQr: async (agent, qrPath, caption) => {
         const record = manager.findByAgent(agent as never);
         if (record === undefined) return false;

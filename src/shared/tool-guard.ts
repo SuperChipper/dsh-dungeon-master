@@ -5,7 +5,7 @@
  * 群里任何人都能让 bot 用 pwsh/read/grep 去翻 ~/.dsh/.env、别的群的存档。所以：
  *
  *   - 主人私聊、fullAccessUsers 私聊、fullAccessGroups 群，以及主人在聊天里确认加入的会话
- *     （features/tool-access.ts）：不限制（只拦敏感路径）；
+ *     （features/tool-access.ts）：不限制，敏感路径也不拦（见 sensitivePathsApply）；
  *   - 其它 QQ 会话：
  *       · 终端类工具（pwsh/bash/terminal_*）直接拒绝 —— 命令里能拼任意路径，没法按参数判断；
  *       · 会派生子 agent 的工具拒绝 —— 子 agent 不在会话表里，会绕过本拦截；
@@ -39,6 +39,7 @@ const PATH_TOOLS: Record<string, readonly string[]> = {
   glob: ['path', 'root', 'paths'],
   grep: ['path', 'root', 'paths'],
   qqbot_send_file: ['file_path'],
+  qqbot_video_frames: ['video'],
 };
 
 /** 不给 path 就会默认搜整个工作目录的工具 */
@@ -99,6 +100,15 @@ export function hasFullToolAccess(session: ToolGuardSession, config: ImQQBotConf
     || (grants?.users.includes(session.peerId) ?? false);
 }
 
+/**
+ * 敏感路径名单对这个会话还管不管用。白名单会话有终端，文件工具拦了它照样能 cat，
+ * 只会让主人查 ~/.dsh 下的会话记录和日志时白绕一圈，所以不拦。
+ * toolAccess 关掉时所有会话都算「完整权限」，那时名单是唯一一道防线，必须照拦。
+ */
+export function sensitivePathsApply(config: ImQQBotConfig, fullAccess: boolean): boolean {
+  return !(config.toolAccess?.enabled === true && fullAccess);
+}
+
 /** 解析符号链接：路径不存在时取最近的已存在祖先再拼回去 */
 export function canonical(path: string): string {
   let current = resolve(path);
@@ -116,9 +126,18 @@ export function canonical(path: string): string {
   }
 }
 
-function isWithin(path: string, root: string): boolean {
+/** path 是否在 root 里（含 root 本身）。只比字面路径，两边要先各自解析好 */
+export function isWithin(path: string, root: string): boolean {
   const rel = relative(root, path);
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+/**
+ * 按真实位置判断 path 是否在 root 里：目录里一个指到外面的链接不算在内，
+ * root 本身是链接（media 挂到别的盘）也照样认。
+ */
+export function isWithinReal(path: string, root: string): boolean {
+  return isWithin(canonical(path), canonical(root));
 }
 
 function pathArgs(args: unknown, keys: readonly string[]): string[] {
@@ -166,10 +185,11 @@ export function createToolGuard(deps: ToolGuardDeps): (exec: GuardedExecution) =
     const paths = pathKeys === undefined
       ? []
       : pathArgs(exec.arguments, pathKeys).map((p) => canonical(resolve(deps.cwd, p)));
-    if (paths.some((p) => sensitive.some((root) => isWithin(p, root)))) return DENY_SENSITIVE;
+    const fullAccess = deps.isFullAccess(session);
+    if (sensitivePathsApply(deps.config, fullAccess) && paths.some((p) => sensitive.some((root) => isWithin(p, root)))) return DENY_SENSITIVE;
     if (WRITE_TOOLS.has(exec.name) && paths.some((p) => noWrite.some((root) => isWithin(p, root)))) return DENY_NO_WRITE;
 
-    if (deps.isFullAccess(session)) return undefined;
+    if (fullAccess) return undefined;
 
     if (SHELL_TOOLS.has(exec.name)) return DENY_SHELL;
     if (AGENT_TOOLS.has(exec.name)) return DENY_AGENT;

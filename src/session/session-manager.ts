@@ -23,7 +23,6 @@ import { loadNativeImageBlock, type AttachmentStoreLike } from '../media/native-
 import { ModelResolver } from '../model/model-resolver.ts';
 import type { ModelRoute, ModelEntry } from '../model/types.ts';
 import { IdleEvictor } from './idle-evictor.ts';
-import { resolveSessionCwd } from '../shared/file-access.ts';
 import type { StickerStore, StickerMatchResult } from '../media/sticker-store.ts';
 import { chatKeyOf, formatNotesHint, selectNotesForInjection, type NotesStore } from '../notes/notes-store.ts';
 import type { NoteMetricsStore } from '../notes/note-metrics.ts';
@@ -1047,7 +1046,7 @@ export class SessionManager {
           const created = await this.agents.create({
             sessionId,
             meta: {
-              cwd: resolveSessionCwd(scope, senderId, this.config),
+              cwd: this.config.cwd || process.cwd(),
               ...(agentPreset ? { agentPreset } : {}),
             },
             ...(route ? { agentOptions: route } : {}),
@@ -1076,7 +1075,7 @@ export class SessionManager {
             const created = await this.agents.create({
               sessionId: SessionId(fresh),
               meta: {
-                cwd: resolveSessionCwd(scope, senderId, this.config),
+                cwd: this.config.cwd || process.cwd(),
                 ...(agentPreset ? { agentPreset } : {}),
               },
               ...(route ? { agentOptions: route } : {}),

@@ -28,8 +28,6 @@ interface AccessControlWire {
 
 /** 文件访问白名单（与 src/config.ts 的 FileAccessConfig 对应） */
 interface FileAccessWire {
-  ownerOnly: boolean;
-  extraAllow: string[];
   sensitivePaths: string[];
 }
 
@@ -565,8 +563,6 @@ export function ConfigPanel(): ReactNode {
     if (changed.fileAccess !== undefined) {
       const f = changed.fileAccess as FileAccessWire;
       changed.fileAccess = {
-        ...f,
-        extraAllow: f.extraAllow.map((s) => s.trim()).filter(Boolean),
         sensitivePaths: f.sensitivePaths.map((s) => s.trim()).filter(Boolean),
       };
     }
@@ -635,7 +631,7 @@ export function ConfigPanel(): ReactNode {
 
   const dirty = (Object.keys(form) as Array<keyof ConfigWire>).some((key) => !shallowEqual(form[key], initial[key]));
   const access: AccessControlWire = form.access ?? { c2cMode: 'open', c2cAllow: [], groupMode: 'open', groupAllow: [] };
-  const fileAccess: FileAccessWire = form.fileAccess ?? { ownerOnly: true, extraAllow: [], sensitivePaths: [] };
+  const fileAccess: FileAccessWire = form.fileAccess ?? { sensitivePaths: [] };
   const media: MediaWire = form.media ?? { enabled: true, maxMB: 200, ttlHours: 24, maxTotalMB: 1024 };
   const vision: VisionWire = form.vision ?? {
     enabled: false, native: false, provider: '', model: '',
@@ -726,7 +722,7 @@ export function ConfigPanel(): ReactNode {
     createElement('div', { className: 'imqb2-group-title' }, '主人与文件访问'),
     createElement(FieldRow, {
       label: '主人 openid', value: form.ownerOpenid ?? '', placeholder: '留空表示未设置主人',
-      help: '用于识别私聊主人；配合下方文件访问白名单限制敏感文件',
+      help: '用于识别私聊主人：主人私聊不受工具限制，也只有主人能批准权限申请',
       onChange: (v) => { patch('ownerOpenid', v); },
     }),
     createElement(AreaRow, {
@@ -734,20 +730,10 @@ export function ConfigPanel(): ReactNode {
       value: (form.adminOpenids ?? []).join('\n'),
       onChange: (v) => { patch('adminOpenids', v.split('\n').map((s) => s.trim())); },
     }),
-    createElement(SwitchRow, {
-      label: '仅主人可访问文件', checked: fileAccess.ownerOnly,
-      help: '开启后，只有主人私聊或额外允许的 openid 能收发本地文件',
-      onChange: (v) => { patch('fileAccess', { ...fileAccess, ownerOnly: v }); },
-    }),
     createElement(AreaRow, {
-      label: '额外允许的 openid', help: '每行一个；这些用户也可访问文件', rows: 2,
-      value: fileAccess.extraAllow.join('\n'),
-      onChange: (v) => { patch('fileAccess', { ...fileAccess, extraAllow: v.split('\n').map((s) => s.trim()) }); },
-    }),
-    createElement(AreaRow, {
-      label: '敏感路径（拦截）', help: '每行一个目录或文件前缀；命中后禁止访问/发送', rows: 3,
+      label: '敏感路径（拦截）', help: '每行一个目录或文件前缀；受限会话命中后禁止访问/发送，主人私聊和白名单会话不拦', rows: 3,
       value: fileAccess.sensitivePaths.join('\n'),
-      onChange: (v) => { patch('fileAccess', { ...fileAccess, sensitivePaths: v.split('\n').map((s) => s.trim()) }); },
+      onChange: (v) => { patch('fileAccess', { sensitivePaths: v.split('\n').map((s) => s.trim()) }); },
     }),
 
     createElement('div', { className: 'imqb2-group-title' }, '基础设置'),
