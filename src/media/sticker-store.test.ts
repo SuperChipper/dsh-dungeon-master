@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -166,6 +166,42 @@ describe('StickerStore', () => {
     writeImage(media, 'inside.png');
 
     expect(() => store.save({ source: outside, emotion: '测试' })).toThrow(/允许的目录/);
+  });
+
+  it('media 里指到外面的目录链接不算在允许目录内', () => {
+    const { base, media, store } = setup();
+    const outside = join(base, 'outside');
+    mkdirSync(outside);
+    writeImage(outside, 'secret.png');
+    // junction 在 Windows 上不需要管理员权限；其它平台这个参数被忽略，就是普通符号链接
+    symlinkSync(outside, join(media, 'link'), 'junction');
+
+    expect(() => store.save({ source: join(media, 'link', 'secret.png'), emotion: '测试' })).toThrow(/允许的目录/);
+    expect(() => store.match(join(media, 'link', 'secret.png'))).toThrow(/允许的目录/);
+  });
+
+  it('允许目录本身是链接时，真实路径和链接路径都认', () => {
+    const { base, root } = setup();
+    const real = join(base, 'real-media');
+    mkdirSync(real);
+    const linked = join(base, 'media-link');
+    symlinkSync(real, linked, 'junction');
+    const store = new StickerStore({ root, allowedRoots: [linked], maxBytes: 1024, maxAutoEntries: 10 });
+
+    expect(store.save({ source: writeImage(real, 'a.png', 'bytes-a'), emotion: '开心' }).saved).toBe(true);
+    writeImage(real, 'b.png', 'bytes-b');
+    expect(store.save({ source: join(linked, 'b.png'), emotion: '开心' }).saved).toBe(true);
+  });
+
+  it('经链接绕进敏感目录的也拒绝', () => {
+    const { media, root } = setup();
+    const hidden = join(media, 'private');
+    mkdirSync(hidden);
+    writeImage(hidden, 'secret.png');
+    symlinkSync(hidden, join(media, 'alias'), 'junction');
+    const store = new StickerStore({ root, allowedRoots: [media], sensitivePaths: [hidden], maxBytes: 1024, maxAutoEntries: 10 });
+
+    expect(() => store.save({ source: join(media, 'alias', 'secret.png'), emotion: '测试' })).toThrow(/敏感目录/);
   });
 
   it('拒绝敏感路径', () => {

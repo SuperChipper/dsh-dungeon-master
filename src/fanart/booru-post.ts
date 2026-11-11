@@ -11,6 +11,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { HttpGet } from './http.ts';
+import { sniffImageExt as sniffAnyImageExt } from '../media/image-sniff.ts';
 import { hasBlockedTag, isLargeEnough } from './types.ts';
 
 /** safebooru 的 JSON API（danbooru 1.x 的镜像，tag 语法与 danbooru 相同） */
@@ -140,10 +141,9 @@ export async function pickBooruPost(
 
 /** 按文件头认图片类型；JPEG / PNG 之外的不发（webp 在部分客户端显示不稳） */
 export function sniffImageExt(bytes: Buffer): 'jpg' | 'png' | undefined {
-  if (bytes.length < 8) return undefined;
-  if (bytes[0] === 0xff && bytes[1] === 0xd8) return 'jpg';
-  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'png';
-  return undefined;
+  const ext = sniffAnyImageExt(bytes);
+  // 共用的嗅探还认 gif/webp；这条管线原本就只收 JPEG/PNG，限制留在这里
+  return ext === 'jpg' || ext === 'png' ? ext : undefined;
 }
 
 /** 从 source 链接里认画师（只有推特来源认得出来，pixiv 的作品页没有账号） */

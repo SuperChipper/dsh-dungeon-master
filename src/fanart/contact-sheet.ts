@@ -4,6 +4,7 @@
  *
  * sharp 是可选依赖：装不上时返回 undefined，调用方退化成让模型逐张看。
  */
+import { loadSharp } from '../shared/sharp.ts';
 
 const CELL_W = 400;
 const CELL_H = 520;
@@ -18,15 +19,6 @@ type SharpFactory = (input?: unknown, options?: unknown) => {
   toFile(path: string): Promise<unknown>;
 };
 
-let sharpPromise: Promise<SharpFactory | undefined> | undefined;
-
-async function loadSharp(): Promise<SharpFactory | undefined> {
-  sharpPromise ??= import('sharp')
-    .then((mod) => ((mod as { default?: unknown }).default ?? mod) as SharpFactory)
-    .catch(() => undefined);
-  return sharpPromise;
-}
-
 function labelSvg(n: number): Buffer {
   return Buffer.from(
     `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64">`
@@ -38,7 +30,7 @@ function labelSvg(n: number): Buffer {
 
 /** 拼对比图写到 outPath；成功返回 outPath，sharp 不可用或全部图片读不了返回 undefined */
 export async function buildContactSheet(imagePaths: readonly string[], outPath: string): Promise<string | undefined> {
-  const sharp = await loadSharp();
+  const sharp = await loadSharp<SharpFactory>();
   if (sharp === undefined || imagePaths.length === 0) return undefined;
 
   const cols = Math.min(MAX_COLS, imagePaths.length);

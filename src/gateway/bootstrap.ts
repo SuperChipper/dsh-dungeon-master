@@ -403,6 +403,7 @@ export async function bootstrapGateway(
     config.vision,
     config.asr,
     logger,
+    resolveTmpDir(config),
   );
 
   // ── 听音频（qqbot_transcribe）：本机 whisper 常挂，改走能吃音频的模型 ──

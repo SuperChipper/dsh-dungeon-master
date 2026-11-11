@@ -77,6 +77,7 @@ export interface ChatCompletionOptions {
   timeoutMs?: number;
   maxTokens?: number;
   logger?: Logger;
+  signal?: AbortSignal;
 }
 
 /**
@@ -84,8 +85,12 @@ export interface ChatCompletionOptions {
  * 空正文按错误处理：那几乎总是 reasoning 吃光了额度，不能当成「没有内容」静默吞掉。
  */
 export async function chatCompletion(content: unknown[], options: ChatCompletionOptions = {}): Promise<string> {
+  options.signal?.throwIfAborted();
   const endpoint = options.endpoint ?? chatEndpointFromEnv();
   const key = await resolveChatKey(endpoint.keyRef);
+  options.signal?.throwIfAborted();
+  const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? 300000);
+  const signal = options.signal === undefined ? timeoutSignal : AbortSignal.any([timeoutSignal, options.signal]);
 
   const body = JSON.stringify({
     model: endpoint.model,
@@ -106,18 +111,25 @@ export async function chatCompletion(content: unknown[], options: ChatCompletion
       'x-opencode-session': crypto.randomUUID(),
     },
     body,
-    signal: AbortSignal.timeout(options.timeoutMs ?? 300000),
+    signal,
   });
+  signal.throwIfAborted();
   if (!response.ok) {
     const detail = await response.text().catch(() => '');
+    signal.throwIfAborted();
     throw new Error(`chat 网关 HTTP ${response.status} ${detail.slice(0, 200)}`);
   }
 
   const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string | null } }>;
+    choices?: Array<{ message?: { content?: string | null }; finish_reason?: string | null }>;
     usage?: { prompt_tokens?: number; completion_tokens?: number };
   };
-  const text = data.choices?.[0]?.message?.content ?? '';
+  signal.throwIfAborted();
+  const choice = data.choices?.[0];
+  if (choice?.finish_reason === 'length') {
+    throw new Error('chat 网关输出被截断（finish_reason=length，达到 max_tokens 上限）');
+  }
+  const text = choice?.message?.content ?? '';
   if (text.trim() === '') throw new Error('chat 网关返回空正文（多半是思考吃掉了额度，检查 reasoning_effort）');
   options.logger?.debug(
     `im-qqbot: chat ${endpoint.model} in=${data.usage?.prompt_tokens ?? '?'} out=${data.usage?.completion_tokens ?? '?'}`,
@@ -177,7 +189,7 @@ export async function describeVideoViaChat(
   const text = await chatCompletion([
     { type: 'video_url', video_url: { url: `data:video/mp4;base64,${video.toString('base64')}` } },
     { type: 'text', text: prompt },
-  ], { timeoutMs: 600000, maxTokens: 2048, endpoint: videoEndpointFromEnv(), ...options });
+  ], { timeoutMs: 600000, maxTokens: 8192, endpoint: videoEndpointFromEnv(), ...options });
   if (MISSED_VIDEO_RE.test(text)) {
     throw new Error(`视频没有送进模型（回的是寒暄）：${text.slice(0, 80)}`);
   }

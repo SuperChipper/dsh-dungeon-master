@@ -167,6 +167,113 @@ describe('chat 协议（mode: chat）', () => {
   });
 });
 
+describe('ASR cancellation', () => {
+  const audio = { data: Buffer.from('RIFF'), name: 'v.wav' };
+  const withFallback: AsrConfig = {
+    ...asr,
+    fallback: { enabled: true, baseUrl: 'https://fallback.example.com/v1', apiKey: 'fallback-key', model: 'whisper', timeoutMs: 5000 },
+  };
+
+  afterEach(() => {
+    setChatKeyResolver(undefined);
+  });
+
+  it.each(['chat', 'openai'] as const)('%s pre-aborted calls never resolve keys or fetch', async (mode) => {
+    const resolver = vi.fn(async () => 'sk-chat');
+    setChatKeyResolver(resolver);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new AbortController();
+    controller.abort();
+    await expect(requestTranscription(audio, { ...withFallback, mode }, undefined, controller.signal))
+      .rejects.toBe(controller.signal.reason);
+    expect(resolver).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['chat', 'openai'] as const)('%s cancellation reaches fetch and never falls back or becomes offline', async (mode) => {
+    setChatKeyResolver(async () => 'sk-chat');
+    const controller = new AbortController();
+    // Even a connection-shaped rejection must preserve cancellation once the caller aborts.
+    const reason = Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      expect(init.signal!.aborted).toBe(false);
+      controller.abort(reason);
+      expect(init.signal!.aborted).toBe(true);
+      throw reason;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(requestTranscription(audio, { ...withFallback, mode }, undefined, controller.signal))
+      .rejects.toBe(reason);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['chat', 'openai'] as const)('%s preserves timeout cancellation with fallback enabled', async (mode) => {
+    setChatKeyResolver(async () => 'sk-chat');
+    const timeout = new AbortController();
+    const timeoutMock = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal);
+    const controller = new AbortController();
+    const reason = new DOMException('Request timed out', 'TimeoutError');
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      timeout.abort(reason);
+      expect(init.signal!.aborted).toBe(true);
+      expect(controller.signal.aborted).toBe(false);
+      throw init.signal!.reason;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      await expect(requestTranscription(audio, { ...withFallback, mode }, undefined, controller.signal))
+        .rejects.toBe(reason);
+      expect(timeoutMock).toHaveBeenCalledWith(asr.timeoutMs);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      timeoutMock.mockRestore();
+    }
+  });
+
+  it.each([
+    ['chat', 200], ['chat', 503], ['openai', 200], ['openai', 503],
+  ] as const)('%s cancellation while reading HTTP %s does not fall back or return text', async (mode, status) => {
+    setChatKeyResolver(async () => 'sk-chat');
+    const controller = new AbortController();
+    const reason = new DOMException('Canceled response body', 'AbortError');
+    const response = new Response('body', { status });
+    if (status === 200) {
+      vi.spyOn(response, 'json').mockImplementation(async () => {
+        controller.abort(reason);
+        return { text: 'stale result', choices: [{ message: { content: 'stale result' } }] };
+      });
+    } else {
+      vi.spyOn(response, 'text').mockImplementation(async () => {
+        controller.abort(reason);
+        throw reason;
+      });
+    }
+    const fetchMock = vi.fn(async () => response);
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(requestTranscription(audio, { ...withFallback, mode }, undefined, controller.signal))
+      .rejects.toBe(reason);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['chat', 'openai'] as const)('%s propagates cancellation to its native fallback request', async (mode) => {
+    setChatKeyResolver(async () => 'sk-chat');
+    const controller = new AbortController();
+    const reason = new DOMException('Canceled fallback', 'AbortError');
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      if (fetchMock.mock.calls.length === 1) return new Response('unavailable', { status: 503 });
+      controller.abort(reason);
+      expect(init.signal!.aborted).toBe(true);
+      throw init.signal!.reason;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(requestTranscription(audio, { ...withFallback, mode }, undefined, controller.signal))
+      .rejects.toBe(reason);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1]![0]).toBe('https://fallback.example.com/v1/audio/transcriptions');
+  });
+});
+
 describe('transcribeVoices', () => {
   it('prefers QQ asr_refer_text and only calls ASR when missing', async () => {
     const transcribe = vi.fn(async () => ({ text: '在线结果', duration: 3 }));

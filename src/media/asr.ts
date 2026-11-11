@@ -121,8 +121,21 @@ function resolveApiKey(endpoint: AsrEndpoint): string {
   return endpoint.apiKey || process.env.QQBOT_ASR_API_KEY || '';
 }
 
+/** 取消不能被当成服务故障，否则会向备用接口重复发送同一段音频。 */
+function rethrowCancellation(err: unknown, signal?: AbortSignal): void {
+  signal?.throwIfAborted();
+  if (err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError')) throw err;
+}
+
 /** 调用一个 OpenAI 兼容转写接口；连不上时抛 AsrOfflineError，5xx 抛 AsrServerError */
-async function postTranscription(audio: { data: Buffer; name: string }, endpoint: AsrEndpoint): Promise<string> {
+async function postTranscription(
+  audio: { data: Buffer; name: string },
+  endpoint: AsrEndpoint,
+  signal?: AbortSignal,
+): Promise<string> {
+  signal?.throwIfAborted();
+  const timeoutSignal = AbortSignal.timeout(endpoint.timeoutMs);
+  const requestSignal = signal === undefined ? timeoutSignal : AbortSignal.any([timeoutSignal, signal]);
   const form = new FormData();
   form.append('file', new Blob([new Uint8Array(audio.data)]), audio.name);
   form.append('model', endpoint.model);
@@ -134,17 +147,21 @@ async function postTranscription(audio: { data: Buffer; name: string }, endpoint
       method: 'POST',
       headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
       body: form,
-      signal: AbortSignal.timeout(endpoint.timeoutMs),
+      signal: requestSignal,
     });
   } catch (err) {
+    rethrowCancellation(err, requestSignal);
     throw isConnectionError(err) ? new AsrOfflineError(endpoint.baseUrl, err) : err;
   }
+  requestSignal.throwIfAborted();
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
+    requestSignal.throwIfAborted();
     if (resp.status >= 500) throw new AsrServerError(resp.status, body);
     throw new Error(`HTTP ${resp.status} ${body.slice(0, 200)}`);
   }
   const json = await resp.json() as { text?: unknown };
+  requestSignal.throwIfAborted();
   return typeof json.text === 'string' ? json.text.trim() : '';
 }
 
@@ -157,7 +174,9 @@ export async function requestTranscription(
   audio: { data: Buffer; name: string },
   asr: AsrConfig,
   logger?: Logger,
+  signal?: AbortSignal,
 ): Promise<string> {
+  signal?.throwIfAborted();
   if (asr.mode === 'chat') {
     const endpoint = chatEndpointFromEnv();
     try {
@@ -166,25 +185,28 @@ export async function requestTranscription(
         endpoint,
         timeoutMs: asr.timeoutMs,
         logger,
+        signal,
       });
     } catch (err) {
+      rethrowCancellation(err, signal);
       if (isConnectionError(err)) throw new AsrOfflineError(endpoint.baseUrl, err);
       const fallback = asr.fallback;
       if (fallback?.enabled !== true) throw err;
       const reason = err instanceof Error ? err.message : String(err);
       logger?.info(`im-qqbot: ASR chat 网关不可用（${reason}），改用备用接口 ${fallback.baseUrl}`);
-      return postTranscription(audio, fallback);
+      return postTranscription(audio, fallback, signal);
     }
   }
 
   try {
-    return await postTranscription(audio, asr);
+    return await postTranscription(audio, asr, signal);
   } catch (err) {
+    rethrowCancellation(err, signal);
     const fallback = asr.fallback;
     const switchable = err instanceof AsrOfflineError || err instanceof AsrServerError;
     if (!switchable || fallback === undefined || !fallback.enabled) throw err;
     logger?.info(`im-qqbot: ASR 主接口不可用（${err.message}），改用备用接口 ${fallback.baseUrl}`);
-    return postTranscription(audio, fallback);
+    return postTranscription(audio, fallback, signal);
   }
 }
 

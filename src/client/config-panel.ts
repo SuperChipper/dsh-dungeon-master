@@ -1013,7 +1013,7 @@ export function ConfigPanel(): ReactNode {
     createElement('div', { className: 'imqb2-group-title' }, '视频理解'),
     createElement(SwitchRow, {
       label: '启用视频理解', checked: video.enabled,
-      help: '注册 qqbot_describe_video：抽帧宫格 + 音轨转写；需要视觉模型和 ffmpeg',
+      help: '注册 qqbot_describe_video：长片按时间分段，视频直传失败才抽帧；音轨逐段转写，需要视觉模型和 ffmpeg',
       onChange: (v) => { patch('video', { ...video, enabled: v }); },
     }),
     createElement(FieldRow, {
@@ -1022,11 +1022,11 @@ export function ConfigPanel(): ReactNode {
       onChange: (v) => { patch('video', { ...video, ffmpegPath: v }); },
     }),
     createElement(NumberRow, {
-      label: '最多抽帧数', value: video.maxFrames, min: 1, max: 24, step: 1,
+      label: '每段最多抽帧数', value: video.maxFrames, min: 1, max: 24, step: 1,
       onChange: (v) => { patch('video', { ...video, maxFrames: v }); },
     }),
     createElement(NumberRow, {
-      label: '最多分析前多少秒', value: video.maxSeconds, min: 10, max: 3600, step: 10,
+      label: '每段最多秒数（封顶300）', value: video.maxSeconds, min: 10, max: 300, step: 10,
       onChange: (v) => { patch('video', { ...video, maxSeconds: v }); },
     }),
 

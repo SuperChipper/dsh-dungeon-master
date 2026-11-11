@@ -7,9 +7,9 @@ import {
   videoEndpointFromEnv,
 } from './chat-gateway.ts';
 
-function stubFetch(content: string | null, status = 200) {
+function stubFetch(content: string | null, status = 200, finishReason?: string) {
   const mock = vi.fn(async () => new Response(
-    JSON.stringify({ choices: [{ message: { content } }], usage: { prompt_tokens: 10, completion_tokens: 2 } }),
+    JSON.stringify({ choices: [{ message: { content }, finish_reason: finishReason }], usage: { prompt_tokens: 10, completion_tokens: 2 } }),
     { status, headers: { 'content-type': 'application/json' } },
   ));
   vi.stubGlobal('fetch', mock);
@@ -42,8 +42,85 @@ describe('chatCompletion', () => {
     await expect(chatCompletion([{ type: 'text', text: 'hi' }])).rejects.toThrow(/空正文/);
   });
 
+  it.each(['partial transcript', null])('rejects length-truncated output even when content is %s', async (content) => {
+    setChatKeyResolver(async () => 'sk-x');
+    stubFetch(content, 200, 'length');
+    await expect(chatCompletion([])).rejects.toThrow(/截断.*finish_reason=length.*max_tokens/);
+  });
+
+  it('accepts a completed response with finish_reason=stop', async () => {
+    setChatKeyResolver(async () => 'sk-x');
+    stubFetch('complete transcript', 200, 'stop');
+    await expect(chatCompletion([])).resolves.toBe('complete transcript');
+  });
+
   it('缺凭证时报出是哪个 ref', async () => {
     await expect(chatCompletion([{ type: 'text', text: 'hi' }])).rejects.toThrow(/OPENCODE_GO_API_KEY/);
+  });
+
+  it.each(['completion', 'audio', 'video'] as const)('%s cancellation reaches the fetch signal', async (kind) => {
+    setChatKeyResolver(async () => 'sk-x');
+    const controller = new AbortController();
+    const reason = new DOMException('Canceled by caller', 'AbortError');
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      const signal = init.signal!;
+      expect(signal.aborted).toBe(false);
+      controller.abort(reason);
+      expect(signal.aborted).toBe(true);
+      throw signal.reason;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const options = { signal: controller.signal };
+    const request = kind === 'audio'
+      ? transcribeViaChat(Buffer.from('a'), 'wav', options)
+      : kind === 'video'
+        ? describeVideoViaChat(Buffer.from('v'), 'describe', options)
+        : chatCompletion([], options);
+    await expect(request).rejects.toBe(reason);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('pre-aborted calls do not resolve credentials or issue requests', async () => {
+    const resolver = vi.fn(async () => 'sk-x');
+    setChatKeyResolver(resolver);
+    const fetchMock = stubFetch('ok');
+    const controller = new AbortController();
+    controller.abort();
+    await expect(chatCompletion([], { signal: controller.signal })).rejects.toBe(controller.signal.reason);
+    expect(resolver).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('cancellation while resolving credentials prevents the network request', async () => {
+    const controller = new AbortController();
+    setChatKeyResolver(async () => {
+      controller.abort();
+      return 'sk-x';
+    });
+    const fetchMock = stubFetch('ok');
+    await expect(chatCompletion([], { signal: controller.signal })).rejects.toBe(controller.signal.reason);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the timeout active when a caller signal is supplied', async () => {
+    setChatKeyResolver(async () => 'sk-x');
+    const timeout = new AbortController();
+    const timeoutMock = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal);
+    const controller = new AbortController();
+    const reason = new DOMException('Request timed out', 'TimeoutError');
+    try {
+      vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+        timeout.abort(reason);
+        expect(init.signal!.aborted).toBe(true);
+        expect(controller.signal.aborted).toBe(false);
+        throw init.signal!.reason;
+      }));
+      await expect(chatCompletion([], { signal: controller.signal, timeoutMs: 1234 }))
+        .rejects.toBe(reason);
+      expect(timeoutMock).toHaveBeenCalledWith(1234);
+    } finally {
+      timeoutMock.mockRestore();
+    }
   });
 });
 
@@ -56,8 +133,23 @@ describe('describeVideoViaChat', () => {
     expect(text).toBe('视频里在吃咖喱');
     const body = JSON.parse((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
     expect(body.model).toBe('mimo-v2.6-flash');
+    expect(body.max_tokens).toBe(8192);
     expect(body.messages[0].content[0].type).toBe('video_url');
     expect(body.messages[0].content[0].video_url.url).toMatch(/^data:video\/mp4;base64,/);
+  });
+
+  it('allows callers to override the video token budget', async () => {
+    setChatKeyResolver(async () => 'sk-x');
+    const fetchMock = stubFetch('complete');
+    await describeVideoViaChat(Buffer.from('v'), 'describe', { maxTokens: 1234 });
+    const body = JSON.parse((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
+    expect(body.max_tokens).toBe(1234);
+  });
+
+  it('rejects truncated video output instead of returning a partial description', async () => {
+    setChatKeyResolver(async () => 'sk-x');
+    stubFetch('partial video subtitles', 200, 'length');
+    await expect(describeVideoViaChat(Buffer.from('v'), 'describe')).rejects.toThrow(/截断/);
   });
 
   it('模型没收到视频、回一段寒暄时按失败处理（否则幻觉会被当成描述）', async () => {

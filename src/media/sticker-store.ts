@@ -18,7 +18,9 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { extname, join, resolve } from 'node:path';
+import { isWithin, isWithinReal } from '../shared/tool-guard.ts';
+import { sniffImageExt } from './image-sniff.ts';
 import type { Logger } from '../types.ts';
 
 /** index.json 中的一条表情记录（保留旧条目的未知字段） */
@@ -95,24 +97,6 @@ const MAX_FILENAME_STEM = 48;
  * QQ 下载的图片经常出现「.png 里装 GIF/JPG」的情况，扩展名不可信；
  * 存表情时以文件头为准，避免库里的文件名和内容对不上。
  */
-function sniffImageExt(bytes: Uint8Array): string | undefined {
-  if (bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return '.png';
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return '.jpg';
-  if (bytes.length >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return '.gif';
-  if (
-    bytes.length >= 12 &&
-    bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
-    bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
-  ) return '.webp';
-  return undefined;
-}
-
-/** 路径是否位于 root 目录内（含 root 本身） */
-function isWithin(path: string, root: string): boolean {
-  const rel = relative(resolve(root), resolve(path));
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
-}
-
 /** 规范化情绪标签：去掉换行/路径字符，限制长度 */
 function normalizeEmotion(input: string): string {
   const value = input.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -190,10 +174,10 @@ export class StickerStore {
     const source = resolve(input.source);
 
     if (!existsSync(source)) throw new Error(`图片不存在: ${source}`);
-    if (!this.allowedRoots.some((root) => isWithin(source, root))) {
+    if (!this.allowedRoots.some((root) => isWithinReal(source, root))) {
       throw new Error(`图片不在允许的目录内: ${source}（允许: ${this.allowedRoots.join('、')}）`);
     }
-    if (this.sensitivePaths.some((root) => isWithin(source, root))) {
+    if (this.sensitivePaths.some((root) => isWithin(source, root) || isWithinReal(source, root))) {
       throw new Error(`图片位于敏感目录，禁止收藏: ${source}`);
     }
 
@@ -206,7 +190,8 @@ export class StickerStore {
 
     const sourceExt = extname(source).toLowerCase();
     const bytes = readFileSync(source);
-    const sniffedExt = sniffImageExt(bytes);
+    const sniffed = sniffImageExt(bytes);
+    const sniffedExt = sniffed === undefined ? undefined : `.${sniffed}`;
     if (!IMAGE_EXTS.has(sourceExt) && sniffedExt === undefined) {
       throw new Error(`不支持的图片格式: ${sourceExt || '(无扩展名)'}`);
     }
@@ -271,10 +256,10 @@ export class StickerStore {
   match(source: string): StickerMatchResult | undefined {
     const resolved = resolve(source);
     if (!existsSync(resolved)) throw new Error(`图片不存在: ${resolved}`);
-    if (!this.allowedRoots.some((root) => isWithin(resolved, root))) {
+    if (!this.allowedRoots.some((root) => isWithinReal(resolved, root))) {
       throw new Error(`图片不在允许的目录内: ${resolved}（允许: ${this.allowedRoots.join('、')}）`);
     }
-    if (this.sensitivePaths.some((root) => isWithin(resolved, root))) {
+    if (this.sensitivePaths.some((root) => isWithin(resolved, root) || isWithinReal(resolved, root))) {
       throw new Error(`图片位于敏感目录，禁止匹配: ${resolved}`);
     }
     const stat = statSync(resolved);

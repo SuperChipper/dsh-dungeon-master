@@ -76,9 +76,9 @@ export interface VideoConfig {
   enabled: boolean;
   /** ffmpeg 可执行文件（空 = PATH 里的 ffmpeg；ffprobe 取同目录） */
   ffmpegPath: string;
-  /** 每个视频最多抽多少帧（拼成一张宫格图交给视觉模型） */
+  /** 每个片段降级抽帧时的最大帧数 */
   maxFrames: number;
-  /** 最多分析视频前多少秒（画面抽帧 + 音轨转写） */
+  /** 每段最多分析秒数；最长300秒，长片自动逐段处理 */
   maxSeconds: number;
 }
 
@@ -637,8 +637,8 @@ export const AsrSchema: Schema<AsrConfig> = Schema.object({
 export const VideoSchema: Schema<VideoConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('是否注册 qqbot_describe_video（需 vision 已配置 + ffmpeg 可用）'),
   ffmpegPath: Schema.string().default('').description('ffmpeg 路径（空=PATH 里的 ffmpeg）'),
-  maxFrames: Schema.number().default(8).description('每个视频最多抽帧数（拼成一张宫格图）'),
-  maxSeconds: Schema.number().default(300).description('最多分析视频前多少秒'),
+  maxFrames: Schema.number().default(8).description('每段降级抽帧时的最大帧数（拼成宫格图）'),
+  maxSeconds: Schema.number().default(300).description('每段最多秒数（实际封顶300；长片逐段处理，每次最多24段/2小时）'),
 }).default({
   enabled: true,
   ffmpegPath: '',
