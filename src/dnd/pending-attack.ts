@@ -18,15 +18,13 @@ import {
   describePending,
   findCharacter,
   isOut,
+  reactionBlocked,
   reactionsOf,
   roomOf,
 } from './campaign.ts';
 import { canReact, cellOf, distanceFeet } from './battlefield.ts';
 
 export { reactionsOf };
-
-/** 窗口开多久；到时没回的算不用。太短玩家来不及打字，太长一只怪能卡住整桌 */
-export const REACTION_WINDOW_MS = 30_000;
 
 function hasResource(ch: Character, key: string | undefined): boolean {
   if (key === undefined) return true;
@@ -47,13 +45,13 @@ export interface AttackOutcome {
  */
 export function eligibleReactors(c: Campaign, attacker: Character, target: Character, outcome: AttackOutcome): ReactorOption[] {
   if (outcome.natural === 1) return [];
-  const reacted = c.initiative?.reacted ?? [];
   const room = roomOf(c, target);
   const enemyAttack = (attacker.kind === 'monster') !== (target.kind === 'monster');
   const attackerCell = cellOf(c, attacker);
   return c.characters.flatMap((ch) => {
     if (ch.kind !== 'pc' || !canReact(ch) || roomOf(c, ch) !== room) return [];
-    const free = !reacted.includes(ch.name);
+    // 用过反应或受惊：反手一击、挡攻击这类都不行（天赋类「自己攻击时」的不占反应，不受影响）
+    const free = reactionBlocked(c, ch.name) === undefined;
     return reactionsOf(ch).flatMap((r) => {
       if (!hasResource(ch, r.resource)) return [];
       if (r.range !== undefined) {
@@ -82,7 +80,6 @@ export function eligibleReactors(c: Campaign, attacker: Character, target: Chara
 export function manualReactors(c: Campaign, value: unknown): ReactorOption[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new Error('hold_for 要是数组，如 [{by:"奇塔露", name:"时间变幻"}]');
-  const reacted = c.initiative?.reacted ?? [];
   return value.map((raw) => {
     const o = (raw ?? {}) as Record<string, unknown>;
     const by = typeof o.by === 'string' ? o.by.trim() : '';
@@ -93,7 +90,8 @@ export function manualReactors(c: Campaign, value: unknown): ReactorOption[] {
       throw new Error(`hold_for 只用来等玩家：${ch.name} 不是绑了玩家的 PC。NPC/怪物的反应由你决定，传 hold=true 后直接 dnd_apply reaction`);
     }
     if (!canReact(ch)) throw new Error(`${ch.name} 现在做不了反应`);
-    if (reacted.includes(ch.name)) throw new Error(`${ch.name} 这一轮的反应已经用过了，要到他下个回合开始才恢复`);
+    const blocked = reactionBlocked(c, ch.name);
+    if (blocked !== undefined) throw new Error(blocked);
     return { character: ch.name, reaction: name, manual: true };
   });
 }
@@ -186,12 +184,14 @@ export function holdNotice(p: PendingRoll): string {
     + '落账前 next、再次攻击、豁免效果、移动都会被拒绝。';
 }
 
-/** 提前落账时报错；窗口时间到了就不再等没回话的人 */
-export function assertWindowClosed(p: PendingRoll, now: number = Date.now()): void {
+/**
+ * 还有人没答复时不能落账。以前 30 秒没回就算不用，可群里打字慢、想规则的人常被这样吃掉反应，现在不限时。
+ * 玩家离开了（一直不回）由 DM 传 decline 替他跳过。
+ */
+export function assertWindowClosed(p: PendingRoll): void {
   const waiting = waitingOn(p);
-  const left = p.at + REACTION_WINDOW_MS - now;
-  if (waiting.length === 0 || left <= 0) return;
-  throw new Error(`反应窗口还开着：还在等 ${waiting.join('、')}（剩约 ${Math.ceil(left / 1000)} 秒）。这条回复先停下问他们；说不用的传 decline，时间到了系统会提醒你。`);
+  if (waiting.length === 0) return;
+  throw new Error(`反应窗口还开着：还在等 ${waiting.join('、')}。这条回复先停下问他们，不限时；说不用的、或者人一直不在的，传 decline 跳过（替不在的人跳过要在回复里说一句）。`);
 }
 
 /** 记下 PC 点了「不用」或说了不用；不是这笔的可反应者就报错，免得记错人 */
@@ -255,9 +255,8 @@ export function consumesReaction(p: PendingRoll, by: string): boolean {
 export function findReactor(c: Campaign, p: PendingRoll, name: string): Character {
   const ch = findCharacter(c, name);
   if (ch === undefined) throw new Error(`找不到角色「${name}」`);
-  if (consumesReaction(p, ch.name) && (c.initiative?.reacted ?? []).includes(ch.name)) {
-    throw new Error(`${ch.name} 这一轮的反应已经用过了，要到他下个回合开始才恢复`);
-  }
+  const blocked = consumesReaction(p, ch.name) ? reactionBlocked(c, ch.name) : undefined;
+  if (blocked !== undefined) throw new Error(blocked);
   if (!canReact(ch)) throw new Error(`${ch.name} 现在做不了反应`);
   return ch;
 }

@@ -8,8 +8,12 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { rollD20, type Roller, cryptoRoller } from './dice.ts';
+import { createHash } from 'node:crypto';
+import { parseProgress } from './progress-patch.ts';
+import { rollD20, rollExpression, type Roller, cryptoRoller } from './dice.ts';
 import type { ChronicleEntry } from './chronicle.ts';
+import type { CardSpell } from './spell-links.ts';
+import type { BackstoryHook } from './hooks.ts';
 import { type Adventure, type QuestStatus, type Site, findSite, isHub, roomGraph, siteOfRoom } from './adventure.ts';
 import {
   type DungeonExit,
@@ -67,6 +71,10 @@ export interface Character {
   notes?: string;
   /** 武器：攻击时按名字取伤害和属性，避免模型临时编伤害骰 */
   weapons?: Weapon[];
+  /** 会的法术：回合按钮「我的法术」照这个列清单和 wiki 链接（见 spell-links.ts） */
+  spells?: CardSpell[];
+  /** 玩家给的来历里没了结的事，场景沾边时提醒 DM（见 hooks.ts）；只有 PC 有 */
+  hooks?: BackstoryHook[];
   /** 0 HP 时的死亡豁免计数 */
   deathSaves?: { successes: number; failures: number };
   /** 工具会自动处理的特性，如「不死坚韧」 */
@@ -264,11 +272,27 @@ export interface InitiativeState {
   pending?: PendingRoll;
   /** 本轮用过反应的人；到他自己的回合开始时恢复 */
   reacted?: string[];
+  /**
+   * 受惊的人：第 1 轮轮到时工具直接跳过，跳过前也不能反应。
+   * 以前靠 DM 逐个喊「点结束回合」，一场突袭要等五六个人各点一次按钮。
+   */
+  surprised?: string[];
 }
 
 export interface CampaignSummary {
   at: number;
   text: string;
+  /** 摘要写入时对应的房间与团况，用于区分叙事地点和模组的粗粒度房间 */
+  room?: string;
+  state?: string;
+}
+
+export interface SessionHandoff {
+  at: number;
+  room: string;
+  /** 不把新变化拼回旧摘要，避免挤掉尚未了结的线头 */
+  changes: string[];
+  needsReview: boolean;
 }
 
 export interface Campaign {
@@ -287,6 +311,9 @@ export interface Campaign {
   characters: Character[];
   initiative?: InitiativeState;
   summaries: CampaignSummary[];
+  handoff?: SessionHandoff;
+  /** 只给 DM 的候选计划，不能作为已经发生的事实 */
+  preparation?: { at: number; state: string; text: string };
   /** 最近的关键事件（伤害、倒地、移动），摘要里展示最后几条 */
   log: string[];
 
@@ -327,11 +354,6 @@ const MAX_SUMMARIES = 10;
 /** 一条进度/结团摘要的上限：每次开团都整条注入 */
 export const SUMMARY_MAX_CHARS = 1500;
 const SUMMARY_LOG_LINES = 5;
-
-/** 不在这里列出的状态也允许，只是不做特殊处理 */
-export const KNOWN_CONDITIONS = [
-  '目盲', '魅惑', '耳聋', '恐慌', '擒抱', '失能', '隐形', '麻痹', '石化', '中毒', '倒地', '束缚', '震慑', '昏迷', '力竭', '死亡', '稳定',
-];
 
 export function createCampaign(key: string, adv: Adventure, now = Date.now()): Campaign {
   const startSite = siteOfRoom(adv, adv.start);
@@ -453,6 +475,7 @@ export interface CharacterInput {
   speed?: number;
   reactions?: ReactionDef[];
   weapons?: Weapon[];
+  spells?: CardSpell[];
   notes?: string;
   traits?: string[];
   srd?: string;
@@ -508,6 +531,7 @@ export function upsertCharacter(c: Campaign, input: CharacterInput): { character
   if (input.speed !== undefined) next.speed = clampInt(input.speed, 0, 300);
   if (input.reactions !== undefined) next.reactions = input.reactions;
   if (input.weapons !== undefined) next.weapons = input.weapons;
+  if (input.spells !== undefined) next.spells = input.spells;
   if (input.notes !== undefined) next.notes = input.notes;
   if (input.traits !== undefined) next.traits = [...new Set(input.traits.map(normalizeTrait))];
   if (input.srd !== undefined) next.srd = input.srd;
@@ -770,19 +794,80 @@ export interface InitiativeRoll {
   detail: string;
 }
 
-/** 为参战者掷先攻并排序；names 省略时取 room（默认队伍主位置）里的 combatants() */
-export function startInitiative(c: Campaign, roller: Roller = cryptoRoller, names?: string[], room?: string): InitiativeRoll[] {
+/**
+ * 为参战者掷先攻并排序；names 省略时取 room（默认队伍主位置）里的 combatants()。
+ * `bonus` 是开战时就已生效的额外先攻值（灵敏之赐 1d8、警觉 +5、状态加成），按角色名给骰子表达式，
+ * 由这里掷进去——否则「d20 + 敏调」的半成品会被当成最终结果，玩家事后发现少算了也只能认。
+ */
+export function startInitiative(
+  c: Campaign, roller: Roller = cryptoRoller, names?: string[], room?: string, bonus: Record<string, string> = {},
+  surprisedNames: string[] = [],
+): InitiativeRoll[] {
   const members = names === undefined || names.length === 0 ? combatants(c, room) : names.map((n) => requireCharacter(c, n));
   if (members.length === 0) throw new Error('没有可以参战的角色');
+  // 掷骰前查完：名字写错时什么都还没掷
+  const surprised = [...new Set(surprisedNames.map((n) => requireCharacter(c, n).name))];
+  const outsider = surprised.filter((n) => !members.some((m) => m.name === n));
+  if (outsider.length > 0) throw new Error(`surprised 里的 ${outsider.join('、')} 不在参战者里`);
   const rolls = members.map((ch) => {
     const r = rollD20(initBonusOf(ch), 'none', roller);
-    return { name: ch.name, init: r.total, detail: r.detail, tiebreak: initBonusOf(ch) };
+    const expr = bonus[ch.name];
+    const extra = expr === undefined ? undefined : rollExpression(expr, roller);
+    const flat = initBonusOf(ch) + (extra?.total ?? 0);
+    return {
+      name: ch.name,
+      init: r.total + (extra?.total ?? 0),
+      detail: extra === undefined ? r.detail : `${r.detail} + ${expr} ${extra.detail}`,
+      tiebreak: flat,
+    };
   });
   rolls.sort((a, b) => b.init - a.init || b.tiebreak - a.tiebreak);
   c.initiative = { round: 1, turn: 0, order: rolls.map(({ name, init }) => ({ name, init })) };
+  if (surprised.length > 0) c.initiative.surprised = surprised;
   c.begun = true;
-  pushLog(c, `进入战斗：${rolls.map((r) => `${r.name}(${r.init})`).join(' > ')}`);
+  pushLog(c, `进入战斗：${rolls.map((r) => `${r.name}(${r.init})`).join(' > ')}${surprised.length > 0 ? `；受惊：${surprised.join('、')}` : ''}`);
   return rolls.map(({ name, init, detail }) => ({ name, init, detail }));
+}
+
+export function isSurprised(c: Campaign, name: string): boolean {
+  return c.initiative?.surprised?.includes(name) ?? false;
+}
+
+/** 此刻为什么不能反应；能反应时返回 undefined */
+export function reactionBlocked(c: Campaign, name: string): string | undefined {
+  if (isSurprised(c, name)) return `${name} 受惊，自己第一个回合过去之前不能反应`;
+  if (c.initiative?.reacted?.includes(name) === true) return `${name} 这一轮的反应已经用过了，要到他下个回合开始才恢复`;
+  return undefined;
+}
+
+/** 指针往后挪一格；回到表头算新一轮。新一轮开始时突袭已经结束 */
+function stepTurn(state: InitiativeState): boolean {
+  state.turn++;
+  if (state.turn < state.order.length) return false;
+  state.turn = 0;
+  state.round++;
+  delete state.surprised;
+  return true;
+}
+
+/**
+ * 当前行动者受惊时整回合跳过，一直挪到第一个没受惊的人（或第 2 轮）。
+ * start 之后和每次 next 之后都要调：开场排第一的就可能是受惊的人。
+ */
+export function skipSurprised(c: Campaign): { skipped: string[]; newRound: boolean } {
+  const state = requireInitiative(c);
+  const skipped: string[] = [];
+  let newRound = false;
+  while (state.surprised !== undefined) {
+    const current = state.order[state.turn];
+    if (current === undefined || !state.surprised.includes(current.name)) break;
+    state.surprised = state.surprised.filter((n) => n !== current.name);
+    if (state.surprised.length === 0) delete state.surprised;
+    skipped.push(current.name);
+    if (stepTurn(state)) newRound = true;
+  }
+  if (skipped.length > 0) pushLog(c, `受惊跳过：${skipped.join('、')}`);
+  return { skipped, newRound };
 }
 
 /**
@@ -881,7 +966,7 @@ export function nextRollId(c: Campaign): number {
 }
 
 /** 推进到下一个还能行动的角色（跳过死亡的；昏迷的 PC 保留，要做死亡豁免） */
-export function nextTurn(c: Campaign): { round: number; current: InitiativeEntry; newRound: boolean } {
+export function nextTurn(c: Campaign): { round: number; current: InitiativeEntry; newRound: boolean; skipped: string[] } {
   assertNoPending(c, '推进回合');
   const state = requireInitiative(c);
   for (const entry of [...state.order]) {
@@ -889,22 +974,18 @@ export function nextTurn(c: Campaign): { round: number; current: InitiativeEntry
     if (ch === undefined || isOut(ch)) removeFromInitiative(state, entry.name);
   }
   if (state.order.length === 0) throw new Error('先攻表里已经没有能行动的角色，用 dnd_initiative end 结束战斗');
-  let newRound = false;
   delete state.moved;
   delete state.dashed;
-  state.turn++;
-  if (state.turn >= state.order.length) {
-    state.turn = 0;
-    state.round++;
-    newRound = true;
-  }
+  let newRound = stepTurn(state);
+  const skip = skipSurprised(c);
+  newRound ||= skip.newRound;
   // 反应到自己回合开始时恢复
   const current = state.order[state.turn]!;
   if (state.reacted !== undefined) {
     state.reacted = state.reacted.filter((n) => n !== current.name);
     if (state.reacted.length === 0) delete state.reacted;
   }
-  return { round: state.round, current, newRound };
+  return { round: state.round, current, newRound, skipped: skip.skipped };
 }
 
 /** 结束战斗：清空先攻，移除已死亡的怪物 */
@@ -1515,24 +1596,44 @@ export function resourceTag(ch: Character): string {
 export function addSummary(c: Campaign, text: string, now = Date.now()): void {
   const value = text.trim();
   if (value.length === 0) return;
-  c.summaries.push({ at: now, text: value.slice(0, SUMMARY_MAX_CHARS) });
+  if (value.length > SUMMARY_MAX_CHARS) {
+    throw new Error(`进度共 ${value.length} 字，超过 ${SUMMARY_MAX_CHARS} 字，未保存、旧进度保留。请用 summary 精简后整份重写；增量修改旧摘要时可用 set={"旧进度":""} 移除已核对的旧段，保留未结事项。`);
+  }
+  c.summaries.push({ at: now, text: value, room: c.currentRoom, state: campaignState(c) });
   if (c.summaries.length > MAX_SUMMARIES) c.summaries.splice(0, c.summaries.length - MAX_SUMMARIES);
 }
 
-/** 停团兜底摘要取的日志条数 */
-const FALLBACK_LOG_LINES = 15;
+/** 元数据变化不代表剧情推进；备团计划也不能混进已发生事实。 */
+export function campaignState(c: Campaign): string {
+  const { summaries, handoff, preparation, active, updatedAt, sessionStartedAt, rollSeq, ...state } = c;
+  return createHash('sha256').update(JSON.stringify(state)).digest('hex');
+}
+
+function fitHandoff(lines: string[], budget = 1000): string[] {
+  const kept: string[] = [];
+  let used = 0;
+  for (const line of [...lines].reverse()) {
+    if (used + line.length + 1 > budget) break;
+    kept.unshift(line);
+    used += line.length + 1;
+  }
+  if (kept.length < lines.length) kept.unshift(`（另有 ${lines.length - kept.length} 条未展示，请 dnd_chronicle search 核对；近期日志也可用 dnd_prepare show 看）`);
+  return kept;
+}
 
 /**
- * 停团时这次开团没写过进度（/dnd end 直接停、模型没调 dnd_progress/dnd_end），就用上一条进度 + 最近日志拼一条，
- * 下次开团的「上次进度」至少接得上。只注入最后一条摘要，所以要把上一条带上，不然旧线头会丢。
+ * 两个结团入口共用的交接：旧摘要完整保留，摘要之后的工具事实另存。
+ * 不能只看「本场写过一次」：早先存过档，后半场仍可能推进了剧情。
  */
 export function ensureSessionSummary(c: Campaign, now = Date.now()): boolean {
   const last = c.summaries.at(-1);
-  if (last !== undefined && last.at >= (c.sessionStartedAt ?? 0)) return false;
-  const recent = c.log.slice(-FALLBACK_LOG_LINES);
-  if (recent.length === 0) return false;
-  const previous = last === undefined ? '' : `${last.text.slice(0, 700)}\n之后：`;
-  addSummary(c, `（停团时没写进度，以下是自动整理的最近记录）\n${previous}${recent.join('；')}`, now);
+  const changed = last?.state !== campaignState(c);
+  const since = last?.at ?? c.sessionStartedAt ?? 0;
+  const events = changed ? (c.chronicle ?? []).filter((e) => e.at >= since).map((e) => `- ${e.text}`) : [];
+  const changes = fitHandoff(events.length > 0 ? events : changed ? c.log.slice(-5).map((line) => `- 近期日志（可能含存档前内容）：${line}`) : []);
+  c.handoff = { at: now, room: c.currentRoom, changes, needsReview: changed || last === undefined || /【[^】\n]*$/.test(last.text) };
+  if (last !== undefined || changes.length === 0) return changes.length > 0;
+  addSummary(c, `【自动交接】\n工具记录，尚未人工核对具体停点与玩家决定：\n${changes.join('\n')}`, now);
   return true;
 }
 
@@ -1561,6 +1662,9 @@ export function summarize(c: Campaign, adv: Adventure): string {
     ? `${adv.name}｜${isHub(site) ? '城镇' : '场景'}：${site?.name ?? '?'}`
     : `${isHub(site) ? '城镇' : '地城'}：${site?.name ?? adv.name}`;
   lines.push(`${where}｜当前房间：${room?.name ?? c.currentRoom}（${c.currentRoom}）｜已探索 ${seen}/${total}`);
+  const last = c.summaries.at(-1);
+  const scene = last?.room === c.currentRoom ? parseProgress(last.text).find((s) => s.name === '位置') : undefined;
+  if (scene !== undefined) lines.push(`具体叙事位置（最近存档）：${scene.lines.join('；')}；房间 ID 可能只表示大区域，别把它当成重新出发。`);
   const exits = visibleExits(c, adv).map((e) => `${e.name}(${e.to})${e.locked === true ? '[过不去]' : ''}`).join('、');
   lines.push(`可见出口：${exits || '无'}`);
 
@@ -1585,6 +1689,10 @@ export function summarize(c: Campaign, adv: Adventure): string {
     const order = s.order.map((e, i) => (i === s.turn ? `▶${e.name}(${e.init})` : `${e.name}(${e.init})`)).join(' > ');
     lines.push(`战斗第 ${s.round} 轮：${order}`);
     lines.push(...battleLines(c, (id) => findRoom(graph, id)?.name ?? id));
+    if (s.reacted?.length) lines.push(`已用反应：${s.reacted.join('、')}`);
+    if (s.moved && Object.keys(s.moved).length) lines.push(`本回合已移动：${Object.entries(s.moved).map(([name, feet]) => `${name} ${feet}尺`).join('、')}`);
+    if (s.dashed?.length) lines.push(`本回合已冲刺：${s.dashed.join('、')}`);
+    if (s.surprised?.length) lines.push(`受惊：${s.surprised.join('、')}`);
     if (s.pending !== undefined) lines.push(pendingSummaryLine(s.pending));
   }
   lines.push(...storySummaryLines(c, adv, occupied));
@@ -1598,7 +1706,8 @@ export function summarize(c: Campaign, adv: Adventure): string {
  * markdown：站位画成代码块里的字符网格（只有 markdown 消息等宽）；纯文本消息退回坐标列表。
  * 探索进度、出口这些 /dnd map 已经有的不在这里重复。
  */
-export function playerStatus(c: Campaign, adv: Adventure, viewer?: string, format: 'text' | 'markdown' = 'text'): string {
+/** format=image：站位已经在战斗图上了，文字里不再列坐标和字符网格 */
+export function playerStatus(c: Campaign, adv: Adventure, viewer?: string, format: 'text' | 'markdown' | 'image' = 'text'): string {
   const lines: string[] = [];
   const graph = roomGraph(adv);
   const room = findRoom(graph, c.currentRoom);
@@ -1618,7 +1727,7 @@ export function playerStatus(c: Campaign, adv: Adventure, viewer?: string, forma
     const visible = (ch: Character): boolean => !hiddenFromPlayers(ch);
     const roomName = (id: string): string => findRoom(graph, id)?.name ?? id;
     const grid = format === 'markdown' ? battleGridLines(c, roomName, visible) : undefined;
-    lines.push(...(grid ?? battleLines(c, roomName, visible)));
+    if (format !== 'image') lines.push(...(grid ?? battleLines(c, roomName, visible)));
     const mine = viewer === undefined ? [] : c.characters.filter((ch) => ch.playerId === viewer && !isOut(ch) && cellOf(c, ch) !== undefined);
     for (const ch of mine) lines.push(distancesFrom(c, ch.name, visible));
     if (s.pending !== undefined) lines.push(`⏳ ${describePending(s.pending)}还没结算，等反应`);

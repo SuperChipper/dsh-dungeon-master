@@ -53,3 +53,40 @@ describe('/dnd 子命令只认英文', () => {
     expect(await run('new sunken-bell blank', 'c2c')).toContain('🎲 开团');
   });
 });
+
+describe('/dnd map 和 DM 发的是同一张图', () => {
+  const hasSharp = async (): Promise<boolean> => import('sharp').then(() => true, () => false);
+
+  it('能发图就发图，图下附一段说明', async () => {
+    if (!(await hasSharp())) return;
+    const { run, service } = setupWithService();
+    await run('start sunken-bell');
+    const sendImage = vi.fn(() => Promise.resolve());
+    service.sendImage = sendImage;
+    expect(await run('map')).toEqual({ kind: 'noop' });
+    const [target, path, caption] = sendImage.mock.calls[0]! as unknown as [unknown, string, string];
+    expect(target).toMatchObject({ scope: 'group', targetId: 'G1', msgId: 'M1' });
+    expect(path).toMatch(/\.(png|jpg)$/);
+    expect(caption).toContain('📍');
+  });
+
+  it('没接上发图时退回文字地图；没开战要战斗图就说还没有场地图', async () => {
+    const { run, service } = setupWithService();
+    await run('start sunken-bell');
+    expect(await run('map')).toContain('🗺️');
+    service.sendImage = vi.fn(() => Promise.resolve());
+    if (await hasSharp()) expect(await run('map battle')).toContain('还没有场地图');
+  });
+});
+
+function setupWithService() {
+  const root = mkdtempSync(join(tmpdir(), 'dnd-cmd-'));
+  const service = new DndService({ store: new CampaignStore(join(root, 'campaigns')), library: new AdventureLibrary(), mapDir: root });
+  const manager = { dndService: service, sessionKey: (s: string, id: string) => `${s}:${id}` };
+  const cmd = dndCommand({ manager, config: {} } as never);
+  const run = (raw: string) => cmd.handler({
+    message: { kind: 'group', groupOpenid: 'G1', senderId: 'U1', messageId: 'M1' },
+    command: { raw },
+  } as never);
+  return { run, service };
+}

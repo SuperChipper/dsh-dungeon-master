@@ -10,7 +10,7 @@ import { AdventureLibrary } from './adventure.ts';
 import { type Campaign, CampaignStore, findCharacter, parseCampaign, playerStatus, upsertCharacter } from './campaign.ts';
 import { DndService } from './dnd-service.ts';
 import { registerDndTools } from './dnd-tools.ts';
-import { REACTION_WINDOW_MS, classifyReactionReply } from './pending-attack.ts';
+import { classifyReactionReply } from './pending-attack.ts';
 import { DndTurnButtons } from './turn-buttons.ts';
 
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
@@ -211,21 +211,6 @@ describe('攻击重掷', () => {
     expect(await t.call('dnd_check', { type: 'attack', character: '狼', target: 'Kriv', hold_for: CHRONAL })).toContain('待结算');
   });
 
-  it('重开窗口后旧计时器不再提醒，新的到点才提醒', async () => {
-    vi.useFakeTimers();
-    const t = setup();
-    t.rolls.push(5);
-    await t.call('dnd_check', { type: 'attack', character: '狼', target: 'Kriv', hold_for: CHRONAL });
-    t.buttons.scheduleReaction(t.record as never);
-    await vi.advanceTimersByTimeAsync(2000 + 10_000);
-    t.rolls.push(15, 2);
-    await t.chronal('Kriv');
-    t.buttons.scheduleReaction(t.record as never);
-    await vi.advanceTimersByTimeAsync(REACTION_WINDOW_MS - 10_000);
-    expect(t.followup).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(10_000 + 2000);
-    expect(t.followup.mock.calls[0]![0].content[0].text).toContain('Kriv 没回');
-  });
 });
 
 describe('失败状态和伤害同一步落账', () => {
@@ -376,5 +361,42 @@ describe('存档和玩家视角', () => {
     t.rolls.push(18);
     await t.castOnGoblin({ hold_for: [{ by: '奇塔露', name: '银光嘲弄' }] });
     expect(classifyReactionReply(t.campaign(), 'P5', '银光嘲弄！')).toEqual({ kind: 'use', characters: ['奇塔露'] });
+  });
+});
+
+describe('战斗图代替字符网格', () => {
+  const hasSharp = (): Promise<boolean> => import('sharp').then(() => true, () => false);
+  const withMap = async () => {
+    const t = setup();
+    const sendImage = vi.fn((..._args: unknown[]) => Promise.resolve());
+    t.service.sendImage = sendImage as never;
+    await t.call('dnd_position', { action: 'terrain', width: 6, height: 4, areas: [{ kind: 'object', x: 2, y: 2, name: '石台' }] });
+    await t.call('dnd_position', { action: 'set', placements: [{ name: '狼', x: 0, y: 0 }, { name: 'Kriv', x: 3, y: 0 }, { name: '奇塔露', x: 4, y: 1 }] });
+    return { ...t, sendImage };
+  };
+
+  it('查看状态：能出图就发战斗图，血量和先攻附在图下，不再发字符网格', async () => {
+    if (!(await hasSharp())) return;
+    const t = await withMap();
+    expect(await t.buttons.sendStatus(t.key, { scope: 'group', targetId: 'G1' } as never, 'P2')).toBe(true);
+    expect(t.sender.sendMarkdown).not.toHaveBeenCalled();
+    const [, path, text] = t.sendImage.mock.calls[0] as [unknown, string, string];
+    expect(path).toMatch(/\.jpg$/);
+    expect(text).toContain('⚔ 第 1 轮');
+    expect(text).toContain('🧱 挡路：石台');
+    expect(text).not.toContain('```');
+  });
+
+  it('每轮只自动发一张战斗图：同一轮第二个 PC 的回合提示不再带图', async () => {
+    if (!(await hasSharp())) return;
+    const t = await withMap();
+    t.service.store.update(t.key, (c) => { c.initiative!.turn = 1; });
+    t.buttons.schedule(t.record as never);
+    await vi.waitFor(() => expect(t.sender.sendMarkdown).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(t.sendImage).toHaveBeenCalledTimes(1);
+    t.service.store.update(t.key, (c) => { c.initiative!.turn = 3; });
+    t.buttons.schedule(t.record as never);
+    await vi.waitFor(() => expect(t.sender.sendMarkdown).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(t.sendImage).toHaveBeenCalledTimes(1);
   });
 });

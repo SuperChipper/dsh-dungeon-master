@@ -12,6 +12,7 @@ import { explored, partyPositions, visibleExits } from './campaign.ts';
 import { type Adventure, isHub, siteOfRoom } from './adventure.ts';
 import { locationKnown } from './story.ts';
 import { type DungeonRoom, exitKey, findRoom } from './dungeon.ts';
+import { loadSharp } from '../shared/sharp.ts';
 
 const CELL = 36;
 const PAD = 1;
@@ -44,7 +45,8 @@ function stubEnd(from: Box, to: Box, extra: number): { x: number; y: number } {
   return { x: from.cx + ux * (t + extra), y: from.cy + uy * (t + extra) };
 }
 
-export function buildMapSvg(c: Campaign, adv: Adventure): string {
+/** title 给了就整条标题用它（map-view 会带上所在房间和探索进度），否则是场景名 + 右边的进度 */
+export function buildMapSvg(c: Campaign, adv: Adventure, title?: string): string {
   const dungeon = siteOfRoom(adv, c.currentRoom) ?? adv.sites[0]!;
   // 城镇：画出玩家知道的所有地点（没去过的虚线框），地点之间不画通道
   const hub = isHub(dungeon);
@@ -66,8 +68,8 @@ export function buildMapSvg(c: Campaign, adv: Adventure): string {
   for (let x = 0; x <= width; x += CELL) parts.push(`<line x1="${x}" y1="${TITLE_H}" x2="${x}" y2="${height}"/>`);
   for (let y = TITLE_H; y <= height; y += CELL) parts.push(`<line x1="0" y1="${y}" x2="${width}" y2="${y}"/>`);
   parts.push('</g>');
-  parts.push(`<text x="16" y="29" font-family="${FONT}" font-size="20" font-weight="bold" fill="#e8dcc0">${esc(dungeon.name)}</text>`);
-  parts.push(`<text x="${width - 16}" y="29" font-family="${FONT}" font-size="14" fill="#9a927f" text-anchor="end">已探索 ${seen}/${total}</text>`);
+  parts.push(`<text x="16" y="29" font-family="${FONT}" font-size="20" font-weight="bold" fill="#e8dcc0">${esc(title ?? dungeon.name)}</text>`);
+  if (title === undefined) parts.push(`<text x="${width - 16}" y="29" font-family="${FONT}" font-size="14" fill="#9a927f" text-anchor="end">已探索 ${seen}/${total}</text>`);
 
   // 通道画在房间下面，房间盖住中心那段，只露出房间之间的部分
   const drawn = new Set<string>();
@@ -120,20 +122,11 @@ export function buildMapSvg(c: Campaign, adv: Adventure): string {
 
 type SharpFactory = (input?: unknown) => { png(): { toFile(path: string): Promise<unknown> } };
 
-let sharpPromise: Promise<SharpFactory | undefined> | undefined;
-
-async function loadSharp(): Promise<SharpFactory | undefined> {
-  sharpPromise ??= import('sharp')
-    .then((mod) => ((mod as { default?: unknown }).default ?? mod) as SharpFactory)
-    .catch(() => undefined);
-  return sharpPromise;
-}
-
 /** 渲染 PNG 到 outPath；sharp 不可用时返回 undefined */
-export async function renderMapPng(c: Campaign, adv: Adventure, outPath: string): Promise<string | undefined> {
-  const sharp = await loadSharp();
+export async function renderMapPng(c: Campaign, adv: Adventure, outPath: string, title?: string): Promise<string | undefined> {
+  const sharp = await loadSharp<SharpFactory>();
   if (sharp === undefined) return undefined;
   mkdirSync(dirname(outPath), { recursive: true });
-  await sharp(Buffer.from(buildMapSvg(c, adv))).png().toFile(outPath);
+  await sharp(Buffer.from(buildMapSvg(c, adv, title))).png().toFile(outPath);
   return outPath;
 }

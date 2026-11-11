@@ -82,15 +82,24 @@ export function buildTextMap(c: Campaign, adv: Adventure): string {
   const names = [...occupied].map((id) => site.rooms.find((r) => r.id === id)?.name).filter((n): n is string => n !== undefined);
   lines.push('', `${PARTY} 你们在：${names.map(plainName).join('、') || '?'}`);
   for (let i = 0; i < legend.length; i += 3) lines.push(legend.slice(i, i + 3).join('　'));
-  const exits = visibleExits(c, adv);
-  if (exits.length > 0) {
-    lines.push(`🚪 能去：${exits.map((e) => {
-      const name = plainName(e.name);
-      const where = !e.known ? '（未探索）' : (e.label.includes(name) ? '' : `（${name}）`);
-      return `${plainName(e.label.replace(/^通往/, '去'))}${where}${e.locked === true ? '[过不去]' : ''}`;
-    }).join('；')}`);
-  }
+  const exits = exitsLine(c, adv);
+  if (exits !== undefined) lines.push(exits);
   return lines.join('\n');
+}
+
+/**
+ * 「🚪 能去：…」一行；文字地图和图片地图的说明共用。limit 限制条数，城镇里已知地点一多，整行会刷屏。
+ */
+export function exitsLine(c: Campaign, adv: Adventure, limit = Infinity): string | undefined {
+  const exits = visibleExits(c, adv);
+  if (exits.length === 0) return undefined;
+  const shown = exits.slice(0, limit).map((e) => {
+    const name = plainName(e.name);
+    const where = !e.known ? '（未探索）' : (e.label.includes(name) ? '' : `（${name}）`);
+    return `${plainName(e.label.replace(/^通往/, '去'))}${where}${e.locked === true ? '[过不去]' : ''}`;
+  });
+  const more = exits.length > shown.length ? `…等 ${exits.length} 处` : '';
+  return `🚪 能去：${shown.join('；')}${more}`;
 }
 
 /** 模组房间名常带书里的区域号（「3. 狗洞」），和地图上的 emoji 编号放一起会看混，图例里去掉 */

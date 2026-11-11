@@ -118,5 +118,5 @@ export function kickoffMessage(r: Roster, begun: boolean, reason: 'complete' | '
     : `[系统 · 签到] 有人点了「开始」，不等了。已到：${r.arrived.map((ch) => ch.name).join('、') || '无'}`
       + `${r.missing.length > 0 ? `；未到：${r.missing.map((ch) => ch.name).join('、')}` : ''}。`;
   return `${head}开场第一句简短说明谁到了${r.missing.length > 0 ? '、谁没来' : ''}，然后`
-    + `${begun ? '用两三句回顾上次的进度，接着描述队伍现在的处境' : '按开场要求叙述'}，最后问大家做什么。不要再列签到名单。`;
+    + `${begun ? '先核对最新团况、停团交接和玩家已定行动，再用两三句回顾上次的进度，接着描述现在的处境；大区域房间名不代表队伍退回起点，备团计划不代表事情已经发生；若战斗未完，沿原先攻与待结算继续' : '按开场要求叙述'}，最后问大家做什么。不要再列签到名单。`;
 }

@@ -36,12 +36,12 @@ export interface ApprovalButtonData {
 }
 
 /**
- * 跑团按钮：a=动作（end 结束回合 / status 查看状态 / in 签到 / go 开场 / roster 发名单 / react 用反应 / pass 不用反应），
- * n=角色名，r=轮次，react/pass 时是待结算序号（防止点到过期的旧按钮），i=待结算名单里的下标
+ * 跑团按钮：a=动作（end 结束回合 / status 查看状态 / spells 我的法术 / in 签到 / go 开场 / roster 发名单 /
+ * react 用反应 / pass 不用反应），n=角色名，r=轮次，react/pass 时是待结算序号（防止点到过期的旧按钮），i=待结算名单里的下标
  */
 export interface DndButtonData {
   t: 'dnd';
-  a: 'end' | 'status' | 'in' | 'go' | 'roster' | 'react' | 'pass';
+  a: 'end' | 'status' | 'spells' | 'in' | 'go' | 'roster' | 'react' | 'pass';
   n?: string;
   r?: number;
   i?: number;

@@ -24,7 +24,6 @@ import {
   type PendingD20,
   type ReactorOption,
   addSummary,
-  SUMMARY_MAX_CHARS,
   UNDEAD_FORTITUDE,
   applyDamage,
   assertCanAct,
@@ -39,11 +38,11 @@ import {
   deathSave,
   describePending,
   endInitiative,
-  explored,
   findCharacter,
   findWeapon,
   gotoTurn,
   grantTempHp,
+  isOut,
   heal,
   inInitiative,
   isRangedWeapon,
@@ -55,6 +54,8 @@ import {
   moveParty,
   nextRollId,
   nextTurn,
+  isSurprised,
+  skipSurprised,
   partyPositions,
   pushLog,
   recordDeathFailures,
@@ -93,8 +94,7 @@ import {
 } from './chronicle.ts';
 import type { DndService } from './dnd-service.ts';
 import { exitsOf, findRoom, resolveRoom } from './dungeon.ts';
-import { renderMapPng } from './map-render.ts';
-import { renderBookMap } from './book-map.ts';
+import { mapCaption, renderPartyMap } from './map-view.ts';
 import {
   type NpcState,
   afterChange,
@@ -124,8 +124,12 @@ import {
 import { ABILITIES, ABILITY_NAMES, type Ability, type Skill, SKILLS, parseAbility, parseSkill, skillLabel } from './rules.ts';
 import { applyProgressPatch, isEmptyPatch, parseProgressPatch } from './progress-patch.ts';
 import { type SrdEntry, type SrdKind, candidatesText, resolveSrdQuery, zhTable } from './srd-lookup.ts';
+import { type CardSpell, type SpellInput, type UrlCheck, mergeSpells, resolveSpells, spellLine } from './spell-links.ts';
+import { HOOK_TIERS, type HookResponse, addHook, closeHook, hookHint, hookLine, planHook, updateHook, useHook } from './hooks.ts';
 import {
+  type AreaRequest,
   type MoveRequest,
+  areaReport,
   type Placement,
   attackRangeNote,
   battleGridLines,
@@ -189,6 +193,8 @@ export interface DndToolDeps {
   onPendingAttack?(record: SessionRecord): void;
   /** 群成员短别名（#U3）和 openid 互换；不传时 declared_by / player_id 按原样当 openid */
   members?: MemberIds;
+  /** 写法术时验 wiki 链接；测试里替换掉，免得联网 */
+  checkUrl?: UrlCheck;
 }
 
 /** 模型只看得到群内短别名，要真实 openid 的参数由这里换回去 */
@@ -220,7 +226,11 @@ const TEXT_OUTPUT = {
  * （11-07 结果写着「命中【机密：AC 13】」「摇摇欲坠【机密：HP 1→7/40】」，群里照样出现「命中 AC 13」「还剩 7 点」）。
  * 成败工具已经判好，DM 用不上这些数字；真要看就 dnd_character show。
  */
-const SECRET_NOTE = '（群里只说命中没命中、过没过和伤势词）';
+/**
+ * 原来写「群里只说命中没命中、过没过和伤势词」，DM 读成连骰子也别念，玩家两次要求「攻击和伤害的过程要告诉我们」。
+ * 要藏的只是怪物的数值。
+ */
+const SECRET_NOTE = '（骰子和加值照写；怪物的 AC、HP、DC 不报，伤势只说伤势词）';
 /** 暗骰也要当场交代结果，只是不给数字：静默结算等于让玩家在黑箱里打架 */
 const HIDDEN_ROLL_NOTE = '（暗骰：不报点数和 DC，但要当场说结果：过了/没过，或角色察觉到/没察觉到什么）';
 
@@ -300,15 +310,40 @@ function strList(value: unknown): string[] | undefined {
   return value.filter((v): v is string => typeof v === 'string' && v.trim().length > 0).map((v) => v.trim());
 }
 
+/** 开战时的先攻加值表 {角色名: 骰子表达式}；数字也收，转成常数表达式 */
+function initiativeBonusArg(value: unknown): Record<string, string> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {};
+  const out: Record<string, string> = {};
+  for (const [rawName, rawExpr] of Object.entries(value as Record<string, unknown>)) {
+    const name = rawName.trim();
+    const expr = typeof rawExpr === 'number' ? String(rawExpr) : (typeof rawExpr === 'string' ? rawExpr.trim() : '');
+    if (name.length > 0 && expr.length > 0) out[name] = expr;
+  }
+  return out;
+}
+
 function advantageOf(value: unknown): Advantage {
   return value === 'advantage' || value === 'disadvantage' ? value : 'none';
 }
 
 /** 新建卡的名字含着一个还活着、还没上场的模组 NPC 的名字或别名（两个字以上） */
+/**
+ * 死了的也要拦：11-08 存档把内兹纳记成已死，DM 想让他出场时 fight=true 报「已经死了」，
+ * 就用 create 现建了一张没挂 npcId 的卡，数值也是现编的（多了一发模组里没有的火球）。
+ */
 function moduleNpcNamed(c: Campaign, adventure: Adventure, name: string): Npc | undefined {
   const bare = name.replace(/\d+$/, '');
-  return adventure.npcs.find((npc) => npcAlive(c, npc.id) && npcCharacter(c, npc.id) === undefined
-    && [npc.name, ...(npc.aliases ?? [])].some((n) => n.length >= 2 && bare.includes(n)));
+  return adventure.npcs.find((npc) => {
+    if (npcCharacter(c, npc.id) !== undefined) return false;
+    const names = [npc.name, ...(npc.aliases ?? [])].filter((n) => n.length >= 2);
+    // 死了的只拦同名：「黑蜘蛛的替身」这种冒名的生物要能建
+    return npcAlive(c, npc.id) ? names.some((n) => bare.includes(n)) : names.includes(bare);
+  });
+}
+
+/** 存档记他死了、桌上又说他活着时该怎么办 */
+function reviveHint(npc: Npc): string {
+  return `存档记 ${npc.name} 已死。本桌裁定他其实没死，就先 dnd_story npc ${npc.id} alive=true，再 fight=true 或 join=true（数据照模组，要加强用 hp 和 dnd_character update）。`;
 }
 
 function readChronicle(c: Campaign, action: 'search' | 'list', query: string | undefined): string {
@@ -400,6 +435,9 @@ function sheet(ch: Character, who: (openid: string) => string = (id) => id): str
     lines.push(`武器 ${w.name}${weaponTags(w)}：命中 ${hit >= 0 ? '+' : ''}${hit}，伤害 ${weaponDamage(ch, w)}${w.notes ? `（${w.notes}）` : ''}`);
   }
   if ((ch.reactions?.length ?? 0) > 0) lines.push(`反应：${ch.reactions!.map((r) => r.name).join('、')}`);
+  if ((ch.spells?.length ?? 0) > 0) lines.push(spellLine(ch.spells!));
+  const hooks = (ch.hooks ?? []).filter((h) => h.closed !== true);
+  if (hooks.length > 0) lines.push(`背景钩子 ${hooks.length} 条（dnd_hook list）`);
   if (ch.conditions.length > 0) lines.push(`状态：${ch.conditions.join('、')}`);
   if (ch.deathSaves !== undefined) lines.push(`死亡豁免：成功 ${ch.deathSaves.successes}/3 失败 ${ch.deathSaves.failures}/3`);
   const resources = Object.entries(ch.resources ?? {}).map(([k, r]) => `${k} ${r.current}/${r.max}（${{ short: '短休回满', long: '长休回满', none: '不回复' }[r.reset]}）`);
@@ -426,6 +464,19 @@ function parseSkills(values: string[] | undefined): Skill[] | undefined {
     const skill = parseSkill(v);
     if (skill === undefined) throw new Error(`未知技能: ${v}。可用：${Object.values(SKILLS).map((s) => s.name).join('、')}`);
     return skill;
+  });
+}
+
+function parseSpellInputs(value: unknown, field: string): SpellInput[] {
+  if (!Array.isArray(value)) throw new Error(`${field} 要是数组，如 [{name:"魔能爆", level:0}]`);
+  return value.map((raw, i) => {
+    const o = (raw ?? {}) as Record<string, unknown>;
+    const name = typeof o.name === 'string' ? o.name.trim() : '';
+    const level = typeof o.level === 'number' && Number.isInteger(o.level) ? o.level : NaN;
+    if (name === '') throw new Error(`${field}[${i}] 缺 name`);
+    if (!(level >= 0 && level <= 9)) throw new Error(`${field}[${i}]「${name}」的 level 要是 0-9（戏法填 0）`);
+    const en = typeof o.en === 'string' && o.en.trim() !== '' ? o.en.trim() : undefined;
+    return { name, level, ...(en !== undefined ? { en } : {}) };
   });
 }
 
@@ -981,6 +1032,10 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
       }
       // 豁免和死亡豁免是被动发生的，不需要宣告；攻击和检定是主动行动
       if (type !== 'save' && type !== 'death') {
+        // 借机攻击要花反应；受惊的人轮到自己之前没有反应。对抗检定也走 reaction=true，不拦
+        if (args.reaction === true && type === 'attack' && isSurprised(c, ch.name)) {
+          throw new Error(`${ch.name} 受惊，自己第一个回合过去之前不能反应，这次借机打不了`);
+        }
         // 打断回合顺序的反应/借机攻击之后，下一个 PC 回合重新给完整的停手提示
         if (args.reaction === true && c.initiative !== undefined) c.initiative.rebrief = true;
         assertCanAct(c, ch, actOptions());
@@ -1005,7 +1060,11 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         if (targetName === undefined) throw new Error('dnd_check: 攻击需要 target');
         const target = requireCharacter(c, targetName);
         const weaponName = str(args.weapon);
-        const weapon = weaponName === undefined ? undefined : findWeapon(ch, weaponName);
+        // srd 建的怪只有卡面上的攻击加值和伤害，没有武器列表：「咬」报错后 DM 只能战斗中逐只补武器。
+        // 没有武器列表的怪直接用卡面数值，武器名只当描述；PC 写错武器名仍然报错
+        const cardAttack = weaponName !== undefined && ch.kind !== 'pc' && (ch.weapons?.length ?? 0) === 0;
+        const weapon = weaponName === undefined || cardAttack ? undefined : findWeapon(ch, weaponName);
+        const label = weapon?.name ?? (cardAttack ? weaponName : undefined);
         const override = str(args.ability);
         const ability = override !== undefined ? parseAbility(override) : (weapon === undefined ? undefined : weapon.ability ?? 'str');
         const modifier = weapon !== undefined ? weaponAttackModifier(ch, weapon, ability) : attackModifier(ch, ability);
@@ -1013,7 +1072,7 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         const roll = rollD20(modifier + bonus, adv, service.roller);
         const crit = roll.natural === 20;
         const hit = crit || (roll.natural !== 1 && roll.total >= target.ac);
-        const lines = [`${ch.name}${weapon !== undefined ? `（${weapon.name}）` : ''} 攻击 ${target.name}：${roll.detail}${extraNote}${target.kind === 'monster' ? '' : ` vs AC ${target.ac}`} → ${crit ? '重击！' : (hit ? '命中' : (roll.natural === 1 ? '天然 1，失手' : '未命中'))} #R${id}${spentNote}`];
+        const lines = [`${ch.name}${label !== undefined ? `（${label}）` : ''} 攻击 ${target.name}：${roll.detail}${extraNote}${target.kind === 'monster' ? '' : ` vs AC ${target.ac}`} → ${crit ? '重击！' : (hit ? '命中' : (roll.natural === 1 ? '天然 1，失手' : '未命中'))} #R${id}${spentNote}`];
         const extra = str(args.damage);
         const expression = attackExpression(ch, weapon, extra);
         const defense = parseDefense(args.defense);
@@ -1133,8 +1192,13 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         required: ['by', 'name'],
         additionalProperties: false,
       },
-      decline: { type: 'array', items: { type: 'string' }, description: 'Characters whose player said they will not react to the pending roll.' },
-      settle: { type: 'boolean', description: 'Apply the pending roll. Refused while the reaction window is open and someone has not answered.' },
+      decline: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Characters who will not react: their player said no, or the player is away and has not answered for a while '
+          + '(the window has no time limit, so skipping an absent player is your call; say so in the reply).',
+      },
+      settle: { type: 'boolean', description: 'Apply the pending roll. Refused while someone has not answered (no time limit).' },
       cancel: { type: 'boolean', description: 'Drop the pending roll without applying it. Spent resources stay spent; if it should not have happened at all, use dnd_undo roll=.' },
       declared_by: { type: 'string', description: 'For reaction by a PC: member id of the player who said so (the #U number, pass "U3").' },
     },
@@ -1207,10 +1271,32 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
           + 'two-handed weapon dice) and "箭术" (+2 to hit with ranged weapons). With these set, never add them by hand.',
       },
       expertise: { type: 'array', items: { type: 'string' }, description: 'Skills with expertise (double proficiency), e.g. ["巧手","隐匿"].' },
+      spells: {
+        type: 'array',
+        description: 'Spells the character knows or has prepared, replacing the list. Fill it whenever a caster\'s sheet is '
+          + 'written or levels up: players open it from the 「我的法术」 turn button, each with a wiki link. The English '
+          + 'wiki link is checked when written; give `en` when the Chinese name is not an SRD spell (脆弱诅咒 → Hex).',
+        items: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Chinese name as the table says it.' },
+            level: { type: 'integer', description: '0 for cantrips.' },
+            en: { type: 'string', description: 'English name, when the Chinese one is not in the SRD table.' },
+          },
+          required: ['name', 'level'],
+          additionalProperties: false,
+        },
+      },
+      add_spells: { type: 'array', description: 'Spells learned (same shape as spells); replaces one of the same name.', items: { type: 'object' } },
+      remove_spells: { type: 'array', items: { type: 'string' }, description: 'Spells forgotten or swapped out, by name.' },
       add_items: { type: 'array', items: { type: 'string' }, description: 'Items picked up.' },
       remove_items: { type: 'array', items: { type: 'string' }, description: 'Items used up or handed over.' },
       gp_change: { type: 'integer', description: 'Gold gained (+) or spent (-).' },
-      kind: { type: 'string', enum: ['pc', 'npc', 'monster'] },
+      kind: {
+        type: 'string',
+        enum: ['pc', 'npc', 'monster'],
+        description: 'npc = on the party\'s side. Anyone fighting the party, named villains included, is monster: npc cards count as allies, so their AC and HP show and reactions against them are not offered.',
+      },
       player: { type: 'string', description: 'Player nickname in the group (PCs).' },
       player_id: { type: 'string', description: 'Player member id from their tag "[昵称 #U3]" (pass "U3") (PCs). Binds the PC so only this player can act for it.' },
       class_name: { type: 'string', description: 'e.g. 战士 / 法师 / 游荡者' },
@@ -1261,6 +1347,30 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
       // SRD 数据先取回来（网络请求不能放进同步的 mutate 里）
       const srdIndex = action === 'create' ? str(args.srd) : undefined;
       const srdBase = srdIndex === undefined ? undefined : srdMonsterInput(await requireSrd('monsters', srdIndex));
+      // 法术链接要联网验，放在改存档之前：验不过整张卡都不动
+      const spellArgs = args.spells === undefined ? undefined : parseSpellInputs(args.spells, 'spells');
+      const addSpellArgs = args.add_spells === undefined ? undefined : parseSpellInputs(args.add_spells, 'add_spells');
+      const spellNotes: string[] = [];
+      let newSpells: CardSpell[] | undefined;
+      let addSpells: CardSpell[] = [];
+      if (spellArgs !== undefined || addSpellArgs !== undefined) {
+        const list = await srdList('spells');
+        const slugOf = (name: string): string | undefined => {
+          const r = resolveSrdQuery(name, list, zhTable('spells'));
+          return r.kind === 'exact' ? r.index : undefined;
+        };
+        if (spellArgs !== undefined) {
+          const r = await resolveSpells(spellArgs, slugOf, deps.checkUrl);
+          newSpells = r.spells;
+          spellNotes.push(...r.notes);
+        }
+        if (addSpellArgs !== undefined) {
+          const r = await resolveSpells(addSpellArgs, slugOf, deps.checkUrl);
+          addSpells = r.spells;
+          spellNotes.push(...r.notes);
+        }
+      }
+      const removeSpells = strList(args.remove_spells) ?? [];
       return mutate(exec, (c, adventure) => {
         const name = str(args.name);
         if (name === undefined) throw new Error('dnd_character: name 不能为空');
@@ -1268,6 +1378,7 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         if (action === 'create' && str(args.kind) !== 'pc') {
           // 11-05 黑蜘蛛被现场建成「黑蜘蛛·内兹纳尔」，死讯没挂到模组的内兹纳上，神庙的剧本还让他再出场一次
           const npc = moduleNpcNamed(c, adventure, name);
+          if (npc !== undefined && !npcAlive(c, npc.id)) throw new Error(`「${name}」是模组里的具名 NPC ${npc.name}(${npc.id})。${reviveHint(npc)}`);
           if (npc !== undefined) {
             throw new Error(`「${name}」是模组里的具名 NPC ${npc.name}(${npc.id})：上场用 dnd_story npc ${npc.id} fight=true（同行用 join=true），数据照模组。确实是另一个生物就换个不含「${npc.name}」和他别名的名字。`);
           }
@@ -1314,7 +1425,14 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         const remove = strList(args.remove_items) ?? [];
         const gp = int(args.gp_change) ?? 0;
         if (add.length > 0 || remove.length > 0 || gp !== 0) changeInventory(c, character.name, add, remove, gp);
+        const itemHint = add.length > 0 ? hookHint(c, add.join('\n')) : undefined;
+        if (newSpells !== undefined || addSpells.length > 0 || removeSpells.length > 0) {
+          const ch = requireCharacter(c, character.name);
+          ch.spells = mergeSpells(newSpells ?? ch.spells ?? [], addSpells, removeSpells);
+        }
         lines.push(sheet(requireCharacter(c, character.name), whoOf(exec)));
+        if (spellNotes.length > 0) lines.push(`【DM】${spellNotes.join('；')}`);
+        if (itemHint !== undefined) lines.push(itemHint);
         return lines.join('\n');
       });
     },
@@ -1381,7 +1499,11 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
   register(
     'dnd_initiative',
     'Combat rounds. start: roll initiative for everyone alive in the current room (or the given participants) and '
-    + 'sort. next: end the current creature\'s turn (on a PC turn only that player can end it: pass declared_by). '
+    + 'sort. Pass `surprised` with everyone caught off guard (the ambushed side, sleeping guards): the tool skips their '
+    + 'round-1 turn by itself and they cannot react until it has passed, so never ask those players to click end turn. '
+    + 'Before rolling, collect every effect that adds to initiative (灵敏之赐 +1d8, 警觉 +5, 状态/专长) and '
+    + 'pass it in `bonus` as {name: dice expression} — the tool rolls it in, so never add it by hand afterwards. '
+    + 'next: end the current creature\'s turn (on a PC turn only that player can end it: pass declared_by). '
     + 'join: add late arrivals (teammates who caught up, newly spawned monsters) to the running fight: rolls '
     + 'initiative only for `participants` and slots them in, keeping the round and everyone else\'s order; never '
     + 'end+start just to add someone. '
@@ -1391,6 +1513,12 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
       action: { type: 'string', enum: ['start', 'join', 'next', 'goto', 'end', 'status'] },
       participants: { type: 'array', items: { type: 'string' }, description: 'Optional for start; required for join.' },
       room: { type: 'string', description: 'For start: room id where the fight happens (default: the party\'s main room).' },
+      bonus: {
+        type: 'object',
+        additionalProperties: { type: 'string' },
+        description: 'For start: initiative bonuses already in effect, {name: dice expression}, e.g. {"奇塔露":"1d8"} for 灵敏之赐 or {"卡厄斯":"5"}. Rolled into the total by the tool.',
+      },
+      surprised: { type: 'array', items: { type: 'string' }, description: 'For start: participants who are surprised; the tool skips their first turn.' },
       name: { type: 'string', description: 'For goto.' },
       round: { type: 'integer', description: 'For goto.' },
       declared_by: { type: 'string', description: 'For next on a PC turn: member id (the #U number in "[昵称 #U3]", pass "U3") of that PC\'s player, who said they are done.' },
@@ -1408,11 +1536,19 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         const roomArg = str(args.room);
         const room = roomArg === undefined ? undefined : resolveRoom(roomGraph(adventure), roomArg)?.id;
         if (roomArg !== undefined && room === undefined) throw new Error(`没有这个房间: ${roomArg}`);
-        const rolls = startInitiative(c, service.roller, strList(args.participants), room);
+        const surprised = strList(args.surprised) ?? [];
+        const rolls = startInitiative(c, service.roller, strList(args.participants), room, initiativeBonusArg(args.bonus), surprised);
+        const { skipped } = skipSurprised(c);
         turnChanged();
+        const state = requireInitiative(c);
+        const surpriseNote = surprised.length === 0 ? ''
+          : `\n【突袭】受惊的人第 1 轮整回合由工具跳过，跳过之前也不能反应：${surprised.join('、')}。不用叫他们点结束回合。`
+            + (skipped.length > 0 ? `已跳过：${skipped.join('、')}。` : '');
         const away = positionNote(c, adventure, rolls.map((r) => r.name), new Set([room ?? c.currentRoom]));
         const field = battlemapHint(c, adventure, room ?? c.currentRoom);
-        return `先攻：\n${rolls.map((r, i) => `${i + 1}. ${r.name} ${r.detail}`).join('\n')}\n${field}\n第 1 轮，${combatTurnPrompt(c, rolls[0]!.name, { recentSenders: sendersOf(exec) })}${away}`;
+        const unused = Object.keys(initiativeBonusArg(args.bonus)).filter((n) => !rolls.some((r) => r.name === n));
+        const warn = unused.length > 0 ? `\n【DM】bonus 里这几个名字不在参战者里，没算进去：${unused.join('、')}` : '';
+        return `先攻：\n${rolls.map((r, i) => `${i + 1}. ${r.name} ${r.detail}`).join('\n')}\n${field}${surpriseNote}\n第 ${state.round} 轮，${combatTurnPrompt(c, state.order[state.turn]!.name, { recentSenders: sendersOf(exec) })}${away}${warn}`;
       }
       if (action === 'join') {
         const rooms = fightRooms(c);
@@ -1429,10 +1565,11 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
       }
       if (action === 'next') {
         assertCanEndTurn(c, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec), dmOverride: args.dm_override === true });
-        const { round, current, newRound } = nextTurn(c);
+        const { round, current, newRound, skipped } = nextTurn(c);
         turnChanged();
+        const skippedNote = skipped.length > 0 ? `受惊跳过：${skipped.join('、')}（这一回合什么都做不了，回复里一句带过）。\n` : '';
         // 新一轮把顺序带上，DM 照着列给玩家，不用守则里再交代
-        return `${newRound ? `进入第 ${round} 轮（回复里把这一轮的顺序列一遍）：${orderLine(c)}\n` : ''}${combatTurnPrompt(c, current.name, { recentSenders: sendersOf(exec) })}`;
+        return `${skippedNote}${newRound ? `进入第 ${round} 轮（回复里把这一轮的顺序列一遍）：${orderLine(c)}\n` : ''}${combatTurnPrompt(c, current.name, { recentSenders: sendersOf(exec) })}`;
       }
       if (action === 'goto') {
         const entry = gotoTurn(c, String(args.name ?? ''), int(args.round));
@@ -1510,7 +1647,7 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         // 剧本写着他在这儿，可他已经在别处死了（黑蜘蛛在洞外被打死，神庙的剧本还让他开打）
         const goneHere = adventure.npcs.filter((n) => npcRoom(c, n) === result.room.id && !npcAlive(c, n.id) && npcCharacter(c, n.id) === undefined);
         if (goneHere.length > 0) {
-          lines.push(`【DM】本桌已死：${goneHere.map((n) => `${n.name}(${n.id})`).join('、')}。上面剧本里他在场的部分作废，房间按他不在写；他身上的东西已经搜过就不再出现。`);
+          lines.push(`【DM】本桌已死：${goneHere.map((n) => `${n.name}(${n.id})`).join('、')}。上面剧本里他在场的部分作废，房间按他不在写；他身上的东西已经搜过就不再出现。和账本里的裁定对不上时先问桌上，裁定他活着就 dnd_story npc <id> alive=true。`);
         }
         // 房间文本是首次进门的剧本，不跟踪打完的仗；就在这里提醒，这是重放开场伏击的那一步
         if (!result.firstVisit) lines.push('【DM】这里来过：上面是首次进门的剧本，不跟踪清空的怪、已触发的事件、搜过的东西。现况按团况和敌人名单说，别重放打过的仗。');
@@ -1518,12 +1655,20 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
       }
       if (result.spawned.length > 0) {
         lines.push(`【DM 机密】本房间敌人：${result.spawned.map(spawnLine).join('；')}`);
+        const scale = partySizeHint(c, adventure);
+        if (scale !== undefined) lines.push(scale);
       }
       if (result.movers.length > 0) {
         const npcs = npcsIn(c, adventure, result.room.id);
         if (npcs.length > 0) lines.push(`【DM】这里的 NPC（dnd_lookup npc 看详情）：${npcs.map((n) => `${n.name}(${n.id})：${n.look}`).join('；')}`);
         const pending = pendingTriggers(c, adventure, result.room.id);
         if (pending.length > 0) lines.push(`【DM】这里可能发生（吻合时 dnd_story trigger）：${pending.map((t) => `${t.id}：${t.when}`).join('；')}`);
+        // 只在首次进门时提：走回头路每次都提，DM 会学会无视它
+        if (result.firstVisit) {
+          const scene = [result.site.name, result.room.name, result.view.playerView, result.view.dmNotes, ...npcs.map(npcSceneText), ...pending.map((t) => t.when)];
+          const hint = hookHint(c, scene.join('\n'), result.movers);
+          if (hint !== undefined) lines.push(hint);
+        }
       }
       lines.push(`可见出口：${result.exits.map((e) => `${e.label} → ${e.known ? e.name : '未探索'}(${e.to})${e.locked === true ? '[暂时过不去]' : ''}`).join('；') || '无'}`);
       const positions = partyPositions(c);
@@ -1550,10 +1695,21 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
     + 'move: one creature moves on its own turn. Prefer intent over coordinates: `to` a creature (ends adjacent), a '
     + 'door, the corridor outside, an obstacle; `away_from` a creature; `feet` caps the distance; `keep_adjacent` '
     + 'when the player says to stay next to someone; dash / drag / disengage as declared. Use x/y only when the '
-    + 'player named a cell. show: everyone\'s positions; with `from`, distances from that creature. remove: drop a mark '
+    + 'player named a cell. area: before an area spell or breath (fireball, hypnotic pattern, lightning bolt), list who the '
+    + 'shape covers so the placement is checked on the grid instead of guessed; tell the players honestly if an ally is in it. '
+    + 'show: everyone\'s positions; with `from`, distances from that creature. remove: drop a mark '
     + 'or placement (never remove someone who just stepped outside: move them `to` the corridor outside).',
     {
-      action: { type: 'string', enum: ['terrain', 'set', 'move', 'show', 'remove'] },
+      action: { type: 'string', enum: ['terrain', 'set', 'move', 'area', 'show', 'remove'] },
+      shape: {
+        type: 'string',
+        enum: ['sphere', 'cube', 'line'],
+        description: 'For area: sphere = radius around a point (fireball 20); cube = x/y is the north-west corner (hypnotic pattern 30); '
+          + 'line = from the caster toward x/y or `at` (lightning bolt 100, breath 30). Cones are not computed.',
+      },
+      size: { type: 'integer', description: 'For area: radius / side / length in feet.' },
+      at: { type: 'string', description: 'For area: centre (sphere) or direction (line) on this creature or mark instead of x/y.' },
+      caster: { type: 'string', description: 'For area: who casts it; sorts the covered into foes and allies, and is the start of a line.' },
       room: { type: 'string', description: 'For terrain: room id (default: the room of the fight / the party).' },
       width: { type: 'integer', description: 'For terrain: map width in cells, including walls and corridor cells (max 40).' },
       height: { type: 'integer', description: 'For terrain: map height in cells (max 40).' },
@@ -1630,6 +1786,22 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         const grid = c.initiative === undefined ? undefined : battleGridLines(c, roomName);
         if (grid !== undefined) lines.push('', ...grid);
         return lines.join('\n');
+      }
+      if (action === 'area') {
+        const shape = str(args.shape);
+        if (shape !== 'sphere' && shape !== 'cube' && shape !== 'line') throw new Error('area 要给 shape：sphere / cube / line');
+        const size = int(args.size);
+        if (size === undefined) throw new Error('area 要给 size（尺）');
+        const request: AreaRequest = { shape, size };
+        const at = str(args.at);
+        const caster = str(args.caster);
+        const x = int(args.x);
+        const y = int(args.y);
+        if (at !== undefined) request.at = at;
+        if (caster !== undefined) request.caster = caster;
+        if (x !== undefined) request.x = x;
+        if (y !== undefined) request.y = y;
+        return areaReport(c, request);
       }
       if (action === 'set') {
         const notes = setPositions(c, parsePlacements(args.placements));
@@ -1725,6 +1897,10 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
       return mutate(exec, (c, adventure) => {
         const lines = storyAction(c, adventure, action, id, args, srdBase);
         for (const line of lines) pushLog(c, line);
+        // NPC 第一次照面、入队、翻脸：DM 正要给他台词，这时候提来历最用得上
+        const npc = action === 'npc' && (args.met === true || args.join === true || args.fight === true) ? findNpc(adventure, id) : undefined;
+        const hint = npc === undefined ? undefined : hookHint(c, npcSceneText(npc));
+        if (hint !== undefined) lines.push(hint);
         return lines.join('\n');
       });
     },
@@ -1736,7 +1912,8 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
     + 'whether it was said, quests they offer), quest, site (rules, rooms, what groups there know), room (notes, '
     + 'events, NPCs), leads (all leads and which the players know). Omit id to list everything of that kind. '
     + 'brief=true (npc/room) returns one line: who is there with HP/conditions, attitude, unfired event and '
-    + 'unsaid fact ids. Use it for quick checks; read the full card before revealing facts or ruling on DM notes.',
+    + 'unsaid fact ids. Use it for quick checks; read the full card before revealing facts or ruling on DM notes. '
+    + 'Read-only access also works while paused for explicitly requested DM preparation; never use it to spoil future scenes in chat.',
     {
       kind: { type: 'string', enum: ['npc', 'quest', 'site', 'room', 'leads'] },
       id: { type: 'string', description: 'Id or name; omit to list.' },
@@ -1744,31 +1921,41 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
     },
     ['kind'],
     (args, exec) => {
-      const { campaign, adventure } = service.require(recordOf(exec).sessionKey);
+      const key = recordOf(exec).sessionKey;
+      const found = service.active(key) ?? service.saved(key);
+      if (found === undefined) throw new Error('这个群没有团档（或模组文件丢失）');
+      const { campaign, adventure } = found;
       return lookup(campaign, adventure, String(args.kind), str(args.id), args.brief === true);
     },
   );
 
   register(
     'dnd_map',
-    'Send the map of where the party is to the group as an image. Uses the module book\'s player map when the site has one '
-    + '(rooms not yet visited are blacked out, cropped to the explored part); otherwise draws a schematic of the explored rooms.',
+    'Send a map to the group as an image. During a fight (initiative running, positions set) it sends the battle map of '
+    + 'the fight\'s room: the room\'s terrain (on the module book\'s art when the room has it) with everyone\'s position, '
+    + 'grid coordinates matching dnd_position, hidden monsters left out. Send it once positions are set at the start of a '
+    + 'fight and whenever players ask where things are, not every turn. Outside a fight it sends the exploration map: the '
+    + 'book\'s player map with unvisited rooms blacked out, or a schematic when the site has none.',
     {
       caption: { type: 'string', description: 'Optional short text sent with the map.' },
-      schematic: { type: 'boolean', description: 'Force the box-and-line schematic even when a book map exists.' },
+      view: { type: 'string', enum: ['auto', 'battle', 'explore'], description: 'auto (default): battle map during a fight, else the exploration map.' },
+      schematic: { type: 'boolean', description: 'Exploration map only: force the box-and-line schematic even when a book map exists.' },
     },
     [],
     async (args, exec) => {
       const record = recordOf(exec);
       const { campaign, adventure } = service.require(record.sessionKey);
       const out = join(service.mapDir, `${record.sessionKey.replace(/[^a-zA-Z0-9_-]+/g, '_')}-${Date.now()}.png`);
-      const book = args.schematic === true ? undefined : await renderBookMap(campaign, adventure, out);
-      const path = book ?? await renderMapPng(campaign, adventure, out);
-      if (path === undefined) throw new Error('dnd_map: 地图渲染需要 sharp，当前环境没装上');
-      await deps.sendImage(record, path, str(args.caption));
-      const { site, seen, total } = explored(campaign, adventure);
-      const kind = book !== undefined ? '模组地图' : '示意图';
-      return `「${site?.name ?? adventure.name}」${kind}已发到群里（已探索 ${seen}/${total} 个房间）。不用再复述地图内容。`;
+      const view = (['battle', 'explore'] as const).find((v) => v === args.view) ?? 'auto';
+      const map = await renderPartyMap(campaign, adventure, out, view, { schematic: args.schematic === true })
+        .catch((err: unknown) => { throw new Error(`dnd_map: ${err instanceof Error ? err.message : String(err)}，先 dnd_position terrain 画一张`); });
+      if (map === undefined) throw new Error('dnd_map: 地图渲染需要 sharp，当前环境没装上');
+      // 地点、轮次、轮到谁画在图的标题条上；图例、能去哪附在图下面（DM 自己的话放最前）
+      const caption = [str(args.caption), mapCaption(campaign, adventure, map.kind)].filter((s) => s !== undefined && s.length > 0).join('\n');
+      await deps.sendImage(record, map.path, caption);
+      return map.kind === 'battle'
+        ? '战斗图已发，图下附了图例（坐标和 dnd_position 一致）。图上和图例里有的别再复述。'
+        : '地图已发，图下附了能去的地方。图上和说明里有的别再复述。';
     },
   );
 
@@ -1778,7 +1965,11 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
     + 'say they will stop soon, or they ask to save (存档). Progress is organised in sections 【位置】【队伍】'
     + '【物品与欠账】【任务与线头】【待办】. Send ONLY what changed: `set` replaces whole sections, `append` adds '
     + 'items, `remove` deletes items (any line containing the text); the tool merges them into the latest save. '
-    + 'Use `summary` only for the first save or a full rewrite. Only the merged latest one is injected next time. '
+    + 'At a session handoff also record 【刚刚发生】【已定行动】【同行与留守】【未结事项】【下次接续】: '
+    + 'the exact narrative stopping point, last event, choices already made, NPC whereabouts, open matters and next step. '
+    + 'Use `summary` for the first save or a full rewrite. Unsectioned old saves become 【旧进度】, removable with set={"旧进度":""} '
+    + 'after keeping unresolved matters. The entire merged save must fit 1500 characters; oversized writes are rejected and the old save stays intact. '
+    + 'Only the merged latest one is injected next time. '
     + 'Player-known information only: no DCs, monster stats or DM-only notes. Use this instead of '
     + 'qqbot_notes_save for campaign progress.',
     {
@@ -1813,7 +2004,6 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
         const notes = [
           result.changed.length > 0 ? `改了：${result.changed.join('、')}` : '',
           result.missed.length > 0 ? `没找到要删的：${result.missed.join('；')}` : '',
-          result.text.length > SUMMARY_MAX_CHARS ? `进度超过 ${SUMMARY_MAX_CHARS} 字被截断，删掉做完的条目或精简一下` : '',
         ].filter(Boolean);
         return `已写进团档，下次开团的「上次进度」用这一条。${notes.length > 0 ? `\n${notes.join('\n')}` : ''}`;
       });
@@ -1861,22 +2051,124 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): void {
   );
 
   register(
+    'dnd_hook',
+    'Backstory hooks on PC sheets: unresolved things from a character\'s past that the PLAYER told you (someone they '
+    + 'look for, a debt, a place they fled). Never invent one for them. add: the player\'s words plus trigger words '
+    + '(names, places, groups, objects, 2+ characters); from then on room entries, NPC meetings and found items that '
+    + 'mention a trigger word carry a 【DM · 背景钩子】 note. Whether to use it is your call. Tiers: 1 a detail in the '
+    + 'scene, 2 an NPC line (both at will); 3 a message arrives, 4 a dilemma (plan first, play it a scene or a session '
+    + 'later); 5 the person shows up (plan, ask the player, then player_ok=true). use: after you played a tier, with '
+    + 'response bit/ignored once the player reacted. If a player ignored it, wait before pushing again. list: all hooks, '
+    + 'least recently touched first. close: the matter is settled.',
+    {
+      action: { type: 'string', enum: ['add', 'update', 'list', 'plan', 'use', 'close'] },
+      character: { type: 'string', description: 'PC name (not needed for list).' },
+      id: { type: 'integer', description: 'Hook number on that PC (update/plan/use/close).' },
+      text: { type: 'string', description: 'add/update: the unresolved matter, in the player\'s words. plan: how and when you will play it.' },
+      keys: { type: 'array', items: { type: 'string' }, description: 'add/update: trigger words, e.g. ["拉西亚","红袍法师"].' },
+      tier: { type: 'integer', description: 'plan/use: 1-5 (see the tool description).' },
+      response: { type: 'string', enum: ['bit', 'ignored'], description: 'use: whether the player picked it up.' },
+      player_ok: { type: 'boolean', description: 'use tier 5: the player agreed to this person appearing.' },
+    },
+    ['action'],
+    (args, exec) => {
+      const action = String(args.action);
+      if (action === 'list') {
+        const key = recordOf(exec).sessionKey;
+        const found = service.active(key) ?? service.saved(key);
+        if (found === undefined) throw new Error('这个群没有团档');
+        const pcs = found.campaign.characters.filter((ch) => ch.kind === 'pc');
+        const lines = pcs.flatMap((ch) => (ch.hooks ?? []).map((h) => ({ ch, h })))
+          .sort((a, b) => Number(a.h.closed === true) - Number(b.h.closed === true) || (a.h.usedAt ?? 0) - (b.h.usedAt ?? 0))
+          .map(({ ch, h }) => `- ${hookLine(ch, h)}`);
+        const none = pcs.filter((ch) => (ch.hooks ?? []).every((h) => h.closed === true)).map((ch) => ch.name);
+        return [
+          lines.length > 0 ? `背景钩子（最久没碰的在前）：\n${lines.join('\n')}` : '还没有背景钩子。',
+          none.length > 0 ? `还没留过（或都了结了）：${none.join('、')}。有机会问问玩家角色有什么放不下的事。` : '',
+          `档位：${HOOK_TIERS.slice(1).map((t, i) => `${i + 1} ${t}`).join('；')}`,
+        ].filter(Boolean).join('\n');
+      }
+      return mutate(exec, (c) => {
+        const ch = requireCharacter(c, String(args.character ?? ''));
+        const id = int(args.id);
+        const needId = (): number => {
+          if (id === undefined) throw new Error(`dnd_hook ${action} 要给 id`);
+          return id;
+        };
+        if (action === 'add') {
+          const hook = addHook(ch, String(args.text ?? ''), strList(args.keys) ?? []);
+          addEntry(c, { kind: 'backstory', text: `${ch.name} 的背景钩子 #${hook.id}：${hook.text}` });
+          return `已挂上：${hookLine(ch, hook)}`;
+        }
+        if (action === 'update') {
+          const keys = strList(args.keys);
+          return `已改：${hookLine(ch, updateHook(ch, needId(), { ...(str(args.text) !== undefined ? { text: str(args.text)! } : {}), ...(keys !== undefined ? { keys } : {}) }))}`;
+        }
+        if (action === 'plan') {
+          const tier = int(args.tier) ?? 0;
+          const hook = planHook(ch, needId(), tier, String(args.text ?? ''));
+          return `已记下打算：${hookLine(ch, hook)}${tier === 5 ? `\n演之前先问 ${ch.player ?? ch.name} 同不同意，点头了再 use player_ok=true。` : ''}`;
+        }
+        if (action === 'use') {
+          const tier = int(args.tier) ?? 0;
+          const response = str(args.response) as HookResponse | undefined;
+          const hook = useHook(ch, needId(), tier, { ...(response !== undefined ? { response } : {}), playerOk: args.player_ok === true });
+          addEntry(c, { kind: 'backstory', repeatable: true, text: `${ch.name} 的钩子 #${hook.id}（${hook.text.slice(0, 30)}）演到第 ${tier} 档：${HOOK_TIERS[tier]}${response === 'bit' ? '，玩家接了' : (response === 'ignored' ? '，玩家没接' : '')}` });
+          const next = response === 'ignored' ? '玩家没接，过一阵再碰，别连着推。' : '';
+          return `已记：${hookLine(ch, hook)}${next ? `\n${next}` : ''}`;
+        }
+        if (action === 'close') {
+          const hook = closeHook(ch, needId());
+          addEntry(c, { kind: 'backstory', text: `${ch.name} 的钩子 #${hook.id} 了结：${hook.text}` });
+          return `已了结：${hookLine(ch, hook)}`;
+        }
+        throw new Error(`dnd_hook 不认识的 action: ${action}`);
+      });
+    },
+  );
+
+  register(
+    'dnd_prepare',
+    'Private DM preparation for the next session; works both while active and paused. show returns current recorded state, '
+    + 'handoff, open matters, backstory hooks and any saved plan. save stores a complete DM-only candidate plan (max 2000 characters): '
+    + 'possible next scenes/NPCs/rules/hooks and questions to verify; look up stat blocks when needed instead of copying them into the plan. clear removes the plan. This never starts play or changes '
+    + 'characters, quests or resources. Plans are NOT events that happened; never send the plan or tool output to players. '
+    + 'If state changed since planning, show flags it for review. Read module details with dnd_lookup when preparing.',
+    {
+      action: { type: 'string', enum: ['show', 'save', 'clear'] },
+      plan: { type: 'string', description: 'For save: the full private candidate plan, not a recap of established facts.' },
+    },
+    ['action'],
+    (args, exec) => {
+      const key = recordOf(exec).sessionKey;
+      if (args.action === 'show') return service.preparationContext(key);
+      if (args.action === 'clear') {
+        service.savePreparation(key, '');
+        return '已清除 DM 备团计划，团况未变。';
+      }
+      if (args.action !== 'save' || str(args.plan) === undefined) throw new Error('dnd_prepare save 要给非空 plan');
+      service.savePreparation(key, str(args.plan)!);
+      return '已保存 DM 私有备团计划；它尚未发生，下次开团会核对团况后供参考，不向玩家转发。';
+    },
+  );
+
+  register(
     'dnd_end',
-    'End tonight\'s session when players want to stop. Write a story summary (what happened, party state, open '
-    + 'threads); it is saved and injected next time the game starts. Progress is saved automatically after every '
-    + 'change: do NOT call this when players only ask to save (存档) — it ends the game and every roll fails until /dnd start.',
-    { summary: { type: 'string' } },
-    ['summary'],
+    'Pause tonight\'s session using the SAME end operation as the player command /dnd end. Combat initiative, positions '
+    + 'and pending reactions are preserved. Optional summary (max 1500 characters) is a full handoff: 【位置】【刚刚发生】'
+    + '【已定行动】【同行与留守】【未结事项】【下次接续】, player-known facts only. Without summary, keeps the last save '
+    + 'and adds a separate handoff of later tool facts. Oversized summaries reject the whole operation; nothing is truncated. '
+    + 'May also supplement a handoff after players already paused; this does not restart play. For a save without pausing '
+    + 'use dnd_progress. For private future plans use dnd_prepare.',
+    { summary: { type: 'string', description: 'Optional complete handoff, at most 1500 characters. Not DM future plans.' } },
+    [],
     (args, exec) => {
       const record = recordOf(exec);
       const text = str(args.summary);
-      if (text === undefined) throw new Error('dnd_end: summary 不能为空');
-      const state = mutate(exec, (c, adventure) => {
-        addSummary(c, text);
-        return summarize(c, adventure);
-      });
-      service.stop(record.sessionKey);
-      return `已结团并保存进度。下次发送 /dnd start 继续。\n${state}`;
+      if (args.summary !== undefined && text === undefined) throw new Error('dnd_end: summary 不能为空');
+      const stopped = service.stop(record.sessionKey, text);
+      if (stopped === undefined) return '现在没有进行中的团。';
+      return '已暂停并保存进度与停团交接，战斗状态保留。下次发送 /dnd start 继续。要核对交接用 dnd_prepare show，别把 DM 私有资料发到群里。';
     },
   );
 
@@ -2000,7 +2292,7 @@ export function storyAction(
     if (args.join === true || args.fight === true) {
       if (args.join === true && args.fight === true) throw new Error('join 和 fight 只能选一个');
       const mode = args.join === true ? 'join' : 'fight';
-      if (!npcAlive(c, npc.id)) throw new Error(`${npc.name} 已经死了`);
+      if (!npcAlive(c, npc.id)) throw new Error(`${npc.name} 已经死了。${reviveHint(npc)}`);
       const hp = int(args.hp);
       const { character, created } = upsertCharacter(c, { ...npcCharacterInput(c, npc, mode, srdBase), ...(hp !== undefined ? { hp } : {}) });
       // 态度本来就对时 updateNpc 只回一句「已更新」，上场这里不用重复
@@ -2083,7 +2375,11 @@ function battlemapHint(c: Campaign, adventure: Adventure, room: string): string 
   }
   const from = c.enteredFrom?.[room];
   const door = from === undefined ? undefined : map.areas.find((a) => a.kind === 'door' && a.to === from);
-  return `【场地】${terrainLine(map)}。`
+  // 从书里的地图生成的场地图只标了屋子轮廓外的墙；屋里的石柱、坑、隔墙、门要 DM 照房间描述补
+  const artNote = map.art !== undefined && !map.areas.some((a) => a.kind !== 'wall')
+    ? `这张场地图用模组地图做底图（dnd_map 发给玩家看），只标了屋子轮廓外的墙（涂黑的格子自动算墙）：屋里的石柱、坑、隔墙、门和障碍要按房间描述用 dnd_position terrain 补上（width=${map.width} height=${map.height} 不变就保留底图）。`
+    : '';
+  return `【场地】${terrainLine(map)}。${artNote}`
     + (door !== undefined ? `队伍是从「${areaName(door)}」进来的：PC 用 set placements near="${areaName(door)}" 摆在门边。` : 'PC 摆位可以用 near=门或地标的名字。');
 }
 
@@ -2106,6 +2402,27 @@ function orderLine(c: Campaign): string {
  * 战斗中有人走进交战房间、或者刷出了新怪时，提醒模型用 join 拉进先攻表；
  * 不提醒的话模型要么让他们一直站着不动，要么 end 再 start 把整场重来。
  */
+/** 拿去对背景钩子触发词的 NPC 文字：名字、别名、身份、阵营、外貌 */
+function npcSceneText(npc: Npc): string {
+  return [npc.name, ...(npc.aliases ?? []), npc.role, npc.faction ?? '', npc.look].join('\n');
+}
+
+/** 模组没写人数时按官方默认 4 人 */
+const DEFAULT_PARTY_SIZE = 4;
+
+/**
+ * 本桌人比模组多时，刷怪那一步给出调强度的规矩。11-08 的内兹纳是现场凭感觉加强的（多一发火球、HP 照现编的 45 算），
+ * 也没先跟桌上说；规矩放在刷怪的结果里，DM 正好在决定这一场怎么打。
+ */
+export function partySizeHint(c: Campaign, adventure: Adventure): string | undefined {
+  const pcs = c.characters.filter((ch) => ch.kind === 'pc' && !isOut(ch)).length;
+  const design = adventure.partySize ?? DEFAULT_PARTY_SIZE;
+  if (pcs <= design) return undefined;
+  return `【DM】模组按 ${design} 人写，本桌 ${pcs} 人。要调就在开打前定：小怪最多 ${Math.floor(pcs * 1.5)} 只（PC 数 ×1.5）；`
+    + '首领 HP 最多按模组卡 ×1.5（以 dnd_lookup 查到的模组数值为准）；想加压力先换一只更强的、或给网、黑暗、地形，别堆数量。'
+    + '调过就先在群里说一句「这一段我上调过」（不说细节），再 dnd_chronicle add kind=ruling 记下调了什么。';
+}
+
 export function combatJoinHint(c: Campaign, room: string, movers: string[], spawned: string[]): string | undefined {
   if (c.initiative === undefined) return undefined;
   const fightRooms = new Set(c.initiative.order.map((e) => {

@@ -2,7 +2,7 @@
  * dnd_progress 的增量写入：进度文本按「【段名】」分段，模型只交改动的段（set 覆盖、append 追加条目、remove 删条目），
  * 由这里和上一条进度合并。以前每次都要整份重写，存一次档就把整段进度再生成一遍。
  *
- * 不带段头的旧进度（或停团兜底摘要）整体算作开头的无名段，原样保留，新段接在后面。
+ * 不带段头的旧进度迁到可编辑的【旧进度】，避免它永远占在开头、模型却删不掉。
  */
 
 export interface ProgressSection {
@@ -71,6 +71,7 @@ export function isEmptyPatch(patch: ProgressPatch): boolean {
 
 export function applyProgressPatch(base: string | undefined, patch: ProgressPatch): PatchResult {
   const sections = parseProgress(base ?? '');
+  for (const section of sections) if (section.name === '') section.name = '旧进度';
   const changed = new Set<string>();
   const missed: string[] = [];
   const get = (name: string): ProgressSection => {

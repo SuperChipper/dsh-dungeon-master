@@ -119,6 +119,16 @@ describe('具名 NPC 的死讯', () => {
     service.store.update(key, (c) => { c.npcs.boss = { alive: false }; });
     expect(await call('dnd_character', { action: 'create', name: '黑蜘蛛的替身', kind: 'monster', max_hp: 10 })).toContain('已建卡');
   });
+
+  it('存档记他死了、桌上又要他出场：同名建卡被拦，fight 报错里给出 alive=true 的路', async () => {
+    const { service, key, call } = setup();
+    service.store.update(key, (c) => { c.npcs.boss = { alive: false }; });
+    await expect(call('dnd_character', { action: 'create', name: '内兹纳', kind: 'npc', max_hp: 45 }))
+      .rejects.toThrow(/dnd_story npc boss alive=true/);
+    await expect(call('dnd_story', { action: 'npc', id: 'boss', fight: true })).rejects.toThrow(/alive=true/);
+    await call('dnd_story', { action: 'npc', id: 'boss', alive: true });
+    expect(await call('dnd_story', { action: 'npc', id: 'boss', fight: true })).toContain('敌对');
+  });
 });
 
 describe('口供', () => {

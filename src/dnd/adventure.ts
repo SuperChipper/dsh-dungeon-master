@@ -222,6 +222,8 @@ export interface Adventure {
   name: string;
   credits?: string;
   levels?: { start: number; end: number };
+  /** 模组按几人写的遭遇；缺省 4（官方模组的默认）。本桌人多时 dnd_move 刷怪会提醒怎么调 */
+  partySize?: number;
   /** 整本模组的 DM 机密：反派、计划、东西真正在哪；每条一句 */
   truth: string[];
   /** 开团念给玩家的开场（/dnd new 会直接发到群里） */

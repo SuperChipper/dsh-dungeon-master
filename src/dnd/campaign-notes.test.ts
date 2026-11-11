@@ -55,12 +55,13 @@ describe('dnd_progress', () => {
 describe('停团兜底摘要', () => {
   const campaign = (over: Partial<Campaign>): Campaign => ({ summaries: [], log: [], ...over }) as unknown as Campaign;
 
-  it('这次开团没写进度：上一条进度 + 最近日志拼一条', () => {
-    const c = campaign({ sessionStartedAt: 100, log: ['卡厄斯 受到 3 点伤害', '队伍进入「地窖」'] });
+  it('旧进度全文保留，新日志单独写进停团交接', () => {
+    const c = campaign({ sessionStartedAt: 100 });
     addSummary(c, '上次停在门口', 50);
+    c.log.push('卡厄斯 受到 3 点伤害', '队伍进入「地窖」');
     expect(ensureSessionSummary(c, 200)).toBe(true);
     expect(c.summaries.at(-1)!.text).toContain('上次停在门口');
-    expect(c.summaries.at(-1)!.text).toContain('队伍进入「地窖」');
+    expect(c.handoff!.changes.join('\n')).toContain('队伍进入「地窖」');
   });
 
   it('这次已经写过进度、或者什么都没发生时不补', () => {
@@ -76,7 +77,7 @@ describe('停团兜底摘要', () => {
     service.stop(key);
     service.start(key, 'sunken-bell', false);
     const state = service.promptSections(key).map((s) => s.text).join('\n');
-    expect(state).toContain('上次进度：（停团时没写进度');
+    expect(state).toContain('上次进度：【自动交接】');
     expect(state).toContain('卡厄斯 打开了地窖的门');
   });
 });

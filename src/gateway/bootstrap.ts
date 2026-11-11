@@ -575,6 +575,10 @@ export async function bootstrapGateway(
 
   // ── 跑团工具注册（dnd_*） ──
   if (dndService !== undefined) {
+    // /dnd map 发的是被动回复：target 就是那条 /dnd 消息，不用换新的 msgId
+    dndService.sendImage = async (target, path, caption) => {
+      await mediaSender.sendImage(target, { localPath: path }, caption !== undefined ? { content: caption } : undefined);
+    };
     registerDndTools(ctx, {
       service: dndService,
       manager,

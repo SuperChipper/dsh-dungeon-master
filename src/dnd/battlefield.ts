@@ -15,6 +15,7 @@ import {
   findCharacter,
   isOut,
   isRangedWeapon,
+  isSurprised,
   reactionsOf,
   requireCharacter,
   requireInitiative,
@@ -98,9 +99,16 @@ export function mapOf(c: Campaign, room: string): BattleMap | undefined {
   return c.battlemaps?.[room];
 }
 
+function sameSize(a: BattleMap, b: BattleMap): boolean {
+  return a.width === b.width && a.height === b.height;
+}
+
 /** 画/重画一个房间的场地图；返回站在墙里、障碍里的人，让 DM 挪出来 */
 export function setBattleMap(c: Campaign, room: string, input: unknown): { map: BattleMap; misplaced: string[] } {
   const map = parseBattleMap(input);
+  // DM 在模组底图上补门、补障碍时只会重画 areas；尺寸没变就还是同一张底图，别把它丢了
+  const previous = mapOf(c, room)?.art;
+  if (map.art === undefined && previous !== undefined && sameSize(mapOf(c, room)!, map)) map.art = previous;
   for (const area of map.areas) {
     if (area.to !== undefined && area.to === room) throw new Error(`${areaName(area)} 的 to 是这个房间自己（${room}），应该填门通往的房间`);
   }
@@ -304,7 +312,7 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
 
   const others = placedIn(c, from.room).filter(({ ch: o }) => o.name !== ch.name && o.name !== dragged?.name);
   const foes = others.filter(({ ch: o }) => isHostile(ch, o));
-  const reactors = foes.filter(({ ch: o }) => canReact(o));
+  const reactors = foes.filter(({ ch: o }) => canReact(o) && !isSurprised(c, o.name));
   // 5e：能穿过友方的格子，不能穿过敌人的
   const blocked = (at: Cell): boolean => foes.some(({ cell }) => cell.x === at.x && cell.y === at.y);
   const taken = (at: Cell): boolean => others.some(({ cell }) => cell.x === at.x && cell.y === at.y);
@@ -736,6 +744,79 @@ export function distancesFrom(c: Campaign, name: string, visible: (ch: Character
   return `${ch.name}(${cell.x},${cell.y}) 到：${who}${marks.length > 0 ? `；标记：${marks.join('、')}` : ''}`;
 }
 
+export type AreaShape = 'sphere' | 'cube' | 'line';
+
+export interface AreaRequest {
+  shape: AreaShape;
+  /** 球的半径、立方的边长、线的长度，尺 */
+  size: number;
+  /** 球心 / 立方西北角 / 线的终点方向：格子坐标 */
+  x?: number;
+  y?: number;
+  /** 代替 x/y：以这个人或地标所在格为球心（或线的方向） */
+  at?: string;
+  /** 施法者：分敌我用；line 从他身边起算 */
+  caster?: string;
+}
+
+/**
+ * 范围法术会罩到谁。11-08 的火球是 DM 凭眼睛摆的，说「三只都能罩住，队友一个都进不去」，
+ * 可两只蜘蛛各贴着一个队友，按格子不连队友根本圈不住。
+ * 距离和工具别处一样按格算（斜着也是 5 尺）；球心落在格子上。锥形各家画法不一，不在这里算。
+ */
+export function areaReport(c: Campaign, req: AreaRequest): string {
+  if (!Number.isInteger(req.size) || req.size < 5 || req.size % 5 !== 0) throw new Error('size 要是 5 的倍数（尺）');
+  const caster = req.caster === undefined ? undefined : requireCharacter(c, req.caster);
+  const casterCell = caster === undefined ? undefined : cellOf(c, caster);
+  let point: BattleCell | undefined;
+  if (req.at !== undefined) {
+    const who = findCharacter(c, req.at);
+    point = who !== undefined ? cellOf(c, who) : c.initiative?.marks?.[req.at];
+    if (point === undefined) throw new Error(`${req.at} 没摆位，也不是标记；给 x/y`);
+  } else if (req.x !== undefined && req.y !== undefined) {
+    const room = casterCell?.room ?? fightRoomOf(c);
+    point = { x: requireCoord(req.x, 'x'), y: requireCoord(req.y, 'y'), room };
+  } else {
+    throw new Error('要给 at（人或标记），或者 x/y');
+  }
+  const cells = req.shape === 'sphere'
+    ? (at: Cell): boolean => distanceFeet(at, point) <= req.size
+    : req.shape === 'cube'
+      ? (at: Cell): boolean => at.x >= point.x && at.y >= point.y && at.x < point.x + req.size / 5 && at.y < point.y + req.size / 5
+      : lineCells(casterCell, point, req.size);
+  const inside = placedIn(c, point.room).filter(({ ch, cell }) => ch.name !== caster?.name && cells(cell));
+  const marks = Object.entries(c.initiative?.marks ?? {}).filter(([, at]) => at.room === point.room && cells(at)).map(([n]) => n);
+  const side = (ch: Character): boolean => (caster !== undefined ? isHostile(caster, ch) : ch.kind === 'monster');
+  const foes = inside.filter(({ ch }) => side(ch)).map(({ ch }) => ch.name);
+  const friends = inside.filter(({ ch }) => !side(ch)).map(({ ch }) => ch.name);
+  const shapeName = { sphere: `半径 ${req.size} 尺的球`, cube: `边长 ${req.size} 尺的立方`, line: `${req.size} 尺长、5 尺宽的线` }[req.shape];
+  const where = req.shape === 'line' ? `从 ${caster?.name ?? '?'} 朝 (${point.x},${point.y})` : req.shape === 'cube' ? `西北角 (${point.x},${point.y})` : `中心 (${point.x},${point.y})`;
+  const lines = [`${shapeName}，${where}：`, `- ${caster !== undefined ? '敌方' : '怪物'}：${foes.join('、') || '无'}`, `- ${caster !== undefined ? '己方' : '队伍/NPC'}：${friends.join('、') || '无'}`];
+  if (marks.length > 0) lines.push(`- 标记：${marks.join('、')}`);
+  if (friends.length > 0) lines.push('【DM】己方也在范围里：换个落点再试，或照实告诉玩家会波及谁，别说「队友一个都进不去」。');
+  return lines.join('\n');
+}
+
+function fightRoomOf(c: Campaign): string {
+  const current = c.initiative?.order[c.initiative.turn]?.name;
+  const ch = current === undefined ? undefined : findCharacter(c, current);
+  return (ch === undefined ? undefined : roomOf(c, ch)) ?? c.currentRoom;
+}
+
+/** 线：从施法者所在格朝目标点走直线，走满长度为止（不含施法者自己那格） */
+function lineCells(from: BattleCell | undefined, toward: BattleCell, feet: number): (at: Cell) => boolean {
+  if (from === undefined) throw new Error('line 要给 caster，而且他要已经摆位');
+  const dx = toward.x - from.x;
+  const dy = toward.y - from.y;
+  const steps = Math.max(Math.abs(dx), Math.abs(dy));
+  if (steps === 0) throw new Error('线的方向点不能是施法者自己那格');
+  const hit = new Set<string>();
+  for (let i = 1; i <= feet / 5; i++) {
+    hit.add(`${Math.round(from.x + (dx * i) / steps)},${Math.round(from.y + (dy * i) / steps)}`);
+  }
+  return (at) => hit.has(`${at.x},${at.y}`);
+}
+
 /** 近战判断只看备注里写明的投掷/触及；其余按普通近战武器 */
 function weaponReach(weapon: Weapon): number | undefined {
   if (isRangedWeapon(weapon) || /投掷|thrown/i.test(weapon.notes ?? '')) return undefined;
@@ -759,7 +840,9 @@ export function attackRangeNote(
   const parts = [`距离 ${feet} 尺`];
   // 只看直线上有没有墙和障碍：挡住了多半够不着、也看不见；门洞、柱子边上的掩护仍由 DM 判
   const wall = wallBetween(mapOf(c, from.room), from, to);
-  if (wall !== undefined) parts.push(`中间隔着${areaName(wall)}，多半打不到也看不见；判错了 dnd_undo`);
+  // object 是挡路的东西（裂谷、桌子、熔炉、石柱），不一定挡视线：18 号的裂谷让隔坑射箭报了三次「看不见」
+  if (wall?.kind === 'wall') parts.push(`中间隔着${areaName(wall)}，多半打不到也看不见；判错了 dnd_undo`);
+  else if (wall !== undefined) parts.push(`中间有${areaName(wall)}：坑和矮家具不挡视线，高的柱子、熔炉可能给掩护，你判`);
   const reach = options.weapon === undefined ? undefined : weaponReach(options.weapon);
   if (options.weapon === undefined) {
     if (feet > MELEE_REACH_FEET && options.reaction !== true) parts.push(`如果是近战就够不到：应先 dnd_position move，判错了 dnd_undo`);

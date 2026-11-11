@@ -14,6 +14,7 @@ import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import type { Campaign } from './campaign.ts';
 import { partyPositions } from './campaign.ts';
 import { type Adventure, type MapRect, type SiteMap, mapRects, siteOfRoom } from './adventure.ts';
+import { loadSharp } from '../shared/sharp.ts';
 
 /** 发到群里的图最长边；原图 2750 宽，QQ 里看缩略图也够用 */
 const MAX_SIDE = 1800;
@@ -107,32 +108,42 @@ export function buildFogSvg(plan: FogPlan, width: number, height: number): strin
 
 interface SharpImage {
   metadata(): Promise<{ width?: number; height?: number }>;
-  composite(layers: { input: Buffer }[]): SharpImage;
+  composite(layers: { input: Buffer; left?: number; top?: number }[]): SharpImage;
   extract(region: { left: number; top: number; width: number; height: number }): SharpImage;
   resize(options: { width: number; height: number; fit: 'inside'; withoutEnlargement: boolean }): SharpImage;
+  png(): SharpImage;
   jpeg(options: { quality: number }): SharpImage;
-  toBuffer(): Promise<Buffer>;
+  toBuffer(options?: { resolveWithObject: true }): Promise<Buffer>;
   toFile(path: string): Promise<unknown>;
 }
-type SharpFactory = (input: string | Buffer) => SharpImage;
+type SharpFactory = (input: string | Buffer | { create: { width: number; height: number; channels: 3; background: string } }) => SharpImage;
 
-let sharpPromise: Promise<SharpFactory | undefined> | undefined;
+const FONT = "'Microsoft YaHei','PingFang SC','Noto Sans CJK SC','Source Han Sans SC',sans-serif";
 
-async function loadSharp(): Promise<SharpFactory | undefined> {
-  sharpPromise ??= import('sharp')
-    .then((mod) => ((mod as { default?: unknown }).default ?? mod) as SharpFactory)
-    .catch(() => undefined);
-  return sharpPromise;
+/**
+ * 标题条（和战斗图一样，地点、进度写在图上，消息里不用再附文字）。
+ * 字号跟着图宽走：1800 宽的图在手机上会被缩小三四倍，固定 20 像素的字就看不清了。
+ */
+function titleSize(width: number): { font: number; height: number } {
+  const font = Math.max(20, Math.round(width / 42));
+  return { font, height: Math.round(font * 2.2) };
+}
+
+function titleSvg(width: number, title: string): string {
+  const text = title.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const { font, height } = titleSize(width);
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><rect width="${width}" height="${height}" fill="#1b1d22"/>`
+    + `<text x="${Math.round(font * 0.7)}" y="${Math.round(font * 1.45)}" font-family="${FONT}" font-size="${font}" font-weight="bold" fill="#e8dcc0">${text}</text></svg>`;
 }
 
 /**
  * 画书里的地图，输出 JPEG（outPath 的扩展名会被换成 .jpg）。
  * 场景没有可用地图、或者 sharp 不可用时返回 undefined，调用方退回示意图。
  */
-export async function renderBookMap(c: Campaign, adv: Adventure, outPath: string): Promise<string | undefined> {
+export async function renderBookMap(c: Campaign, adv: Adventure, outPath: string, title?: string): Promise<string | undefined> {
   const plan = planFog(c, adv);
   if (plan === undefined) return undefined;
-  const sharp = await loadSharp();
+  const sharp = await loadSharp<SharpFactory>();
   if (sharp === undefined) return undefined;
   const { width, height } = await sharp(plan.image).metadata();
   if (width === undefined || height === undefined) return undefined;
@@ -140,9 +151,21 @@ export async function renderBookMap(c: Campaign, adv: Adventure, outPath: string
   const covered = await sharp(plan.image).composite([{ input: Buffer.from(buildFogSvg(plan, width, height)) }]).toBuffer();
   const out = outPath.replace(/\.[a-z]+$/i, '') + '.jpg';
   mkdirSync(dirname(out), { recursive: true });
-  await sharp(covered)
+  const cropped = sharp(covered)
     .extract(cropBox(plan, width, height))
-    .resize({ width: MAX_SIDE, height: MAX_SIDE, fit: 'inside', withoutEnlargement: true })
+    .resize({ width: MAX_SIDE, height: MAX_SIDE, fit: 'inside', withoutEnlargement: true });
+  if (title === undefined) {
+    await cropped.jpeg({ quality: 85 }).toFile(out);
+    return out;
+  }
+  const body = await cropped.png().toBuffer();
+  const size = await sharp(body).metadata();
+  const h = size.height ?? MAX_SIDE;
+  // 只露出一小间屋时图很窄，标题会被截掉：画布按标题加宽（中文一个字约 20 像素），图靠左
+  const w = Math.max(size.width ?? MAX_SIDE, 28 + [...title].length * 20);
+  const strip = titleSize(w).height;
+  await sharp({ create: { width: w, height: h + strip, channels: 3, background: '#1b1d22' } })
+    .composite([{ input: Buffer.from(titleSvg(w, title)), left: 0, top: 0 }, { input: body, left: 0, top: strip }])
     .jpeg({ quality: 85 })
     .toFile(out);
   return out;

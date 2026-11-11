@@ -170,6 +170,17 @@ describe('先攻', () => {
     expect(c.characters.some((ch) => ch.name === '巨鼠2')).toBe(false);
     expect(c.initiative).toBeUndefined();
   });
+
+  it('开战时就生效的先攻加值（灵敏之赐这类）由工具掷进去', () => {
+    const c = party();
+    moveParty(c, BELL, 'nave');
+    // 艾琳 d20=3、1d8=5、敏调 +3 → 11；其余照常
+    const rolls = startInitiative(c, fixed(3, 5, 10, 1, 1, 1), undefined, undefined, { 艾琳: '1d8' });
+    const 艾琳 = rolls.find((r) => r.name === '艾琳');
+    expect(艾琳?.init).toBe(11);
+    expect(艾琳?.detail).toContain('1d8');
+    expect(c.initiative?.order.find((e) => e.name === '艾琳')?.init).toBe(11);
+  });
 });
 
 describe('中途入战', () => {

@@ -7,10 +7,13 @@
 import type { Roller } from './dice.ts';
 import { cryptoRoller } from './dice.ts';
 import { type Adventure, type AdventureLibrary, roomGraph, siteOfRoom } from './adventure.ts';
-import { type Campaign, CampaignStore, createCampaign, ensureSessionSummary, reconcileKnownSites, summarize } from './campaign.ts';
+import { type Campaign, CampaignStore, addSummary, campaignState, createCampaign, ensureSessionSummary, reconcileKnownSites, summarize } from './campaign.ts';
+import { PREPARATION_MAX_CHARS, preparationLines, recoveryLines } from './session-recovery.ts';
 import { type CheckIn, rosterOf, rosterPrompt } from './check-in.ts';
 import { chronicleLines } from './chronicle.ts';
+import { hookPromptLines } from './hooks.ts';
 import { PromptLatch } from '../features/prompt-latch.ts';
+import type { ReplyTarget } from '../types.ts';
 import { findRoom } from './dungeon.ts';
 import { inOpening, openingLines, roomView } from './story.ts';
 
@@ -40,7 +43,7 @@ const DM_RULES = [
   '',
   '【裁定】',
   '- 创意动作（推下楼梯、卡身位、拿环境当掩护）：你定检定和合理后果，别直接说不。',
-  '- 后果只按规则和工具结果：不额外加缴械、摔倒、装备损坏，不凭空加状态、不跳过回合。战斗中的欺瞒/分心最多给一次优势。受惊者照样掷先攻、有自己的回合，只是第一个回合不能移动、动作、附赠动作，那个回合结束前也不能反应。',
+  '- 后果只按规则和工具结果：不额外加缴械、摔倒、装备损坏，不凭空加状态、不跳过回合。战斗中的欺瞒/分心最多给一次优势。突袭时把受惊的人传进 dnd_initiative start 的 surprised，第 1 轮工具替他们跳过。',
   '- 能力和法术只给规则允许的信息。可以补氛围细节，不能补线索、捷径、剧情。一次只推进到需要玩家表态的那一点，不替他们规划下一步。',
   '- 时限说在前面：限时增益当场讲截止时间，花时间的事先报总耗时。',
   '- 记住玩家给过的长期约定（「时间充裕就默认上引导术」），之后自动算进去；当场做的临场裁定用 dnd_progress append 记到【待办】。',
@@ -69,7 +72,9 @@ const DM_RULES = [
   '',
   '【记忆与存档】',
   '- 玩家提到以前的事，或你要说「没有这人」「没去过」「没发生过」之前，先查（dnd_chronicle search、dnd_character show、dnd_lookup）。查不到只说「我这边没记录」再问玩家；玩家说得对就照他说的补记。',
+  '- 玩家讲的角色来历里没了结的事（找的人、欠的债、逃开的地方），用 dnd_hook add 记成钩子；工具结果里的「背景钩子」接不接你定，1-2 档随手用，再往上先 plan，那个人亲自出现之前先问玩家。',
   '- 工具记不到的（临场编的人和事、俘虏、承诺和欠账、线头、背景新发现、本桌裁定）用 dnd_chronicle add 记；一段剧情告一段落、接交任务、快下线时用 dnd_progress 记进度。',
+  '- 收团用 dnd_end（与玩家 /dnd end 同一暂停流程），只存档用 dnd_progress；交接记清具体停点、刚发生的事、已定行动、同行与留守、未结事项和下次第一步。dnd_prepare 只存 DM 候选计划，不能当作已发生事实，也不能念给玩家。',
   '- 笔记（qqbot_notes_save）只记跨团通用、玩家知道的东西（玩家偏好、DM 约定、角色梗）：DC、怪物数值、DM 笔记、秘密不写；跑团进度只写团档。',
   '- 没有角色卡的玩家，问清名字和职业再建卡。玩家问规则可以提醒他用 /dnd search、/dnd spells 查 wiki；要看地图用 dnd_map。',
   '- 如果现在是要你写对话的压缩摘要（checkpoint）：技术类小节没有必要就写 (none)，工具用法、文件路径不用留。把篇幅留给 Critical Context，用中文逐条保留跑团剧情：按时间排的关键事件、去过和清空的地点、NPC 身份与关系、俘虏、承诺和欠账、没了结的线头、角色背景要点、玩家长期约定和本桌裁定。战斗中还要写明：这一轮谁已行动、谁用过反应、挂在目标身上的效果（猎人印记、专注、神圣武器）；站位和 HP 团况里有，不用转述。',
@@ -85,6 +90,7 @@ const PAUSED_RULES = [
   '- 发生过什么以团档为准：先 dnd_chronicle search 查，查到再说；查不到就说「我这边没记录」。模组文件是剧本，不是发生过的事，两边对不上时按团档。',
   '- 玩家还没亲历的东西停团也不说：没去过的地点和房间、没见过的怪和 NPC、怪物数值和 DC、DM 笔记、后面的剧情。问起就说「到了再看」，也不要为了回答去翻模组文件。',
   '- 说错了就一句改正、给出正确说法；不检讨、不讲自己怎么记混的。',
+  '- 明确要求备团时可用 dnd_prepare show/save，计划仅 DM 可见，不推进剧情。收团后补写交接可用 dnd_end summary，不用重新 start；不把 DM 计划发到群里。',
 ].join('\n');
 
 /** 跟着队伍位置和章节变的背景：本章要点、当前场景的通用规则 */
@@ -103,6 +109,8 @@ export class DndService {
   public readonly roller: Roller;
   /** 地图 PNG 输出目录 */
   public readonly mapDir: string;
+  /** 发图片到群里：启动时由 bootstrap 接上，/dnd map 和 dnd_map 发同一张图；没接上时 /dnd map 退回文字地图 */
+  public sendImage?: (target: ReplyTarget, path: string, caption?: string) => Promise<void>;
   /** 这一次开团的签到表（会话 key → 签到）；只在内存里，见 check-in.ts */
   public readonly checkIns = new Map<string, CheckIn>();
   /** 这段对话 system prompt 里锁住的背景，见 promptSections */
@@ -179,16 +187,44 @@ export class DndService {
     return { campaign, adventure, resumed: false, carried: campaign.characters.map((ch) => ch.name) };
   }
 
-  public stop(key: string): Campaign | undefined {
+  /** 命令和 DM 工具共用一次落盘；暂停后也允许补写交接，不会重新开团。 */
+  public stop(key: string, summary?: string): Campaign | undefined {
     const campaign = this.store.load(key);
-    if (campaign === undefined || !campaign.active) return undefined;
-    this.background.forget(key);
+    if (campaign === undefined || (!campaign.active && summary === undefined)) return undefined;
+    if (summary !== undefined) {
+      if (!summary.trim()) throw new Error('结团摘要不能为空');
+      addSummary(campaign, summary);
+    }
     campaign.active = false;
-    campaign.initiative = undefined;
     ensureSessionSummary(campaign);
     this.store.save(campaign);
+    this.background.forget(key);
     this.checkIns.delete(key);
     return campaign;
+  }
+
+  public savePreparation(key: string, text: string): void {
+    const campaign = this.store.load(key);
+    if (campaign === undefined) throw new Error('这个群没有团档');
+    const value = text.trim();
+    if (value.length > PREPARATION_MAX_CHARS) throw new Error(`备团计划超过 ${PREPARATION_MAX_CHARS} 字，未保存，请精简`);
+    if (value.length === 0) delete campaign.preparation;
+    else campaign.preparation = { at: Date.now(), state: campaignState(campaign), text: value };
+    this.store.save(campaign);
+  }
+
+  public preparationContext(key: string): string {
+    const found = this.active(key) ?? this.saved(key);
+    if (found === undefined) throw new Error('这个群没有团档（或模组文件丢失）');
+    const { campaign, adventure } = found;
+    return [
+      '【备团资料 · DM 私有】以下已记录事实与候选计划分别列出；不要向玩家转发。',
+      summarize(campaign, adventure),
+      `最近进度：${campaign.summaries.at(-1)?.text ?? '尚未写过；需查账本确认具体停点。'}`,
+      ...recoveryLines(campaign), ...chronicleLines(campaign), ...sceneLines(campaign, adventure),
+      ...hookPromptLines(campaign), ...preparationLines(campaign),
+      '备团只准备下一步可能涉及的地点、NPC、规则、钩子和待确认问题。查模组用 dnd_lookup；未来安排不是事实，不替玩家选路，不自动修改任务或资源。',
+    ].join('\n');
   }
 
   /**
@@ -209,7 +245,11 @@ export class DndService {
     if (adventure.truth.length > 0) lines.unshift(`模组背景：${adventure.truth.join(' ')}`);
     const last = campaign.summaries.at(-1);
     if (last !== undefined) lines.push(`上次进度：${last.text}`);
+    if (last !== undefined || campaign.handoff !== undefined) lines.push(...recoveryLines(campaign));
     lines.push(...chronicleLines(campaign));
+    // 开团时锁进背景：钩子很少变，每场开头看一眼最久没碰的是谁就够
+    lines.push(...hookPromptLines(campaign));
+    lines.push(...preparationLines(campaign));
     const current = lines.join('\n');
     const text = epoch === undefined ? current : this.background.hold(key, epoch, current);
     return [
@@ -238,6 +278,9 @@ export class DndService {
     // 跨场景、换章后 system prompt 里锁住的还是旧规则，新的先写在这里
     const held = this.background.peek(key);
     if (held !== undefined) lines.push(...sceneLines(campaign, adventure).filter((line) => !held.includes(line)));
+    if (campaign.preparation && campaign.preparation.state !== campaignState(campaign)) {
+      lines.push('DM 备团计划对应的团况已变化：先 dnd_prepare show 重新核对，不能按旧计划自动推进。');
+    }
     const checkIn = this.checkIns.get(key);
     if (checkIn !== undefined) lines.push(rosterPrompt(rosterOf(checkIn, campaign)));
     return lines.join('\n');

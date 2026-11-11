@@ -7,7 +7,7 @@ import { AdventureLibrary } from './adventure.ts';
 import { type Campaign, CampaignStore, findCharacter, playerStatus, upsertCharacter } from './campaign.ts';
 import { DndService } from './dnd-service.ts';
 import { registerDndTools } from './dnd-tools.ts';
-import { REACTION_WINDOW_MS, classifyReactionReply, eligibleReactors, reactionReplyNote, reactionsOf } from './pending-attack.ts';
+import { classifyReactionReply, eligibleReactors, reactionReplyNote, reactionsOf } from './pending-attack.ts';
 import { ACK, DndTurnButtons, buildReactionKeyboard } from './turn-buttons.ts';
 import { encodeButtonData } from '../features/button-utils.ts';
 import { pendingReactionReply } from '../gateway/middleware-setup.ts';
@@ -131,21 +131,18 @@ describe('攻击先算后结', () => {
     expect(t.campaign().initiative!.pending).toEqual(before);
   });
 
-  it('窗口开着、还有人没答复时不能落账；都答复了或时间到可以', async () => {
+  it('还有人没答复时不能落账，过多久都一样；DM 传 decline 替他跳过才行', async () => {
     const t = setup();
     t.rolls.push(15, 3);
     await t.biteKriv();
+    await expect(t.call('dnd_apply', { target: 'Kriv', settle: true })).rejects.toThrow(/不限时/);
+    t.service.store.update(t.key, (c) => { c.initiative!.pending!.at -= 3_600_000; });
     await expect(t.call('dnd_apply', { target: 'Kriv', settle: true })).rejects.toThrow(/反应窗口还开着/);
     expect(t.hp('Kriv')).toBe(20);
     const text = await t.call('dnd_apply', { target: 'Kriv', decline: ['Kriv'], settle: true });
     expect(text).toContain('受 7');
     expect(t.hp('Kriv')).toBe(13);
     expect(t.campaign().initiative!.pending).toBeUndefined();
-
-    t.rolls.push(15, 3);
-    await t.biteKriv();
-    t.service.store.update(t.key, (c) => { c.initiative!.pending!.at -= REACTION_WINDOW_MS; });
-    expect(await t.call('dnd_apply', { target: 'Kriv', settle: true })).toContain('受 7');
   });
 
   it('target 对不上、没有待结算时报错', async () => {
@@ -449,7 +446,7 @@ describe('反应按钮', () => {
     expect(t.campaign().initiative!.turn).toBe(1);
   });
 
-  it('回复发完才发按钮，时间到提醒 DM 落账；已落账就不打扰', async () => {
+  it('回复发完才发按钮；不限时，没人答复也不会自己算「不用」去催 DM', async () => {
     vi.useFakeTimers();
     const t = setup();
     t.rolls.push(15, 3);
@@ -457,30 +454,21 @@ describe('反应按钮', () => {
     t.buttons.scheduleReaction(t.record as never);
     await vi.advanceTimersByTimeAsync(2000);
     expect(t.sender.sendMarkdown).toHaveBeenCalledTimes(1);
+    expect(t.sender.sendMarkdown.mock.calls[0]![1]).toContain('不限时');
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(t.followup).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(REACTION_WINDOW_MS);
-    expect(t.followup.mock.calls[0]![0].content[0].text).toContain('时间到');
-
-    t.followup.mockClear();
-    await t.call('dnd_apply', { target: 'Kriv', settle: true });
-    t.rolls.push(15, 3);
-    await t.biteKriv();
-    t.buttons.scheduleReaction(t.record as never);
-    await vi.advanceTimersByTimeAsync(2000);
-    await t.call('dnd_apply', { target: 'Kriv', decline: ['Kriv'], settle: true });
-    await vi.advanceTimersByTimeAsync(REACTION_WINDOW_MS);
-    expect(t.followup).not.toHaveBeenCalled();
+    expect(t.campaign().initiative!.pending).toBeDefined();
   });
 
-  it('按钮发不出去也照样计时，玩家打字回应的路不受影响', async () => {
+  it('按钮发不出去时待结算照样挂着，玩家打字回应的路不受影响', async () => {
     vi.useFakeTimers();
     const t = setup();
     t.sender.sendMarkdown.mockRejectedValueOnce(new Error('no keyboard permission'));
     t.rolls.push(15, 3);
     await t.biteKriv();
     t.buttons.scheduleReaction(t.record as never);
-    await vi.advanceTimersByTimeAsync(2000 + REACTION_WINDOW_MS);
-    expect(t.followup.mock.calls[0]![0].content[0].text).toContain('时间到');
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(t.campaign().initiative!.pending).toBeDefined();
   });
 
   it('button_data 能编码 react 和 pass', () => {

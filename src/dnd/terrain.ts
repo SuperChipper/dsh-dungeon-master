@@ -30,6 +30,21 @@ export interface BattleMap {
   height: number;
   /** 后写的盖住先写的：先画整面墙，再在墙上开门 */
   areas: TerrainArea[];
+  /** 模组书里这间屋的底图：发给玩家的战斗图用它，规则仍只看 areas */
+  art?: BattleArt;
+}
+
+/**
+ * 场地图在书里地图上的位置。书里的地图本来就是 5 尺一格，格子 (0,0) 的左上角落在原图 (left, top)，
+ * 一格 cell 像素。shade 是这张图里不属于这间屋的格子（隔壁没去过的屋、走廊），出图时涂黑。
+ */
+export interface BattleArt {
+  /** 图片路径，相对模组目录 */
+  image: string;
+  left: number;
+  top: number;
+  cell: number;
+  shade?: Array<[number, number, number, number]>;
 }
 
 export interface Cell {
@@ -72,7 +87,29 @@ export function parseBattleMap(input: unknown): BattleMap {
     const to = typeof a.to === 'string' && a.to.trim().length > 0 ? a.to.trim() : undefined;
     return { kind, x, y, ...(w !== 1 ? { w } : {}), ...(h !== 1 ? { h } : {}), ...(name !== undefined ? { name } : {}), ...(to !== undefined ? { to } : {}) };
   });
-  return { width, height, areas };
+  const art = o.art === undefined ? undefined : parseArt(o.art, width, height);
+  return { width, height, areas, ...(art !== undefined ? { art } : {}) };
+}
+
+function parseArt(input: unknown, width: number, height: number): BattleArt {
+  const a = (input ?? {}) as Record<string, unknown>;
+  if (typeof a.image !== 'string' || a.image.length === 0) throw new Error('art.image 要给图片路径');
+  const num = (v: unknown, label: string, min: number): number => {
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < min) throw new Error(`art.${label} 要是不小于 ${min} 的数，收到 ${String(v)}`);
+    return v;
+  };
+  const shade = a.shade === undefined ? undefined : a.shade;
+  if (shade !== undefined && (!Array.isArray(shade) || shade.some((r) => !Array.isArray(r) || r.length !== 4
+    || r.some((n) => !Number.isInteger(n) || n < 0) || r[0] + r[2] > width || r[1] + r[3] > height))) {
+    throw new Error('art.shade 要是 [x, y, 宽, 高] 格子矩形的数组，且在场地图范围内');
+  }
+  return {
+    image: a.image,
+    left: num(a.left, 'left', 0),
+    top: num(a.top, 'top', 0),
+    cell: num(a.cell, 'cell', 8),
+    ...(shade !== undefined ? { shade: shade as BattleArt['shade'] } : {}),
+  };
 }
 
 export function inBounds(map: BattleMap, at: Cell): boolean {
@@ -88,8 +125,13 @@ export function areaAt(map: BattleMap, at: Cell): TerrainArea | undefined {
   for (let i = map.areas.length - 1; i >= 0; i--) {
     if (covers(map.areas[i]!, at)) return map.areas[i];
   }
+  // 底图上不属于这间屋的格子（隔壁、岩体）算墙；画在上面的门、门外照样优先
+  if (map.art?.shade?.some(([x, y, w, h]) => at.x >= x && at.x < x + w && at.y >= y && at.y < y + h) === true) return OUTSIDE_ROOM;
   return undefined;
 }
+
+/** 底图涂黑那部分的墙：只有一个，areaCells 拿它能取回所有涂黑的格子 */
+const OUTSIDE_ROOM: TerrainArea = { kind: 'wall', x: 0, y: 0, name: '屋外' };
 
 /** 走不进去：图外、墙、障碍物 */
 export function blocksMove(map: BattleMap | undefined, at: Cell): boolean {
@@ -118,10 +160,6 @@ export function findArea(map: BattleMap, query: string): TerrainArea | undefined
     ?? named.find((a) => a.to === q)
     // 「门」同时包含在「门(通B)」和「门外(通B)」里：取名字最短的那个，离原话最近
     ?? named.filter((a) => areaName(a).includes(q) || q.includes(areaName(a))).sort((a, b) => areaName(a).length - areaName(b).length)[0];
-}
-
-export function chebyshevFeet(a: Cell, b: Cell): number {
-  return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y)) * CELL_FEET;
 }
 
 export interface Reach {

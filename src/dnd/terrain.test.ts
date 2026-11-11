@@ -274,10 +274,12 @@ describe('画出来', () => {
     expect(line).toContain('场地 10×6：门外(通B)(0-1,2-2)、门(通B)(2,2)、石柱(5-5,1-3)[挡路]、碎石(6-7,4-4)[难行]');
   });
 
-  it('隔着石柱攻击会提醒', () => {
+  it('隔着障碍只提醒可能有掩护，不说看不见；隔着墙才说', () => {
     const c = arena();
     setPositions(c, [{ name: 'Kriv', x: 4, y: 2 }, { name: '狼', x: 6, y: 2 }]);
-    expect(attackRangeNote(c, findCharacter(c, 'Kriv')!, findCharacter(c, '狼')!, {})).toContain('中间隔着石柱');
+    const note = attackRangeNote(c, findCharacter(c, 'Kriv')!, findCharacter(c, '狼')!, {})!;
+    expect(note).toContain('中间有石柱');
+    expect(note).not.toContain('看不见');
   });
 });
 

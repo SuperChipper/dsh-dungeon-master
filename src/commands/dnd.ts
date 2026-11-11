@@ -9,15 +9,17 @@ import type { ReplyTarget } from '../types.ts';
 import { getScopePeer } from '../shared/index.ts';
 import { playerStatus } from '../dnd/campaign.ts';
 import { buildTextMap } from '../dnd/text-map.ts';
+import { mapCaption, renderPartyMap } from '../dnd/map-view.ts';
+import { join } from 'node:path';
 
 const USAGE = [
   '用法：',
   '/dnd start [模组id] — 开团（同一模组的旧团会接着跑），群里会带签到按钮，人齐自动开场',
   '/dnd new [模组id] [blank] — 存档旧团开新团（默认带上 PC 卡，加 blank 从零建卡）',
-  '/dnd status — 看团况（战斗中带站位和你到各人的距离）',
-  '/dnd map — 在聊天框里画出当前场景的地图和你们的位置',
+  '/dnd status — 看团况（战斗中发战斗图，带血量、先攻和你到各人的距离）',
+  '/dnd map [battle|explore] — 发地图：战斗中是站位图，平时是探索过的地方（和 DM 发的是同一张）',
   '/dnd checkin — 再发一次签到按钮',
-  '/dnd end — 暂停（让 DM 写摘要请直接说「今天先到这」）',
+  '/dnd end [摘要] — 保存交接并暂停，战斗状态保留；也可直接说「今天先到这」',
   '/dnd dungeons — 列出可用模组',
   '/dnd search <词条> — 查 wiki（法术、技能、职业、专长、怪物…），如 /dnd search 火球术',
   '/dnd spells [职业] — 职业法术列表，如 /dnd spells 牧师',
@@ -68,7 +70,7 @@ const HELP = [
   '【查规则】',
   '· /dnd search 火球术：给出 wiki 词条链接，法术、技能、职业特性、专长、怪物都能查。',
   '· /dnd spells 牧师：职业法术列表。',
-  '· 回合按钮里的「查询」会在输入框里预填 /dnd search。',
+  '· 回合按钮里的「我的法术」列出你自己卡上的法术，带 wiki 链接；卡上还没有就找 DM 补。',
   `· wiki 首页：${RULES_WIKI}`,
   '',
   '命令：/dnd start｜new｜status｜checkin｜end｜dungeons｜search｜spells｜help',
@@ -133,8 +135,12 @@ export function dndCommand({ manager }: CommandDeps): CategorizedCommand {
       }
 
       if (sub === 'end') {
-        const stopped = service.stop(key);
-        return stopped === undefined ? '现在没有进行中的团。' : '⏸ 已暂停，进度和角色卡都保存了。下次 /dnd start 接着跑。';
+        try {
+          const stopped = service.stop(key, rest.trim() || undefined);
+          return stopped === undefined ? '现在没有进行中的团。' : '⏸ 已暂停，进度、角色卡和停团交接已保存；战斗状态保留。下次 /dnd start 接着跑。';
+        } catch (err) {
+          return err instanceof Error ? err.message : String(err);
+        }
       }
 
       if (sub === 'status') {
@@ -148,6 +154,21 @@ export function dndCommand({ manager }: CommandDeps): CategorizedCommand {
       if (sub === 'map') {
         const found = service.active(key);
         if (found === undefined) return '现在没有进行中的团。';
+        const view = arg === 'battle' || arg === 'explore' ? arg : 'auto';
+        if (service.sendImage !== undefined) {
+          try {
+            const out = join(service.mapDir, `${key.replace(/[^a-zA-Z0-9_-]+/g, '_')}-cmd-${Date.now()}.png`);
+            const map = await renderPartyMap(found.campaign, found.adventure, out, view);
+            if (map !== undefined) {
+              await service.sendImage(target, map.path, mapCaption(found.campaign, found.adventure, map.kind));
+              return { kind: 'noop' as const };
+            }
+          } catch (err) {
+            // 战斗图要场地图；还没画就说一句，别退回一张对不上的文字图
+            if (view === 'battle') return `${err instanceof Error ? err.message : String(err)}，等 DM 摆好位再看。`;
+          }
+        }
+        // 没装 sharp 或者图发不出去：退回聊天框里的文字地图
         return buildTextMap(found.campaign, found.adventure);
       }
 

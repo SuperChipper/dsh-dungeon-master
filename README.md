@@ -2,205 +2,137 @@
 
 **[English](./README_EN.md) | 简体中文**
 
-**[tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot) 的二次开发版本：在官方 QQ Bot 插件的基础上，加了 D&D 跑团 DM、跨会话长期记忆、表情收藏、B 站只读工具、原生读图和一系列群聊体验改进。**
+**在 QQ 群里跑 D&D 5e 的 AI 地下城主。** 这是 [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot) 的二次开发版本：群里发一句 `/dnd start`，bot 就成了这个群的 DM，骰子、检定、先攻、站位、血量全部由工具结算，模型只负责讲故事。
 
-> 安装、扫码绑定、基础配置项、内置命令和整体架构都沿用上游，请看 **[上游 README](https://github.com/tencent-connect/dsh-qqbot#readme)**。本文只介绍这个仓库新增和改动的部分。
+> 安装、扫码绑定、基础配置项、内置命令和整体架构都沿用上游，请看 **[上游 README](https://github.com/tencent-connect/dsh-qqbot#readme)**。本文主要讲跑团，其余新增功能在[文末](#其他功能)简要列出。
 
-## Playwright 浏览器
+## 三步开团
 
-在 QQ 机器人设置页的「浏览器」中启用，先配置 `ownerOpenid`。默认使用本机已安装的 Chrome、有窗口模式，登录态存放于 agent 工作目录的 `.qqbot-browser/`（自定义目录请自行排除 Git 和备份共享）。支持 Edge；选择 Chromium 时需先运行 `npx playwright-core install chromium`。
+1. 按[本地运行](#本地运行)装好插件，把 bot 拉进群。
+2. 群里发 `/dnd start`。这条消息带签到按钮，人齐自动开场；有人来不了就点「开始」。
+3. @bot 说清楚自己的角色做什么：「卡厄斯用巨剑砍地精 3」「恩佐潜行到门口听动静」。
 
-保存设置触发插件重载后，在主人私聊里说「打开小红书，我先登录」或「打开 https://x.com」。在弹出的浏览器里手动扫码、登录或完成验证，然后让 bot 继续读取、搜索、滚动、截图。`qqbot_browser` 支持 `open/read/click/fill/press/scroll/back/screenshot/close`；截图返回临时 PNG 路径，可用 `qqbot_send_file` 发送。动态页面没加载完时可再次 `read`；遇到平台限制会正常显示登录/验证页面，不能保证免验证。默认关闭功能。
-
-需要在群内浏览、搜索或提取网页内容时，在「浏览群白名单」（`browser.allowedGroups`）逐行添加群 openid（不是普通 QQ 群号）。空名单仅主人私聊可用，名单内群的所有成员均可调用；此权限独立于终端和文件工具白名单。各群使用独立浏览器配置目录（`userDataDir/groups/<群标识哈希>`），同群共享登录态和页面，不与主人私聊或其他群共享。请在对应群触发的浏览器窗口中单独登录。群白名单不授予其他用户私聊访问权限。
-
-也可在群里对 bot 说「申请本群的浏览权限」，bot 会调用 `qqbot_browser_access(action="grant")`，在本群发出「同意 / 拒绝」按钮。只有主人在原群点击才有效，10 分钟过期；等待审批期间不会授予权限，相同申请不会重复发送。`status` 查询本群状态，`revoke` 申请撤销；主人私聊可直接指定 `group` openid 加入/移出。批准后先保存到当前运行 profile 的 `browser.allowedGroups`，再更新权限，保存失败则不授权；设置页、聊天审批使用同一份名单。保存会触发插件重载，旧申请按钮随重载失效。审批按钮发在申请群，不额外私聊通知主人。
-
-本机模式使用独立配置目录持久保存 Cookie、localStorage 等状态，不要填写日常 Chrome 的用户数据目录。同一目录不能被多个浏览器进程同时占用。插件重载会关闭其启动的浏览器，下次操作时重新打开并复用登录态。语言、时区、无头模式、超时和返回字数均可在设置页调整；第一次登录请保持有窗口模式。
-
-如需接入已有 Chromium 指纹浏览器，在其管理端启动配置文件，选择 CDP 模式，并给宿主进程设置 `QQBOT_BROWSER_CDP_ENDPOINT`（HTTP 或 WebSocket 调试地址）。主人私聊在已有 context 中新建专用标签页；授权群各自创建临时隔离 context，不继承主人登录态，关闭或重载后群登录态不保留（需要持久群登录态请用本机模式）。工具关闭时断开连接，保留外接浏览器。指纹和代理由外接浏览器管理；本机模式可选设 `QQBOT_BROWSER_PROXY_SERVER`。这些环境变量不会通过配置接口回传。普通 Chrome 模式不提供指纹伪装。
-
-## 新增内容一览
-
-| 方向 | 内容 |
-|------|------|
-| 🎲 跑团 | D&D 5e AI 地下城主：掷骰/检定/先攻全走工具、行动只认本人、回合按钮、迷雾地图、原创地城、wiki 速查 |
-| 💬 群聊 | 概率插话、持久化群记忆、能看群里的历史图片、只回应触发消息、合并消息保留发送者、上下文游标与自动压缩 |
-| 🧠 记忆 | 所有会话共享的 Markdown 笔记库，按内容自动召回；群专属笔记不串到别的群 |
-| 😺 表情 | 按情绪自动收藏表情、按哈希匹配表情、梗图识别 skill |
-| 🖼 媒体 | 图文同发（caption）、`deepseek-native` 原生读图、语音识别、视频理解、合并转发里的图片 |
-| 🔧 工具 | B 站只读工具、同人图挑选（fanart picker）、Agent 临时目录、定期清理 |
-| ⏰ 定时 | `/new` 自动迁移定时任务、群聊主动消息失败后补发 |
-| 🔒 权限 | allowlist fail-closed、主人/管理员才能改配置和点审批、B 站登录仅限私聊主人、按会话限制终端和文件工具 |
-| 🧩 DSH 集成 | 在 DSH Web「插件」页安装和配置、桌宠余额兼容 `deepseek-native` |
+不用换 preset，也不用开新会话：开团后每回合额外注入「DM 守则 + 精简团况」两段 system prompt，`/dnd end` 后恢复普通聊天。
 
 ---
 
-## 🎲 D&D 5e 跑团
-
-在群里发 `/dnd start`，bot 就变成这个群的地下城主（DM）。不用换 preset 或开新会话：开团后每回合额外注入「DM 守则 + 精简团况」两段 system prompt，`/dnd end` 后恢复普通聊天。
+## 🎲 跑团
 
 ### 设计原则
 
-- **所有裁定都走工具**：骰点、检定、伤害、HP、状态、位置、资源都只能通过 `dnd_*` 工具改动，模型不能自己编点数。
-- **机密不给到嘴边**：DM 笔记、暗门只出现在工具结果中（`dnd_*` 的结果永远不在群里展示）；怪物的 AC/HP 和 DC 连例行工具结果和团况里都不给，只给成败和伤势词（毫发无伤 / 受了点伤 / 伤得不轻 / 摇摇欲坠），要裁定时 DM 用 `dnd_character show` 专门查。停团后注入一小段守则，聊团时不剧透、先查账本再答。
-- **行动只认本人**：PC 绑定玩家 openid，只有本人宣告才能行动；工具还会核对这个人最近确实发过消息，模型照抄 openid 也冒充不了。
-- **严格回合制**：战斗中只有当前回合的角色能主动行动；PC 的回合只有本人能结束（附赠动作、移动还没用完）。
-- **每回合只注入精简摘要**：完整状态存在 JSON 里，prompt 里只放团况摘要，控制上下文成本。
+- **所有裁定都走工具**：骰点、检定、伤害、HP、状态、位置、资源只能通过 `dnd_*` 工具改动，模型不能自己编点数。
+- **机密不给到嘴边**：DM 笔记、暗门只出现在工具结果里（`dnd_*` 的结果永远不在群里展示）。怪物的 AC、HP 和 DC 连例行的工具结果和团况里都不给，只给成败和伤势词（毫发无伤 / 受了点伤 / 伤得不轻 / 摇摇欲坠），要裁定时 DM 用 `dnd_character show` 专门查。
+- **行动只认本人**：PC 绑定玩家 openid，只有本人宣告才能行动。工具还会核对这个人最近确实发过消息，模型照抄 openid 也冒充不了。
+- **严格回合制**：战斗中只有当前回合的角色能主动行动，PC 的回合只有本人能结束。
+- **状态存在档里，不靠模型记**：完整状态是一份 JSON，每回合只往 prompt 里放精简团况。站位、待结算的反应这类要跨压缩保留的东西都写在团况里，不依赖压缩摘要的转述。
+- **判错了能回滚**：每次改动都留快照，可以按步数或按骰子编号撤销。
 
-### 玩家怎么玩
+### 玩家命令
 
 | 命令 | 说明 |
 |------|------|
-| `/dnd start [地城id]` | 开团（同一地城的旧团接着跑）；群里这条消息带签到按钮，人齐自动开场 |
-| `/dnd new [地城id] [blank]` | 存档旧团，从头开新团（加 blank 不带旧角色卡） |
-| `/dnd status` | 玩家视角的团况；战斗中画站位示意图（字符网格，有场地图时连墙 `#`、门 `+`、门外 `:`、难行地形 `~` 和障碍一起画；发不出 markdown 时退回坐标列表），附你的角色到各人的距离（隐形、躲藏的怪不画） |
+| `/dnd start [模组id]` | 开团（同一模组的旧团接着跑）；消息带签到按钮，人齐自动开场 |
+| `/dnd new [模组id] [blank]` | 存档旧团，从头开新团（默认带上旧角色卡，加 `blank` 从零建卡） |
+| `/dnd status` | 玩家视角的团况：血量、资源、先攻顺序，战斗中附你到各人的距离 |
+| `/dnd map [battle\|explore]` | 发地图：战斗中是站位图，平时是已探索部分的迷雾地图 |
 | `/dnd checkin` | 再发一次签到按钮 |
-| `/dnd end` | 暂停（想让 DM 写剧情摘要就直接说「今天先到这」） |
-| `/dnd dungeons` | 列出可用地城 |
-| `/dnd search <词条>` | 查 [灰机 D&D wiki](https://dnd.huijiwiki.com/wiki/)（法术、技能、职业、专长、怪物…） |
+| `/dnd end [摘要]` | 保存交接并暂停，战斗状态保留；也可以直接说「今天先到这」 |
+| `/dnd dungeons` | 列出可用模组 |
+| `/dnd search <词条>` | 查[灰机 D&D wiki](https://dnd.huijiwiki.com/wiki/)（法术、技能、职业、专长、怪物…） |
 | `/dnd spells [职业]` | 职业法术列表 |
 | `/dnd help` | 玩法说明 |
 
-- **@bot 并说清楚角色做什么**才算行动；闲聊、问规则、「查询状态」都不算，不掷骰也不消耗动作。
+### 一场团怎么进行
+
+- **说行动**：@bot 并说清楚角色做什么才算行动。闲聊、问规则、「查询状态」都不算，不掷骰也不消耗动作。只能控制自己的角色。
 - **回合按钮**：轮到 PC 时，bot 在 DM 的回复后补一条带按钮的消息。
-  - 「结束回合」：只有本人点击有效，其他人点会收到无权限提示；点击后先攻由工具推进，DM 接着结算怪物回合。
-  - 「查看状态」：由工具直接回复，不经过模型。
-  - 「攻击 / 施法 / 其他行动 / 查询」：只往自己的输入框里预填文字。
-  - 机器人需要开通 QQ 开放平台的消息按钮权限；发送失败会在本次运行中自动关闭按钮，退回纯文字推进。
-- **分头行动**：只有说了要走的人才会移动，其他人留在原地；地图上每个有人的房间各标一个人数。
-- **判错了可以回滚**：大家同意的话说「卷回到 xx 之前」，DM 会用快照撤销，不会靠改数字硬凑。
+  - 「结束回合」只有本人点击有效，点击后先攻由工具推进，DM 接着结算怪物回合。
+  - 「查看状态」由工具直接回复，不经过模型。
+  - 「我的法术」列出点击者自己的法术和法术位，每条带 wiki 链接。
+  - 「行动」往自己的输入框里预填角色名。
+  - 需要 QQ 开放平台的消息按钮权限；发送失败会在本次运行中自动关闭按钮，退回纯文字推进。
+- **反应窗口**：有人能反应时，攻击只掷骰、先挂成待结算，等本人答复（护盾术、尖刻言语、时间变幻重掷）；一直没人应，由 DM 替他跳过。
+- **分头行动**：只有说了要走的人才会移动，其他人留在原地，地图上每个有人的房间各标人数。
+- **回滚**：大家同意的话说「卷回到 xx 之前」，DM 用快照撤销，不会靠改数字硬凑。
+- **收团与续团**：停团时写一份交接（位置、刚刚发生、已定行动、同行与留守、未结事项、下次接续），先攻、站位和待结算反应原样保留，下次 `start` 接着跑。停团后聊团不剧透，DM 先查账本再答。
+
+### 地图与战斗站位
+
+- **战斗站位**：一格 5 尺，按房间画场地图（墙、门、门外走廊、障碍、难行地形）。移动按意图走（靠近某人、守在门边、远离、冲刺、拖人、撤离），自动绕墙寻路、难行地形双倍，离开威胁范围时报借机，攻击时对照距离和隔墙。
+- **范围法术**：球、立方、线形先查罩到哪些敌我，再决定放不放。
+- **图片地图**（需要可选依赖 `sharp`）：战斗中发当前房间的战斗图，标出站位和坐标，模组有底图就用底图；平时发已探索部分的迷雾地图，有书里的玩家版地图就用它。没装 `sharp` 时退回聊天框里的字符地图。
 
 ### DM 工具
 
-| 工具 | 作用 |
-|------|------|
-| `dnd_roll` | 任意骰子表达式（`2d6+3`、`4d6kh3`…） |
-| `dnd_check` | 技能/属性检定、豁免、攻击、死亡豁免；隐藏 DC/AC；武器、法术攻击、额外骰（引导术/激励）、消耗资源，命中后自动扣血，豁免失败可附带状态；有人能反应时攻击只掷骰、先挂成待结算，留出反应窗口，豁免和检定由 DM 用 hold_for 点名挂起；每一骰带 #R 编号 |
-| `dnd_apply` | 伤害（带伤害类型/重击）、治疗、临时 HP、状态；给待结算的攻击、豁免、检定改数值（尖刻言语、护盾术、导引打击）或整颗 d20 重掷（时间变幻），再落账 |
-| `dnd_character` | 建卡/改卡（玩家绑定、武器、生命骰、物品金币）；`srd=goblin count=3` 从 SRD 取真实数值临时加怪 |
-| `dnd_resource` | 法术位、圣疗池、诗人激励、职业特性次数 |
-| `dnd_rest` | 短休（工具掷生命骰回血）/ 长休 |
-| `dnd_initiative` | 先攻 start / next / goto / end / status；只拉在场的人 |
-| `dnd_move` | 房间移动（`who` 分头行动、暗门发现），返回玩家视角描述 + DM 机密 |
-| `dnd_position` | 战斗内站位（一格 5 尺）：按房间画场地图（墙、门、门外走廊、障碍、难行地形，存档沿用；模组房间可预写 `battlemap`）、摆位（可 `near` 门边）、回合内移动、距离查询；移动按意图走（`to` 某人/门/门外、`keep_adjacent`、`away_from`、冲刺、拖人、撤离），绕墙寻路、难行地形双倍；移动时报借机，攻击时对照距离和隔墙，站位随团况保留，压缩不丢 |
-| `dnd_map` | 渲染已探索部分的迷雾地图并发到群里（需要可选依赖 `sharp`） |
-| `dnd_undo` | 列出最近改动 / 一次撤销 N 步 / 按骰子编号撤回那一骰和它之后的后果 |
-| `dnd_end` | 结团并写剧情摘要，下次开团时注入 |
-| `dnd_srd` | 查 5e SRD 怪物/法术（dnd5eapi.co） |
+| 类别 | 工具 | 作用 |
+|------|------|------|
+| 掷骰 | `dnd_roll` | 任意骰子表达式（`2d6+3`、`4d6kh3`…） |
+| | `dnd_check` | 技能/属性检定、豁免、攻击、死亡豁免；隐藏 DC/AC，命中自动扣血，豁免失败可附带状态；每一骰带 `#R` 编号 |
+| | `dnd_apply` | 伤害（类型/重击）、治疗、临时 HP、状态；给待结算的攻击、豁免、检定改数值或整颗 d20 重掷后再落账 |
+| 角色 | `dnd_character` | 建卡/改卡（玩家绑定、武器、法术清单、物品金币）；`srd=goblin count=3` 从 SRD 取真实数值加怪 |
+| | `dnd_resource` | 法术位、圣疗池、诗人激励、职业特性次数 |
+| | `dnd_rest` | 短休（工具掷生命骰回血）/ 长休 |
+| 战斗 | `dnd_initiative` | 先攻 start / next / goto / end / status；`surprised` 的人第 1 轮由工具跳过 |
+| | `dnd_position` | 战斗内站位：画场地图、摆位、回合内移动、距离查询、`area` 查范围法术 |
+| 探索 | `dnd_move` | 房间移动（`who` 分头行动、暗门发现），返回玩家视角描述 + DM 机密 |
+| | `dnd_map` | 发战斗图或迷雾地图到群里 |
+| 剧情 | `dnd_story` | 按 id 改模组里写好的剧情状态：触发器、信息、任务、NPC 生死与同行 |
+| | `dnd_lookup` | 查模组细节（房间、NPC、线索），只给 DM 看 |
+| | `dnd_hook` | 背景钩子：玩家讲的角色来历里没了结的事挂在 PC 卡上，碰到触发词提醒 DM，分 5 档推进 |
+| | `dnd_chronicle` | 长期剧情账本：临场事实、承诺、俘虏和未结线头，按关键词查询；停团后仍可查 |
+| 存档 | `dnd_undo` | 列出最近改动 / 撤销 N 步 / 按骰子编号撤回那一骰和它之后的后果 |
+| | `dnd_progress` | 保存进度但不暂停，按段增量修改 |
+| | `dnd_prepare` | DM 私有备团：核对团况与交接，保存候选计划；不推进剧情、不向群里发送 |
+| | `dnd_end` | 与 `/dnd end` 共用保存与暂停流程 |
+| 查询 | `dnd_srd` | 查 5e SRD 怪物/法术（dnd5eapi.co） |
 
-工具层还自动处理部分规则：PC 0 HP 倒地与死亡豁免、溢出伤害即死、重击骰子翻倍、「不死坚韧」（光耀伤害和重击不触发）；手动解除「死亡」会被拒绝。
+工具层还自动处理一部分规则：PC 0 HP 倒地与死亡豁免、溢出伤害即死、重击骰子翻倍、「不死坚韧」；手动解除「死亡」会被拒绝。
 
-### 地城与数据
+### 模组
 
-- **内置地城「沉钟修道院」**：原创的 7 房间小地城，适合 1–3 级、3–5 人一晚打完，怪物数值取自 SRD 5.1（CC BY 4.0）。
-- **自定义地城**：把同结构的 JSON 放进 `<dnd.root>/dungeons/`（房间坐标、玩家视角、DM 笔记、出口/暗门、遭遇）。
-- **团的数据**：每个群一份 `<dnd.root>/campaigns/<会话>.json`，改动快照存在 `campaigns/history/`（最近 40 步）。
-- **版权**：商业模组（如《凡达林的失落矿坑》）的文本不要提交进仓库，只放在本地自用。
+- **内置「沉钟修道院」**：原创的 7 房间小地城，适合 1–3 级、3–5 人一晚打完，怪物数值取自 SRD 5.1（CC BY 4.0）。
+- **自己写模组**：把 JSON 放进 `<dnd.root>/adventures/`，小模组一个文件，大模组按场景拆文件；文件改了自动重读，不用重启。模组可以写章节、场景、房间、NPC（含 `knows`：他知道什么、不知道什么）、线索、任务、触发器和战斗场地图。完整写法见 **[模组编写指南](./docs/dnd-module-authoring.md)**。
+- 旧的单地城格式（`dungeons/*.json`）仍然可用。
+- **版权**：商业模组（如《凡达林的失落矿坑》）转出来的文本只放在本机自用，不要提交进仓库。
 
----
+### 数据与配置
 
-## 💬 群聊体验
-
-- **概率插话**：`groupReplyProbability` > 0 时，没有 @bot 的群消息也会按概率触发回复；开团期间自动关闭，避免把闲聊当成行动。
-- **持久化群记忆**：所有群消息（包括没 @bot 的）落盘为 JSONL，重启后能接上长期上下文；只注入上次之后的新消息（游标绑定 sessionId）。
-- **能看群里的历史图片**：被触发时下载最近几张历史图片，标成 `[图片#n]`。当前消息在说图时才原生注入，其余的留路径按需查看。
-- **只回应触发消息**：历史只作背景，回复只针对 `[Current message]`；群聊里默认隐藏工具报错。
-- **合并消息保留发送者**：几个人连续 @bot 被合并成一条时，每行带上自己的 `[昵称 (openid)]`，不会都算到第一个人头上。
-- **自动压缩**：会话上下文超过 `autoCompactTokens`（默认 120000）后在后台压缩。
-- **被动回复窗口**：群聊 msgId 过期后改为主动发送；发送失败的文字会挂起，等下一次用户消息时提示模型补发。
-
-## 🧠 共享笔记（长期记忆）
-
-`notes.root`（默认 `cwd/notes`）下的 Markdown 是 bot 的长期记忆，**所有群、私聊和本机会话共用一份**，只有会话专属笔记例外：
-
-- **自动召回**：每条消息（含引用原文）检索笔记库，足够相关时注入 `[共享笔记 · 可能相关]`。
-- **工具**：`qqbot_notes_search` 检索，`qqbot_notes_save` 新建或追加小节（自动标注日期和来源）。
-- **会话专属笔记**：`qqbot_notes_save` 的 `scope` 可选 `shared`（默认）或 `chat`。`chat` 笔记存在 `notes/chats/<scope>_<peerId>/`，只在这个群/私聊里检索和召回，避免把 A 群的跑团设定当成 B 群发生过的事；看起来像跑团记录的笔记默认存成 `chat`。召回时会话专属笔记标 `[本会话]`，并提示共享笔记不一定发生在本群；跑团状态以 `dnd_*` 工具为准。本机会话能看到全部笔记。
-- 本地 BM25 + 中文二字切词，不需要向量服务；文件改动后自动重建索引。
-
-> 共享笔记对所有会话可见，私聊内容也可能在群里被召回。不要让 bot 记隐私，主人应定期翻看 `notes/` 清理。
-
-## 😺 表情
-
-- **`qqbot_save_sticker`**：bot 看到图片后按自己的情绪决定要不要收藏。按 SHA-256 去重，按文件头识别真实格式，写入 `stickers/index.json`，并注入后续对话的表情清单。
-- **`qqbot_match_sticker`**：用户发来的图按哈希在自己的表情库里精确匹配。
-- **`meme-recognition` skill**：没命中时 OCR + 文本检索（KnowYourMeme、萌娘百科、百度、B 站…），按置信度回答，不编出处。
-
-## 🖼 媒体
-
-- **图文同发**：`qqbot_send_file` 新增 `caption`，文字和图片/视频/文件作为同一条富媒体消息发出；模型误写的 `<qqbot_send_file>` 文本标签会被剥离。
-- **原生读图**：新增 pi-ai 路由 `deepseek-native`（`deepseek-flash`，text + image）和 `vision.native`，图片作为 `ImageBlock` 直接交给主模型；`qqbot_describe_image` 保留给 OCR、图表、长截图。已有会话需要 `/new` 或 `/model` 切换后才生效。
-- **语音识别**：`asr.enabled` 开启后，QQ 没给识别文本的语音会下载（SILK 用 silk-wasm 解码为 WAV）再转写。`asr.mode` 选协议：`chat`（默认）走 `chat/completions` + `input_audio`，端点和凭证取自 `QQBOT_TRANSCRIBE_*`，默认 opencode-go 的 mimo，不需要单独 ASR 密钥；`openai` 走 `/audio/transcriptions`（multipart），任何 OpenAI 兼容服务都行，换 Groq / SenseVoice 只改 `baseUrl` 和 `model`。`asr.fallback` 永远是 openai 协议，两种模式都能用。
-- **视频理解**：`qqbot_describe_video` 优先把整段视频经 `video_url` + data URI 交给 `deepseek-v4.1-flash` 自己看（文件超过 15MB 先用 ffmpeg 压到 480p）；压缩后仍超限才退回「均匀抽帧 + 宫格」的老路径。音轨整段抽成 48kbps mp3 单独转写，最后合成「画面 + 语音」文本。返回里的 `mode` 说明这次走的是 `video` 还是 `frames`。需要 vision 已配置且能找到 ffmpeg/ffprobe，否则不注册。
-- **音频转写**：`qqbot_transcribe` 把音频/视频里的人声转成带时间轴的说话人分段文字（`12.50-18.20 | SPEAKER_01: ...`）。不走 `asr` 配置：本地 ffmpeg 抽成 48 kbps 单声道 mp3，交给能吃音频的模型（默认 OpenCode go 的 `mimo-v2.6-flash`），超过 10 分钟自动切片。`QQBOT_TRANSCRIBE_BASE_URL` / `QQBOT_TRANSCRIBE_MODEL` / `QQBOT_TRANSCRIBE_KEY_REF` 换端点和模型，密钥从凭证库解析。本机 whisper 挂掉时它就是唯一的路；只想看画面、或要「画面 + 语音」一起描述仍用 `qqbot_describe_video`。
-- **合并转发里的图片**：QQ 不把聊天记录里的图片放进附件，只在展开的文本里留一行带 URL 的 `[附件n] 类型:图片 …`（URL 过期后就打不开）。现在会把这些图片提取出来下载到 media（每条消息最多 8 张），文本改写成 `[图片#n: 本地路径]`，编号接在历史图片之后；开了 `vision.native` 时直接作为原生图片交给主模型，并附一句提示说明哪些已下载、哪些只剩 URL。
-
-## 🔧 工具
-
-- **以图搜图**：`qqbot_reverse_image` 拿本地图片查出处，补 `qqbot_match_sticker`（只查本地库）够不到的地方。两个源：`trace.moe` 认动画截图，返回作品名 + 第几集 + 时间点，免费免 key；`SauceNAO` 溯源同人图，返回作者和原帖，需要免费 `QQBOT_SAUCENAO_KEY`（2026-11 起匿名调用被关掉了）。**图片会上传到这两个第三方服务**，所以只在用户明确问「这是谁 / 出自哪」时才调，不自动对每张收到的图发起。
-- **B 站只读工具**：`bili_search`、`bili_video`、`bili_comments`、`bili_subtitle`，以及扫码登录 `bili_login` / `bili_login_check`。
-  - 只读，不注册发评论、投稿、私信等写操作。
-  - 凭证只存在本机 `~/.dsh/bili-read/`。
-  - 登录和字幕仅限私聊主人/管理员。
-  - 参考了 [dsh-bili-scroll](https://github.com/c1overzz/dsh-bili-scroll)（MIT）的接口思路，用纯 Node 实现。
-- **同人图挑选 `qqbot_fanart_pick`**：从 pixiv/safebooru 的 CP 标签池抽几张候选，拼成带编号的预览图让模型挑选；发出去的图记为已看过。
-- **Agent 临时目录**：`tmpDir`（默认 `cwd/tmp`），脚本、截图、下载都写在这里；超过 `tmpTtlHours` 没改动的条目自动清理。
-- **定期清理**：启动时一次、之后每小时一次，按规则回收文件。
-  - 内置规则：`media/` 逐个文件超过 `media.ttlHours` 删除，总量超过 `media.maxTotalMB` 时从最旧的删；`media/fanart/` 里发过的图 7 天后删除（`seen*.json` 保留）；`tmp/` 以顶层条目为单位（取子树里最新的 mtime）超过 `tmpTtlHours` 删除，总量超过 `tmpMaxTotalMB` 时从最旧的条目删；`qqbot_describe_video` 崩溃时遗留在系统临时目录的工作目录 1 小时后删除。
-  - `cleanup.rules` 可以追加目录（如定时任务的 `state/`），每条规则可设 `unit`（`file` 逐个文件 / `entry` 顶层条目整体）、`ttlHours`、`keep`（永不删除的文件名，如 `*.json`、`*.log`）、`match`、`recursive`、`maxTotalMB`。规则目录必须位于工作目录、插件目录或系统临时目录之内，否则忽略。
-  - 不跟随符号链接；超量删除时跳过 10 分钟内改动过的条目；`cleanup.dryRun` 只记日志不删除。
-  - 主人/管理员发 `/bot-cleanup` 查看各目录占用和最近一次清理，`/bot-cleanup run` 立即清理，`/bot-cleanup dry` 试跑看会删什么。
-  - `~/.dsh/attachments`（dsh 自己的图片存储）不在清理范围内：旧会话还引用着这些文件。
-
-## ⏰ 定时任务
-
-- `/new` 会捕获旧会话里还在生效的 daily/weekly/every 任务，在新会话第一条消息中注入重建指令，并删除旧会话里的原任务避免重复触发；一次性任务不迁移。
-- 保留「旧 sessionId → 当前会话」的映射，旧任务恢复时仍能路由到当前群。
-
-## 🔒 权限收紧
-
-- `allowlist` 为空时拒绝所有人（fail-closed），不再退化成全放行。
-- `/model`、`/preset` 的修改，以及群聊审批按钮，只有 `ownerOpenid` / `adminOpenids` 能操作。
-- 审批卡片先登记再发送，修复快速点击的竞态；旧卡片点击会提示已失效。
-- **按会话限制工具**（`toolAccess`）：DSH 的沙箱只限制写、不限制读，群友可以让 bot 用 pwsh/read/grep 去翻 `~/.dsh/.env` 或别的群的存档。现在通过 `tools.guard()` 按会话拦截：
-  - **白名单会话**（主人私聊、`toolAccess.fullAccessGroups` / `fullAccessUsers`、主人在聊天里确认加入的会话）不受限制；
-  - **其他 QQ 会话**：不给终端（`pwsh` / `bash` / `terminal_*`），不给会派生子 agent 的工具（子 agent 会绕过拦截）；文件工具（read/grep/glob/write/edit/`qqbot_send_file` 等）只能碰 media、表情库、临时目录和 `toolAccess.readRoots`，符号链接按真实路径判断，grep/glob 必须显式给 path；受限会话的提示词里会说明这些限制；
-  - `fileAccess.sensitivePaths` 对所有 QQ 会话都拦，白名单会话也不例外；
-  - 本机会话（Web/Desktop）不受影响。
-- **`qqbot_tool_access`**：主人在私聊里直接说「给 XX 群开终端」即可生效；在群里，模型只能发起申请，bot 发一条确认按钮，只有主人本人点「同意」才生效（点击者 openid 由 QQ 回调给出，无法伪造）。运行时授予的白名单存在 `~/.dsh-qqbot/tool-access.json`。
-
-## 🧩 DSH 集成
-
-- 可以在 DSH Web 的「插件」页安装、启停，并在详情页直接修改配置（模型、提示词、插话概率、访问控制、主人 openid、文件白名单…）。
-- 桌宠余额：为 `deepseek-native` 注册同接口的余额 provider，并带 DeepSeek 峰/谷档位。
-
----
-
-## 新增配置项
-
-上游已有的配置项见[上游 README](https://github.com/tencent-connect/dsh-qqbot#readme)。下面是本仓库新增的：
+- 每个群一份团档 `<dnd.root>/campaigns/<会话>.json`，改动快照存在 `campaigns/history/`（最近 40 步）。团档只能经 `dnd_*` 工具修改，文件工具写不进去。
+- 状态怎么跨压缩、跨停团保留，以及踩过的坑，见 **[跑团状态长期化的开发记录](./docs/dnd-long-lived-state.md)**。
 
 | 配置 | 默认值 | 说明 |
 |------|--------|------|
-| `groupReplyProbability` | `0` | 群聊未 @ 时随机回复概率（0–1） |
-| `autoCompactTokens` | `120000` | 上下文超过此 token 数时自动压缩（0 = 关闭） |
-| `tmpDir` / `tmpTtlHours` | `cwd/tmp` / `72` | Agent 临时目录及清理时间 |
-| `tmpMaxTotalMB` / `media.maxTotalMB` | `4096` / `1024` | 临时目录 / media 总量上限，超出从最旧的删（0 = 不限） |
-| `cleanup.rules` / `cleanup.dryRun` | `[]` / `false` | 额外的清理规则；只记日志不删除 |
-| `vision.native` | `false` | 图片作为原生 ImageBlock 交给主模型 |
-| `asr.enabled` / `baseUrl` / `apiKey` / `model` | `false` / SiliconFlow / `''`（= `QQBOT_ASR_API_KEY`）/ `FunAudioLLM/SenseVoiceSmall` | 在线语音识别 |
-| `asr.preferQQ` / `asr.timeoutMs` | `true` / `30000` | 有 QQ 自带识别文本时不调接口；转写超时 |
-| `video.enabled` / `ffmpegPath` / `maxFrames` / `maxSeconds` | `true` / `''`（PATH）/ `8` / `300` | 视频理解工具 |
-| `stickers.*` | 见配置页 | 表情目录、来源白名单、大小与条目上限 |
-| `toolAccess.enabled` | `true` | 按会话限制终端和文件工具（关闭 = 所有 QQ 会话都能用终端、读任意路径） |
-| `toolAccess.fullAccessGroups` / `fullAccessUsers` | `[]` / `[]` | 不受限的群 / 私聊 openid（主人私聊始终不受限） |
-| `toolAccess.readRoots` | `[]` | 受限会话额外允许文件工具访问的目录（media、表情库、临时目录始终允许） |
-| `notes.enabled` / `notes.root` | `true` / `cwd/notes` | 共享笔记库 |
-| `notes.autoInject` / `injectTopK` / `injectMaxChars` / `injectMinCoverage` | `true` / `2` / `600` / `0.4` | 自动召回 |
-| `fanart.enabled` / `proxy` / `poolDir` | `true` / `''` / `scripts/` | 同人图挑选 |
-| `dnd.enabled` / `dnd.root` | `true` / `cwd/dnd` | 跑团开关与数据目录 |
+| `dnd.enabled` | `true` | 跑团开关（`/dnd` 命令 + `dnd_*` 工具） |
+| `dnd.root` | `cwd/dnd` | 团档、模组的数据目录 |
 | `dnd.turnButtons` | `true` | 轮到玩家时发回合按钮 |
+| `dnd.interjections` | `true` | 开团期间也按插话概率随机吐槽（只吐槽、不结算）；关掉后只回 @ |
+
+---
+
+## 其他功能
+
+除跑团外，本仓库在上游基础上还加了这些。配置项都在 DSH Web「插件」页的 QQ 机器人设置里，带说明。
+
+| 方向 | 内容 |
+|------|------|
+| 💬 群聊 | 未 @ 时按概率或「回复欲望」打分接话；群消息落盘，重启后接得上；能看历史图片；合并消息保留各自发送者；上下文超限自动压缩；`/new` 时把旧会话的要点写成交接带进新会话（`/new blank` 完全从头） |
+| 🧠 记忆 | `notes/` 下的 Markdown 笔记库，所有会话共用、按内容自动召回；`chat` 范围的笔记只在本群可见。主人私聊发 `/bot-notes` 查看注入情况 |
+| 😺 表情 | 按情绪自动收藏（`qqbot_save_sticker`）、按哈希匹配（`qqbot_match_sticker`）、梗图识别 skill |
+| 🖼 媒体 | 图文同发（`caption`）、`deepseek-native` 原生读图、语音识别、整段视频理解与关键帧复查、音频转写、合并转发里的图片 |
+| 🔧 工具 | 以图搜图、B 站只读工具、同人图挑选、Playwright 浏览器（默认关闭，按群白名单授权）、Agent 临时目录与定期清理（`/bot-cleanup`） |
+| ⏰ 定时 | `/new` 和人设切换时自动迁移定时任务；群聊主动消息失败后补发 |
+| 🔁 模型 | 上游状态监测与主备模型自动切换（`modelFailover`，默认关闭） |
+| 🧩 DSH 集成 | 在 DSH Web「插件」页安装、启停和改配置；桌宠余额兼容 `deepseek-native` |
+
+### 权限
+
+- `allowlist` 为空时拒绝所有人（fail-closed）；`/model`、`/preset` 和审批按钮只有 `ownerOpenid` / `adminOpenids` 能操作。
+- **按会话限制工具**（`toolAccess`，默认开启）：主人私聊和白名单会话不受限；其他 QQ 会话不给终端和子 agent，文件工具只能碰 media、表情库、临时目录和 `toolAccess.readRoots`。本机会话（Web/Desktop）不受影响。
+- 主人在私聊里说「给 XX 群开终端」即可加白名单；在群里只能发起申请，由主人本人点按钮同意。
+- `fileAccess.sensitivePaths` 里的路径对受限会话一律拦（即使在 `readRoots` 里）；白名单会话有终端，不拦。关掉 `toolAccess` 后对所有 QQ 会话都拦。
+- B 站登录和字幕仅限私聊主人/管理员；以图搜图会把图片上传到第三方服务，只在用户明确问出处时才调用。
+
+> 共享笔记对所有会话可见，私聊内容也可能在群里被召回。不要让 bot 记隐私，主人应定期翻看 `notes/` 清理。
 
 ## 本地运行
 
@@ -210,12 +142,12 @@ npx @deepseek-ai/dsh plugin --profile qqbot add /path/to/dsh-qqbot
 npx @deepseek-ai/dsh --profile qqbot
 ```
 
-插件加载的是 `dist/`：改完代码要 `pnpm build`，并**重启 dsh** 才会生效。其他安装方式见上游 README。
+插件加载的是 `dist/`：改完代码要 `pnpm build`，并**重启 dsh** 才会生效。图片地图需要可选依赖 `sharp`，视频相关工具需要 ffmpeg/ffprobe。其他安装方式见上游 README。
 
 ## 安全与隐私
 
 - 凭据只放在 profile 的 `cordis.patch.yml` 或环境变量里，不要提交。
-- 运行期数据不进仓库：`media/`（群聊和私聊附件，可能涉及他人隐私）、`stickers/`（用户投稿）、`notes/`（长期记忆）、`dnd/`（团的数据）、`tmp/`。
+- 运行期数据不进仓库：`media/`（群聊和私聊附件，可能涉及他人隐私）、`stickers/`、`notes/`、`dnd/`、`tmp/`。
 - 提交前用 `git status --short` 和 `git diff --cached` 复查。
 
 ## 致谢与许可
@@ -224,5 +156,6 @@ npx @deepseek-ai/dsh --profile qqbot
 - 宿主：[deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)
 - 怪物与法术数据：System Reference Document 5.1（Wizards of the Coast，[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)）
 - 规则查阅：[灰机 D&D wiki](https://dnd.huijiwiki.com/wiki/)
+- B 站接口思路参考 [dsh-bili-scroll](https://github.com/c1overzz/dsh-bili-scroll)（MIT）
 
 [MIT](./LICENSE)

@@ -26,6 +26,7 @@ import {
 } from './adventure.ts';
 import { type Campaign, type Character, type CharacterInput, woundLabel } from './campaign.ts';
 import type { DungeonMonster, DungeonRoom } from './dungeon.ts';
+import { pcsWithoutHooks } from './hooks.ts';
 
 export interface NpcState {
   met?: boolean;
@@ -376,12 +377,19 @@ export function beginAdventure(c: Campaign, adv: Adventure): { lines: string[]; 
 export function openingLines(c: Campaign, adv: Adventure): string[] {
   if (!inOpening(c)) return [];
   const steps = adv.opening ?? [];
+  const pcs = c.characters.filter((ch) => ch.kind === 'pc');
+  const missing = pcsWithoutHooks(c);
+  // 开场是问来历最自然的时候；带过来的老角色已经留过就不再问
+  const hookStep = pcs.length > 0 && missing.length === 0
+    ? []
+    : [`顺便问问${missing.length > 0 ? ` ${missing.join('、')}` : '每个人'}：角色过去有没有放不下的事（在找的人、欠的债、逃开的地方）。愿意说就用 dnd_hook add 记下他的原话和触发词，不想说就算了，别替他编。`];
   return [
     '【开场还没做完】/dnd new 已经把开场白发到群里了。先带玩家做下面的事，一步一步来、等玩家回应；'
       + '不要描述第一个场景、不要提任何敌人或危险、不要掷骰。玩家都准备好了（或者说「开始吧」）再调用 dnd_story action=begin，按它返回的玩家视角描述第一个场景。',
     ...(steps.length > 0
       ? steps.map((s, i) => `${i + 1}. ${s}`)
       : ['1. 让每个人介绍自己的角色（名字、职业、一两句来历）。', '2. 问清楚队伍怎么上路、谁走前面谁殿后。']),
+    ...hookStep,
   ];
 }
 

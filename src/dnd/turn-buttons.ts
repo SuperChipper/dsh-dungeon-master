@@ -12,11 +12,15 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { SessionManager, SessionRecord } from '../session/index.ts';
 import type { Logger, ReplyTarget } from '../types.ts';
 import { BUTTONS_PER_ROW, buttonLabel, decodeButtonData, encodeButtonData } from '../features/button-utils.ts';
+import { mapCaption, renderPartyMap } from './map-view.ts';
+import { join } from 'node:path';
+import type { Adventure } from './adventure.ts';
 import { type Campaign, type PendingRoll, describePending, findCharacter, nextTurn, playerStatus } from './campaign.ts';
-import { REACTION_WINDOW_MS, waitingOn } from './pending-attack.ts';
+import { waitingOn } from './pending-attack.ts';
 import { type CheckIn, arrivalNotice, checkInHint, createCheckIn, isComplete, kickoffMessage, markArrived, rosterOf, rosterText } from './check-in.ts';
 import type { DndService } from './dnd-service.ts';
 import { combatTurnPrompt } from './dnd-tools.ts';
+import { spellListText } from './spell-links.ts';
 
 /** acknowledgeInteraction 的返回码：QQ 客户端据此弹提示 */
 export const ACK = { ok: 0, failed: 1, duplicate: 3, denied: 4 } as const;
@@ -65,10 +69,10 @@ export function buildTurnKeyboard(name: string, round: number): InlineKeyboard {
         },
         {
           buttons: [
-            commandButton('dnd-attack', '攻击', `${name} 攻击 `),
-            commandButton('dnd-cast', '施法', `${name} 施放 `),
-            commandButton('dnd-other', '其他行动', `${name} `),
-            commandButton('dnd-wiki', '查询', '/dnd search '),
+            // 原来攻击 / 施法 / 其他行动三个，只差预填的一个动词；一行四个按钮在手机上全被截成「其他…」「我的…」
+            commandButton('dnd-act', '行动', `${name} `),
+            // 原来是预填 /dnd search 的「查询」：玩家得自己记得法术名再打字，战斗里没人用
+            callbackButton('dnd-spells', '我的法术', 0, encodeButtonData({ t: 'dnd', a: 'spells', n: name })),
           ],
         },
       ],
@@ -127,6 +131,8 @@ export class DndTurnButtons {
   /** 还没发出去的签到提醒（会话 key → 这一批刚签到的 openid） */
   private readonly pendingArrivals = new Map<string, { openids: string[]; timer: ReturnType<typeof setTimeout> }>();
   private disabled = false;
+  /** 每个会话最后一次自动发战斗图的那一轮：一轮只发一张，每回合都发会刷屏 */
+  private readonly lastImage = new Map<string, string>();
 
   public constructor(
     private readonly service: DndService,
@@ -159,6 +165,7 @@ export class DndTurnButtons {
     this.lastSent.set(record.sessionKey, mark);
     const text = `▶ 第 ${pc.round} 轮 · 轮到 **${pc.name}**${pc.player !== undefined ? `〈${pc.player}〉` : ''}\n`
       + '宣告动作请 @我；动作、附赠动作、移动都用完了点「结束回合」（只有你本人点才算）。';
+    await this.sendRoundImage(record, found.campaign, found.adventure);
     try {
       await this.sender.sendMarkdown(record.replyTarget, text, { keyboard: buildTurnKeyboard(pc.name, pc.round) });
     } catch (err) {
@@ -168,9 +175,33 @@ export class DndTurnButtons {
     }
   }
 
+  /** 画当前的战斗图；没开战、没摆位、没场地图或发不了图时返回 undefined */
+  private async battleImage(key: string, campaign: Campaign, adventure: Adventure): Promise<string | undefined> {
+    if (this.service.sendImage === undefined || campaign.initiative === undefined) return undefined;
+    const out = join(this.service.mapDir, `${key.replace(/[^a-zA-Z0-9_-]+/g, '_')}-turn-${Date.now()}.png`);
+    const map = await renderPartyMap(campaign, adventure, out, 'battle').catch(() => undefined);
+    return map?.path;
+  }
+
+  /** 每轮第一个 PC 回合前发一张战斗图：玩家每轮至少看到一次最新站位，其余回合提示保持纯文字 */
+  private async sendRoundImage(record: SessionRecord, campaign: Campaign, adventure: Adventure): Promise<void> {
+    const state = campaign.initiative;
+    if (state === undefined) return;
+    // 带上先攻表：新开的一场仗也是第 1 轮，不能被上一场的记号挡住
+    const mark = `${state.round}:${state.order.map((e) => e.name).join(',')}`;
+    if (this.lastImage.get(record.sessionKey) === mark) return;
+    this.lastImage.set(record.sessionKey, mark);
+    try {
+      const path = await this.battleImage(record.sessionKey, campaign, adventure);
+      if (path !== undefined) await this.service.sendImage!(record.replyTarget, path, mapCaption(campaign, adventure, 'battle'));
+    } catch (err) {
+      this.logger.warn(`im-qqbot: 每轮战斗图发送失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   /**
-   * 有一笔待结算：回复发完后发反应按钮，再开始计时。计时不看按钮能不能发：
-   * 按钮关着时玩家照样打字回应，时间到了也要提醒 DM 落账，否则这笔会一直挂着。
+   * 有一笔待结算：回复发完后发反应按钮。不限时：玩家点按钮或打字答复，都答复了叫醒 DM；
+   * 有人一直不回时由 DM 用 dnd_apply decline 替他跳过。
    */
   public scheduleReaction(record: SessionRecord): void {
     void record.agent.whenIdle()
@@ -185,7 +216,7 @@ export class DndTurnButtons {
     if (p === undefined) return;
     if (!this.disabled && record.scope === 'group' && p.reactors.length > 0) {
       const text = `⚡ ${describePending(p)}还没结算。要用反应的点下面，只有本人点才算，也可以直接打字说。`
-        + `约 ${Math.round(REACTION_WINDOW_MS / 1000)} 秒没回算不用。`;
+        + '不限时，等本人答复；人不在的话 DM 会替他跳过。';
       try {
         await this.sender.sendMarkdown(record.replyTarget, text, { keyboard: buildReactionKeyboard(p) });
       } catch (err) {
@@ -193,17 +224,6 @@ export class DndTurnButtons {
         this.logger.warn(`im-qqbot: 反应按钮发送失败，本次运行不再发按钮: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    const timer = setTimeout(() => this.reactionTimeout(record, p.seq, p.at), REACTION_WINDOW_MS);
-    timer.unref?.();
-  }
-
-  private reactionTimeout(record: SessionRecord, seq: number, at: number): void {
-    const p = this.service.active(record.sessionKey)?.campaign.initiative?.pending;
-    // at 变了 = 重掷后窗口重开过，新开的那个计时器会负责提醒
-    if (p === undefined || p.seq !== seq || p.at !== at) return;
-    const waiting = waitingOn(p);
-    if (waiting.length === 0) return;
-    this.notifyDm(record, `[系统 · 反应窗口] 时间到，${waiting.join('、')} 没回，算不用。用 dnd_apply target=${p.target} settle=true 落账，再接着结算。`);
   }
 
   private notifyDm(record: SessionRecord, text: string): void {
@@ -260,6 +280,18 @@ export class DndTurnButtons {
   public async sendStatus(key: string, target: ReplyTarget, viewer: string | undefined): Promise<boolean> {
     const found = this.service.active(key);
     if (found === undefined) return false;
+    // 战斗中能出图就发战斗图，血量、先攻、距离这些文字附在图下面；出不了图才用字符网格
+    // 没开战或发不了图时不等这一步：按钮回调要求立刻回话
+    if (this.service.sendImage !== undefined && found.campaign.initiative !== undefined) try {
+      const path = await this.battleImage(key, found.campaign, found.adventure);
+      if (path !== undefined) {
+        const text = `🎲 ${found.adventure.name}\n${playerStatus(found.campaign, found.adventure, viewer, 'image')}\n${mapCaption(found.campaign, found.adventure, 'battle')}`;
+        await this.service.sendImage!(target, path, text);
+        return true;
+      }
+    } catch (err) {
+      this.logger.warn(`im-qqbot: 跑团状态图发送失败，退回 markdown: ${err instanceof Error ? err.message : String(err)}`);
+    }
     try {
       await this.sender.sendMarkdown(target, `🎲 ${found.adventure.name}\n${playerStatus(found.campaign, found.adventure, viewer, 'markdown')}`);
       return true;
@@ -408,6 +440,17 @@ export class DndTurnButtons {
       if (record !== undefined) void this.sendStatus(key, record.replyTarget, event.group_member_openid ?? event.user_openid);
       return ACK.ok;
     }
+    if (button.a === 'spells') {
+      if (record === undefined) return ACK.failed;
+      // 谁点就列谁的：按钮挂在当前回合那条消息上，别的玩家等回合时也想翻自己的法术
+      const clicker = event.group_member_openid ?? event.user_openid;
+      const ch = found.campaign.characters.find((x) => x.kind === 'pc' && x.playerId !== undefined && x.playerId === clicker)
+        ?? findCharacter(found.campaign, String(button.n ?? ''));
+      if (ch === undefined) return ACK.failed;
+      void this.sender.sendMarkdown(record.replyTarget, spellListText(ch.name, ch.spells ?? [], ch.resources))
+        .catch((err: unknown) => this.logger.warn(`im-qqbot: 法术清单发送失败: ${err instanceof Error ? err.message : String(err)}`));
+      return ACK.ok;
+    }
 
     // 结束回合：必须还是按钮上的那个回合，且由该 PC 的玩家本人点
     const pc = currentPc(found.campaign);
@@ -419,14 +462,15 @@ export class DndTurnButtons {
     if (found.campaign.initiative?.pending !== undefined) return ACK.failed;
 
     const next = this.service.store.update(key, (c) => {
-      const { round, current, newRound } = nextTurn(c);
-      return { round, newRound, prompt: combatTurnPrompt(c, current.name) };
+      const { round, current, newRound, skipped } = nextTurn(c);
+      return { round, newRound, skipped, prompt: combatTurnPrompt(c, current.name) };
     }, `按钮 结束回合 ${pc.name}`);
     this.logger.info(`im-qqbot: 跑团按钮结束回合 key=${key} ${pc.name} by=${clicker ?? '?'}`);
 
     if (record !== undefined) {
       const text = `[系统 · 按钮] ${pc.name}${pc.player !== undefined ? `〈${pc.player}〉` : ''} 点了「结束回合」，`
         + `先攻已由工具推进（不要再为 ${pc.name} 调用 dnd_initiative next）。`
+        + `${next.skipped.length > 0 ? `受惊跳过：${next.skipped.join('、')}。` : ''}`
         + `${next.newRound ? `进入第 ${next.round} 轮。` : ''}${next.prompt}`;
       record.agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' as const } }));
       this.schedule(record);
