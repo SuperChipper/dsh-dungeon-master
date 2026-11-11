@@ -9,10 +9,13 @@ lib/
 .env.*
 !.env.example
 # 从 profile 复制出的本地覆盖，可能含真实 AppID/AppSecret
-cordis.patch.local.yml
+cordis.patch.local*.yml
+cordis.patch.yml.bak*
+cordis.dev.yml.bak*
 
 # ── 本地运行态（会话、QQ 附件缓存）──
 .dsh-sessions/
+/.dsh/
 # 只忽略仓库根目录的运行时 media/，不能误伤 src/media/ 与 dist/media/
 /media/
 cordis.dev.yml
@@ -35,6 +38,11 @@ npm-debug.log*
 Thumbs.db
 .vscode/
 .idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/.venv/
+/coverage/
 
 # ── 本地生成物 ──
 # 出图与实验产物，体积大且可重新生成
