@@ -13,7 +13,7 @@ export function personaCommand({ manager, config }: CommandDeps): CategorizedCom
   return {
     name: ['persona', '人设'],
     category: 'qqbot',
-    description: '查看或切换这个群的人设（用法: /persona [名字]）',
+    description: '查看或切换当前群聊或私聊的人设（用法: /persona [名字]）',
     authorized: (ctx) => {
       // 无参数只是调出卡片（不是管理员就没有按钮）；带名字才是修改
       const raw = (ctx.command?.raw ?? '').trim();
@@ -22,7 +22,6 @@ export function personaCommand({ manager, config }: CommandDeps): CategorizedCom
     },
     handler: async (cmdCtx) => {
       const { scope, peerId } = getScopePeer(cmdCtx);
-      if (scope !== 'group') return '人设只能在群里切换。';
       const personas = manager.personaSwitch;
       if (personas === undefined || manager.personaStore === undefined) return '人设功能没有启用。';
 
@@ -32,9 +31,9 @@ export function personaCommand({ manager, config }: CommandDeps): CategorizedCom
         await personas.sendCard(target, cmdCtx.message.senderId);
         return { kind: 'noop' as const };
       }
-      if (arg === DEFAULT_PERSONA_ID || arg === DEFAULT_PERSONA_NAME) return personas.apply(peerId, DEFAULT_PERSONA_ID);
+      if (arg === DEFAULT_PERSONA_ID || arg === DEFAULT_PERSONA_NAME) return personas.apply(peerId, DEFAULT_PERSONA_ID, scope);
       const persona = manager.personaStore.find(arg);
-      return persona === undefined ? `没有这个人设：${arg}` : personas.apply(peerId, persona.id);
+      return persona === undefined ? `没有这个人设：${arg}` : personas.apply(peerId, persona.id, scope);
     },
   };
 }

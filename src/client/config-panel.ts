@@ -179,6 +179,7 @@ interface DndWire {
   root: string;
   turnButtons: boolean;
   interjections: boolean;
+  combatAgent?: { enabled: boolean; provider: string; model: string; reasoningEffort: string; contextChars: number };
 }
 
 /** 回复欲望的模型打分（与 src/config.ts 的 ReplyJudgeConfig 对应） */
@@ -698,6 +699,7 @@ export function ConfigPanel(): ReactNode {
     locale: 'zh-CN', timezoneId: 'Asia/Shanghai', timeoutMs: 30000, maxTextChars: 12000,
   };
   const dnd: DndWire = form.dnd ?? { enabled: true, root: '', turnButtons: true, interjections: true };
+  const combatAgent = dnd.combatAgent ?? { enabled: false, provider: 'opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high', contextChars: 8000 };
   const replyDesire: ReplyDesireWire = {
     enabled: false, threshold: 0.6, names: [], engagedMs: 90000, engagedMaxTurns: 8,
     ...form.replyDesire,
@@ -1387,6 +1389,27 @@ export function ConfigPanel(): ReactNode {
       label: '开团后允许随机插嘴', checked: dnd.interjections,
       help: '只吐槽、不结算；关闭后开团后只回 @',
       onChange: (v) => { patch('dnd', { ...dnd, interjections: v }); },
+    }),
+    createElement(SwitchRow, {
+      label: '独立战斗代理', checked: combatAgent.enabled,
+      help: '开战后的下一次回复交给战斗模型，战后把团况交回主 DM；每场独立上下文，用量可用 /dnd combat 查看',
+      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, enabled: v } }); },
+    }),
+    createElement(FieldRow, {
+      label: '战斗 Provider', value: combatAgent.provider, placeholder: 'opencode-go',
+      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, provider: v.trim() } }); },
+    }),
+    createElement(FieldRow, {
+      label: '战斗模型', value: combatAgent.model, placeholder: 'deepseek-v4.1-flash',
+      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, model: v.trim() } }); },
+    }),
+    createElement(NumberRow, {
+      label: '战斗交接字数', value: combatAgent.contextChars, min: 1000, max: 30000, step: 1000,
+      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, contextChars: v } }); },
+    }),
+    createElement(FieldRow, {
+      label: '战斗推理强度', value: combatAgent.reasoningEffort, placeholder: 'high（留空使用模型默认）',
+      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, reasoningEffort: v.trim() } }); },
     }),
 
     form.cwd !== undefined

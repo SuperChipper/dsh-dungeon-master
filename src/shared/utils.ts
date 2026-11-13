@@ -154,8 +154,8 @@ function profileDirFromInstalledLink(home: string): string | null {
     return null;
   }
   const ownRoot = safeRealpath(PLUGIN_ROOT);
+  if (ownRoot === null) return null;
   const packageName = readPluginName();
-  if (packageName === null) return null;
 
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
@@ -170,13 +170,19 @@ function profileDirFromInstalledLink(home: string): string | null {
     } catch {
       continue;
     }
-    const bundles = manifest.dsh?.profile?.bundles;
-    if (!Array.isArray(bundles) || !bundles.includes(packageName)) continue;
+    const rawBundles = manifest.dsh?.profile?.bundles;
+    if (!Array.isArray(rawBundles)) continue;
+    const bundles = rawBundles.filter((b): b is string => typeof b === 'string' && b.length > 0);
+    // 优先核对当前 package.json 包名；本地 link 安装改包名尚未重组时，其余指向同一源码根的 bundle 同样成立
+    const ordered = packageName !== null && bundles.includes(packageName)
+      ? [packageName, ...bundles.filter((b) => b !== packageName)]
+      : bundles;
 
-    const installed = join(dir, 'node_modules', ...packageName.split('/'));
-    const resolved = safeRealpath(installed);
-    // 链接安装：依赖解析到当前源码；注册表副本则交给路径探测。
-    if (ownRoot !== null && resolved === ownRoot) return dir;
+    for (const bundle of ordered) {
+      const installed = join(dir, 'node_modules', ...bundle.split('/'));
+      // 链接安装：依赖解析到当前源码；注册表副本则交给路径探测。
+      if (safeRealpath(installed) === ownRoot) return dir;
+    }
   }
   return null;
 }

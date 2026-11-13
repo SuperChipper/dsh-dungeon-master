@@ -11,7 +11,7 @@
 ### 新功能
 
 - **`qqbot_booru_fetch` 搜图工具**：按 tag（如 `shinosawa_hiro rating:general -ai-generated`）在 safebooru 上取一张 `latest`/`random` 的图，自动去重（`media/fanart/seen.json`，发出去的那张由 send-file 回调记为已发）、校验文件头与大小、落地到 `tmp/fanart/yuri-<id>.<ext>` 并返回路径，直接喂给 `qqbot_send_file`。角色新图推送这类定时任务不用再每轮手搓下载脚本。danbooru 本体对这台机器走 Cloudflare 质询（API/cdn 全 403），safebooru 是同一套 tag 语法的镜像且同图同字节，故统一走它。
-- **纳入 DSH 插件管理**：可在 DSH Web 的「插件」页安装、启停 `@tencent-connect/dsh-qqbot`，并在组合包详情页直接调整配置，无需手改 profile 文件。
+- **纳入 DSH 插件管理**：可在 DSH Web 的「插件」页安装、启停 `dsh-dungeon-master`，并在组合包详情页直接调整配置，无需手改 profile 文件。
 - **配置项扩展**：新增群聊未 @ 回复概率、群历史条数、会话闲置超时、主人 openid、文件访问白名单/敏感路径等可编辑项。
 - **表情自动收藏**：bot 会根据自己看到图片时的情绪，决定是否调用 `qqbot_save_sticker` 收藏；工具按内容哈希去重、更新 `stickers/index.json`，并把新表情注入后续对话的表情清单，不再需要手改人设里的固定对照表。
 - **图文同发**：`qqbot_send_file` 新增 `caption`，图片/视频/文件可以和整段文字作为同一条富媒体消息发出；QQ 会话 prompt 优先使用 caption，不再单独回一段文字。
@@ -25,7 +25,7 @@
 
 ### 体验优化
 
-- **配置入口调整**：端内配置从「设置 → QQ 机器人」迁移到「插件 → 已安装插件 → @tencent-connect/dsh-qqbot」；设置页保留扫码绑定与状态查看。
+- **配置入口调整**：端内配置从「设置 → QQ 机器人」迁移到「插件 → 已安装插件 → dsh-dungeon-master」；设置页保留扫码绑定与状态查看。
 - **链接安装定位修复**：通过 `ctx.baseUrl`、`DSH_PROFILE_DIR` 与安装链接探测定位 profile，修复本地路径安装时扫码/配置写入找不到 profile 的问题。
 - **运行方式说明**：以 Web 插件方式运行时 bot 与 DSH Web 同进程，请勿同时启动独立 profile（如旧的启动脚本），避免同一机器人建立两个连接。
 

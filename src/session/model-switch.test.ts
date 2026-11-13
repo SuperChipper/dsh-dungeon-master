@@ -55,6 +55,8 @@ function harness() {
   const proto = SessionManager.prototype as unknown as Record<string, unknown>;
   self.applyModelSelection = proto.applyModelSelection;
   self.syncExplicitRoute = proto.syncExplicitRoute;
+  // getOrCreate 现在委托给会话打开与人设交接方法，沿用真实实现以保留这条复用路径的覆盖。
+  for (const method of ['waitForPersonaSwitch', 'openSession', 'receivePersonaHandoff']) self[method] = proto[method];
   return { self, record, sessions, agent, installedEvents, appended, setHeader: (h) => { header = h; } };
 }
 

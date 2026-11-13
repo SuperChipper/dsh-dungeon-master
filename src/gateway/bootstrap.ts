@@ -61,6 +61,7 @@ import { CampaignStore } from '../dnd/campaign.ts';
 import { AdventureLibrary } from '../dnd/adventure.ts';
 import { DndService } from '../dnd/dnd-service.ts';
 import { registerDndTools } from '../dnd/dnd-tools.ts';
+import { DndCombatAgents } from '../dnd/combat-agent.ts';
 import { DndToolScope } from '../dnd/tool-scope.ts';
 import { ACK, DndTurnButtons } from '../dnd/turn-buttons.ts';
 import { PersonaStore } from '../features/persona-store.ts';
@@ -315,7 +316,7 @@ export async function bootstrapGateway(
     : undefined;
   manager.dndButtons = dndButtons;
 
-  // ── 群聊人设（/persona 卡片；选择按群持久化） ──
+  // ── 聊天人设（/persona 卡片；选择按群或私聊持久化） ──
   const personaStore = new PersonaStore({ logger });
   const personaSwitch = new PersonaSwitch(manager, personaStore, sender, config, logger);
   manager.personaStore = personaStore;
@@ -590,13 +591,24 @@ export async function bootstrapGateway(
         );
       },
       onTurnChange: (record) => dndButtons?.schedule(record),
+      onCombatStart: (record, field) => {
+        const starting = manager.combatAgents?.startAfterReply(record, field);
+        if (starting === undefined) return false;
+        void starting.then((child) => { if (child !== undefined) dndButtons?.schedule(child); })
+          .catch((err: unknown) => logger.warn(`im-qqbot: 自动战斗交接失败: ${String(err)}`));
+        return true;
+      },
       onPendingAttack: (record) => dndButtons?.scheduleReaction(record),
       members: memberIdsFor(getSenderAliases(), config.appId),
     });
     // 没开团的会话不带跑团工具：开团、停团时跟着换
     if (dndToolNames.length > 0) {
-      const toolScope = new DndToolScope(dndService, dndToolNames, logger);
+      const toolScope = new DndToolScope(dndService, dndToolNames, logger, (record) => manager.combatAgents?.toolView(record) ?? 'full');
       manager.dndToolScope = toolScope;
+      manager.combatAgents = new DndCombatAgents(
+        agents, dndService, () => config.dnd?.combatAgent,
+        (record) => toolScope.sync(record), logger,
+      );
       dndService.onStateChange = (key) => manager.syncDndTools(key);
       // 不是 QQ 会话的 agent 也不带跑团工具：每个 agent 出现时先全藏，QQ 会话建好记录后再按团的状态放开。
       // 这两个事件按 agent 作用域派发，根作用域监听要带 global（同 agent/assistant-stream）

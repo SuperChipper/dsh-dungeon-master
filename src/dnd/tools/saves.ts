@@ -64,14 +64,18 @@ export function registerSaveTools(kit: ToolKit): void {
 
   register(
     'dnd_prepare',
-    'Private DM preparation for the next session; works both while active and paused. show returns current recorded state, '
-    + 'handoff, open matters, backstory hooks and any saved plan. save stores a complete DM-only candidate plan (max 2000 characters): '
-    + 'possible next scenes/NPCs/rules/hooks and questions to verify; look up stat blocks when needed instead of copying them into the plan. clear removes the plan. This never starts play or changes '
-    + 'characters, quests or resources. Plans are NOT events that happened; never send the plan or tool output to players. '
-    + 'If state changed since planning, show flags it for review. Read module details with dnd_lookup when preparing.',
+    'Private DM preparation for the upcoming session; works both while active and paused. Prepare upcoming content in '
+    + 'advance instead of summarizing past events (past progress belongs in dnd_progress / dnd_end). Before saving a plan, '
+    + 'inspect likely next rooms/NPCs with dnd_lookup and, when cards only summarize tables or mechanics, read the module\'s '
+    + 'full text/tables under dnd/adventures/<id>/ (random encounter tables, trap/puzzle DCs, faction clocks, loot tables). '
+    + 'show returns current recorded state, handoff, open matters, backstory hooks and any saved plan. save stores a '
+    + 'complete DM-only forward-looking plan (max 2000 characters): candidate next scenes, key module tables/mechanics, '
+    + 'NPCs, hooks and questions to verify; look up stat blocks when needed instead of copying them into the plan. clear '
+    + 'removes the plan. This never starts play or changes characters, quests or resources. Plans are NOT events that '
+    + 'happened; never send the plan or tool output to players. If state changed since planning, show flags it for review.',
     {
       action: { type: 'string', enum: ['show', 'save', 'clear'] },
-      plan: { type: 'string', description: 'For save: the full private candidate plan, not a recap of established facts.' },
+      plan: { type: 'string', description: 'For save: forward-looking private plan for upcoming scenes/tables/mechanics, never a recap of past events.' },
     },
     ['action'],
     (args, exec) => {

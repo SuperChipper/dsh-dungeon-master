@@ -17,6 +17,7 @@ const USAGE = [
   '/dnd start [模组id] — 开团（同一模组的旧团会接着跑），群里会带签到按钮，人齐自动开场',
   '/dnd new [模组id] [blank] — 存档旧团开新团（默认带上 PC 卡，加 blank 从零建卡）',
   '/dnd status — 看团况（战斗中发战斗图，带血量、先攻和你到各人的距离）',
+  '/dnd combat — 查看最近一场战斗代理的模型与用量（缓存单列）',
   '/dnd map [battle|explore] — 发地图：战斗中是站位图，平时是探索过的地方（和 DM 发的是同一张）',
   '/dnd checkin — 再发一次签到按钮',
   '/dnd end [摘要] — 保存交接并暂停，战斗状态保留；也可直接说「今天先到这」',
@@ -73,14 +74,14 @@ const HELP = [
   '· 回合按钮里的「我的法术」列出你自己卡上的法术，带 wiki 链接；卡上还没有就找 DM 补。',
   `· wiki 首页：${RULES_WIKI}`,
   '',
-  '命令：/dnd start｜new｜status｜checkin｜end｜dungeons｜search｜spells｜help',
+  '命令：/dnd start｜new｜status｜combat｜checkin｜end｜dungeons｜search｜spells｜help',
 ].join('\n');
 
 export function dndCommand({ manager }: CommandDeps): CategorizedCommand {
   return {
     name: 'dnd',
     category: 'qqbot',
-    description: '跑团：开团/结团/团况/玩法说明（用法: /dnd start|new|status|checkin|end|dungeons|search|spells|help）',
+    description: '跑团：开团/结团/团况/战斗用量/玩法说明（用法: /dnd start|new|status|combat|checkin|end|dungeons|search|spells|help）',
     handler: async (cmdCtx) => {
       const service = manager.dndService;
       if (service === undefined) return '跑团功能未启用（配置 dnd.enabled）';
@@ -90,6 +91,7 @@ export function dndCommand({ manager }: CommandDeps): CategorizedCommand {
       const rest = [arg, ...more].filter((s): s is string => s !== undefined && s.length > 0).join(' ');
       // 带按钮的回复直接回这条 /dnd 消息（被动回复），不借会话里上一条消息的 msgId
       const target: ReplyTarget = { scope, targetId: peerId, msgId: cmdCtx.message.messageId, receivedAt: Date.now() };
+      if (sub === 'combat') return manager.combatAgents?.report(key) ?? '战斗代理不可用。';
 
       // 查规则不需要开团，也不需要启用跑团服务之外的东西
       if (sub === 'search') {

@@ -10,7 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- **DSH plugin management**: install, enable/disable, and configure `@tencent-connect/dsh-qqbot` from the DSH Web Plugins page and the bundle detail form, without hand-editing profile files.
+- **DSH plugin management**: install, enable/disable, and configure `dsh-dungeon-master` from the DSH Web Plugins page and the bundle detail form, without hand-editing profile files.
 - **More editable settings**: group reply probability, group history size, session idle timeout, owner openid, and file-access allowlist / sensitive paths.
 - **Automatic sticker collection**: the bot decides — based on how it feels about an image — whether to call `qqbot_save_sticker`; the tool deduplicates by content hash, updates `stickers/index.json`, and injects the new sticker into later turns' catalog, so the fixed persona table no longer needs manual edits.
 - **Media with caption**: `qqbot_send_file` now accepts `caption`, so an image/video/file and the full reply can be sent as one rich-media message; the QQ-session prompt prefers caption over a separate text reply.
@@ -23,7 +23,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
-- **Config location**: in-app config moved from Settings → QQ Bot to Plugins → Installed plugins → `@tencent-connect/dsh-qqbot`; Settings keeps QR binding and status.
+- **Config location**: in-app config moved from Settings → QQ Bot to Plugins → Installed plugins → `dsh-dungeon-master`; Settings keeps QR binding and status.
 - **Linked installs**: profile resolution now uses `ctx.baseUrl`, `DSH_PROFILE_DIR`, and the installed link, fixing QR/config writes that could not locate the profile for local-path installs.
 - **Runtime note**: in Web-plugin mode the bot shares the DSH Web process; do not run the standalone profile at the same time, or the same bot may open two connections.
 

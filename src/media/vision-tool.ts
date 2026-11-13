@@ -24,6 +24,7 @@ import type {
 } from '@deepseek-ai/dsh-llm';
 import type { VisionConfig } from '../config.ts';
 import type { Logger } from '../types.ts';
+import { QQBOT_MESSAGE_SOURCE } from '../shared/message-source.ts';
 
 /** 通过 dsh-llm 的 ImageBlock 间接引用 dsh-attachment 类型，避免直接依赖 dsh-attachment */
 type ImageAttachmentRef = ImageBlock['attachment'];
@@ -129,7 +130,7 @@ export async function callVision(
       { type: 'image', attachment: imageRef },
       { type: 'text', text: prompt },
     ],
-    source: { kind: 'plugin', plugin: 'dsh-im-qqbot' },
+    source: QQBOT_MESSAGE_SOURCE,
   });
 
   const options: GenerateOptions = {

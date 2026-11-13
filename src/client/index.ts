@@ -104,7 +104,7 @@ export function apply(ctx: Context): void {
   // 以 npm 包名为 key）。插件被关闭时浏览器半边随之卸载，配置入口一起消失。
   if (slots !== undefined) {
     disposers.push(    slots.inject('plugins.bundle.config', () => slots.register(
-      { name: 'plugins.bundle.config', key: '@tencent-connect/dsh-qqbot' },
+      { name: 'plugins.bundle.config', key: 'dsh-dungeon-master' },
       ConfigPanel,
     )));
   }

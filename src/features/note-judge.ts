@@ -12,6 +12,7 @@ import type { ContentBlock, GenerateOptions } from '@deepseek-ai/dsh-llm';
 import type { NoteJudgeConfig } from '../config.ts';
 import type { Logger } from '../types.ts';
 import { pickLowestEffort, type JudgeLlm } from './reply-judge.ts';
+import { QQBOT_MESSAGE_SOURCE } from '../shared/message-source.ts';
 
 export interface JudgedNote {
   file: string;
@@ -121,7 +122,7 @@ export class NoteJudge {
         system: buildNoteJudgeSystem(),
         messages: [createUserMessage({
           content: [{ type: 'text', text: buildNoteJudgePrompt(request.query, request.notes) }],
-          source: { kind: 'plugin', plugin: 'dsh-im-qqbot' },
+          source: QQBOT_MESSAGE_SOURCE,
         })],
         // 档位没关干净时思考会吃掉 completion 额度，留够余量让 JSON 写得出来
         maxTokens: 1024,

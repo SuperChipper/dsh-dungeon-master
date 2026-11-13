@@ -1,10 +1,10 @@
 /** 战斗：dnd_initiative（先攻）、dnd_position（站位与场地图）。 */
 import { roomGraph } from '../adventure.ts';
 import {
-assertCanAct,assertNoPending,
+assertCanAct,assertDeclaredByOwner,assertNoPending,
 assertCanEndTurn,endInitiative,gotoTurn,fightRooms,
 joinInitiative,nextTurn,skipSurprised,requireCharacter,
-requireInitiative,startInitiative
+requireInitiative,startInitiative,spendReaction
 } from '../campaign.ts';
 import { findRoom,resolveRoom } from '../dungeon.ts';
 import {
@@ -14,11 +14,11 @@ areaReport,battleGridLines,
 battleLines,
 distancesFrom,
 hiddenFromPlayers,
-moveOnGrid,
-moveResultText,removePosition,
+removePosition,
 setBattleMap,
 setPositions,unplaced
 } from '../battlefield.ts';
+import { beginMovement } from '../movement.ts';
 import { terrainLine } from '../terrain.ts';
 import {
 parsePlacements,
@@ -39,8 +39,10 @@ export function registerCombatTools(kit: ToolKit): void {
     'Combat rounds. start: roll initiative for everyone alive in the current room (or the given participants) and '
     + 'sort. Pass `surprised` with everyone caught off guard (the ambushed side, sleeping guards): the tool skips their '
     + 'round-1 turn by itself and they cannot react until it has passed, so never ask those players to click end turn. '
-    + 'Before rolling, collect every effect that adds to initiative (灵敏之赐 +1d8, 警觉 +5, 状态/专长) and '
-    + 'pass it in `bonus` as {name: dice expression} — the tool rolls it in, so never add it by hand afterwards. '
+    + 'Before rolling, check every participant\'s sheet and table agreements. Fixed total initiative is saved with '
+    + 'dnd_character init_bonus (otherwise Dexterity only); notes do not automatically apply class passives. '
+    + 'Collect remaining active effects (灵敏之赐 +1d8, an unsaved fixed bonus) in `bonus` as {name: dice expression}. '
+    + 'Never repeat a bonus already included in init_bonus or add it by hand afterwards. '
     + 'next: end the current creature\'s turn (on a PC turn only that player can end it: pass declared_by). '
     + 'join: add late arrivals (teammates who caught up, newly spawned monsters) to the running fight: rolls '
     + 'initiative only for `participants` and slots them in, keeping the round and everyone else\'s order; never '
@@ -77,16 +79,17 @@ export function registerCombatTools(kit: ToolKit): void {
         const surprised = strList(args.surprised) ?? [];
         const rolls = startInitiative(c, service.roller, strList(args.participants), room, initiativeBonusArg(args.bonus), surprised);
         const { skipped } = skipSurprised(c);
-        turnChanged();
         const state = requireInitiative(c);
         const surpriseNote = surprised.length === 0 ? ''
           : `\n【突袭】受惊的人第 1 轮整回合由工具跳过，跳过之前也不能反应：${surprised.join('、')}。不用叫他们点结束回合。`
             + (skipped.length > 0 ? `已跳过：${skipped.join('、')}。` : '');
         const away = positionNote(c, adventure, rolls.map((r) => r.name), new Set([room ?? c.currentRoom]));
         const field = battlemapHint(c, adventure, room ?? c.currentRoom);
+        const delegated = deps.onCombatStart?.(recordOf(exec), field) === true;
+        if (!delegated) turnChanged();
         const unused = Object.keys(initiativeBonusArg(args.bonus)).filter((n) => !rolls.some((r) => r.name === n));
         const warn = unused.length > 0 ? `\n【DM】bonus 里这几个名字不在参战者里，没算进去：${unused.join('、')}` : '';
-        return `先攻：\n${rolls.map((r, i) => `${i + 1}. ${r.name} ${r.detail}`).join('\n')}\n${field}${surpriseNote}\n第 ${state.round} 轮，${combatTurnPrompt(c, state.order[state.turn]!.name, { recentSenders: sendersOf(exec) })}${away}${warn}`;
+        return `先攻：\n${rolls.map((r, i) => `${i + 1}. ${r.name} ${r.detail}`).join('\n')}\n${delegated ? '【战斗委派】回复只叙述开场并停下。回复结束后战斗代理自动接手场地图、摆位和当前回合；不要再用主 DM 结算攻击或 next。' : field}${surpriseNote}\n第 ${state.round} 轮，${delegated ? `当前 ${state.order[state.turn]!.name}` : combatTurnPrompt(c, state.order[state.turn]!.name, { recentSenders: sendersOf(exec) })}${away}${warn}`;
       }
       if (action === 'join') {
         const rooms = fightRooms(c);
@@ -117,6 +120,8 @@ export function registerCombatTools(kit: ToolKit): void {
       if (action === 'end') {
         assertNoPending(c, '结束战斗');
         const { rounds, defeated } = endInitiative(c);
+        // 专用子级在工具落账后直接交回主 DM，省掉一次收尾模型请求。
+        if (kit.manager.combatAgents?.isChild(recordOf(exec).agent)) exec.concludeTurn?.();
         return `战斗结束，共 ${rounds} 轮。${defeated.length > 0 ? `击败：${defeated.join('、')}` : ''}`;
       }
       const graph = roomGraph(adventure);
@@ -137,7 +142,10 @@ export function registerCombatTools(kit: ToolKit): void {
     + 'move: one creature moves on its own turn. Prefer intent over coordinates: `to` a creature (ends adjacent), a '
     + 'door, the corridor outside, an obstacle; `away_from` a creature; `feet` caps the distance; `keep_adjacent` '
     + 'when the player says to stay next to someone; dash / drag / disengage as declared. Use x/y only when the '
-    + 'player named a cell. area: before an area spell or breath (fireball, hypnotic pattern, lightning bolt), list who the '
+    + 'player named a cell. Movement pauses at an opportunity-attack trigger BEFORE the remaining route is applied; '
+    + 'ask the listed players, resolve dnd_check attack reaction=true (spends their reaction), then dnd_apply target=mover settle=true. '
+    + 'Never bypass this with set; set is only for initial placement, correction or actual forced movement. '
+    + 'area: before an area spell or breath (fireball, hypnotic pattern, lightning bolt), list who the '
     + 'shape covers so the placement is checked on the grid instead of guessed; tell the players honestly if an ally is in it. '
     + 'show: everyone\'s positions; with `from`, distances from that creature. remove: drop a mark '
     + 'or placement (never remove someone who just stepped outside: move them `to` the corridor outside).',
@@ -209,6 +217,7 @@ export function registerCombatTools(kit: ToolKit): void {
       from: { type: 'string', description: 'For show: list distances from this creature.' },
       declared_by: { type: 'string', description: 'For move of a PC: member id of the player who declared it (the #U number, pass "U3").' },
       reaction: { type: 'boolean', description: 'For move: movement off-turn (a reaction, a feature); not counted against this turn\'s speed.' },
+      use_reaction: { type: 'boolean', description: 'For move: this feature actually spends the mover\'s reaction (e.g. a readied move). Records 0/1 until their next turn. Off-turn movement alone need not cost a reaction.' },
       dm_override: { type: 'boolean', description: 'For move: a player explicitly delegated this PC\'s move. Say so in the reply.' },
     },
     ['action'],
@@ -246,12 +255,13 @@ export function registerCombatTools(kit: ToolKit): void {
         return areaReport(c, request);
       }
       if (action === 'set') {
+        assertNoPending(c, '重新摆位');
         const notes = setPositions(c, parsePlacements(args.placements));
         return [...battleLines(c, roomName), ...notes].join('\n');
       }
       if (action === 'move') {
         const ch = requireCharacter(c, String(args.name ?? ''));
-        if (args.reaction !== true) assertNoPending(c, '移动');
+        assertNoPending(c, '移动');
         if (args.dm_override === true && str(args.declared_by) === undefined) {
           throw new Error('dnd_position: dm_override 还要给 declared_by（委托的玩家编号，如 U4），并在回复里写明是谁委托的');
         }
@@ -262,6 +272,10 @@ export function registerCombatTools(kit: ToolKit): void {
           recentSenders: sendersOf(exec),
         });
         if (args.reaction === true) requireInitiative(c).rebrief = true;
+        if (args.use_reaction === true) {
+          assertDeclaredByOwner(ch, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec) }, '反应移动');
+          spendReaction(c, ch.name);
+        }
         const request: MoveRequest = { reaction: args.reaction === true };
         const text = (key: keyof MoveRequest, value: unknown): void => {
           const v = str(value);
@@ -280,9 +294,14 @@ export function registerCombatTools(kit: ToolKit): void {
         if (feet !== undefined) request.feet = feet;
         if (args.dash === true) request.dash = true;
         if (args.disengage === true) request.disengage = true;
-        return moveResultText(moveOnGrid(c, ch.name, request));
+        const result = beginMovement(c, ch.name, request);
+        if (c.initiative?.movement !== undefined) deps.onPendingAttack?.(recordOf(exec));
+        return result;
       }
-      if (action === 'remove') return removePosition(c, String(args.name ?? ''));
+      if (action === 'remove') {
+        assertNoPending(c, '删除站位');
+        return removePosition(c, String(args.name ?? ''));
+      }
       if (action !== 'show') throw new Error(`dnd_position: 未知 action ${action}`);
       requireInitiative(c);
       const lines = battleLines(c, roomName);

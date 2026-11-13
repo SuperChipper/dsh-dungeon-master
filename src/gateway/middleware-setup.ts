@@ -72,7 +72,7 @@ export function pendingReactionReply(
   const groupId = message.groupOpenid;
   if (message.kind !== 'group' || groupId === undefined) return undefined;
   const campaign = manager.dndService?.active(manager.sessionKey('group', groupId))?.campaign;
-  if (campaign?.initiative?.pending === undefined) return undefined;
+  if (campaign?.initiative?.pending === undefined && campaign?.initiative?.movement === undefined) return undefined;
   const reply = classifyReactionReply(campaign, message.senderId, String(message.content ?? ''));
   return reply === undefined ? undefined : { note: reactionReplyNote(campaign, reply) };
 }

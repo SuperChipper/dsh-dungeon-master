@@ -8,7 +8,7 @@ import { CampaignStore, applyDamage, changeCondition, createCampaign, findCharac
 import { SUNKEN_BELL } from './dungeons/sunken-bell.ts';
 import { DndService } from './dnd-service.ts';
 import { combatTurnPrompt, registerDndTools, srdMonsterInput } from './dnd-tools.ts';
-import { attackRangeNote, battleGridLines, battleLines, cellOf, distanceFeet, distancesFrom, moveOnGrid, moveResultText, setBattleMap, setPositions, turnPositionNote, unplaced } from './battlefield.ts';
+import { areaReport, attackRangeNote, battleGridLines, battleLines, cellOf, distanceFeet, distancesFrom, moveOnGrid, moveResultText, setBattleMap, setPositions, turnPositionNote, unplaced } from './battlefield.ts';
 
 const BELL = adventureFromDungeon(SUNKEN_BELL);
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
@@ -31,6 +31,28 @@ describe('距离', () => {
   it('一格 5 尺，斜走也算 5 尺', () => {
     expect(distanceFeet({ x: 0, y: 0 }, { x: 1, y: 1 })).toBe(5);
     expect(distanceFeet({ x: 0, y: 0 }, { x: 3, y: 1 })).toBe(15);
+  });
+});
+
+describe('范围法术自伤检查', () => {
+  it('贴身目标上的球形范围把施法者列入己方，远处施法者不列入', () => {
+    const c = arena();
+    setPositions(c, [{ name: '刻德温', x: 5, y: 5 }, { name: '狼', x: 5, y: 4 }]);
+    const near = areaReport(c, { caster: '刻德温', at: '狼', shape: 'sphere', size: 20 });
+    expect(near).toContain('敌方：狼');
+    expect(near).toContain('己方：刻德温');
+    expect(near).toContain('己方也在范围里');
+    setPositions(c, [{ name: '刻德温', x: 0, y: 0 }]);
+    expect(areaReport(c, { caster: '刻德温', at: '狼', shape: 'sphere', size: 20 })).toContain('己方：无');
+  });
+
+  it('立方按几何位置计入施法者，射线起点仍不含施法者', () => {
+    const c = arena();
+    setPositions(c, [{ name: '刻德温', x: 5, y: 5 }, { name: '狼', x: 5, y: 4 }]);
+    expect(areaReport(c, { caster: '刻德温', x: 4, y: 4, shape: 'cube', size: 10 })).toContain('己方：刻德温');
+    const line = areaReport(c, { caster: '刻德温', at: '狼', shape: 'line', size: 30 });
+    expect(line).toContain('敌方：狼');
+    expect(line).toContain('己方：无');
   });
 });
 

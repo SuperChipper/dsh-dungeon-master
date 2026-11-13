@@ -105,6 +105,7 @@ class OutboundRouter {
 
     const record = this.manager.findBySessionId(session.header.id);
     if (record === undefined) return;
+    this.manager.combatAgents?.observe(record, raw);
 
     switch (event.type) {
       case 'assistant/chunk':

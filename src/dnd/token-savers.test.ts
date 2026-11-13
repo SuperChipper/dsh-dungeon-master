@@ -149,7 +149,8 @@ describe('回合提示去重', () => {
     const second = combatTurnPrompt(c, '恩佐');
     expect(second).not.toContain('不要替他选目标');
     expect(second).toContain('停下等他本人宣告');
-    expect(second.length).toBeLessThan(first.length / 2);
+    // 实时反应名额和站位不属于重复规则，去重预算只比较规则行。
+    expect(second.split('\n')[0]!.length).toBeLessThan(first.split('\n')[0]!.length / 2);
     expect(combatTurnPrompt(c, '地精2')).toMatch(/^轮到 地精2（你决定），结算完 next。/);
     startInitiative(c, fixed(20, 15), ['卡厄斯', '地精1']);
     expect(combatTurnPrompt(c, '卡厄斯')).toContain('不要替他选目标');

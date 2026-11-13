@@ -13,6 +13,14 @@ cordis.patch.local.yml
 /stickers/
 # 共享笔记默认在 agent cwd/notes；未配置 cwd 时也不要把笔记提交/打包
 /notes/
+/dnd/
+/tmp/
+/output/
+/.qqbot-browser/
+AGENTS.md
+package-lock.json
+pnpm-lock.yaml
+pnpm-workspace.yaml
 .git/
 .gitignore
 *.tsbuildinfo

@@ -124,6 +124,7 @@ export async function handleInbound(
     receivedAt: Date.now(),
   };
 
+  await manager.waitForPersonaSwitch?.(scope, peerId);
   // ── 群历史：被 @/随机触发时读持久化群记忆，并按需下载最近几张历史图片 ──
   // 只注入上次注入之后的新消息：更早的已经在会话历史里了，重复注入只会让上下文越滚越大。
   // 游标绑定 sessionId，换了新会话（/new）时会话里没有旧历史，退回完整的最近 N 条。
@@ -182,6 +183,7 @@ export async function handleInbound(
     for (const id of mwState.mergedSenders ?? []) {
       if (id !== msg.senderId) manager.noteSender(record, id);
     }
+    record = await manager.routeDndRecord(record);
   } catch (err) {
     logger.error(`ERROR creating session: ${err instanceof Error ? err.message : String(err)}`);
     // 兜底回复：会话创建失败时告知用户，避免静默无响应

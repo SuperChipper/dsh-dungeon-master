@@ -26,7 +26,7 @@ import {
   findRoom,
 } from './dungeon.ts';
 import { ABILITIES, type Ability, type Skill, abilityModifier, parseAbility, parseSkill, proficiencyBonus, SKILLS } from './rules.ts';
-import { battleGridLines, battleLines, cellOf, distancesFrom, hiddenFromPlayers } from './battlefield.ts';
+import { type MoveRequest, battleGridLines, battleLines, canReact, cellOf, distancesFrom, hiddenFromPlayers } from './battlefield.ts';
 import { pendingSummaryLine } from './pending-attack.ts';
 import type { BattleMap } from './terrain.ts';
 import { type NpcState, afterChange, describeCondition, evalCondition, locationKnown, roomView, storySummaryLines } from './story.ts';
@@ -57,7 +57,7 @@ export interface Character {
   /** 怪物/NPC 的命中加值与伤害（PC 按属性+熟练算） */
   attackBonus?: number;
   damage?: string;
-  /** 先攻加值覆盖（怪物用；PC 取敏捷调整值） */
+  /** 固定先攻总加值覆盖；未设置时取敏捷调整值，临时骰在开战时另传 */
   initBonus?: number;
   /** 步行速度（尺）；缺省按 30 算，只用来提醒超速 */
   speed?: number;
@@ -163,6 +163,8 @@ export interface ReactorOption {
   reaction: string;
   /** DM 用 hold_for 点名问的（时间变幻这类不登记触发条件的反应）；重掷后重算名单时保留 */
   manual?: boolean;
+  /** NPC/怪物由 DM 决定，不生成可被群成员点击的反应按钮。 */
+  npc?: boolean;
 }
 
 interface PendingBase {
@@ -187,6 +189,7 @@ export interface PendingAttack extends PendingBase {
   weapon?: string;
   /** 额外伤害表达式；未命中转命中时落账才掷，要留着 */
   extraDamage?: string;
+  onHit?: OnHitEffect;
   natural: number;
   rollDetail: string;
   total: number;
@@ -203,6 +206,16 @@ export interface PendingAttack extends PendingBase {
   attackMod: number;
   acMod: number;
   damageMod: number;
+}
+
+/** 玩家预先授权的命中追加；防守方反应全部结束后才掷骰和扣资源。 */
+export interface OnHitEffect {
+  name: string;
+  damage: string;
+  damageType: string;
+  spend: string;
+  criticalOnly?: boolean;
+  defense?: 'resistant' | 'immune' | 'vulnerable';
 }
 
 /** 豁免/检定里一个人的那一骰 */
@@ -237,8 +250,21 @@ export interface PendingCheck extends PendingBase {
 
 export type PendingRoll = PendingAttack | PendingCheck;
 
+/** 移动在触发借机的格子暂停；反应攻击仍使用 pending，可以再被护盾等反应打断。 */
+export interface PendingMovement extends PendingBase {
+  kind: 'move';
+  resume: MoveRequest;
+}
+
+export type ReactionWindow = PendingRoll | PendingMovement;
+
+export function reactionWindow(c: Campaign | undefined): ReactionWindow | undefined {
+  return c?.initiative?.pending ?? c?.initiative?.movement;
+}
+
 /** 这笔是什么，给提示和报错用 */
-export function describePending(p: PendingRoll): string {
+export function describePending(p: ReactionWindow): string {
+  if (p.kind === 'move') return `${p.target} 的移动（借机）`;
   if (p.kind === 'attack') return `${p.attacker}→${p.target} 的攻击`;
   const who = p.rolls.map((r) => r.name).join('、');
   return p.attacker === who ? `${who} 的${p.label}` : `${p.attacker} 的效果（${who} ${p.label}）`;
@@ -268,8 +294,14 @@ export interface InitiativeState {
   moved?: Record<string, number>;
   /** 当前回合冲刺过的人（移动力翻倍）；和 moved 一起清 */
   dashed?: string[];
+  disengaged?: string[];
+  /** 护盾术持续到施法者下回合开始，不只保护触发它的那一次攻击。 */
+  shielded?: string[];
   /** 同一时间只有一笔：落账前不能推进，所以不需要队列 */
   pending?: PendingRoll;
+  movement?: PendingMovement;
+  /** 哨兵等已经登记反应消耗、尚未掷骰的还击；不能再扣第二次，也不能当作任意反应通行证。 */
+  counterAttacks?: Array<{ by: string; target: string; name: string }>;
   /** 本轮用过反应的人；到他自己的回合开始时恢复 */
   reacted?: string[];
   /**
@@ -836,8 +868,22 @@ export function isSurprised(c: Campaign, name: string): boolean {
 /** 此刻为什么不能反应；能反应时返回 undefined */
 export function reactionBlocked(c: Campaign, name: string): string | undefined {
   if (isSurprised(c, name)) return `${name} 受惊，自己第一个回合过去之前不能反应`;
-  if (c.initiative?.reacted?.includes(name) === true) return `${name} 这一轮的反应已经用过了，要到他下个回合开始才恢复`;
+  if (c.initiative?.reacted?.includes(name) === true) return `${name} 的反应已经用过了，要到他下个回合开始才恢复`;
   return undefined;
+}
+
+export function spendReaction(c: Campaign, name: string): void {
+  const ch = requireCharacter(c, name);
+  const blocked = reactionBlocked(c, ch.name);
+  if (blocked !== undefined) throw new Error(blocked);
+  if (!canReact(ch)) throw new Error(`${ch.name} 现在做不了反应`);
+  if (c.initiative === undefined) throw new Error('反应名额只在战斗中记账');
+  c.initiative.reacted = [...new Set([...(c.initiative.reacted ?? []), ch.name])];
+  c.initiative.rebrief = true;
+}
+
+export function armorClass(c: Campaign | undefined, ch: Character): number {
+  return ch.ac + (c?.initiative?.shielded?.includes(ch.name) === true ? 5 : 0);
 }
 
 /** 指针往后挪一格；回到表头算新一轮。新一轮开始时突袭已经结束 */
@@ -954,7 +1000,7 @@ export function requireInitiative(c: Campaign): InitiativeState {
 
 /** 有待结算的骰子时拒绝往下走：只靠提醒拦不住，模型常把一只怪的回合一口气结算完 */
 export function assertNoPending(c: Campaign, what: string): void {
-  const p = c.initiative?.pending;
+  const p = reactionWindow(c);
   if (p === undefined) return;
   throw new Error(`还有一笔待结算（${describePending(p)}），先不能${what}。玩家回应后 dnd_apply target=${p.target} settle=true 落账；判错了才用 cancel=true。`);
 }
@@ -976,11 +1022,14 @@ export function nextTurn(c: Campaign): { round: number; current: InitiativeEntry
   if (state.order.length === 0) throw new Error('先攻表里已经没有能行动的角色，用 dnd_initiative end 结束战斗');
   delete state.moved;
   delete state.dashed;
+  delete state.disengaged;
+  delete state.counterAttacks;
   let newRound = stepTurn(state);
   const skip = skipSurprised(c);
   newRound ||= skip.newRound;
   // 反应到自己回合开始时恢复
   const current = state.order[state.turn]!;
+  if (state.shielded !== undefined) state.shielded = state.shielded.filter((name) => name !== current.name);
   if (state.reacted !== undefined) {
     state.reacted = state.reacted.filter((n) => n !== current.name);
     if (state.reacted.length === 0) delete state.reacted;
@@ -1035,6 +1084,8 @@ export interface MoveResult {
   checks: ExitCheckRoll[];
   /** 出口检定失败的后果（DM 视角） */
   failText?: string;
+  /** 出口检定没由工具掷：DM 已经用 dnd_check 另行结算过，这里是那几骰的编号 */
+  checkDone?: number[];
   /** afterChange 产生的剧情提示 */
   story: string[];
   /** 玩家现在能看到的出口 */
@@ -1151,6 +1202,8 @@ function rollExitCheck(ch: Character, check: ExitCheck, roller: Roller): ExitChe
  * 战斗中只能单独移动当前回合的角色。
  * 跨场景：从场景入口走到另一个已知场景的入口（有 routes 时要有路）。
  * 出口有 requires 时条件不满足就过不去；有 check 时工具给每个人掷骰，没过的留在原地。
+ * checkDone：这道检定桌上已经用 dnd_check 投过了（模组写的是攀爬，玩家选了别的办法，DM 改掷了体质豁免），
+ * 传那几骰的编号就不再掷一遍。11-11 吞蛇台阶就是先投了豁免，换房间时工具又掷一次，DM 只好逐个手改 room。
  */
 export function moveParty(
   c: Campaign,
@@ -1159,6 +1212,7 @@ export function moveParty(
   discoverHidden = false,
   who?: string[],
   roller: Roller = cryptoRoller,
+  checkDone: readonly number[] = [],
 ): MoveResult {
   const graph = roomGraph(adv);
   const whole = who === undefined || who.length === 0;
@@ -1214,10 +1268,15 @@ export function moveParty(
   }
 
   const check = exit.check;
-  const checks = check === undefined ? [] : candidates.map((ch) => rollExitCheck(ch, check, roller));
+  // 编号对不上的不认：只有真掷过的骰才能顶替出口检定
+  const unknownRoll = checkDone.find((id) => !Number.isInteger(id) || id < 1 || id > (c.rollSeq ?? 0));
+  if (unknownRoll !== undefined) throw new Error(`没有 #R${unknownRoll} 这一骰（目前最新是 #R${c.rollSeq ?? 0}）。check_done 填 dnd_check 结果里的骰子编号`);
+  const settledByHand = check !== undefined && checkDone.length > 0;
+  const checks = check === undefined || settledByHand ? [] : candidates.map((ch) => rollExitCheck(ch, check, roller));
   const movers = candidates.filter((ch) => checks.find((r) => r.name === ch.name)?.passed !== false);
   const failText = check !== undefined && checks.some((r) => !r.passed) ? check.fail : undefined;
   if (checks.length > 0) pushLog(c, `${exit.label}检定：${checks.map((r) => `${r.name}${r.passed ? '成功' : '失败'}`).join('、')}`);
+  if (settledByHand) pushLog(c, `${exit.label}检定已另行结算（${checkDone.map((id) => `#R${id}`).join(' ')}）`);
 
   const everyone = whole && movers.length === candidates.length;
   const firstSiteVisit = movers.length > 0 && site.id !== fromSite.id && !site.rooms.some((r) => c.revealed.includes(r.id));
@@ -1256,6 +1315,7 @@ export function moveParty(
     spawned,
     checks,
     ...(failText !== undefined ? { failText } : {}),
+    ...(settledByHand ? { checkDone: [...checkDone] } : {}),
     story,
     exits: visibleExits(c, adv, movers.length > 0 ? room.id : from),
   };
@@ -1358,8 +1418,10 @@ export function gotoTurn(c: Campaign, name: string, round?: number): InitiativeE
   const idx = state.order.findIndex((e) => e.name === ch.name);
   if (idx === -1) throw new Error(`${ch.name} 不在先攻表里`);
   state.turn = idx;
+  delete state.counterAttacks;
   delete state.moved;
   delete state.dashed;
+  delete state.disengaged;
   if (round !== undefined && round >= 1) state.round = Math.trunc(round);
   pushLog(c, `先攻指针调整到第 ${state.round} 轮 ${ch.name}`);
   return state.order[idx]!;
@@ -1443,7 +1505,7 @@ export function attackModifier(ch: Character, ability?: Ability): number {
 
 // ── 资源、休息、物品 ──
 
-function requireResource(ch: Character, key: string): [string, Resource] {
+export function requireResource(ch: Character, key: string): [string, Resource] {
   const q = key.trim();
   const entries = Object.entries(ch.resources ?? {});
   const found = entries.find(([k]) => k === q) ?? entries.find(([k]) => k.includes(q) || q.includes(k));
@@ -1585,8 +1647,9 @@ export function changeInventory(c: Campaign, name: string, add: string[] = [], r
   return ch;
 }
 
-export function resourceTag(ch: Character): string {
+export function resourceTag(ch: Character, c?: Campaign): string {
   const parts = Object.entries(ch.resources ?? {}).map(([k, r]) => `${k}${r.current}/${r.max}`);
+  if (c?.initiative !== undefined && inInitiative(c, ch.name)) parts.push(`反应${reactionBlocked(c, ch.name) === undefined && canReact(ch) ? 1 : 0}/1`);
   if (ch.hitDie !== undefined) parts.push(`生命骰${ch.level - (ch.hitDiceUsed ?? 0)}/${ch.level}`);
   return parts.length > 0 ? ` {${parts.join(' ')}}` : '';
 }
@@ -1639,10 +1702,10 @@ export function ensureSessionSummary(c: Campaign, now = Date.now()): boolean {
 
 // ── 每回合注入的精简摘要 ──
 
-function hpTag(ch: Character): string {
+function hpTag(ch: Character, c?: Campaign): string {
   const temp = ch.tempHp > 0 ? `+${ch.tempHp}` : '';
   const cond = ch.conditions.length > 0 ? ` [${ch.conditions.join(',')}]` : '';
-  return `${ch.name} ${ch.hp}${temp}/${ch.maxHp} AC${ch.ac}${cond}`;
+  return `${ch.name} ${ch.hp}${temp}/${ch.maxHp} AC${armorClass(c, ch)}${cond}`;
 }
 
 /** 队伍主位置所在的场景，以及这个场景探索了几个房间 */
@@ -1669,7 +1732,7 @@ export function summarize(c: Campaign, adv: Adventure): string {
   lines.push(`可见出口：${exits || '无'}`);
 
   const party = c.characters.filter((ch) => ch.kind !== 'monster');
-  lines.push(`队伍：${party.length > 0 ? party.map((ch) => `${hpTag(ch)}${ch.player ? `〈${ch.player}〉` : ''}${resourceTag(ch)}`).join('；') : '还没有角色卡'}`);
+  lines.push(`队伍：${party.length > 0 ? party.map((ch) => `${hpTag(ch, c)}${ch.player ? `〈${ch.player}〉` : ''}${resourceTag(ch, c)}`).join('；') : '还没有角色卡'}`);
   const positions = partyPositions(c);
   if (positions.size > 1) {
     lines.push(`队伍分头行动：${[...positions].map(([room, members]) => `${findRoom(graph, room)?.name ?? room}：${members.map((ch) => ch.name).join('、')}`).join('｜')}`);
@@ -1690,10 +1753,14 @@ export function summarize(c: Campaign, adv: Adventure): string {
     lines.push(`战斗第 ${s.round} 轮：${order}`);
     lines.push(...battleLines(c, (id) => findRoom(graph, id)?.name ?? id));
     if (s.reacted?.length) lines.push(`已用反应：${s.reacted.join('、')}`);
+    if (s.shielded?.length) lines.push(`护盾术生效：${s.shielded.join('、')}（到各自下回合开始）`);
+    if (s.disengaged?.length) lines.push(`本回合已撤离：${s.disengaged.join('、')}`);
+    if (s.counterAttacks?.length) lines.push(`待还击（反应已扣）：${s.counterAttacks.map((r) => `${r.by}→${r.target}·${r.name}`).join('、')}，原攻击落账后 dnd_check attack reaction=true；不再另扣反应。`);
     if (s.moved && Object.keys(s.moved).length) lines.push(`本回合已移动：${Object.entries(s.moved).map(([name, feet]) => `${name} ${feet}尺`).join('、')}`);
     if (s.dashed?.length) lines.push(`本回合已冲刺：${s.dashed.join('、')}`);
     if (s.surprised?.length) lines.push(`受惊：${s.surprised.join('、')}`);
     if (s.pending !== undefined) lines.push(pendingSummaryLine(s.pending));
+    if (s.movement !== undefined) lines.push(pendingSummaryLine(s.movement));
   }
   lines.push(...storySummaryLines(c, adv, occupied));
   if (c.log.length > 0) lines.push(`最近：${c.log.slice(-SUMMARY_LOG_LINES).join('；')}`);
@@ -1731,6 +1798,7 @@ export function playerStatus(c: Campaign, adv: Adventure, viewer?: string, forma
     const mine = viewer === undefined ? [] : c.characters.filter((ch) => ch.playerId === viewer && !isOut(ch) && cellOf(c, ch) !== undefined);
     for (const ch of mine) lines.push(distancesFrom(c, ch.name, visible));
     if (s.pending !== undefined) lines.push(`⏳ ${describePending(s.pending)}还没结算，等反应`);
+    if (s.movement !== undefined) lines.push(`⏳ ${s.movement.target} 暂停移动，等借机反应`);
   }
   return lines.join('\n');
 }
@@ -1797,9 +1865,9 @@ export class CampaignStore {
    * 读取 → 修改 → 保存；fn 抛错时不保存。改动前的状态存一份快照，供 undo 回滚。
    * label 可以是函数：骰子编号在 fn 里才分配，标签要等它跑完再取。
    */
-  public update<T>(key: string, fn: (c: Campaign) => T, label: string | (() => string) = '改动'): T {
+  public update<T>(key: string, fn: (c: Campaign) => T, label: string | (() => string) = '改动', options: { allowPaused?: boolean } = {}): T {
     const c = this.load(key);
-    if (c === undefined || !c.active) throw new Error('这个群还没有进行中的团。让玩家发送 /dnd start 开团');
+    if (c === undefined || (!c.active && !options.allowPaused)) throw new Error('这个群还没有进行中的团。让玩家发送 /dnd start 开团');
     const before = JSON.stringify(c);
     const seqBefore = c.rollSeq;
     const result = fn(c);

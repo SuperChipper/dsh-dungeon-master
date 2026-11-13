@@ -15,7 +15,7 @@ import { BUTTONS_PER_ROW, buttonLabel, decodeButtonData, encodeButtonData } from
 import { mapCaption, renderPartyMap } from './map-view.ts';
 import { join } from 'node:path';
 import type { Adventure } from './adventure.ts';
-import { type Campaign, type PendingRoll, describePending, findCharacter, nextTurn, playerStatus } from './campaign.ts';
+import { type Campaign, type ReactionWindow, describePending, findCharacter, nextTurn, playerStatus, reactionWindow } from './campaign.ts';
 import { waitingOn } from './pending-attack.ts';
 import { type CheckIn, arrivalNotice, checkInHint, createCheckIn, isComplete, kickoffMessage, markArrived, rosterOf, rosterText } from './check-in.ts';
 import type { DndService } from './dnd-service.ts';
@@ -90,8 +90,8 @@ function shortName(name: string): string {
  * 反应窗口：每个可用的反应一个按钮，再加一个「不用」。权限不靠 QQ 的 specify_user_ids，
  * 和「结束回合」一样在回调里比对点击者 openid：别人的按钮点了会被拒，提示也更明确。
  */
-export function buildReactionKeyboard(p: PendingRoll): InlineKeyboard {
-  const options = p.reactors.map((r, i) => callbackButton(`dnd-react-${i}`, buttonLabel(`${shortName(r.character)}·${r.reaction}`), 1, encodeButtonData({ t: 'dnd', a: 'react', r: p.seq, i })));
+export function buildReactionKeyboard(p: ReactionWindow): InlineKeyboard {
+  const options = p.reactors.flatMap((r, i) => r.npc === true ? [] : [callbackButton(`dnd-react-${i}`, buttonLabel(`${shortName(r.character)}·${r.reaction}`), 1, encodeButtonData({ t: 'dnd', a: 'react', r: p.seq, i }))]);
   // 挤在一行里名字会被截断 → 默认竖着排；QQ 键盘最多 5 行，选项太多才退回两列，宁可挤也别整条发不出去
   const perRow = options.length + 1 > MAX_KEYBOARD_ROWS ? BUTTONS_PER_ROW : 1;
   const rows: InlineKeyboard['content']['rows'] = [];
@@ -157,7 +157,7 @@ export class DndTurnButtons {
     const found = this.service.active(record.sessionKey);
     if (found === undefined) return;
     // 待结算期间回合按钮点了也推进不了，落账后会再排一次
-    if (found.campaign.initiative?.pending !== undefined) return;
+    if (reactionWindow(found.campaign) !== undefined) return;
     const pc = currentPc(found.campaign);
     if (pc === undefined) return;
     const mark = `${pc.round}:${pc.turn}:${pc.name}`;
@@ -212,9 +212,9 @@ export class DndTurnButtons {
   }
 
   private async openReactionWindow(record: SessionRecord): Promise<void> {
-    const p = this.service.active(record.sessionKey)?.campaign.initiative?.pending;
+    const p = reactionWindow(this.service.active(record.sessionKey)?.campaign);
     if (p === undefined) return;
-    if (!this.disabled && record.scope === 'group' && p.reactors.length > 0) {
+    if (!this.disabled && record.scope === 'group' && p.reactors.some((r) => r.npc !== true)) {
       const text = `⚡ ${describePending(p)}还没结算。要用反应的点下面，只有本人点才算，也可以直接打字说。`
         + '不限时，等本人答复；人不在的话 DM 会替他跳过。';
       try {
@@ -227,17 +227,22 @@ export class DndTurnButtons {
   }
 
   private notifyDm(record: SessionRecord, text: string): void {
-    record.agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' as const } }));
+    const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' as const } });
+    if (this.manager.combatAgents !== undefined) {
+      void this.manager.sendDndFollowup(record, message)
+        .then(() => this.schedule(this.manager.getSessionRecord(record.scope, record.peerId) ?? record))
+        .catch((err: unknown) => this.logger.warn(`im-qqbot: 跑团按钮消息失败: ${String(err)}`));
+    } else record.agent.followup(message);
   }
 
   /** 反应按钮：点击者必须是那个角色的玩家。「不用」只算他自己，全员答复才叫醒 DM，免得每人点一下都触发一轮回复 */
   private reactionClick(event: InteractionEvent, key: string, record: SessionRecord | undefined, button: { a: string; r?: number; i?: number }): number {
-    const p = this.service.active(key)?.campaign.initiative?.pending;
+    const p = reactionWindow(this.service.active(key)?.campaign);
     if (p === undefined || p.seq !== button.r) return ACK.duplicate;
     const clicker = event.group_member_openid ?? event.user_openid;
     const ownsReactor = (name: string): boolean => {
       const ch = this.service.active(key)?.campaign.characters.find((x) => x.name === name);
-      return ch !== undefined && (ch.playerId === undefined || ch.playerId === clicker);
+      return ch !== undefined && ch.kind === 'pc' && ch.playerId !== undefined && ch.playerId === clicker;
     };
     const answered = new Set([...p.declined, ...p.used.map((u) => u.by), ...p.claimed.map((o) => o.character)]);
 
@@ -247,7 +252,7 @@ export class DndTurnButtons {
       const fresh = mine.filter((name) => !answered.has(name));
       if (fresh.length === 0) return ACK.duplicate;
       const left = this.service.store.update(key, (c) => {
-        const pending = c.initiative?.pending;
+        const pending = reactionWindow(c);
         if (pending === undefined) return undefined;
         for (const name of fresh) if (!pending.declined.includes(name)) pending.declined.push(name);
         return waitingOn(pending);
@@ -263,10 +268,14 @@ export class DndTurnButtons {
     if (!ownsReactor(option.character)) return ACK.denied;
     if (answered.has(option.character)) return ACK.duplicate;
     this.service.store.update(key, (c) => {
-      c.initiative?.pending?.claimed.push({ character: option.character, reaction: option.reaction });
+      reactionWindow(c)?.claimed.push({ character: option.character, reaction: option.reaction });
     }, `按钮 反应 ${option.character}·${option.reaction}`);
     this.logger.info(`im-qqbot: 跑团反应按钮 key=${key} ${option.character}·${option.reaction} by=${clicker ?? '?'}`);
     if (record !== undefined) {
+      if (p.kind === 'move') {
+        this.notifyDm(record, `[系统 · 按钮] ${option.character} 的玩家本人点了「${option.reaction}」。用 dnd_check character=${option.character} type=attack target=${p.target} reaction=true 结算借机（本人已确认，不用 declared_by），工具会扣反应；全部处理后 dnd_apply target=${p.target} settle=true 继续移动。`);
+        return ACK.ok;
+      }
       this.notifyDm(record, `[系统 · 按钮] ${option.character} 的玩家本人点了用「${option.reaction}」。这是对「${describePending(p)}」那笔的反应，不是新的回合行动：`
         + `用 dnd_apply target=${p.target} reaction={by:"${option.character}", name:"${option.reaction}", ...} 改数值（重掷类传 reroll:"d20"；豁免/检定的 target 填被改的那个掷骰人），不用 declared_by。`);
     }
@@ -348,7 +357,7 @@ export class DndTurnButtons {
     // 开场叙述会说谁到了，攒着的签到提醒不用再发
     this.cancelArrivals(record.sessionKey);
     const text = kickoffMessage(rosterOf(checkIn, campaign), campaign.begun === true, reason);
-    record.agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' as const } }));
+    this.notifyDm(record, text);
     return true;
   }
 
@@ -459,7 +468,7 @@ export class DndTurnButtons {
     const clicker = event.group_member_openid ?? event.user_openid;
     if (ch?.playerId !== undefined && ch.playerId !== clicker) return ACK.denied;
     // 还有一笔没落账：现在推进就把窗口吃掉了
-    if (found.campaign.initiative?.pending !== undefined) return ACK.failed;
+    if (reactionWindow(found.campaign) !== undefined) return ACK.failed;
 
     const next = this.service.store.update(key, (c) => {
       const { round, current, newRound, skipped } = nextTurn(c);
@@ -472,8 +481,8 @@ export class DndTurnButtons {
         + `先攻已由工具推进（不要再为 ${pc.name} 调用 dnd_initiative next）。`
         + `${next.skipped.length > 0 ? `受惊跳过：${next.skipped.join('、')}。` : ''}`
         + `${next.newRound ? `进入第 ${next.round} 轮。` : ''}${next.prompt}`;
-      record.agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' as const } }));
-      this.schedule(record);
+      this.notifyDm(record, text);
+      if (this.manager.combatAgents === undefined) this.schedule(record);
     }
     return ACK.ok;
   }

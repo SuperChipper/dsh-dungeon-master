@@ -1,5 +1,5 @@
 /**
- * 人设切换卡片：/persona 发一张带按钮的消息，主人和管理员点一下切换当前群的人设。
+ * 人设切换卡片：/persona 发一张带按钮的消息，主人和管理员点一下切换当前聊天的人设。
  *
  * 按钮对所有人可点（QQ 的按钮权限管不到 openid 名单），是否放行看回调里点击者的 openid，
  * 模型改不了，也不提供切换人设的工具：否则群友能把 bot 说动，或者往 system prompt 里塞东西。
@@ -7,7 +7,7 @@
 import type { InlineKeyboard, InteractionEvent } from '@tencent-connect/qqbot-nodejs';
 import type { ImQQBotConfig } from '../config.ts';
 import { privilegedOpenids } from '../shared/permissions.ts';
-import type { Logger, ReplyTarget } from '../types.ts';
+import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
 import { BUTTONS_PER_ROW, buttonLabel, decodeButtonData, encodeButtonData } from './button-utils.ts';
 import { DEFAULT_PERSONA_ID, DEFAULT_PERSONA_NAME, type PersonaStore } from './persona-store.ts';
 
@@ -17,10 +17,10 @@ const ACK = { ok: 0, failed: 1, duplicate: 3, denied: 4 } as const;
 /** QQ 键盘最多 5 行：4 行人设，留 1 行翻页 */
 const PAGE_SIZE = 4 * BUTTONS_PER_ROW;
 
-export type SwitchPersonaOutcome = 'ok' | 'same' | 'dnd' | 'busy';
+export type SwitchPersonaOutcome = 'ok' | 'same' | 'dnd' | 'busy' | 'handoff-incomplete' | 'failed';
 
 export interface PersonaSwitchManager {
-  switchPersona(groupId: string, personaId: string): SwitchPersonaOutcome;
+  switchPersona(peerId: string, personaId: string, scope?: ChatScope): Promise<SwitchPersonaOutcome> | SwitchPersonaOutcome;
 }
 
 export interface PersonaSender {
@@ -95,27 +95,29 @@ export class PersonaSwitch {
 
   /** 发卡片：能管的人看到按钮，其他人只看到当前人设 */
   public async sendCard(target: ReplyTarget, senderId: string | undefined, page = 0): Promise<void> {
-    const currentId = this.store.currentId(target.targetId);
+    const currentId = this.store.currentId(target.targetId, target.scope);
     const text = `当前人设：${this.nameOf(currentId)}`;
     if (!canManagePersona(senderId, this.config)) {
       await this.sender.sendMarkdown(target, text);
       return;
     }
-    await this.sender.sendMarkdown(target, `${text}\n点按钮切换，只影响这个群。`, {
+    await this.sender.sendMarkdown(target, `${text}\n点按钮切换，只影响${target.scope === 'group' ? '这个群' : '当前私聊'}。`, {
       keyboard: buildPersonaKeyboard(this.options(), currentId, page),
     });
   }
 
   /** 切换并返回给人看的结果；按钮和 /persona <名字> 共用 */
-  public apply(groupId: string, personaId: string): string {
+  public async apply(peerId: string, personaId: string, scope: ChatScope = 'group'): Promise<string> {
     const name = this.nameOf(personaId);
-    const outcome = this.manager.switchPersona(groupId, personaId);
-    if (outcome === 'ok') this.logger.info(`im-qqbot: 人设切换 group=${groupId} persona=${personaId}`);
+    const outcome = await this.manager.switchPersona(peerId, personaId, scope);
+    if (outcome === 'ok' || outcome === 'handoff-incomplete') this.logger.info(`im-qqbot: 人设切换 scope=${scope} peer=${peerId} persona=${personaId} handoff=${outcome}`);
     switch (outcome) {
       case 'ok': return `已切换到「${name}」。`;
       case 'same': return `现在就是「${name}」。`;
       case 'dnd': return '正在跑团，结团后再切换人设。';
-      case 'busy': return '我正在回复，等这轮说完再切换。';
+      case 'busy': return '我正在回复、压缩或整理交接，等这轮结束再切换。';
+      case 'handoff-incomplete': return `已切换到「${name}」。交接摘要生成失败，旧交接已保留；新增内容已落盘并标为未覆盖，接手时会提示核对。`;
+      case 'failed': return '交接保存失败，暂未切换人设，请稍后重试。';
     }
   }
 
@@ -123,12 +125,13 @@ export class PersonaSwitch {
     const raw = event.data?.resolved?.button_data;
     const data = raw === undefined ? undefined : decodeButtonData(raw);
     if (data?.t !== 'persona') return ACK.duplicate;
-    const groupId = event.group_openid;
-    if (groupId === undefined) return ACK.failed;
-    const clicker = event.group_member_openid ?? event.user_openid;
+    const peerId = event.group_openid ?? event.user_openid;
+    if (peerId === undefined) return ACK.failed;
+    const scope: ChatScope = event.group_openid !== undefined ? 'group' : 'c2c';
+    const clicker = scope === 'group' ? event.group_member_openid ?? event.user_openid : event.user_openid;
     if (!canManagePersona(clicker, this.config)) return ACK.denied;
 
-    const target: ReplyTarget = { scope: 'group', targetId: groupId, eventId: event.id };
+    const target: ReplyTarget = { scope, targetId: peerId, eventId: event.id };
     const report = (err: unknown): void => {
       this.logger.warn(`im-qqbot: 人设消息发送失败: ${err instanceof Error ? err.message : String(err)}`);
     };
@@ -138,8 +141,8 @@ export class PersonaSwitch {
     }
     // 旧卡片上的人设可能已经删了
     const known = data.p !== undefined && this.options().some((option) => option.id === data.p);
-    const text = known ? this.apply(groupId, data.p!) : '这个人设已经不在了，重新发一次 /persona。';
-    this.sender.sendMarkdown(target, text).catch(report);
+    const reply = known ? this.apply(peerId, data.p!, scope) : Promise.resolve('这个人设已经不在了，重新发一次 /persona。');
+    reply.then((text) => this.sender.sendMarkdown(target, text)).catch(report);
     return ACK.ok;
   }
 }

@@ -1,6 +1,7 @@
 /** 角色卡与资源：dnd_character、dnd_resource、dnd_rest。 */
+import type { Adventure } from '../adventure.ts';
 import {
-type CharacterInput,type CharacterKind,changeInventory,findCharacter,inInitiative,fightRooms,leaveInitiative,removeCharacter,requireCharacter,rest,
+type Campaign,type CharacterInput,type CharacterKind,assertNoPending,changeInventory,findCharacter,inInitiative,fightRooms,leaveInitiative,removeCharacter,requireCharacter,rest,
 restoreResource,
 roomOf,
 setResource,upsertCharacter,
@@ -13,6 +14,7 @@ import { ABILITIES,type Ability } from '../rules.ts';
 import { resolveSrdQuery,zhTable } from '../srd-lookup.ts';
 import { type CardSpell,mergeSpells,resolveSpells } from '../spell-links.ts';
 import { hookHint } from '../hooks.ts';
+import { assertCombatExit } from '../battlefield.ts';
 import {
 parseReactions,str,
 int,
@@ -26,27 +28,63 @@ parseAbilities,srdList,requireSrd,srdMonsterInput,
 numberedNames,type ToolKit
 } from './shared.ts';
 
+/** 暂停时可备好 PC 卡，但不能借写卡改战场或访问敌方数据。 */
+function assertPausedSheet(c: Campaign, args: Record<string, unknown>): void {
+  if (c.active) return;
+  const action = String(args.action);
+  if (!['create', 'update', 'show', 'list'].includes(action)) throw new Error('停团时只支持 PC 建卡、改卡和查卡；不能移除角色');
+  if (args.kind !== undefined && args.kind !== 'pc') throw new Error('停团时只能操作 PC 角色卡');
+  if (args.srd !== undefined || (int(args.count) ?? 1) > 1) throw new Error('停团时不能用 SRD 或 count 建怪；PC 一人一张卡');
+  if (args.room !== undefined) throw new Error('停团写卡不能改变位置；移动请开团后用 dnd_move');
+  if (action === 'list') return;
+  const several = strList(args.names);
+  for (const name of several !== undefined && several.length > 0 ? several : [str(args.name) ?? '']) {
+    const ch = action === 'create' ? findCharacter(c, name) : requireCharacter(c, name);
+    if (ch !== undefined && ch.kind !== 'pc') throw new Error(`停团时只能操作 PC 角色卡：「${ch.name}」不是 PC`);
+  }
+}
+
 export function registerCharacterTools(kit: ToolKit): void {
   const { deps, service, recordOf, mutate, memberId, whoOf, register } = kit;
 
   register(
     'dnd_character',
-    'Create, update, show, list or remove character sheets (PCs, NPCs, extra monsters). Ability scores default to 10. '
+    'Use whenever a player asks to see/check their character sheet, inventory, spells or resources, or to create/edit/level up a character. '
+    + 'For existing sheets, read current data with show before answering or editing (reuse a show result already obtained this turn); never reconstruct a sheet from chat memory. '
+    + 'Full sheet: action=show name="角色名"; quick HP/resources: also brief=true; unknown name: action=list first. '
+    + 'Tool results are DM-only, NOT automatically sent to the group: send the requested PC sheet/content in your reply after reading it. '
+    + 'Edits must be persisted with update (new sheets: create); only confirm saved after success. The update result already contains the saved sheet, so no extra show is needed. '
+    + 'Create, update, show, list or remove character sheets (PCs, NPCs, extra monsters). Ability scores default to 10. '
     + 'Bind a PC to the player\'s group nickname with `player` and `player_id` so they can only act for their own character. '
     + 'New PC: ask name and class, then create with weapons, hit_die and the reactions that change attacks (standard array '
     + '15/14/13/12/10/8 if they want help), and set spell slots / class resources with dnd_resource set. '
+    + 'While paused, create/update/show/list work for PCs only (no remove, SRD, multiple copies or room changes); '
+    + 'no need to start the adventure. Use the player tag as player_id (e.g. U7); never edit campaign JSON. '
+    + 'For updates, omit unchanged fields. notes and arrays such as weapons/traits/reactions/skills/saves/spells REPLACE existing values: '
+    + 'read and preserve unrelated entries; prefer add_spells/remove_spells and add_items/remove_items for incremental changes. '
+    + 'Use structured fields for supported mechanics (e.g. init_bonus, traits, reactions); notes alone do not enable automatic bonuses. '
+    + 'Set spell slots/class-resource limits with dnd_resource set, not just notes. '
     + 'Improvised monsters: pass `srd` (e.g. "goblin") to take real stats from the SRD and `count` for several '
-    + '(named 地精1, 地精2…); they are placed in the party\'s current room unless `room` is given.',
+    + '(named 地精1, 地精2…); they are placed in the party\'s current room unless `room` is given. '
+    + 'The same change for several characters (handing everyone an amulet, moving the party by hand, Aid on three people): '
+    + 'ONE update with `names`, never one call each.',
     {
-      action: { type: 'string', enum: ['create', 'update', 'show', 'list', 'remove'] },
-      name: { type: 'string' },
+      action: { type: 'string', enum: ['create', 'update', 'show', 'list', 'remove'], description: 'show: read a current sheet before displaying/editing; update: persist changes to an existing sheet; create: a new sheet; list: find names; remove: delete.' },
+      name: { type: 'string', description: 'Exact character name for create/update/show/remove. If unknown, use list first; names is for batch update or brief show.' },
+      names: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'For update/show: several characters at once instead of `name`. update applies the same fields to each '
+          + '(room, add_items, remove_items, gp_change, max_hp_change, ac, speed…) and returns one line per character.',
+      },
       srd: { type: 'string', description: 'For create: SRD monster index; fills AC/HP/abilities/attack from dnd5eapi.' },
       count: { type: 'integer', description: 'For create: how many copies (numbered names).' },
       room: {
         type: 'string',
         description: 'Room id the character is in (monsters; PCs that split off). Moving a monster in combat to a room '
-          + 'outside the fight (fleeing, running for help) also takes it out of the initiative order.',
+          + 'outside the fight also takes it out of initiative. Voluntary fleeing must first use dnd_position move to the mapped exit and resolve opportunity attacks.',
       },
+      forced_move: { type: 'boolean', description: 'With room: actual teleport/forced movement or correction only, bypassing the voluntary exit-route check. Never for voluntary fleeing. Explain the cause in the reply.' },
       speed: { type: 'integer', description: 'Walking speed in feet (default 30). dnd_position warns when a turn\'s movement exceeds it.' },
       reactions: {
         type: 'array',
@@ -59,6 +97,9 @@ export function registerCharacterTools(kit: ToolKit): void {
             name: { type: 'string' },
             when: { type: 'string', enum: ['foe_attacks', 'attacked', 'attacking'] },
             resource: { type: 'string' },
+            range: { type: 'integer', description: 'Trigger range in feet (e.g. 哨兵 5, 长柄大师 10).' },
+            counter: { type: 'boolean', description: 'Reaction grants a separate counterattack (e.g. 哨兵); record it with dnd_apply reaction, then dnd_check attack reaction=true after settling.' },
+            enter: { type: 'boolean', description: 'Triggers when an enemy enters reach (长柄大师); movement pauses at this boundary.' },
           },
           required: ['name'],
           additionalProperties: false,
@@ -107,7 +148,16 @@ export function registerCharacterTools(kit: ToolKit): void {
       skills: { type: 'array', items: { type: 'string' }, description: 'Proficient skills, e.g. ["察觉","隐匿"].' },
       saves: { type: 'array', items: { type: 'string' }, description: 'Proficient saves, e.g. ["力量","体质"].' },
       max_hp: { type: 'integer' },
+      max_hp_change: {
+        type: 'integer',
+        description: 'Raise or lower max HP by this much (Aid +5, ending it -5). A raise also adds the same to current HP; '
+          + 'current HP never exceeds the new max. Use this with `names`, since each character\'s max differs.',
+      },
       ac: { type: 'integer' },
+      init_bonus: {
+        type: 'integer',
+        description: 'Fixed TOTAL initiative modifier, replacing Dexterity-only calculation (e.g. dex + Temporal Awareness/Jack of All Trades/Alert). Persist after checking the sheet; do not add it again via initiative bonus. Temporary dice such as Gift of Alacrity go in dnd_initiative start bonus, never here. Changing this does not rewrite already-rolled initiative.',
+      },
       attack_bonus: { type: 'integer', description: 'Monsters/NPCs; PCs use ability + proficiency.' },
       damage: { type: 'string', description: 'Monsters/NPCs: default attack damage, e.g. "1d8+3".' },
       weapons: {
@@ -129,21 +179,29 @@ export function registerCharacterTools(kit: ToolKit): void {
           additionalProperties: false,
         },
       },
-      notes: { type: 'string' },
+      notes: { type: 'string', description: 'Replaces ALL notes. Read current notes and preserve unrelated abilities, passives, active effects and agreements when editing. Notes alone do not apply mechanical bonuses; use supported structured fields too.' },
       brief: { type: 'boolean', description: 'For show: one line (HP, AC, conditions, resources, room) instead of the full sheet.' },
     },
     ['action'],
     async (args, exec) => {
       const action = String(args.action);
+      const key = recordOf(exec).sessionKey;
+      const { campaign } = service.active(key) ?? service.saved(key) ?? service.require(key);
+      assertPausedSheet(campaign, args);
       if (action === 'list' || action === 'show') {
-        const { campaign } = service.require(recordOf(exec).sessionKey);
         if (action === 'list') {
-          return campaign.characters.length === 0
+          const visible = campaign.active ? campaign.characters : campaign.characters.filter((ch) => ch.kind === 'pc');
+          return visible.length === 0
             ? '还没有角色。'
-            : campaign.characters.map((ch) => `${ch.name}${ch.player ? `〈${ch.player}〉` : ''} ${ch.kind} HP ${ch.hp}/${ch.maxHp}${roomOf(campaign, ch) ? ` @${roomOf(campaign, ch)}` : ''}`).join('\n');
+            : visible.map((ch) => `${ch.name}${ch.player ? `〈${ch.player}〉` : ''} ${ch.kind} HP ${ch.hp}/${ch.maxHp}${roomOf(campaign, ch) ? ` @${roomOf(campaign, ch)}` : ''}`).join('\n');
+        }
+        const several = strList(args.names);
+        if (several !== undefined && several.length > 0) {
+          // 一次看几个人只给一行摘要：整张卡连着贴几张，比分开调还费上下文
+          return several.map((n) => characterBrief(campaign, requireCharacter(campaign, n))).join('\n');
         }
         const target = requireCharacter(campaign, String(args.name ?? ''));
-        return args.brief === true ? characterBrief(campaign, target) : sheet(target, whoOf(exec));
+        return args.brief === true ? characterBrief(campaign, target) : sheet(target, whoOf(exec), campaign);
       }
       // SRD 数据先取回来（网络请求不能放进同步的 mutate 里）
       const srdIndex = action === 'create' ? str(args.srd) : undefined;
@@ -172,9 +230,11 @@ export function registerCharacterTools(kit: ToolKit): void {
         }
       }
       const removeSpells = strList(args.remove_spells) ?? [];
-      return mutate(exec, (c, adventure) => {
-        const name = str(args.name);
+      /** 改一张卡，返回给模型看的文字。抛错时整次调用不落盘，批量改到一半失败也不会只改了前几个 */
+      const applyOne = (c: Campaign, adventure: Adventure, name: string | undefined): string => {
         if (name === undefined) throw new Error('dnd_character: name 不能为空');
+        if (args.room !== undefined || action === 'remove') assertNoPending(c, '换房间或移除角色');
+        if (action === 'update' && str(args.room) !== undefined && args.forced_move !== true) assertCombatExit(c, requireCharacter(c, name), String(args.room));
         if (action === 'remove') return `已移除 ${removeCharacter(c, name).name}`;
         if (action === 'create' && str(args.kind) !== 'pc') {
           // 11-05 黑蜘蛛被现场建成「黑蜘蛛·内兹纳尔」，死讯没挂到模组的内兹纳上，神庙的剧本还让他再出场一次
@@ -195,7 +255,7 @@ export function registerCharacterTools(kit: ToolKit): void {
         if (kind !== undefined) input.kind = kind as CharacterKind;
         const optional = {
           player: str(args.player), playerId: memberId(exec, args.player_id, 'player_id'), className: str(args.class_name), level: int(args.level), maxHp: int(args.max_hp),
-          ac: int(args.ac), attackBonus: int(args.attack_bonus), damage: str(args.damage), notes: str(args.notes),
+          ac: int(args.ac), initBonus: int(args.init_bonus), attackBonus: int(args.attack_bonus), damage: str(args.damage), notes: str(args.notes),
           skills: parseSkills(strList(args.skills)), expertise: parseSkills(strList(args.expertise)), saves: parseAbilities(strList(args.saves)),
           weapons: parseWeapons(args.weapons), room: str(args.room), hitDie: str(args.hit_die), traits: strList(args.traits), speed: int(args.speed), reactions: parseReactions(args.reactions),
         };
@@ -209,7 +269,7 @@ export function registerCharacterTools(kit: ToolKit): void {
         if (count > 1) {
           const names = numberedNames(c, name, count);
           const made = names.map((n) => upsertCharacter(c, { ...input, name: n }).character);
-          return `已建卡 ${made.length} 个：${names.join('、')}\n${sheet(made[0]!, whoOf(exec))}`;
+          return `已建卡 ${made.length} 个：${names.join('、')}\n${sheet(made[0]!, whoOf(exec), c)}`;
         }
         if (action === 'create' && findCharacter(c, name)?.name === name) throw new Error(`已经有「${name}」了，改数据用 update，再加一只换个名字或传 count`);
         const roomsBefore = fightRooms(c);
@@ -231,11 +291,32 @@ export function registerCharacterTools(kit: ToolKit): void {
           const ch = requireCharacter(c, character.name);
           ch.spells = mergeSpells(newSpells ?? ch.spells ?? [], addSpells, removeSpells);
         }
-        lines.push(sheet(requireCharacter(c, character.name), whoOf(exec)));
+        const maxHpChange = int(args.max_hp_change) ?? 0;
+        if (maxHpChange !== 0) {
+          const ch = requireCharacter(c, character.name);
+          ch.maxHp = Math.max(1, ch.maxHp + maxHpChange);
+          // 倒地的人不靠加上限站起来：那是治疗的事
+          if (maxHpChange > 0 && ch.hp > 0) ch.hp += maxHpChange;
+          ch.hp = Math.min(ch.hp, ch.maxHp);
+        }
+        lines.push(sheet(requireCharacter(c, character.name), whoOf(exec), c));
         if (spellNotes.length > 0) lines.push(`【DM】${spellNotes.join('；')}`);
         if (itemHint !== undefined) lines.push(itemHint);
         return lines.join('\n');
-      });
+      };
+      return mutate(exec, (c, adventure) => {
+        // 法术链接校验会等待网络；这期间可能收团，落盘前按最新状态再检查。
+        assertPausedSheet(c, args);
+        const several = strList(args.names);
+        if (several === undefined || several.length === 0) return applyOne(c, adventure, str(args.name));
+        if (action !== 'update') throw new Error('names 只用于 update 和 show。一次建多只怪用 count，移除一个个来');
+        // 这些字段是某一个人自己的，批量套给所有人一定是填错了
+        const personal = ['name', 'player', 'player_id', 'weapons', 'spells', 'add_spells', 'remove_spells', 'reactions', 'max_hp', 'class_name']
+          .filter((key) => args[key] !== undefined);
+        if (personal.length > 0) throw new Error(`带 names 批量改时不能给 ${personal.join('、')}：这些是单个人的，分开改（上限统一加减用 max_hp_change）`);
+        for (const who of several) applyOne(c, adventure, who);
+        return `已更新 ${several.length} 个：\n${several.map((who) => characterBrief(c, requireCharacter(c, who))).join('\n')}`;
+      }, { allowPaused: true });
     },
   );
 
@@ -243,7 +324,9 @@ export function registerCharacterTools(kit: ToolKit): void {
     'dnd_resource',
     'Track limited-use resources: spell slots (e.g. "1环法术位"), lay on hands pool ("圣疗池"), bardic inspiration '
     + '("诗人激励"), class features ("战争祭司"), potions. set: create or change max; use: spend (fails if not enough); '
-    + 'restore: give back (omit amount to refill). Set the max the first time a resource comes up. Spend only when the owning player says they use it.',
+    + 'restore: give back (omit amount to refill). Set the max the first time a resource comes up. Spend only when the owning player says they use it. '
+    + 'Reactions are a built-in 0/1 combat resource, shown on dnd_character show and restored at the actor\'s next turn; do not create a second resource or spend it separately. Reaction tools account for it automatically. '
+    + 'While paused, only set on a PC is allowed, to configure a sheet without starting play; use/restore require an active adventure.',
     {
       action: { type: 'string', enum: ['set', 'use', 'restore'] },
       character: { type: 'string' },
@@ -257,7 +340,11 @@ export function registerCharacterTools(kit: ToolKit): void {
     (args, exec) => mutate(exec, (c) => {
       const name = String(args.character ?? '');
       const key = String(args.resource ?? '');
+      if (/^(反应|reaction)$/i.test(key.trim())) throw new Error('反应由战斗工具按 0/1 自动记账，在自己下回合开始恢复；不要用 dnd_resource 重复创建、消耗或恢复。用 dnd_character show 查看');
       const action = String(args.action);
+      if (!c.active && (action !== 'set' || requireCharacter(c, name).kind !== 'pc')) {
+        throw new Error('停团时只能用 dnd_resource set 配置 PC 资源；消耗和恢复请开团后操作');
+      }
       if (action === 'set') {
         const max = int(args.max);
         if (max === undefined) throw new Error('dnd_resource set 需要 max');
@@ -269,7 +356,7 @@ export function registerCharacterTools(kit: ToolKit): void {
         ? useResource(c, name, key, int(args.amount) ?? 1)
         : restoreResource(c, name, key, int(args.amount));
       return `${requireCharacter(c, name).name}「${result.key}」${result.before}→${result.resource.current}/${result.resource.max}`;
-    }),
+    }, { allowPaused: true }),
   );
 
   register(

@@ -4,7 +4,7 @@ import type { ImQQBotConfig } from '../config.ts';
 import { personaCommand } from '../commands/persona.ts';
 import { meCommand } from '../commands/misc.ts';
 import { SessionManager } from '../session/session-manager.ts';
-import type { Logger } from '../types.ts';
+import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
 import { DEFAULT_PERSONA_ID, type Persona, type PersonaStore } from './persona-store.ts';
 import { buildPersonaKeyboard, canManagePersona, PersonaSwitch, type SwitchPersonaOutcome } from './persona-switch.ts';
 
@@ -22,9 +22,9 @@ function fakeStore(personas: Persona[] = [maid], current = DEFAULT_PERSONA_ID): 
 
 function setup(outcome: SwitchPersonaOutcome = 'ok', personas: Persona[] = [maid]) {
   const switchPersona = vi.fn(() => outcome);
-  const sent: Array<{ text: string; keyboard?: unknown }> = [];
+  const sent: Array<{ target: ReplyTarget; text: string; keyboard?: unknown }> = [];
   const sender = {
-    sendMarkdown: vi.fn(async (_t: unknown, text: string, opts?: { keyboard?: unknown }) => { sent.push({ text, keyboard: opts?.keyboard }); }),
+    sendMarkdown: vi.fn(async (target: ReplyTarget, text: string, opts?: { keyboard?: unknown }) => { sent.push({ target, text, keyboard: opts?.keyboard }); }),
   };
   const personaSwitch = new PersonaSwitch({ switchPersona }, fakeStore(personas), sender, config, logger);
   return { personaSwitch, switchPersona, sent };
@@ -37,6 +37,13 @@ function click(data: unknown, member?: string): InteractionEvent {
     ...(member !== undefined ? { group_member_openid: member } : {}),
     data: { resolved: { button_data: JSON.stringify(data) } },
   } as unknown as InteractionEvent;
+}
+
+function directClick(data: unknown, user?: string): InteractionEvent {
+  const event = click(data);
+  delete event.group_openid;
+  if (user !== undefined) event.user_openid = user;
+  return event;
 }
 
 const labels = (keyboard: ReturnType<typeof buildPersonaKeyboard>) => keyboard.content.rows.map((row) => row.buttons.map((b) => b.render_data.label));
@@ -95,25 +102,53 @@ describe('PersonaSwitch', () => {
   it('管理员点按钮切换当前群，并告知结果', async () => {
     const { personaSwitch, switchPersona, sent } = setup();
     expect(personaSwitch.handleInteraction(click({ t: 'persona', a: 'use', p: 'maid' }, 'admin'))).toBe(0);
-    expect(switchPersona).toHaveBeenCalledWith('g1', 'maid');
-    await Promise.resolve();
-    expect(sent[0]!.text).toContain('已切换到「女仆」');
+    expect(switchPersona).toHaveBeenCalledWith('g1', 'maid', 'group');
+    await vi.waitFor(() => expect(sent[0]?.text).toContain('已切换到「女仆」'));
+  });
+
+  it('私聊卡片读取私聊人设，按钮切换后回复当前私聊', async () => {
+    const { switchPersona, sent } = setup();
+    const store = fakeStore([maid], 'maid');
+    const currentId = vi.spyOn(store, 'currentId');
+    const personaSwitch = new PersonaSwitch({ switchPersona }, store, {
+      sendMarkdown: async (target, text, opts) => { sent.push({ target, text, keyboard: opts?.keyboard }); },
+    }, config, logger);
+    await personaSwitch.sendCard({ scope: 'c2c', targetId: 'owner', msgId: 'm1' }, 'owner');
+    expect(currentId).toHaveBeenCalledWith('owner', 'c2c');
+    expect(sent[0]!.text).toContain('当前人设：女仆');
+    expect(sent[0]!.text).toContain('只影响当前私聊');
+    expect(sent[0]!.keyboard).toBeDefined();
+    expect(personaSwitch.handleInteraction(directClick({ t: 'persona', a: 'use', p: 'maid' }, 'owner'))).toBe(0);
+    expect(switchPersona).toHaveBeenCalledWith('owner', 'maid', 'c2c');
+    await vi.waitFor(() => expect(sent[1]?.target).toEqual({ scope: 'c2c', targetId: 'owner', eventId: 'e1' }));
+    expect(sent[1]!.text).toContain('已切换');
+  });
+
+  it('私聊翻页发送到点击者，权限检查与群聊一致，缺少目标时拒绝', async () => {
+    const { personaSwitch, switchPersona, sent } = setup();
+    expect(personaSwitch.handleInteraction(directClick({ t: 'persona', a: 'page', n: 1 }, 'admin'))).toBe(0);
+    expect(sent[0]!.target).toEqual({ scope: 'c2c', targetId: 'admin', eventId: 'e1' });
+    expect(sent[0]!.keyboard).toBeDefined();
+    expect(personaSwitch.handleInteraction(directClick({ t: 'persona', a: 'use', p: 'maid' }, 'stranger'))).toBe(4);
+    expect(personaSwitch.handleInteraction(directClick({ t: 'persona', a: 'use', p: 'maid' }))).toBe(1);
+    await personaSwitch.sendCard({ scope: 'c2c', targetId: 'stranger' }, 'stranger');
+    expect(sent[1]!.keyboard).toBeUndefined();
+    expect(switchPersona).not.toHaveBeenCalled();
   });
 
   it('旧卡片上的人设已删除时不切换', async () => {
     const { personaSwitch, switchPersona, sent } = setup('ok', []);
     expect(personaSwitch.handleInteraction(click({ t: 'persona', a: 'use', p: 'maid' }, 'owner'))).toBe(0);
     expect(switchPersona).not.toHaveBeenCalled();
-    await Promise.resolve();
-    expect(sent[0]!.text).toContain('不在了');
+    await vi.waitFor(() => expect(sent[0]?.text).toContain('不在了'));
   });
 
   it.each([
     ['dnd', '跑团'],
     ['busy', '正在回复'],
     ['same', '现在就是'],
-  ] as const)('切不了时说明原因：%s', (outcome, text) => {
-    expect(setup(outcome).personaSwitch.apply('g1', 'maid')).toContain(text);
+  ] as const)('切不了时说明原因：%s', async (outcome, text) => {
+    expect(await setup(outcome).personaSwitch.apply('g1', 'maid')).toContain(text);
   });
 });
 
@@ -137,20 +172,27 @@ describe('/persona', () => {
   it('按名字切换，也能切回默认；没有的人设报错', async () => {
     const { cmd, switchPersona } = command();
     expect(await cmd.handler(context('admin', '女仆'))).toContain('已切换');
-    expect(switchPersona).toHaveBeenLastCalledWith('g1', 'maid');
+    expect(switchPersona).toHaveBeenLastCalledWith('g1', 'maid', 'group');
     await cmd.handler(context('admin', '默认'));
-    expect(switchPersona).toHaveBeenLastCalledWith('g1', DEFAULT_PERSONA_ID);
+    expect(switchPersona).toHaveBeenLastCalledWith('g1', DEFAULT_PERSONA_ID, 'group');
     expect(await cmd.handler(context('admin', '不存在'))).toContain('没有这个人设');
   });
 
-  it('私聊不能用', async () => {
-    const { cmd } = command();
-    expect(await cmd.handler(context('admin', '', 'c2c'))).toContain('只能在群里');
+  it('私聊支持卡片、按名字切换和恢复默认，沿用管理权限', async () => {
+    const { cmd, sent, switchPersona } = command();
+    expect(cmd.authorized?.(context('stranger', '女仆', 'c2c'))).toMatch(/只有/);
+    expect(cmd.authorized?.(context('admin', '女仆', 'c2c'))).toBe(true);
+    expect(await cmd.handler(context('admin', '', 'c2c'))).toEqual({ kind: 'noop' });
+    expect(sent[0]!.target).toMatchObject({ scope: 'c2c', targetId: 'admin', msgId: 'm1' });
+    expect(await cmd.handler(context('admin', '女仆', 'c2c'))).toContain('已切换');
+    expect(switchPersona).toHaveBeenLastCalledWith('admin', 'maid', 'c2c');
+    await cmd.handler(context('admin', 'default', 'c2c'));
+    expect(switchPersona).toHaveBeenLastCalledWith('admin', DEFAULT_PERSONA_ID, 'c2c');
   });
 });
 
 describe('SessionManager.switchPersona', () => {
-  function manager(options: { status?: string; dnd?: boolean; sessionFor?: string } = {}) {
+  function manager(options: { status?: string; dnd?: boolean; sessionFor?: string; scope?: ChatScope } = {}) {
     const state = { current: DEFAULT_PERSONA_ID };
     const store = {
       currentId: () => state.current,
@@ -163,42 +205,58 @@ describe('SessionManager.switchPersona', () => {
     const self = Object.assign(Object.create(SessionManager.prototype) as SessionManager, {
       personaStore: store,
       dndService: { active: () => (options.dnd === true ? {} : undefined) },
-      sessions: new Map(record === undefined ? [] : [['qqbot:app:group:g1', record]]),
-      sessionKey: () => 'qqbot:app:group:g1',
+      sessions: new Map(record === undefined ? [] : [[`qqbot:app:${options.scope ?? 'group'}:g1`, record]]),
+      sessionKey: (scope: ChatScope, peerId: string) => `qqbot:app:${scope}:${peerId}`,
       currentSessionId: () => 'derived',
       remove,
     });
     return { self, store, remove };
   }
 
-  it('记下当前会话，第一次用的人设拿新会话', () => {
+  it('记下当前会话，第一次用的人设拿新会话', async () => {
     const { self, store, remove } = manager({ status: 'idle' });
-    expect(self.switchPersona('g1', 'maid')).toBe('ok');
-    expect(store.rememberSession).toHaveBeenCalledWith('g1', DEFAULT_PERSONA_ID, 'old');
-    expect(store.select).toHaveBeenCalledWith('g1', 'maid');
+    expect(await self.switchPersona('g1', 'maid')).toBe('ok');
+    expect(store.rememberSession).toHaveBeenCalledWith('g1', DEFAULT_PERSONA_ID, 'old', 'group');
+    expect(store.select).toHaveBeenCalledWith('g1', 'maid', 'group');
     expect(remove).toHaveBeenCalledWith('group', 'g1', expect.any(String));
   });
 
-  it('切回用过的人设时接着原来的会话；会话不在内存里也能记下', () => {
+  it('切回用过的人设时接着原来的会话；会话不在内存里也能记下', async () => {
     const { self, store, remove } = manager({ sessionFor: 'maid-session' });
-    expect(self.switchPersona('g1', 'maid')).toBe('ok');
-    expect(store.rememberSession).toHaveBeenCalledWith('g1', DEFAULT_PERSONA_ID, 'derived');
+    expect(await self.switchPersona('g1', 'maid')).toBe('ok');
+    expect(store.rememberSession).toHaveBeenCalledWith('g1', DEFAULT_PERSONA_ID, 'derived', 'group');
     expect(remove).toHaveBeenCalledWith('group', 'g1', 'maid-session');
+  });
+
+  it.each([undefined, 'maid-session'])('私聊保存当前会话并切到独立的人设会话：%s', async (sessionFor) => {
+    const { self, store, remove } = manager({ status: 'idle', scope: 'c2c', sessionFor });
+    expect(await self.switchPersona('g1', 'maid', 'c2c')).toBe('ok');
+    expect(store.rememberSession).toHaveBeenCalledWith('g1', DEFAULT_PERSONA_ID, 'old', 'c2c');
+    expect(store.select).toHaveBeenCalledWith('g1', 'maid', 'c2c');
+    expect(store.sessionFor).toHaveBeenCalledWith('g1', 'maid', 'c2c');
+    expect(remove).toHaveBeenCalledWith('c2c', 'g1', sessionFor ?? expect.any(String));
+  });
+
+  it('私聊正在回复时不切换', async () => {
+    const { self, store, remove } = manager({ status: 'running', scope: 'c2c' });
+    expect(await self.switchPersona('g1', 'maid', 'c2c')).toBe('busy');
+    expect(store.select).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
   });
 
   it.each([
     [{ status: 'running' }, 'busy'],
     [{ status: 'idle', dnd: true }, 'dnd'],
-  ] as const)('回复中和开团中不切换：%j', (options, outcome) => {
+  ] as const)('回复中和开团中不切换：%j', async (options, outcome) => {
     const { self, store, remove } = manager(options);
-    expect(self.switchPersona('g1', 'maid')).toBe(outcome);
+    expect(await self.switchPersona('g1', 'maid')).toBe(outcome);
     expect(store.select).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
   });
 
-  it('已经是这个人设时什么都不做', () => {
+  it('已经是这个人设时什么都不做', async () => {
     const { self, remove } = manager({ status: 'idle' });
-    expect(self.switchPersona('g1', DEFAULT_PERSONA_ID)).toBe('same');
+    expect(await self.switchPersona('g1', DEFAULT_PERSONA_ID)).toBe('same');
     expect(remove).not.toHaveBeenCalled();
   });
 });

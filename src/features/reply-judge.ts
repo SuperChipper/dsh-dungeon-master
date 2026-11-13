@@ -9,11 +9,13 @@ import { createUserMessage, BlockAssembler } from '@deepseek-ai/dsh-llm';
 import type { ContentBlock, GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { ReplyJudgeConfig } from '../config.ts';
 import type { Logger } from '../types.ts';
+import { QQBOT_MESSAGE_SOURCE } from '../shared/message-source.ts';
 
 /** llm 服务里打分用到的部分 */
 export interface JudgeLlm {
   stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
   resolveModelInfo?(provider: string, model: string, signal?: AbortSignal): Promise<{
+    context?: { contextWindow?: number };
     reasoning?: { efforts: ReadonlyArray<{ id: string; name: string }>; defaultEffort?: string };
   }>;
 }
@@ -114,7 +116,7 @@ export class ReplyJudge {
         system: buildJudgeSystem(request.names, request.persona),
         messages: [createUserMessage({
           content: [{ type: 'text', text: buildJudgeTranscript(request.lines) }],
-          source: { kind: 'plugin', plugin: 'dsh-im-qqbot' },
+          source: QQBOT_MESSAGE_SOURCE,
         })],
         // 思考会吃掉 completion 额度：档位没关干净时，上下文一长 JSON 就写不出来、正文回空串
         maxTokens: 1024,

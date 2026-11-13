@@ -170,6 +170,7 @@ const EDITABLE_CONFIG_SCHEMAS: Record<string, (value: unknown) => unknown> = {
   fanart: (v) => FanartSchema(v as never),
   // allowedGroups 与其余浏览参数共用唯一真源校验，群权限不继承终端白名单。
   browser: (v) => BrowserSchema(v as never),
+  // combatAgent 与跑团共用顶层键，仍由唯一真源校验模型路由和交接字数。
   dnd: (v) => DndSchema(v as never),
   replyDesire: (v) => ReplyDesireSchema(v as never),
 };

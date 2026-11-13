@@ -14,11 +14,14 @@ import {
   type PendingCheck,
   type PendingD20,
   type PendingRoll,
+  type ReactionWindow,
   type ReactorOption,
   describePending,
   findCharacter,
   isOut,
   reactionBlocked,
+  reactionWindow,
+  requireCharacter,
   reactionsOf,
   roomOf,
 } from './campaign.ts';
@@ -53,6 +56,7 @@ export function eligibleReactors(c: Campaign, attacker: Character, target: Chara
     // 用过反应或受惊：反手一击、挡攻击这类都不行（天赋类「自己攻击时」的不占反应，不受影响）
     const free = reactionBlocked(c, ch.name) === undefined;
     return reactionsOf(ch).flatMap((r) => {
+      if (r.enter === true) return [];
       if (!hasResource(ch, r.resource)) return [];
       if (r.range !== undefined) {
         // 没摆位就不按距离筛：宁可多问一句，也别把够得着的人漏掉
@@ -123,12 +127,12 @@ export function requirePending(c: Campaign): PendingRoll {
 }
 
 /** 还要等谁：点了要用但效果还没结算的也算在等 */
-export function waitingOn(p: PendingRoll): string[] {
+export function waitingOn(p: ReactionWindow): string[] {
   const done = new Set([...p.declined, ...p.used.map((u) => u.by)]);
   return [...new Set(p.reactors.map((r) => r.character))].filter((name) => !done.has(name));
 }
 
-function optionsText(p: PendingRoll): string {
+function optionsText(p: ReactionWindow): string {
   return p.reactors.length > 0 ? p.reactors.map((r) => `${r.character}·${r.reaction}`).join('、') : '（DM 手动挂起）';
 }
 
@@ -139,7 +143,8 @@ function rollLine(p: PendingCheck, r: PendingD20): string {
 }
 
 /** 这笔现在的局面，给模型看：只给成败，DC/AC 的数字不给（会被照抄进群里） */
-export function pendingState(p: PendingRoll): string {
+export function pendingState(p: ReactionWindow): string {
+  if (p.kind === 'move') return `${p.target} 暂停在借机触发处，剩余移动还没执行`;
   if (p.kind === 'roll') {
     const damage = p.damage === undefined
       ? ''
@@ -154,11 +159,11 @@ export function pendingState(p: PendingRoll): string {
     : p.rawDamage === undefined
       ? '命中，落账时掷伤害'
       : `命中，伤害 ${Math.max(0, p.rawDamage + p.damageMod)}${p.damageMod !== 0 ? `（原 ${p.rawDamage}）` : ''}，还没扣血`;
-  return `${p.attacker}→${p.target}：${attack}，${damage}`;
+  return `${p.attacker}→${p.target}：${attack}，${damage}${p.onHit !== undefined ? `；预先授权${p.onHit.criticalOnly ? '重击才' : '最终命中才'}用「${p.onHit.name}」（${p.onHit.spend}），未消耗` : ''}`;
 }
 
 /** 团况里的一行：压缩之后这笔账靠它才不会丢 */
-export function pendingSummaryLine(p: PendingRoll): string {
+export function pendingSummaryLine(p: ReactionWindow): string {
   const waiting = waitingOn(p);
   const used = p.used.map((u) => `${u.by}·${u.name}`).join('、');
   return `【待结算 #R${p.seq}】${pendingState(p)}。`
@@ -188,14 +193,14 @@ export function holdNotice(p: PendingRoll): string {
  * 还有人没答复时不能落账。以前 30 秒没回就算不用，可群里打字慢、想规则的人常被这样吃掉反应，现在不限时。
  * 玩家离开了（一直不回）由 DM 传 decline 替他跳过。
  */
-export function assertWindowClosed(p: PendingRoll): void {
+export function assertWindowClosed(p: ReactionWindow): void {
   const waiting = waitingOn(p);
   if (waiting.length === 0) return;
   throw new Error(`反应窗口还开着：还在等 ${waiting.join('、')}。这条回复先停下问他们，不限时；说不用的、或者人一直不在的，传 decline 跳过（替不在的人跳过要在回复里说一句）。`);
 }
 
 /** 记下 PC 点了「不用」或说了不用；不是这笔的可反应者就报错，免得记错人 */
-export function declineReaction(p: PendingRoll, name: string): void {
+export function declineReaction(p: ReactionWindow, name: string): void {
   if (!p.reactors.some((r) => r.character === name)) {
     throw new Error(`${name} 不在这笔的可反应名单里（${optionsText(p)}）`);
   }
@@ -208,7 +213,7 @@ function charactersOf(c: Campaign, senderId: string): Character[] {
 }
 
 const DECLINE_REPLY = /^(不用|不用了|不反应|不了|没有|没|算了|跳过|过|pass|no)[。.!！~～]*$/i;
-const GENERIC_REACTION = /反应|尖刻言语|护盾术|导引打击|招架|反制法术|幸运点|重掷|重骰|时间变幻/;
+const GENERIC_REACTION = /反应|借机|尖刻言语|护盾术|导引打击|招架|反制法术|幸运点|重掷|重骰|时间变幻/;
 
 export interface ReactionReply {
   kind: 'use' | 'decline';
@@ -221,7 +226,7 @@ export interface ReactionReply {
  * 「不用」这种短答只认名单里的人，否则群里随口一句「算了」都会被当成回应。
  */
 export function classifyReactionReply(c: Campaign, senderId: string, text: string): ReactionReply | undefined {
-  const p = c.initiative?.pending;
+  const p = reactionWindow(c);
   if (p === undefined) return undefined;
   const clean = text.replace(/<@!?[^>]*>/g, '').trim();
   if (clean.length === 0 || clean.startsWith('/')) return undefined;
@@ -232,30 +237,35 @@ export function classifyReactionReply(c: Campaign, senderId: string, text: strin
   // DM 点名问的反应（时间变幻）不在角色卡的 reactions 里，名字从名单上认
   const named = mine.some((ch) => reactionsOf(ch).some((r) => clean.includes(r.name)))
     || p.reactors.some((r) => listed.includes(r.character) && clean.includes(r.reaction));
-  return named || GENERIC_REACTION.test(clean) ? { kind: 'use', characters: listed } : undefined;
+  return named || GENERIC_REACTION.test(clean) || (p.kind === 'move' && listed.length > 0 && /^(打|攻击|借机攻击)[。.!！]*$/.test(clean))
+    ? { kind: 'use', characters: listed } : undefined;
 }
 
 /** 接在玩家消息后面的系统标记：没带 (@you) 也算数，也不是新的回合行动 */
 export function reactionReplyNote(c: Campaign, reply: ReactionReply): string {
-  const p = requirePending(c);
+  const p = reactionWindow(c)!;
   const who = reply.characters.join('、');
   const what = describePending(p);
   if (reply.kind === 'decline') {
     return `[系统 · 待结算] 这条是在回答「${what}」那笔的反应询问，不是回合行动：用 dnd_apply target=${p.target} decline=["${who}"] 记下；都答复了再 settle=true。`;
+  }
+  if (p.kind === 'move') {
+    return `[系统 · 借机] 这条在回应 ${p.target} 的移动，不是新回合行动：用 dnd_check character=反应者 type=attack target=${p.target} reaction=true declared_by=本人编号 结算借机；工具会扣反应。所有人答复并结算完后 dnd_apply target=${p.target} settle=true 继续移动。`;
   }
   return `[系统 · 待结算] 这条按对「${what}」那笔的反应处理（没带 @ 也算），不是新的回合行动，也不要 next：`
     + `用 dnd_apply target=${p.target} reaction={by, name, attack_mod/ac_mod/damage_mod 或 reroll:"d20", spend} 改数值，declared_by 填他的编号。`;
 }
 
 /** 这个反应会不会占掉角色本轮的反应：导引打击这类是自己攻击时用的，不算 */
-export function consumesReaction(p: PendingRoll, by: string): boolean {
-  return p.kind !== 'attack' || by !== p.attacker;
+export function consumesReaction(c: Campaign, p: PendingRoll, by: string, name: string): boolean {
+  return !(p.kind === 'attack' && by === p.attacker && reactionsOf(requireCharacter(c, by)).some((r) => r.name === name && r.when === 'attacking'));
 }
 
-export function findReactor(c: Campaign, p: PendingRoll, name: string): Character {
+export function findReactor(c: Campaign, p: PendingRoll, name: string, reactionName: string): Character {
   const ch = findCharacter(c, name);
   if (ch === undefined) throw new Error(`找不到角色「${name}」`);
-  const blocked = consumesReaction(p, ch.name) ? reactionBlocked(c, ch.name) : undefined;
+  if (p.used.some((r) => r.by === ch.name && r.name === reactionName)) throw new Error(`${ch.name} 已经对这笔用过「${reactionName}」`);
+  const blocked = consumesReaction(c, p, ch.name, reactionName) ? reactionBlocked(c, ch.name) : undefined;
   if (blocked !== undefined) throw new Error(blocked);
   if (!canReact(ch)) throw new Error(`${ch.name} 现在做不了反应`);
   return ch;

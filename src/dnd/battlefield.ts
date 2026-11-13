@@ -12,10 +12,12 @@ import {
   type Character,
   type InitiativeState,
   type Weapon,
+  type ReactorOption,
   findCharacter,
   isOut,
   isRangedWeapon,
-  isSurprised,
+  inInitiative,
+  reactionBlocked,
   reactionsOf,
   requireCharacter,
   requireInitiative,
@@ -63,6 +65,17 @@ function isHostile(a: Character, b: Character): boolean {
 
 export function canReact(ch: Character): boolean {
   return !isOut(ch) && ch.hp > 0 && !ch.conditions.some((cond) => CANNOT_REACT.includes(cond));
+}
+
+/** 房间字段不能成为绕过战场路线、借机和出口位置的捷径。 */
+export function assertCombatExit(c: Campaign, ch: Character, targetRoom: string): void {
+  if (!inInitiative(c, ch.name) || roomOf(c, ch) === targetRoom) return;
+  const at = cellOf(c, ch);
+  const map = at === undefined ? undefined : mapOf(c, at.room);
+  const area = at === undefined || map === undefined ? undefined : areaAt(map, at);
+  if (area === undefined || !['door', 'outside'].includes(area.kind) || area.to !== targetRoom) {
+    throw new Error(`${ch.name} 还没走到通往 ${targetRoom} 的出口。战斗中先 dnd_position move 到门口/门外并处理借机，再换 room；没有出口格就先 terrain 标出 door/outside 和 to。不能用改卡代替逃跑路线。`);
+  }
 }
 
 /** 这个房间里已摆位、还活着的人 */
@@ -234,6 +247,9 @@ export interface MoveRequest {
   disengage?: boolean;
   /** 反应/他人回合里的移动：不计入本回合移动力 */
   reaction?: boolean;
+  /** 工具层移动必须暂停；纯路径查询仍可取得完整路线。不能由模型跳过。 */
+  interrupt?: boolean;
+  ignoredReactors?: string[];
 }
 
 export interface MoveResult {
@@ -263,6 +279,7 @@ export interface MoveResult {
   /** 移动力不够、没走到想去的地方 */
   short?: string;
   notes: string[];
+  opportunity?: { reactors: ReactorOption[]; resume: MoveRequest };
 }
 
 /** 按直线走过的格子（含起点终点）；没有场地图、直接给坐标时用 */
@@ -289,7 +306,8 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
   if (from === undefined) throw new Error(`${ch.name} 还没摆位，先 dnd_position set`);
   const map = mapOf(c, from.room);
   const reaction = request.reaction === true;
-  const disengaged = request.disengage === true;
+  if (request.disengage === true) state.disengaged = [...new Set([...(state.disengaged ?? []), ch.name])];
+  const disengaged = state.disengaged?.includes(ch.name) === true;
 
   if (request.dash === true && !reaction) {
     const dashed = state.dashed ?? [];
@@ -312,12 +330,14 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
 
   const others = placedIn(c, from.room).filter(({ ch: o }) => o.name !== ch.name && o.name !== dragged?.name);
   const foes = others.filter(({ ch: o }) => isHostile(ch, o));
-  const reactors = foes.filter(({ ch: o }) => canReact(o) && !isSurprised(c, o.name));
+  const reactors = foes.filter(({ ch: o }) => canReact(o) && !o.conditions.includes('失明') && reactionBlocked(c, o.name) === undefined
+    && !request.ignoredReactors?.includes(o.name));
+  const reachOf = (other: Character): number => Math.max(MELEE_REACH_FEET, ...(other.weapons ?? []).map((w) => weaponReach(w, true) ?? 0));
   // 5e：能穿过友方的格子，不能穿过敌人的
   const blocked = (at: Cell): boolean => foes.some(({ cell }) => cell.x === at.x && cell.y === at.y);
   const taken = (at: Cell): boolean => others.some(({ cell }) => cell.x === at.x && cell.y === at.y);
   const provokesOn = (a: Cell, b: Cell): number => disengaged ? 0
-    : reactors.filter(({ cell }) => distanceFeet(a, cell) <= MELEE_REACH_FEET && distanceFeet(b, cell) > MELEE_REACH_FEET).length;
+    : reactors.filter(({ ch: other, cell }) => distanceFeet(a, cell) <= reachOf(other) && distanceFeet(b, cell) > reachOf(other)).length;
   const factor = dragged === undefined ? 1 : 2;
 
   let dest: Cell;
@@ -330,11 +350,13 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
     if (target !== undefined || request.awayFrom !== undefined) throw new Error('x/y 和 to/away_from 二选一');
     dest = { x: requireCoord(request.x, 'x'), y: requireCoord(request.y, 'y') };
     if (blocksMove(map, dest)) throw new Error(`(${dest.x},${dest.y}) 是${terrainHere(map!, dest)}，站不上去；要去旁边用 to`);
-    if (map === undefined) {
+    const occupied = occupant(c, from.room, dest, ch.name);
+    if (occupied !== undefined && occupied.name !== dragged?.name) throw new Error(`(${dest.x},${dest.y}) 已经站着 ${occupied.name}，换一格，或用 to`);
+    if (map === undefined && foes.length === 0) {
       path = straightPath(from, dest);
       feet = distanceFeet(from, dest) * factor;
     } else {
-      const reached = walk(map, from, { blocked, provokes: provokesOn, costFactor: factor });
+      const reached = walk(map, from, { blocked, provokes: provokesOn, costFactor: factor, stopAt: dest });
       const found = pathTo(reached, dest);
       if (found === undefined) throw new Error(`走不到 (${dest.x},${dest.y})：被墙或敌人堵死了`);
       path = found;
@@ -391,6 +413,44 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
     throw new Error(`走到 (${dest.x},${dest.y}) 就不贴着 ${keep!.name} 了；不给坐标、传 to + keep_adjacent，工具会挑贴着他的格子`);
   }
 
+  let opportunity: MoveResult['opportunity'];
+  if (request.interrupt === true && !disengaged) {
+    const triggers: Array<{ stop: number; character: string; reaction: string }> = [];
+    for (const { ch: other, cell } of reactors) {
+      const reach = reachOf(other);
+      for (let i = 0; i + 1 < path.length; i++) {
+        if (distanceFeet(path[i]!, cell) <= reach && distanceFeet(path[i + 1]!, cell) > reach && wallBetween(map, path[i]!, cell) === undefined) {
+          triggers.push({ stop: i, character: other.name, reaction: '借机攻击' });
+          break;
+        }
+      }
+      for (const r of reactionsOf(other).filter((r) => r.enter === true)) {
+        for (let i = 0; i + 1 < path.length; i++) {
+          if (distanceFeet(path[i]!, cell) > (r.range ?? MELEE_REACH_FEET) && distanceFeet(path[i + 1]!, cell) <= (r.range ?? MELEE_REACH_FEET) && wallBetween(map, path[i + 1]!, cell) === undefined) {
+            triggers.push({ stop: i + 1, character: other.name, reaction: r.name });
+            break;
+          }
+        }
+      }
+    }
+    if (triggers.length > 0) {
+      const first = Math.min(...triggers.map((t) => t.stop));
+      const here = triggers.filter((t) => t.stop === first);
+      const options: ReactorOption[] = here.map(({ character, reaction }) => ({ character, reaction,
+        ...(requireCharacter(c, character).kind !== 'pc' || requireCharacter(c, character).playerId === undefined ? { npc: true } : {}) }));
+      opportunity = { reactors: options, resume: {
+        x: dest.x, y: dest.y, interrupt: true, reaction,
+        ignoredReactors: [...new Set([...(request.ignoredReactors ?? []), ...here.map((t) => t.character)])],
+        ...(request.drag !== undefined ? { drag: request.drag } : {}),
+        ...(request.keepAdjacent !== undefined ? { keepAdjacent: request.keepAdjacent } : {}),
+      } };
+      path = path.slice(0, first + 1);
+      dest = path.at(-1)!;
+      feet = path.slice(1).reduce((sum, step) => sum + CELL_FEET * factor * (map !== undefined && areaAt(map, step)?.kind === 'difficult' ? 2 : 1), 0);
+      short = '已在借机触发处暂停，剩余路程等反应结算后再走';
+    }
+  }
+
   const provokes: string[] = [];
   const stayedIn: string[] = [];
   const enters: Array<{ name: string; reach: number; reaction: string }> = [];
@@ -398,10 +458,10 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
     for (const { ch: other, cell } of reactors) {
       const leaves = path.some((step, i) => {
         const next = path[i + 1];
-        return next !== undefined && distanceFeet(step, cell) <= MELEE_REACH_FEET && distanceFeet(next, cell) > MELEE_REACH_FEET;
+        return next !== undefined && distanceFeet(step, cell) <= reachOf(other) && distanceFeet(next, cell) > reachOf(other);
       });
       if (leaves) provokes.push(other.name);
-      else if (path.length > 1 && path.every((step) => distanceFeet(step, cell) <= MELEE_REACH_FEET)) stayedIn.push(other.name);
+      else if (!opportunity?.reactors.some((r) => r.character === other.name) && path.length > 1 && path.every((step) => distanceFeet(step, cell) <= reachOf(other))) stayedIn.push(other.name);
       // 长柄大师：拿着长柄武器时，敌人「进入」触及范围也吃借机——方向反着算，一回合至多一次
       for (const r of reactionsOf(other)) {
         if (r.enter !== true) continue;
@@ -454,6 +514,7 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
     ...(draggedTo !== undefined ? { dragged: draggedTo } : {}),
     ...(short !== undefined ? { short } : {}),
     notes,
+    ...(opportunity !== undefined ? { opportunity } : {}),
   };
 }
 
@@ -467,12 +528,13 @@ export function moveResultText(r: MoveResult): string {
   if (r.disengaged) lines.push('撤离：这次移动不触发借机。');
   if (r.stayedIn.length > 0) lines.push(`贴着 ${r.stayedIn.join('、')} 挪位，全程没离开触及，不触发借机。`);
   if (r.provokes.length > 0) {
-    lines.push(`【DM】离开了 ${r.provokes.join('、')} 的触及范围：他们可以借机（一回合一次反应，5 尺以外的长触及这里没算）。`);
+    lines.push(`【DM】离开了 ${r.provokes.join('、')} 的触及范围：他们可以借机，消耗反应，到各自下回合开始恢复。`);
   }
   if (r.enters.length > 0) {
     lines.push(`【DM】进入 ${r.enters.map((e) => `${e.name} 的 ${e.reach} 尺触及（${e.reaction}）`).join('、')}：可以借机，用 dnd_check ... reaction=true 结算。`);
   }
   lines.push(...r.notes.map((n) => `【DM】${n}`));
+  if (r.opportunity !== undefined) lines.push(`【移动待结算】在触发处停下：${r.opportunity.reactors.map((r) => `${r.character}·${r.reaction}`).join('、')}。先问玩家，不能提前 next、攻击或走完剩余路程。借机用 dnd_check type=attack reaction=true target=${r.name}；不用传 dnd_apply target=${r.name} decline=[角色名]；全部处理后 settle=true 继续移动。`);
   return lines.join('\n');
 }
 
@@ -784,7 +846,8 @@ export function areaReport(c: Campaign, req: AreaRequest): string {
     : req.shape === 'cube'
       ? (at: Cell): boolean => at.x >= point.x && at.y >= point.y && at.x < point.x + req.size / 5 && at.y < point.y + req.size / 5
       : lineCells(casterCell, point, req.size);
-  const inside = placedIn(c, point.room).filter(({ ch, cell }) => ch.name !== caster?.name && cells(cell));
+  // 球与立方也可能罩住施法者；线的起点由 lineCells 自身排除，不能统一豁免施法者。
+  const inside = placedIn(c, point.room).filter(({ cell }) => cells(cell));
   const marks = Object.entries(c.initiative?.marks ?? {}).filter(([, at]) => at.room === point.room && cells(at)).map(([n]) => n);
   const side = (ch: Character): boolean => (caster !== undefined ? isHostile(caster, ch) : ch.kind === 'monster');
   const foes = inside.filter(({ ch }) => side(ch)).map(({ ch }) => ch.name);
@@ -818,8 +881,8 @@ function lineCells(from: BattleCell | undefined, toward: BattleCell, feet: numbe
 }
 
 /** 近战判断只看备注里写明的投掷/触及；其余按普通近战武器 */
-function weaponReach(weapon: Weapon): number | undefined {
-  if (isRangedWeapon(weapon) || /投掷|thrown/i.test(weapon.notes ?? '')) return undefined;
+export function weaponReach(weapon: Weapon, melee = false): number | undefined {
+  if (isRangedWeapon(weapon) || (!melee && /投掷|thrown/i.test(weapon.notes ?? ''))) return undefined;
   return /触及|reach/i.test(weapon.notes ?? '') ? 10 : MELEE_REACH_FEET;
 }
 

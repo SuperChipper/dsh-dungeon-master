@@ -229,6 +229,15 @@ export interface FanartConfig {
   poolDir: string;
 }
 
+export interface DndCombatAgentConfig {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  reasoningEffort: string;
+  /** 每场新子会话继承的最近对话字数，不复制整个主会话 */
+  contextChars: number;
+}
+
 export interface DndConfig {
   /** 是否启用跑团（/dnd 命令 + dnd_* 工具） */
   enabled: boolean;
@@ -238,6 +247,7 @@ export interface DndConfig {
   turnButtons: boolean;
   /** 跑团期间也按 groupReplyProbability 随机插嘴（只吐槽、不结算）；false = 开团后只回 @ */
   interjections: boolean;
+  combatAgent: DndCombatAgentConfig;
 }
 
 export interface ReplyJudgeConfig {
@@ -556,12 +566,25 @@ export const FanartSchema: Schema<FanartConfig> = Schema.object({
   poolDir: Schema.string().default('').description('CP 池目录（空=插件根目录/scripts）'),
 });
 
+export const DND_COMBAT_AGENT_DEFAULTS: DndCombatAgentConfig = {
+  enabled: false, provider: 'opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high', contextChars: 8000,
+};
+
+export const DndCombatAgentSchema: Schema<DndCombatAgentConfig> = Schema.object({
+  enabled: Schema.boolean().default(false).description('使用独立战斗代理，战后交回主 DM'),
+  provider: Schema.string().default('opencode-go').description('战斗模型 Provider'),
+  model: Schema.string().default('deepseek-v4.1-flash').description('战斗模型 ID'),
+  reasoningEffort: Schema.string().default('high').description('战斗推理强度（空=模型默认）'),
+  contextChars: Schema.number().min(1000).max(30000).step(1).default(8000).description('开战交接的最近对话字数上限'),
+});
+
 /** 跑团子 Schema */
 export const DndSchema: Schema<DndConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('是否启用跑团（/dnd 命令与 dnd_* 工具）'),
   root: Schema.string().default('').description('跑团数据目录（空=工作目录/dnd）'),
   turnButtons: Schema.boolean().default(true).description('轮到玩家时发「结束回合 / 查看状态」按钮'),
   interjections: Schema.boolean().default(true).description('跑团期间也按插话概率随机吐槽（只吐槽、不结算行动）；关掉则开团后只回 @'),
+  combatAgent: DndCombatAgentSchema.default(DND_COMBAT_AGENT_DEFAULTS),
 });
 
 export const REPLY_JUDGE_DEFAULTS: ReplyJudgeConfig = {
@@ -827,5 +850,6 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
     root: '',
     turnButtons: true,
     interjections: true,
+    combatAgent: DND_COMBAT_AGENT_DEFAULTS,
   }).description('跑团配置'),
 });

@@ -28,8 +28,12 @@ import { chatKeyOf, formatNotesHint, selectNotesForInjection, type NoteHit, type
 import type { NoteMetricsStore } from '../notes/note-metrics.ts';
 import type { NoteJudge } from '../features/note-judge.ts';
 import { formatHandoffHint, latestCompactionSummary } from '../features/session-handoff.ts';
+import { collectHandoffInput, generatePersonaHandoff } from '../features/persona-handoff.ts';
+import type { JudgeLlm } from '../features/reply-judge.ts';
+import { createPersonaHandoffMessage, isPersonaHandoffSource } from '../shared/message-source.ts';
 import type { ToolAccess } from '../features/tool-access.ts';
 import type { DndService } from '../dnd/dnd-service.ts';
+import type { DndCombatAgents } from '../dnd/combat-agent.ts';
 import type { DndToolScope } from '../dnd/tool-scope.ts';
 import { PromptLatch } from '../features/prompt-latch.ts';
 import type { DndTurnButtons } from '../dnd/turn-buttons.ts';
@@ -214,10 +218,15 @@ export class SessionManager {
   private readonly pendingNoteInjections = new Map<string, PendingNoteInjection>();
   /** 会话 key → /new 时旧会话的压缩摘要（可能还在压缩）；新会话的第一条消息取走 */
   private readonly pendingHandoffs = new Map<string, Promise<string | undefined>>();
+  /** 切换先完成落盘；期间到来的 QQ 消息等待，不得进入即将离开的人格历史。 */
+  private personaTransitions = new Map<string, Promise<SwitchPersonaOutcome>>();
+  private personaRoutes = new Map<string, ModelRoute>();
+  private disposing = false;
   /** 由 bootstrap 注入的工具权限（终端白名单） */
   public toolAccess?: ToolAccess;
   /** 由 bootstrap 注入的跑团服务（/dnd 命令 + DM prompt 注入） */
   public dndService?: DndService;
+  public combatAgents?: DndCombatAgents;
   /** 按团的状态隐藏用不上的 dnd_* 工具（由 bootstrap 注入） */
   public dndToolScope?: DndToolScope;
   /** 一段对话内锁住的 system prompt 文字（表情清单、本群笔记目录），见 PromptLatch */
@@ -245,8 +254,10 @@ export class SessionManager {
       this.sessions,
       config.sessionIdleTimeout,
       (key, record) => {
+        if (this.personaTransitions.has(key)) return;
         this.logger.info(`evicting idle session: key=${key}`);
         this.sessions.delete(key);
+        void this.combatAgents?.release(key);
         this.modelSelections.delete(record.agent);
         record.agent.cancel({ kind: 'user' });
         void record.handle.dispose().catch(() => {});
@@ -313,11 +324,11 @@ export class SessionManager {
 
       const record = this.findByAgent(context.agent);
       if (!record) return assembled;
+      if (this.combatAgents?.isChild(context.agent)) return assembled;
 
       const sections = [...(assembled.sections ?? [])];
-      const prompt = record.scope === 'group'
-        ? this.personaStore?.current(record.peerId)?.prompt ?? this.config.groupPrompt
-        : this.config.directPrompt;
+      const prompt = this.personaStore?.current(record.peerId, record.scope)?.prompt
+        ?? (record.scope === 'group' ? this.config.groupPrompt : this.config.directPrompt);
       if (prompt) {
         sections.push({ name: 'qqbot:scope-prompt', order: 90, text: prompt });
       }
@@ -388,7 +399,8 @@ export class SessionManager {
       // 跑团：开团的会话每回合注入 DM 守则和不常变的背景；会变的团况走 registerDndStateContext
       if (this.dndService !== undefined) {
         try {
-          const dndSections = this.dndService.promptSections(record.sessionKey, epoch);
+          const toolView = this.combatAgents?.toolView(record) ?? 'full';
+          const dndSections = this.dndService.promptSections(record.sessionKey, epoch, toolView !== 'full');
           sections.push(...dndSections);
           // 开团时本群笔记不走自动注入（见 notesHint），这里只列个目录，玩的时候要用的约定让模型自己去查
           const titles = dndSections.some((s) => s.name === 'qqbot:dnd-dm') ? this.notesStore?.chatNoteTitles(chatKeyOf(record.scope, record.peerId)) ?? [] : [];
@@ -775,7 +787,22 @@ export class SessionManager {
   // ── 会话状态 / 统计 ──
 
   getSessionRecord(scope: ChatScope, peerId: string): SessionRecord | undefined {
-    return this.sessions.get(this.sessionKey(scope, peerId));
+    const key = this.sessionKey(scope, peerId);
+    return this.combatAgents?.current(key) ?? this.sessions.get(key);
+  }
+
+  /** 仅 QQ 入站和跑团按钮走战斗路由，普通 /model 等设置仍作用于主会话。 */
+  async routeDndRecord(record: SessionRecord): Promise<SessionRecord> {
+    const main = this.sessions.get(record.sessionKey) ?? record;
+    return this.combatAgents?.select(main) ?? main;
+  }
+
+  async sendDndFollowup(record: SessionRecord, message: unknown): Promise<void> {
+    const main = this.sessions.get(record.sessionKey);
+    if (main !== undefined) main.lastActivity = Date.now();
+    const target = await this.routeDndRecord(record);
+    target.agent.followup(message);
+    await target.agent.whenIdle();
   }
 
   /** 入站图片本地表情库精确匹配（失败/未启用时返回 undefined，不阻塞消息） */
@@ -789,6 +816,7 @@ export class SessionManager {
 
   /** 按当前消息检索笔记（共享 + 本会话私有），返回要注入的提示块（未启用/无相关结果/出错时返回空串） */
   async notesHint(query: string, scope: ChatScope, peerId: string): Promise<string> {
+    if (this.config.dnd?.combatAgent?.enabled && this.dndService?.active(this.sessionKey(scope, peerId))?.campaign.initiative) return '';
     const notes = this.config.notes;
     if (this.notesStore === undefined || !notes?.autoInject || query.trim().length === 0) return '';
     try {
@@ -999,7 +1027,9 @@ export class SessionManager {
 
   getStatus(scope: ChatScope, peerId: string): SessionStatus {
     const record = this.getSessionRecord(scope, peerId);
-    const route = this.getEffectiveModel(scope, peerId);
+    const route = record !== undefined && this.combatAgents?.isChild(record.agent)
+      ? record.agent.session.requestHeader?.()?.config ?? this.config.dnd?.combatAgent
+      : this.getEffectiveModel(scope, peerId);
 
     return {
       active: !!record,
@@ -1084,7 +1114,7 @@ export class SessionManager {
 
   /** 该 peer 当前（或下一次 getOrCreate 将使用）的 sessionId */
   sessionIdFor(scope: ChatScope, peerId: string): string {
-    const record = this.sessions.get(this.sessionKey(scope, peerId));
+    const record = this.getSessionRecord(scope, peerId);
     return record?.sessionId ?? this.currentSessionId(this.sessionKey(scope, peerId));
   }
 
@@ -1116,6 +1146,28 @@ export class SessionManager {
 
   /** 获取或恢复或创建会话（get → resume → create） */
   async getOrCreate(
+    scope: ChatScope,
+    peerId: string,
+    senderId: string,
+    replyTarget: ReplyTarget,
+  ): Promise<SessionRecord> {
+    await this.waitForPersonaSwitch(scope, peerId);
+    const record = await this.openSession(scope, peerId, senderId, replyTarget);
+    const route = this.personaRoutes?.get(record.sessionKey);
+    if (route) {
+      const current = this.personaModelRoute(record);
+      if (current?.provider !== route.provider || current.model !== route.model) this.applyModelSelection(record, route);
+      this.personaRoutes.delete(record.sessionKey);
+    }
+    await this.receivePersonaHandoff(record);
+    return record;
+  }
+
+  async waitForPersonaSwitch(scope: ChatScope, peerId: string): Promise<void> {
+    await this.personaTransitions?.get(this.sessionKey(scope, peerId));
+  }
+
+  private async openSession(
     scope: ChatScope,
     peerId: string,
     senderId: string,
@@ -1237,9 +1289,13 @@ export class SessionManager {
   syncDndTools(sessionKey: string): void {
     const record = this.sessions.get(sessionKey);
     if (record !== undefined) this.dndToolScope?.sync(record);
+    const child = this.combatAgents?.current(sessionKey);
+    if (child !== undefined) this.dndToolScope?.sync(child);
   }
 
   findBySessionId(sessionId: string): SessionRecord | undefined {
+    const child = this.combatAgents?.findSession(sessionId);
+    if (child !== undefined) return child;
     for (const record of this.sessions.values()) {
       if (record.sessionId === sessionId) return record;
     }
@@ -1248,29 +1304,144 @@ export class SessionManager {
   }
 
   findByAgent(agent: DshAgent): SessionRecord | undefined {
+    const child = this.combatAgents?.findAgent(agent);
+    if (child !== undefined) return child;
     for (const record of this.sessions.values()) {
       if (record.agent === agent) return record;
     }
     return undefined;
   }
 
-  /**
-   * 切换群人设：记下当前人设用的会话，换到目标人设自己的会话（第一次用就是新会话）。
-   * 群历史游标绑定 sessionId，换会话后会重新注入最近的群聊，上下文不会断。
-   */
-  switchPersona(groupId: string, personaId: string): SwitchPersonaOutcome {
+  switchPersona(peerId: string, personaId: string, scope: ChatScope = 'group'): Promise<SwitchPersonaOutcome> {
+    const key = this.sessionKey(scope, peerId);
+    this.personaTransitions ??= new Map();
+    if (this.personaTransitions.has(key)) return Promise.resolve('busy');
+    // 下一微任务才开始，确保恢复旧会话之前，入站等待锁已经存在。
+    const transition = Promise.resolve().then(() => this.performPersonaSwitch(peerId, personaId, scope));
+    this.personaTransitions.set(key, transition);
+    void transition.finally(() => { this.personaTransitions.delete(key); }).catch(() => {});
+    return transition;
+  }
+
+  private async performPersonaSwitch(peerId: string, personaId: string, scope: ChatScope): Promise<SwitchPersonaOutcome> {
+    if (this.disposing) return 'busy';
     const store = this.personaStore;
-    const currentId = store?.currentId(groupId);
+    const currentId = store?.currentId(peerId, scope);
     if (store === undefined || currentId === personaId) return 'same';
-    const key = this.sessionKey('group', groupId);
+    const key = this.sessionKey(scope, peerId);
     // 开团的存档跟着会话走，中途换人设 DM 就换人了
     if (this.dndService?.active(key) !== undefined) return 'dnd';
-    const record = this.sessions.get(key);
-    if (record !== undefined && record.agent.status !== 'idle') return 'busy';
-    store.rememberSession(groupId, currentId!, record?.sessionId ?? this.currentSessionId(key));
-    store.select(groupId, personaId);
-    void this.remove('group', groupId, store.sessionFor(groupId, personaId) ?? randomUUID());
-    return 'ok';
+    let record = this.sessions.get(key);
+    if (record !== undefined && (record.agent.status !== 'idle' || record.compacting)) return 'busy';
+    let incomplete = false;
+    let sourceRoute: ModelRoute | undefined;
+    if (store.handoffs !== undefined) {
+      try {
+        // 空闲回收或进程重启后，也要先恢复来源历史；不能把“不在内存”当成没有对话。
+        record ??= await this.openSession(scope, peerId, peerId, { scope, targetId: peerId });
+        if (record.agent.status !== 'idle' || record.compacting) return 'busy';
+        sourceRoute = this.personaModelRoute(record);
+        const events = [...(record.agent.session.snapshotEvents?.() ?? record.agent.session.events ?? [])];
+        const previous = store.handoffs.read(key);
+        const input = collectHandoffInput(record.sessionId, events, record.agent.session.surface?.nodes, previous.covered[record.sessionId]);
+        input.schedules = readScheduleMigrations(scheduleStorageHome(), record.sessionId);
+        if (input.transcript || previous.pending) {
+          const attempt = store.handoffs.begin(key, currentId!, input);
+          try {
+            const llm = this.ctx.get('llm') as JudgeLlm | undefined;
+            const provider = sourceRoute?.provider;
+            const model = sourceRoute?.model;
+            if (!llm || !provider || !model) throw new Error('交接模型不可用');
+            const summary = await record.agent.runMaintenance((signal) => generatePersonaHandoff(
+              llm, { provider, model }, previous.latest ? `版本 ${previous.latest.version}；时间 ${previous.latest.at}\n${previous.latest.summary}` : '', attempt.transcript,
+              signal,
+              { resume: attempt.progress, source: { fromPersona: attempt.fromPersona, at: attempt.at, cursor: attempt.cursor }, save: (chars, draft) => store.handoffs.checkpoint(key, attempt.id, chars, draft) },
+            ));
+            const after = record.agent.session.snapshotEvents?.() ?? record.agent.session.events ?? [];
+            if (after.length !== events.length || after.at(-1)?.seq !== events.at(-1)?.seq || record.agent.status !== 'idle') {
+              store.handoffs.fail(key, attempt.id, '生成期间历史发生变化，请重新切换');
+              return 'busy';
+            }
+            store.handoffs.complete(key, attempt.id, summary);
+          } catch (err) {
+            incomplete = true;
+            store.handoffs.fail(key, attempt.id, err instanceof Error ? err.message : String(err));
+            this.logger.warn(`persona handoff incomplete: key=${key} attempt=${attempt.id} err=${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      } catch (err) {
+        // 落盘失败不能继续切换，否则连“哪些没覆盖”也无法保证。
+        this.logger.warn(`persona handoff persistence failed: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
+        return 'failed';
+      }
+    }
+    if (sourceRoute && record) {
+      const current = this.personaModelRoute(record);
+      if (record.agent.status !== 'idle' || this.sessions.get(key) !== record
+        || current?.provider !== sourceRoute.provider || current.model !== sourceRoute.model) return 'busy';
+    }
+    if (this.disposing) return 'busy';
+    try {
+      // 人格只改变设定和历史，不应把 Web 实际选用的模型悄悄换回聊天默认。
+      if (sourceRoute) this.modelResolver.setOverride(key, sourceRoute);
+      store.rememberSession(peerId, currentId!, record?.sessionId ?? this.currentSessionId(key), scope);
+      store.select(peerId, personaId, scope);
+    } catch (err) {
+      this.logger.warn(`persona selection persistence failed: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
+      return 'failed';
+    }
+    if (sourceRoute) {
+      this.personaRoutes ??= new Map();
+      this.personaRoutes.set(key, sourceRoute);
+    }
+    await this.remove(scope, peerId, store.sessionFor(peerId, personaId, scope) ?? randomUUID());
+    return incomplete ? 'handoff-incomplete' : 'ok';
+  }
+
+  private personaModelRoute(record: SessionRecord): ModelRoute | undefined {
+    const controller = this.ctx?.get('sessionController') as { agents?: { selectionFor?(agent: DshAgent): ModelSelectionRef } } | undefined;
+    const selected = controller?.agents?.selectionFor?.(record.agent)?.current ?? this.modelSelections?.get(record.agent)?.current;
+    if (selected?.provider && selected.model) return { provider: selected.provider, model: selected.model };
+    const events = record.agent.session.snapshotEvents?.() ?? record.agent.session.events ?? [];
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const event = events[i]!;
+      if (event.type === 'request/header') break;
+      if (event.type === 'model/selection') {
+        const route = event.data as ModelRoute | undefined;
+        if (route?.provider && route.model) return { provider: route.provider, model: route.model };
+      }
+    }
+    const header = record.agent.session.requestHeader?.()?.config;
+    return header?.provider && header.model ? { provider: header.provider, model: header.model } : this.getEffectiveModel(record.scope, record.peerId);
+  }
+
+  /** 在目标人格自己的历史之后追加，成功写入会话后才记接收版本；下一条新消息在它之后。 */
+  private async receivePersonaHandoff(record: SessionRecord): Promise<void> {
+    const store = this.personaStore;
+    if (!store?.handoffs || this.dndService?.active(record.sessionKey) !== undefined) return;
+    const persona = store.currentId(record.peerId, record.scope);
+    const session = record.agent.session;
+    const events = session.snapshotEvents?.() ?? session.events ?? [];
+    const receipt = store.handoffs.read(record.sessionKey).received[persona];
+    // 旧版曾在真正持久化前记接收；加载后没有交接事件时要补送，不能只信账本。
+    const hasDurableDelivery = events.some((event) => {
+      const data = (event.data ?? event.message ?? event) as { source?: unknown; content?: Array<{ text?: string }> };
+      return event.type === 'user/message' && isPersonaHandoffSource(data.source) && data.content?.some((block) => {
+        const text = block.text ?? '';
+        return receipt !== undefined && (receipt.version === 0 || text.includes(`版本 ${receipt.version}；`))
+          && (receipt.attemptId === undefined || text.includes(receipt.attemptId));
+      });
+    });
+    const delivery = store.handoffs.delivery(record.sessionKey, persona, record.sessionId, !hasDurableDelivery);
+    if (!delivery) return;
+    if (!session.append) throw new Error('当前宿主不支持交接写入会话');
+    // 会话已写入、接收账本尚未写入时崩溃：从正文识别已送达记录，避免再次追加。
+    const alreadyWritten = events.some((event) => {
+      const data = (event.data ?? event.message ?? event) as { source?: { plugin?: string }; content?: Array<{ text?: string }> };
+      return isPersonaHandoffSource(data.source) && data.content?.some((block) => block.text === delivery.text);
+    });
+    if (!alreadyWritten) await session.append('user/message', createPersonaHandoffMessage(delivery.text), { surfaceOp: 'append' });
+    store.handoffs.acknowledge(record.sessionKey, persona, record.sessionId, delivery.version, delivery.attemptId);
   }
 
   /**
@@ -1326,6 +1497,7 @@ export class SessionManager {
     beforeDispose?: (record: SessionRecord) => Promise<void>,
   ): Promise<void> {
     const key = this.sessionKey(scope, peerId);
+    const releaseCombat = this.combatAgents?.release(key);
     const record = this.sessions.get(key);
     // 默认派生 ID 未必写进偏好存储；插件重载/空闲回收后仍要捕获旧人设的任务。
     const oldSessionId = record?.sessionId ?? this.currentSessionId(key);
@@ -1345,11 +1517,12 @@ export class SessionManager {
     this.retiredSessionIds.delete(nextSessionId);
     this.modelResolver.setSessionId(key, nextSessionId);
 
-    if (!record) return;
+    if (!record) { await releaseCombat; return; }
     this.sessions.delete(key);
     this.modelSelections.delete(record.agent);
     if (beforeDispose !== undefined) await beforeDispose(record).catch(() => {});
     record.agent.cancel({ kind: 'user' });
+    if (releaseCombat !== undefined) await releaseCombat;
     await record.handle.dispose().catch(() => {});
     this.logger.info(`session removed: key=${key}`);
   }
@@ -1362,6 +1535,7 @@ export class SessionManager {
    */
   async compact(scope: ChatScope, peerId: string): Promise<CompactOutcome> {
     const key = this.sessionKey(scope, peerId);
+    if (this.personaTransitions?.has(key)) return { ok: false, reason: 'busy' };
     const record = this.sessions.get(key);
     if (!record) return { ok: false, reason: 'no-session' };
     return this.compactRecord(key, record);
@@ -1416,6 +1590,8 @@ export class SessionManager {
    * agent 排队，压完再跑。正忙、正在压缩或还不知道上下文大小时跳过，下一轮再判断。
    */
   maybeAutoCompact(record: SessionRecord): void {
+    if (this.personaTransitions?.has(record.sessionKey)) return;
+    if (this.combatAgents?.current(record.sessionKey) !== undefined) return;
     if ((this.config.autoCompactTokens ?? 0) <= 0 || record.compacting) return;
     if (record.contextTokens === undefined || record.agent.status !== 'idle') return;
 
@@ -1477,6 +1653,8 @@ export class SessionManager {
     if (minIdleMs <= 0 || minTokens <= 0) return;
 
     for (const record of this.sessions.values()) {
+      if (this.personaTransitions?.has(record.sessionKey)) continue;
+      if (this.combatAgents?.current(record.sessionKey) !== undefined) continue;
       if (record.compacting || record.idleCompactTriedAt === record.lastActivity) continue;
       if (record.agent.status !== 'idle') continue;
       const eligible = shouldIdleCompact({
@@ -1542,6 +1720,7 @@ export class SessionManager {
   }
 
   async disposeAll(): Promise<void> {
+    this.disposing = true;
     this.evictor.dispose();
     clearInterval(this.idleCompactTimer);
     const records = [...this.sessions.values()];
@@ -1549,6 +1728,7 @@ export class SessionManager {
     for (const record of records) {
       record.agent.cancel({ kind: 'user' });
     }
+    await this.combatAgents?.dispose();
     await Promise.allSettled(records.map((r) => r.handle.dispose()));
     this.logger.info(`all sessions disposed (count=${records.length})`);
   }

@@ -28,13 +28,14 @@ export interface DshAgent {
   /** 底层 session（events / snapshotEvents 用于统计/导出） */
   readonly session: {
     readonly id: string;
+    readonly header?: { cwd?: string };
     readonly events?: readonly SessionEventLike[];
     /** 0.2.x 的 Session 只有 snapshotEvents()，没有 events 字段 */
     snapshotEvents?(): readonly SessionEventLike[];
     /** 追加一条会话事件（换模型时写 model/selection） */
-    append?(type: string, payload: unknown): unknown;
+    append?(type: string, payload: unknown, options?: { surfaceOp: 'append' }): unknown;
     /** 压缩、替换历史时 contentGeneration 会变，普通追加不变 */
-    readonly surface?: { readonly contentGeneration?: number };
+    readonly surface?: { readonly contentGeneration?: number; readonly nodes?: readonly number[] };
     /** 最近一次请求头（取实际路由的 provider/model，用于查上下文窗口） */
     requestHeader?(): { config?: { provider?: string; model?: string } } | undefined;
   };
@@ -88,7 +89,7 @@ export interface DshAgentRegistry {
   /** 从持久化存储恢复 session */
   resume(options: {
     resumeSessionId: string;
-    agentOptions?: { provider?: string; model?: string };
+    agentOptions?: { provider?: string; model?: string; reasoningEffort?: string };
     setup?: AgentSetup;
   }): Promise<DshAgentHandle>;
   /** 创建全新 session */
@@ -96,7 +97,7 @@ export interface DshAgentRegistry {
     sessionId: string;
     meta?: { cwd?: string; parentSession?: string; seedLength?: number; agentPreset?: string };
     seed?: readonly unknown[];
-    agentOptions?: { provider?: string; model?: string };
+    agentOptions?: { provider?: string; model?: string; reasoningEffort?: string };
     setup?: AgentSetup;
   }): Promise<DshAgentHandle>;
 }

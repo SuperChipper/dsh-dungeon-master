@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { DndToolScope, hiddenDndTools, PAUSED_DND_TOOLS, type DndToolLevel } from './tool-scope.ts';
 
-const ALL = ['dnd_roll', 'dnd_check', 'dnd_chronicle', 'dnd_prepare', 'dnd_end', 'dnd_lookup', 'dnd_move'];
+const ALL = ['dnd_roll', 'dnd_check', 'dnd_chronicle', 'dnd_prepare', 'dnd_end', 'dnd_lookup', 'dnd_character', 'dnd_resource', 'dnd_move'];
 
 function setup(initial: DndToolLevel, options: { restrict?: boolean; fail?: boolean } = {}) {
   let level = initial;
@@ -25,7 +25,7 @@ function setup(initial: DndToolLevel, options: { restrict?: boolean; fail?: bool
 }
 
 describe('hiddenDndTools', () => {
-  it('没团档全藏，停团只留查账本和备团那几个，开团全部可见', () => {
+  it('没团档全藏，停团可查账本、备团和写卡，开团全部可见', () => {
     expect(hiddenDndTools('none', ALL)).toEqual(ALL);
     expect(hiddenDndTools('active', ALL)).toEqual([]);
     expect(hiddenDndTools('paused', ALL)).toEqual(['dnd_roll', 'dnd_check', 'dnd_move']);

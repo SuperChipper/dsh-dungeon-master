@@ -2,9 +2,10 @@
 import { join } from 'node:path';
 import { roomGraph } from '../adventure.ts';
 import {
-assertNoPending,moveParty,partyPositions
+assertNoPending,moveParty,partyPositions,requireCharacter,isOut
 } from '../campaign.ts';
-import { findRoom } from '../dungeon.ts';
+import { findRoom,resolveRoom } from '../dungeon.ts';
+import { assertCombatExit } from '../battlefield.ts';
 import { mapCaption,renderPartyMap } from '../map-view.ts';
 import {
 npcAlive,npcCharacter,npcRoom,
@@ -13,7 +14,7 @@ pendingTriggers,shopLine
 } from '../story.ts';
 import { hookHint } from '../hooks.ts';
 import {
-str,strList,spawnLine,npcSceneText,partySizeHint,
+rollIds,str,strList,spawnLine,npcSceneText,partySizeHint,
 combatJoinHint,type ToolKit
 } from './shared.ts';
 
@@ -23,20 +24,28 @@ export function registerExploreTools(kit: ToolKit): void {
   register(
     'dnd_move',
     'Move characters to an adjacent room (moving inside the same room is dnd_position). Omit `who` only when the WHOLE party goes; when one or a few go ahead '
-    + '(scouting, sneaking, fetching something) pass `who` so the others stay put. Returns the player-facing '
-    + 'description (narrate from this) and DM-only notes (use for rulings, never read aloud). First visit reveals '
+    + '(scouting, sneaking, fetching something) pass `who` so the others stay put. '
+    + 'During combat, first dnd_position move to the mapped door/outside leading there and resolve opportunity attacks; this tool cannot skip the battlefield route. '
+    + 'Returns the player-facing description (narrate from this) and DM-only notes (use for rulings, never read aloud). First visit reveals '
     + 'the room and spawns its monsters. In combat, characters in the initiative order move only on their own turn (with `who`); '
     + 'those not in the fight yet (catching up) can move any time, then join with dnd_initiative join. '
     + 'On a revisit (no 「（首次）」) the description is the first-entry script: describe the room as it is now from the '
     + 'state and foe list; do not replay cleared fights or fired events. '
     + 'Pass discover_hidden=true only after a successful check found a secret passage. Exits that need a check '
-    + '(climbing, swimming) are rolled by the tool for each mover; those who fail stay behind. In a town you can go '
+    + '(climbing, swimming) are rolled by the tool for each mover; those who fail stay behind. If the table already '
+    + 'resolved that crossing with dnd_check, pass `check_done` so it is not rolled twice. In a town you can go '
     + 'to any location the players know. From a dungeon\'s entry, or anywhere in a town, you can travel to another '
     + 'known site by its name or id.',
     {
       room: { type: 'string', description: 'Room id or name, or another site\'s id/name (from that site\'s entry).' },
       who: { type: 'array', items: { type: 'string' }, description: 'Characters who move; omit for the whole party.' },
       discover_hidden: { type: 'boolean' },
+      check_done: {
+        type: 'array',
+        items: { type: 'integer' },
+        description: 'Roll ids (#R149 → 149) of the dnd_check rolls that already settled this exit\'s check. The tool then '
+          + 'skips its own roll and moves everyone listed in `who` (or the whole party): leave out whoever failed.',
+      },
       dm_override: {
         type: 'boolean',
         description: 'Move a PC whose player has not spoken this turn: explicit delegation ("Kriv 先过去探路") or '
@@ -48,6 +57,11 @@ export function registerExploreTools(kit: ToolKit): void {
     (args, exec) => mutate(exec, (c, adventure) => {
       assertNoPending(c, '换房间');
       const who = strList(args.who);
+      const destination = resolveRoom(roomGraph(adventure), String(args.room ?? ''));
+      if (destination !== undefined) {
+        const movers = who === undefined ? c.characters.filter((ch) => ch.kind !== 'monster' && !isOut(ch)) : who.map((name) => requireCharacter(c, name));
+        for (const ch of movers) assertCombatExit(c, ch, destination.id);
+      }
       if (who !== undefined && args.dm_override !== true) {
         const senders = sendersOf(exec);
         const silent = who
@@ -61,11 +75,14 @@ export function registerExploreTools(kit: ToolKit): void {
           );
         }
       }
-      const result = moveParty(c, adventure, String(args.room ?? ''), args.discover_hidden === true, who, service.roller);
+      const checkDone = rollIds(args.check_done);
+      const result = moveParty(c, adventure, String(args.room ?? ''), args.discover_hidden === true, who, service.roller, checkDone);
       const lines: string[] = [];
+      if (result.checkDone !== undefined) lines.push(`出口检定按 ${result.checkDone.map((id) => `#R${id}`).join(' ')} 的结果算，没有再掷。`);
       if (result.checks.length > 0) {
         lines.push(`出口检定：${result.checks.map((r) => `${r.name} ${r.detail}`).join('；')}`);
         if (result.failText !== undefined) lines.push(`【DM】没过的人留在原地，后果：${result.failText}（伤害用 dnd_apply）`);
+        lines.push('【DM】这道检定桌上已经用 dnd_check 投过的话：dnd_undo 撤掉这一步，再带 check_done=[那几骰的编号] 重来，别逐个改 room。');
       }
       if (result.movers.length === 0) {
         lines.push('没有人过去。');

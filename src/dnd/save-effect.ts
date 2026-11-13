@@ -36,6 +36,7 @@ export interface SaveTarget {
   name: string;
   advantage?: Advantage;
   bonus?: number;
+  bonusDice?: string;
   defense?: Defense;
 }
 
@@ -50,6 +51,7 @@ export function parseSaveTargets(value: unknown): SaveTarget[] | undefined {
     const t: SaveTarget = { name };
     if (o.advantage === 'advantage' || o.advantage === 'disadvantage' || o.advantage === 'none') t.advantage = o.advantage;
     if (typeof o.bonus === 'number' && Number.isFinite(o.bonus)) t.bonus = Math.trunc(o.bonus);
+    if (typeof o.bonus_dice === 'string') t.bonusDice = o.bonus_dice.trim();
     if (o.defense !== undefined) {
       const d = parseDefense(o.defense);
       if (d === undefined) throw new Error(`${name} 的 defense 只能是 resistant/immune/vulnerable（抗性/免疫/易伤）`);
@@ -130,7 +132,8 @@ export function rollSaveEffect(c: Campaign, input: SaveEffectInput): RolledSaveE
   const damageRoll = input.damage === undefined ? undefined : rollExpression(input.damage, input.roller);
   const saves = resolved.map(({ t, ch }): RolledSave => {
     if (ch.conditions.includes('死亡')) return { name: ch.name, skipped: '已死亡' };
-    const extra = input.bonusDice === undefined ? undefined : rollExpression(input.bonusDice, input.roller);
+    const bonusDice = t.bonusDice ?? input.bonusDice;
+    const extra = bonusDice === undefined || bonusDice.length === 0 ? undefined : rollExpression(bonusDice, input.roller);
     const modifier = checkModifier(ch, 'save', input.ability) + (t.bonus ?? input.bonus ?? 0) + (extra?.total ?? 0);
     const advantage = t.advantage ?? input.advantage ?? 'none';
     const roll = rollD20(modifier, advantage, input.roller);

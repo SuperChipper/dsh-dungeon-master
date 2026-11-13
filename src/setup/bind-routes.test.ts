@@ -416,6 +416,30 @@ describe('bind-routes', () => {
     });
   });
 
+  it('POST config：战斗代理配置可保存，且只写 dnd 顶层键', async () => {
+    const updates: Array<Record<string, unknown>> = [];
+    const { routes } = createHarness({ onUpdateConfig: (config) => { updates.push(config); return true; } });
+    const res = fakeRes();
+    await invoke(routes.get(BIND_CONFIG_PATH), fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({
+      dnd: { combatAgent: { enabled: true, provider: 'opencode-go', model: 'deepseek-v4.1-flash', contextChars: 8000 } },
+    })), res);
+    expect(res.statusCode).toBe(200);
+    expect(Object.keys(updates[0]!)).toEqual(['dnd']);
+    expect(updates[0]).toMatchObject({ dnd: { combatAgent: { enabled: true, model: 'deepseek-v4.1-flash', contextChars: 8000 } } });
+  });
+
+  it.each([
+    { enabled: 'true' }, { provider: 42 }, { model: false }, { reasoningEffort: 42 },
+    { contextChars: 999 }, { contextChars: 30001 }, { contextChars: 1000.5 },
+  ])('POST config：拒绝非法战斗代理字段 %j', async (combatAgent) => {
+    const updates: Array<Record<string, unknown>> = [];
+    const { routes } = createHarness({ onUpdateConfig: (config) => { updates.push(config); return true; } });
+    const res = fakeRes();
+    await invoke(routes.get(BIND_CONFIG_PATH), fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({ dnd: { combatAgent } })), res);
+    expect(res.statusCode).toBe(400);
+    expect(updates).toHaveLength(0);
+  });
+
   it('POST config：speak 通过校验并写入', async () => {
     const updates: Array<Record<string, unknown>> = [];
     const { routes } = createHarness({ onUpdateConfig: (config) => { updates.push(config); return true; } });

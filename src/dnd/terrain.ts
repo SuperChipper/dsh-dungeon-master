@@ -171,6 +171,8 @@ export interface Reach {
 }
 
 export interface WalkOptions {
+  /** 坐标目的地出队时，其最省路线已确定；避免无场地图时每次遍历整张 100×100 网格。 */
+  stopAt?: Cell;
   /** 被敌人占着的格子：5e 不能穿过敌人 */
   blocked: (at: Cell) => boolean;
   /** 走这一步会离开几个敌人的触及 */
@@ -206,6 +208,7 @@ export function walk(map: BattleMap | undefined, from: Cell, options: WalkOption
     const cur = open.shift()!;
     const known = best.get(key(cur))!;
     if (cur.feet > known.feet || (cur.feet === known.feet && cur.provokes > known.provokes)) continue;
+    if (options.stopAt?.x === cur.x && options.stopAt.y === cur.y) break;
     for (const step of STEPS) {
       const next = { x: cur.x + step.x, y: cur.y + step.y };
       if (!passable(next) || options.blocked(next)) continue;

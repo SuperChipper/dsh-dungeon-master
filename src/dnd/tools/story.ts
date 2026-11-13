@@ -15,11 +15,11 @@ import {
 str,
 int,
 strList,readChronicle,storyAction,
-lookup,npcSceneText,fetchSrd,srdMonsterInput,type ToolKit
+lookup,npcSceneText,fetchSrd,srdMonsterInput,characterBrief,sheet,type ToolKit
 } from './shared.ts';
 
 export function registerStoryTools(kit: ToolKit): void {
-  const { service, recordOf, mutate, register } = kit;
+  const { service, recordOf, mutate, whoOf, register } = kit;
 
   register(
     'dnd_story',
@@ -80,9 +80,11 @@ export function registerStoryTools(kit: ToolKit): void {
     + 'events, NPCs), leads (all leads and which the players know). Omit id to list everything of that kind. '
     + 'brief=true (npc/room) returns one line: who is there with HP/conditions, attitude, unfired event and '
     + 'unsaid fact ids. Use it for quick checks; read the full card before revealing facts or ruling on DM notes. '
+    + 'character: a PC or companion sheet (items, gold, resources, spells), also while paused: a player asking what '
+    + 'their own character carries is not a spoiler. Omit id to list the party. '
     + 'Read-only access also works while paused for explicitly requested DM preparation; never use it to spoil future scenes in chat.',
     {
-      kind: { type: 'string', enum: ['npc', 'quest', 'site', 'room', 'leads'] },
+      kind: { type: 'string', enum: ['npc', 'quest', 'site', 'room', 'leads', 'character'] },
       id: { type: 'string', description: 'Id or name; omit to list.' },
       brief: { type: 'boolean', description: 'npc/room only: one-line summary instead of the full card (default false).' },
     },
@@ -92,6 +94,15 @@ export function registerStoryTools(kit: ToolKit): void {
       const found = service.active(key) ?? service.saved(key);
       if (found === undefined) throw new Error('这个群没有团档（或模组文件丢失）');
       const { campaign, adventure } = found;
+      if (args.kind === 'character') {
+        // 只给队伍这边的卡：怪物数值停团也不该顺手查出来
+        const party = campaign.characters.filter((ch) => ch.kind !== 'monster');
+        const id = str(args.id);
+        if (id === undefined) return party.length === 0 ? '还没有角色卡。' : party.map((ch) => characterBrief(campaign, ch)).join('\n');
+        const target = requireCharacter(campaign, id);
+        if (target.kind === 'monster') throw new Error(`${target.name} 是怪物：开团时用 dnd_character show 查，停团不查怪物数值`);
+        return args.brief === true ? characterBrief(campaign, target) : sheet(target, whoOf(exec), campaign);
+      }
       return lookup(campaign, adventure, String(args.kind), str(args.id), args.brief === true);
     },
   );
