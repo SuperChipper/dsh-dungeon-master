@@ -1,3 +1,4 @@
+import { chooseReaction } from './pending-attack.ts';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -30,10 +31,15 @@ function table() {
   });
   const call = async (name: string, args: object) => (await tools.get(name)!.execute(args, { agent: {} })).text;
   const campaign = () => service.store.load(key)!;
+  const consent = (by: string, skill: string): string => service.store.update(key, (c) => {
+    const p = c.initiative!.pending ?? c.initiative!.movement!;
+    const existing = p.claimed.find((r) => r.character === by && r.reaction === skill)?.authorization;
+    return existing ?? chooseReaction(c, p, c.characters.find((ch) => ch.name === by)!.playerId!, by, skill)!.authorization!;
+  }, '测试：玩家本人明确选择');
   const char = (name = '甲') => requireCharacter(campaign(), name);
   const onHit = { name: '至圣斩', damage: '2d8', damage_type: '光耀', spend: '1环法术位' };
   const attack = (extra = {}) => call('dnd_check', { type: 'attack', character: '甲', target: '狼', weapon: '大剑', declared_by: 'P1', on_hit: onHit, ...extra });
-  return { service, key, rolls, roller, call, campaign, char, attack, onHit };
+  return { consent, service, key, rolls, roller, call, campaign, char, attack, onHit };
 }
 
 describe('逐目标祝福骰', () => {
@@ -132,9 +138,9 @@ describe('最终命中才追加并消耗', () => {
     expect(t.char('狼').hp).toBe(100);
     expect(t.char().resources!['1环法术位']!.current).toBe(3);
     t.rolls.push(10, 3, 4);
-    await t.attack({ hold: true });
+    await t.attack({ hold_for: [{ by: '甲', name: '时间变幻' }] });
     t.rolls.push(20, 3, 3, 3, 3, 4, 4, 4, 4);
-    await t.call('dnd_apply', { target: '狼', reaction: { by: '甲', name: '时间变幻', reroll: 'd20' }, declared_by: 'P1', settle: true });
+    await t.call('dnd_apply', { target: '狼', reaction: { by: '甲', name: '时间变幻', authorization: t.consent('甲', '时间变幻'), reroll: 'd20' }, declared_by: 'P1', settle: true });
     expect(t.char('狼').hp).toBe(68); // 武器 16，光耀16
     expect(t.char().resources!['1环法术位']!.current).toBe(2);
   });

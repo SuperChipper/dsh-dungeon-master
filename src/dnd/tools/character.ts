@@ -1,16 +1,17 @@
 /** 角色卡与资源：dnd_character、dnd_resource、dnd_rest。 */
 import type { Adventure } from '../adventure.ts';
 import {
-type Campaign,type CharacterInput,type CharacterKind,assertNoPending,changeInventory,findCharacter,inInitiative,fightRooms,leaveInitiative,removeCharacter,requireCharacter,rest,
+type Campaign,type CharacterInput,type CharacterKind,assertNoPending,changeInventory,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isOut,fightRooms,leaveInitiative,removeCharacter,requireCharacter,requireResource,rest,
 restoreResource,
 roomOf,
+setHexbladeCurse,
 setResource,upsertCharacter,
 useResource
 } from '../campaign.ts';
 import {
 npcAlive
 } from '../story.ts';
-import { ABILITIES,type Ability } from '../rules.ts';
+import { ABILITIES,type Ability,proficiencyBonus } from '../rules.ts';
 import { resolveSrdQuery,zhTable } from '../srd-lookup.ts';
 import { type CardSpell,mergeSpells,resolveSpells } from '../spell-links.ts';
 import { hookHint } from '../hooks.ts';
@@ -110,7 +111,7 @@ export function registerCharacterTools(kit: ToolKit): void {
         type: 'array',
         items: { type: 'string' },
         description: 'Auto-handled traits (replaces the list): "不死坚韧"; fighting styles "巨武器战斗" (rerolls 1-2 on '
-          + 'two-handed weapon dice) and "箭术" (+2 to hit with ranged weapons). With these set, never add them by hand.',
+          + 'two-handed weapon dice) and "箭术" (+2 to hit with ranged weapons); feat "精灵精准" (3d20 take highest on advantage attacks using dex/int/wis/cha). With these set, never add them by hand.',
       },
       expertise: { type: 'array', items: { type: 'string' }, description: 'Skills with expertise (double proficiency), e.g. ["巧手","隐匿"].' },
       spells: {
@@ -168,7 +169,7 @@ export function registerCharacterTools(kit: ToolKit): void {
           properties: {
             name: { type: 'string' },
             damage: { type: 'string' },
-            ability: { type: 'string', enum: ['str', 'dex'] },
+            ability: { type: 'string', enum: ['str', 'dex', 'con', 'int', 'wis', 'cha'] },
             notes: { type: 'string', description: 'damage type, properties, range' },
             magic: { type: 'integer', description: '+N magic weapon: added to hit AND damage automatically.' },
             proficient: { type: 'boolean', description: 'false when the wielder lacks proficiency (no proficiency bonus to hit).' },
@@ -332,6 +333,8 @@ export function registerCharacterTools(kit: ToolKit): void {
       character: { type: 'string' },
       resource: { type: 'string' },
       amount: { type: 'integer', description: 'use/restore: how much (default 1 / refill). For lay on hands, the HP spent.' },
+      target: { type: 'string', description: 'For use on targeted class features (e.g. "咒剑诅咒"): the target creature name. Enables automatic 19-20 crit, +proficiency damage, and on-kill healing.' },
+      temp_hp: { type: 'integer', description: 'Optional temporary HP override for features like "战斗英姿" (computed automatically from fighter level if omitted).' },
       max: { type: 'integer', description: 'For set.' },
       current: { type: 'integer', description: 'For set: current value (default: full for a new resource).' },
       reset: { type: 'string', enum: ['short', 'long', 'none'], description: 'For set: which rest refills it.' },
@@ -352,9 +355,43 @@ export function registerCharacterTools(kit: ToolKit): void {
         const r = setResource(c, name, key, max, reset, int(args.current));
         return `${requireCharacter(c, name).name}「${key.trim()}」${r.current}/${r.max}`;
       }
-      const result = action === 'use'
-        ? useResource(c, name, key, int(args.amount) ?? 1)
-        : restoreResource(c, name, key, int(args.amount));
+      if (action === 'use') {
+        const ch = requireCharacter(c, name);
+        const [matchedKey] = requireResource(ch, key);
+        let curseTarget: ReturnType<typeof requireCharacter> | undefined;
+        if (/^(咒剑诅咒|Hexblade'?s Curse)$/i.test(matchedKey.trim())) {
+          const targetArg = str(args.target);
+          if (targetArg !== undefined) {
+            curseTarget = requireCharacter(c, targetArg);
+          } else if (c.initiative !== undefined) {
+            const foes = c.initiative.order
+              .map((e) => findCharacter(c, e.name))
+              .filter((f): f is NonNullable<typeof f> => f !== undefined && !isOut(f) && (ch.kind === 'monster' ? f.kind !== 'monster' : f.kind === 'monster'));
+            if (foes.length === 1) curseTarget = foes[0];
+            else if (foes.length > 1) {
+              throw new Error('场上不止一个敌方目标，使用「咒剑诅咒」请传 target="目标名" 指定诅咒对象');
+            }
+          }
+        }
+        const result = useResource(c, ch.name, key, int(args.amount) ?? 1);
+        const baseLine = `${ch.name}「${result.key}」${result.before}→${result.resource.current}/${result.resource.max}`;
+        if (curseTarget !== undefined) {
+          setHexbladeCurse(c, ch.name, curseTarget.name);
+          const prof = proficiencyBonus(ch.level);
+          const killHeal = hexbladeKillHeal(ch);
+          return `${baseLine}；已对「${curseTarget.name}」施加咒剑诅咒（攻击该目标天然 19-20 重击、命中伤害自动 +${prof}，请勿在 damage 重复填常数；目标死亡恢复 ${killHeal} HP）`;
+        }
+        if (/^(战斗英姿|Fighting Spirit)$/i.test(result.key.trim())) {
+          const gain = int(args.temp_hp) ?? fightingSpiritTempHp(ch);
+          const hpChange = grantTempHp(c, ch.name, gain);
+          if (c.initiative !== undefined) {
+            c.initiative.fightingSpirit = [...new Set([...(c.initiative.fightingSpirit ?? []), ch.name])];
+          }
+          return `${baseLine}；获得 ${gain} 点临时 HP（当前临时 HP ${hpChange.tempHp}）${c.initiative !== undefined ? '，本回合武器攻击自动具有优势（含精灵精准三骰取高）' : ''}`;
+        }
+        return baseLine;
+      }
+      const result = restoreResource(c, name, key, int(args.amount));
       return `${requireCharacter(c, name).name}「${result.key}」${result.before}→${result.resource.current}/${result.resource.max}`;
     }, { allowPaused: true }),
   );

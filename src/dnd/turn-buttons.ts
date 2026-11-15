@@ -14,9 +14,10 @@ import type { Logger, ReplyTarget } from '../types.ts';
 import { BUTTONS_PER_ROW, buttonLabel, decodeButtonData, encodeButtonData } from '../features/button-utils.ts';
 import { mapCaption, renderPartyMap } from './map-view.ts';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import type { Adventure } from './adventure.ts';
 import { type Campaign, type ReactionWindow, describePending, findCharacter, nextTurn, playerStatus, reactionWindow } from './campaign.ts';
-import { waitingOn } from './pending-attack.ts';
+import { chooseReaction, reactionReplyNote, waitingOn } from './pending-attack.ts';
 import { type CheckIn, arrivalNotice, checkInHint, createCheckIn, isComplete, kickoffMessage, markArrived, rosterOf, rosterText } from './check-in.ts';
 import type { DndService } from './dnd-service.ts';
 import { combatTurnPrompt } from './dnd-tools.ts';
@@ -90,8 +91,12 @@ function shortName(name: string): string {
  * 反应窗口：每个可用的反应一个按钮，再加一个「不用」。权限不靠 QQ 的 specify_user_ids，
  * 和「结束回合」一样在回调里比对点击者 openid：别人的按钮点了会被拒，提示也更明确。
  */
+export function reactionOptionKey(option: { character: string; reaction: string }): string {
+  return createHash('sha256').update(JSON.stringify([option.character, option.reaction])).digest('base64url').slice(0, 16);
+}
+
 export function buildReactionKeyboard(p: ReactionWindow): InlineKeyboard {
-  const options = p.reactors.flatMap((r, i) => r.npc === true ? [] : [callbackButton(`dnd-react-${i}`, buttonLabel(`${shortName(r.character)}·${r.reaction}`), 1, encodeButtonData({ t: 'dnd', a: 'react', r: p.seq, i }))]);
+  const options = p.reactors.flatMap((r, i) => r.npc === true ? [] : [callbackButton(`dnd-react-${i}`, buttonLabel(`${shortName(r.character)}·${r.reaction}`), 1, encodeButtonData({ t: 'dnd', a: 'react', r: p.seq, i, o: reactionOptionKey(r) }))]);
   // 挤在一行里名字会被截断 → 默认竖着排；QQ 键盘最多 5 行，选项太多才退回两列，宁可挤也别整条发不出去
   const perRow = options.length + 1 > MAX_KEYBOARD_ROWS ? BUTTONS_PER_ROW : 1;
   const rows: InlineKeyboard['content']['rows'] = [];
@@ -236,25 +241,36 @@ export class DndTurnButtons {
   }
 
   /** 反应按钮：点击者必须是那个角色的玩家。「不用」只算他自己，全员答复才叫醒 DM，免得每人点一下都触发一轮回复 */
-  private reactionClick(event: InteractionEvent, key: string, record: SessionRecord | undefined, button: { a: string; r?: number; i?: number }): number {
+  private reactionClick(event: InteractionEvent, key: string, record: SessionRecord | undefined, button: { a: string; r?: number; i?: number; o?: string }): number {
     const p = reactionWindow(this.service.active(key)?.campaign);
     if (p === undefined || p.seq !== button.r) return ACK.duplicate;
+    const sourceId = `button:${event.id}`;
+    if (p.reactionReplyIds?.includes(sourceId)) return ACK.duplicate;
     const clicker = event.group_member_openid ?? event.user_openid;
     const ownsReactor = (name: string): boolean => {
       const ch = this.service.active(key)?.campaign.characters.find((x) => x.name === name);
       return ch !== undefined && ch.kind === 'pc' && ch.playerId !== undefined && ch.playerId === clicker;
     };
-    const answered = new Set([...p.declined, ...p.used.map((u) => u.by), ...p.claimed.map((o) => o.character)]);
+    const used = new Set(p.used.map((u) => u.by));
+    const rememberDuplicate = (): number => {
+      // 即使当前选项没变，也要记住这次真实回调；否则它在改选后重投会复活旧选择。纯去重不占 undo 快照。
+      this.service.store.update(key, (c) => {
+        const pending = reactionWindow(c);
+        if (pending !== undefined && pending.seq === button.r) (pending.reactionReplyIds ??= []).push(sourceId);
+      }, '重复反应按钮', { recordHistory: false });
+      return ACK.duplicate;
+    };
 
     if (button.a === 'pass') {
       const mine = [...new Set(p.reactors.map((r) => r.character))].filter(ownsReactor);
       if (mine.length === 0) return ACK.denied;
-      const fresh = mine.filter((name) => !answered.has(name));
-      if (fresh.length === 0) return ACK.duplicate;
+      const fresh = mine.filter((name) => !used.has(name) && !p.declined.includes(name));
+      if (fresh.length === 0) return rememberDuplicate();
       const left = this.service.store.update(key, (c) => {
         const pending = reactionWindow(c);
-        if (pending === undefined) return undefined;
-        for (const name of fresh) if (!pending.declined.includes(name)) pending.declined.push(name);
+        if (pending === undefined || pending.seq !== button.r) return undefined;
+        (pending.reactionReplyIds ??= []).push(sourceId);
+        for (const name of fresh) chooseReaction(c, pending, clicker!, name);
         return waitingOn(pending);
       }, `按钮 不用反应 ${fresh.join('、')}`);
       if (record !== undefined && left !== undefined && left.length === 0) {
@@ -265,19 +281,20 @@ export class DndTurnButtons {
 
     const option = button.i === undefined ? undefined : p.reactors[button.i];
     if (option === undefined) return ACK.failed;
+    if (button.o !== reactionOptionKey(option)) return ACK.duplicate;
     if (!ownsReactor(option.character)) return ACK.denied;
-    if (answered.has(option.character)) return ACK.duplicate;
-    this.service.store.update(key, (c) => {
-      reactionWindow(c)?.claimed.push({ character: option.character, reaction: option.reaction });
+    if (used.has(option.character) || p.claimed.some((r) => r.character === option.character && r.reaction === option.reaction && r.authorization !== undefined)) return rememberDuplicate();
+    const grant = this.service.store.update(key, (c) => {
+      const pending = reactionWindow(c);
+      if (pending === undefined || pending.seq !== button.r) return undefined;
+      (pending.reactionReplyIds ??= []).push(sourceId);
+      return chooseReaction(c, pending, clicker!, option.character, option.reaction);
     }, `按钮 反应 ${option.character}·${option.reaction}`);
+    if (grant === undefined) return ACK.duplicate;
     this.logger.info(`im-qqbot: 跑团反应按钮 key=${key} ${option.character}·${option.reaction} by=${clicker ?? '?'}`);
     if (record !== undefined) {
-      if (p.kind === 'move') {
-        this.notifyDm(record, `[系统 · 按钮] ${option.character} 的玩家本人点了「${option.reaction}」。用 dnd_check character=${option.character} type=attack target=${p.target} reaction=true 结算借机（本人已确认，不用 declared_by），工具会扣反应；全部处理后 dnd_apply target=${p.target} settle=true 继续移动。`);
-        return ACK.ok;
-      }
-      this.notifyDm(record, `[系统 · 按钮] ${option.character} 的玩家本人点了用「${option.reaction}」。这是对「${describePending(p)}」那笔的反应，不是新的回合行动：`
-        + `用 dnd_apply target=${p.target} reaction={by:"${option.character}", name:"${option.reaction}", ...} 改数值（重掷类传 reroll:"d20"；豁免/检定的 target 填被改的那个掷骰人），不用 declared_by。`);
+      this.notifyDm(record, `[系统 · 按钮] ${option.character} 的玩家本人点了用「${option.reaction}」。`
+        + reactionReplyNote(this.service.active(key)!.campaign, { kind: 'use', characters: [option.character], grants: [grant] }));
     }
     return ACK.ok;
   }
@@ -294,7 +311,10 @@ export class DndTurnButtons {
     if (this.service.sendImage !== undefined && found.campaign.initiative !== undefined) try {
       const path = await this.battleImage(key, found.campaign, found.adventure);
       if (path !== undefined) {
-        const text = `🎲 ${found.adventure.name}\n${playerStatus(found.campaign, found.adventure, viewer, 'image')}\n${mapCaption(found.campaign, found.adventure, 'battle')}`;
+        const text = [
+          playerStatus(found.campaign, found.adventure, viewer, 'image'),
+          mapCaption(found.campaign, found.adventure, 'battle'),
+        ].filter((s) => s.length > 0).join('\n');
         await this.service.sendImage!(target, path, text);
         return true;
       }
@@ -302,7 +322,8 @@ export class DndTurnButtons {
       this.logger.warn(`im-qqbot: 跑团状态图发送失败，退回 markdown: ${err instanceof Error ? err.message : String(err)}`);
     }
     try {
-      await this.sender.sendMarkdown(target, `🎲 ${found.adventure.name}\n${playerStatus(found.campaign, found.adventure, viewer, 'markdown')}`);
+      const body = playerStatus(found.campaign, found.adventure, viewer, 'markdown');
+      await this.sender.sendMarkdown(target, found.campaign.initiative !== undefined ? body : `🎲 ${found.adventure.name}\n${body}`);
       return true;
     } catch (err) {
       this.logger.warn(`im-qqbot: 跑团状态 markdown 发送失败，退回纯文字: ${err instanceof Error ? err.message : String(err)}`);

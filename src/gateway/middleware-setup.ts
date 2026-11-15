@@ -36,7 +36,7 @@ import { getHistoryStore, historyGroupKey } from '../features/history-store.ts';
 import { appendGroupMessage } from '../features/group-memory.ts';
 import { makeSenderLabeler, MENTION_MARK, type SenderLabeler } from '../features/message-format.ts';
 import { getSenderAliases } from '../features/sender-alias.ts';
-import { classifyReactionReply, reactionReplyNote } from '../dnd/pending-attack.ts';
+import { classifyReactionReply, recordReactionReply, reactionReplyNote } from '../dnd/pending-attack.ts';
 
 /**
  * 排队消息合并：SDK 默认把几条内容直接拼起来、全算在第一条的发送者头上，
@@ -68,13 +68,30 @@ export function mergeWithSenders(buffered: MiddlewareContext[], label: SenderLab
 export function pendingReactionReply(
   message: MiddlewareContext['message'],
   manager: Pick<SessionManager, 'sessionKey' | 'dndService'>,
+  commit = false,
 ): { note: string } | undefined {
   const groupId = message.groupOpenid;
   if (message.kind !== 'group' || groupId === undefined) return undefined;
   const campaign = manager.dndService?.active(manager.sessionKey('group', groupId))?.campaign;
   if (campaign?.initiative?.pending === undefined && campaign?.initiative?.movement === undefined) return undefined;
   const reply = classifyReactionReply(campaign, message.senderId, String(message.content ?? ''));
-  return reply === undefined ? undefined : { note: reactionReplyNote(campaign, reply) };
+  if (reply === undefined) return undefined;
+  if (commit && message.messageId) {
+    return manager.dndService!.store.update(manager.sessionKey('group', groupId), (c) => {
+      const decision = recordReactionReply(c, message.senderId, reply, message.messageId);
+      return { note: reactionReplyNote(c, decision) };
+    }, '玩家反应答复', { recordHistory: reply.kind !== 'question' });
+  }
+  return { note: reactionReplyNote(campaign, reply) };
+}
+
+/** 短时间窗口内允许自动打断当前思考（steer）的入站消息：私聊连发 + 群聊显式 @bot（隐式冒泡/欲望接话不打断） */
+export function canAutoSteer(ctx: MiddlewareContext): boolean {
+  if (ctx.message.kind === 'c2c') return true;
+  if (ctx.message.kind === 'group') {
+    return (ctx.state.mention as { wasMentioned?: boolean } | undefined)?.wasMentioned === true;
+  }
+  return false;
 }
 
 /** 引用解析走了 msg_elements 时，从 ref store 补回被引用消息的发送者（原文和附件仍用 msg_elements 的） */
@@ -207,7 +224,7 @@ export function setupMiddlewares(
   // 6.5. 待结算期间给反应回应打标记：模型据此不把它当成新的回合行动
   //      放在清洗之后、合并之前，几个人的话合并成一条时每行还带着自己的标记
   bot.use(async (ctx, next) => {
-    const reply = pendingReactionReply(ctx.message, manager);
+    const reply = pendingReactionReply(ctx.message, manager, true);
     if (reply !== undefined) {
       const msg = ctx.message as { content?: string };
       msg.content = `${String(msg.content ?? '')}\n${reply.note}`;
@@ -230,10 +247,12 @@ export function setupMiddlewares(
   // 8.5. 待答问题截获（在 concurrencyGuard 之前，答案消息不排队直接作答）
   bot.use(questionAnswer(manager));
 
-  // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突）
+  // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突；短时显式 @bot / 私聊连发自动 steer 打断当前思考）
   bot.use(serialMerge({
     maxQueue: config.maxQueue,
     maxProcessingMs: config.processingTimeoutMs,
+    steerWindowMs: () => config.steerWindowMs ?? 10_000,
+    canSteer: canAutoSteer,
     onMerge: (buffered) => {
       const peer = buffered[0]!.message.groupOpenid ?? buffered[0]!.message.senderId;
       return mergeWithSenders(buffered, makeSenderLabeler((id) => getSenderAliases().aliasFor(config.appId, peer, id)));

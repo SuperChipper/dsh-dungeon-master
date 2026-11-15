@@ -381,6 +381,8 @@ export interface ImQQBotConfig {
   sessionIdleTimeout: number;
   /** 并发队列最大长度 */
   maxQueue: number;
+  /** 短时间窗口(ms)内显式 @bot（及私聊连发）自动打断当前思考并 steer 追加；0=关闭 */
+  steerWindowMs?: number;
   /** 处理超时(ms)，超时中断当前 LLM 调用 */
   processingTimeoutMs: number;
   /** 待答问题超时(ms)，超时自动拒绝并提示（ask_user_question） */
@@ -762,6 +764,8 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   streaming: Schema.boolean().default(true).description('是否启用流式输出（群聊始终不启用）'),
   sessionIdleTimeout: Schema.number().default(30 * 60 * 1000).description('会话闲置超时(ms)'),
   maxQueue: Schema.number().default(20).description('并发队列最大长度'),
+  steerWindowMs: Schema.number().min(0).max(300000).default(10000)
+    .description('短时间内新消息自动打断当前思考并追加(steer)的时间窗(ms)，群聊仅显式@bot生效、私聊连发生效；0=关闭'),
   processingTimeoutMs: Schema.number().default(30 * 60 * 1000).description('处理超时(ms)，超时中断当前 LLM 调用'),
   askTimeoutMs: Schema.number().default(5 * 60 * 1000).description('待答问题超时(ms)，超时自动拒绝并提示'),
   historyLimit: Schema.number().default(10).description('群历史缓冲条数'),

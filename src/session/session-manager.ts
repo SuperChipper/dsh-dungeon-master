@@ -29,7 +29,9 @@ import type { NoteMetricsStore } from '../notes/note-metrics.ts';
 import type { NoteJudge } from '../features/note-judge.ts';
 import { formatHandoffHint, latestCompactionSummary } from '../features/session-handoff.ts';
 import { collectHandoffInput, generatePersonaHandoff } from '../features/persona-handoff.ts';
-import type { JudgeLlm } from '../features/reply-judge.ts';
+import type { JudgeLine, JudgeLlm } from '../features/reply-judge.ts';
+import { collectJudgeLines } from '../middleware/reply-decider.ts';
+import { sanitizePseudoToolText } from '../media/pseudo-sticker-call.ts';
 import { createPersonaHandoffMessage, isPersonaHandoffSource } from '../shared/message-source.ts';
 import type { ToolAccess } from '../features/tool-access.ts';
 import type { DndService } from '../dnd/dnd-service.ts';
@@ -55,6 +57,7 @@ import { GROUP_MESSAGE_FORMAT_PROMPT } from '../features/message-format.ts';
 import type { PersonaStore } from '../features/persona-store.ts';
 import type { PersonaSwitch, SwitchPersonaOutcome } from '../features/persona-switch.ts';
 import { compactThreshold, decideAutoCompact, deferCeiling, lastTurnUsedTools, shouldIdleCompact } from '../features/compact-policy.ts';
+import { TurnSteerTracker } from '../transport/turn-steer.ts';
 import type {
   SessionEventLike,
   DshAgent,
@@ -95,6 +98,84 @@ interface PendingNoteInjection {
   hits: NoteHit[];
   /** 每段实际注入的正文（截断后），与 hits 一一对应 */
   snippets: string[];
+  /** 入站时采集的最近群聊上下文（不含当前消息） */
+  contextLines?: JudgeLine[];
+}
+
+/** 轮次结束时由出站路由器传回的本轮实际产出，供笔记相关性打分参考 */
+export interface NoteTurnSummary {
+  reply?: string;
+  toolsUsed?: readonly string[];
+}
+
+function cleanUserEventText(raw: string): string {
+  const currentIdx = raw.lastIndexOf('[Current message]');
+  const body = currentIdx >= 0 ? raw.slice(currentIdx + '[Current message]'.length) : raw;
+  const noteTail = '要看更多用 qqbot_notes_search。）';
+  const afterNotes = body.includes(noteTail) ? body.slice(body.lastIndexOf(noteTail) + noteTail.length) : body;
+  return afterNotes
+    .split('\n')
+    .filter((line) => {
+      const t = line.trim();
+      return t !== ''
+        && !t.startsWith('- Image:')
+        && !t.startsWith('- Video:')
+        && !t.startsWith('- File:')
+        && !t.startsWith('- Voice:')
+        && !t.startsWith('[图片已原生附上')
+        && !t.startsWith('[图片未原生注入')
+        && !t.startsWith('[本地表情库]')
+        && !t.startsWith('[转发聊天记录里的图片]');
+    })
+    .join(' ')
+    .trim();
+}
+
+/** 私聊没有群记忆文件，从会话历史里取本轮之前的最近几句对话作为打分背景 */
+function recentSessionLines(agent: DshAgent | undefined, limit: number): JudgeLine[] {
+  try {
+    const events = agent?.session?.snapshotEvents?.() ?? agent?.session?.events ?? [];
+    if (events.length === 0 || limit <= 0) return [];
+    const readMsg = (event: SessionEventLike) => {
+      const data = (event.data ?? event) as {
+        content?: Array<{ type: string; text?: string }>;
+        source?: { kind?: string };
+        message?: { content?: Array<{ type: string; text?: string }>; source?: { kind?: string } };
+      };
+      const message = data.message ?? data;
+      const source = message.source ?? data.source;
+      const text = message.content?.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('\n').trim() ?? '';
+      return { kind: source?.kind, text };
+    };
+    let cut = events.length;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i]!;
+      if (ev.type !== 'user/message') continue;
+      const { kind } = readMsg(ev);
+      if (kind === undefined || kind === 'user') {
+        cut = i;
+        break;
+      }
+    }
+    const lines: JudgeLine[] = [];
+    for (let i = cut - 1; i >= 0 && lines.length < limit; i--) {
+      const ev = events[i]!;
+      if (ev.type !== 'user/message' && ev.type !== 'assistant/message') continue;
+      const { kind, text } = readMsg(ev);
+      if (!text) continue;
+      if (ev.type === 'user/message') {
+        if (kind !== undefined && kind !== 'user') continue;
+        const cleaned = cleanUserEventText(text);
+        if (cleaned) lines.unshift({ sender: '对方', text: cleaned, timestamp: 0 });
+      } else {
+        const cleaned = sanitizePseudoToolText(text).trim();
+        if (cleaned && !cleaned.startsWith('💭')) lines.unshift({ text: cleaned, timestamp: 0 });
+      }
+    }
+    return lines;
+  } catch {
+    return [];
+  }
 }
 
 interface ModelInfoLlm {
@@ -231,6 +312,8 @@ export class SessionManager {
   public dndToolScope?: DndToolScope;
   /** 一段对话内锁住的 system prompt 文字（表情清单、本群笔记目录），见 PromptLatch */
   private readonly promptLatch = new PromptLatch();
+  /** 短时入站自动 steer 阶段跟踪器（与出站事件、流式帧同步） */
+  public readonly turnSteer = new TurnSteerTracker();
   /** 由 bootstrap 注入的跑团按钮（/dnd start 发签到）；按钮关闭时为空 */
   public dndButtons?: DndTurnButtons;
   public personaStore?: PersonaStore;
@@ -815,7 +898,7 @@ export class SessionManager {
   }
 
   /** 按当前消息检索笔记（共享 + 本会话私有），返回要注入的提示块（未启用/无相关结果/出错时返回空串） */
-  async notesHint(query: string, scope: ChatScope, peerId: string): Promise<string> {
+  async notesHint(query: string, scope: ChatScope, peerId: string, messageId?: string, preservePending = false): Promise<string> {
     if (this.config.dnd?.combatAgent?.enabled && this.dndService?.active(this.sessionKey(scope, peerId))?.campaign.initiative) return '';
     const notes = this.config.notes;
     if (this.notesStore === undefined || !notes?.autoInject || query.trim().length === 0) return '';
@@ -828,9 +911,12 @@ export class SessionManager {
       // 这里只登记：消息还在组装，模型未必收得到。等这一轮正常结束再记账、打分（见 settleNoteInjection）
       const key = this.sessionKey(scope, peerId);
       if (selected.length === 0) {
-        this.pendingNoteInjections.delete(key);
+        if (!preservePending) this.pendingNoteInjections.delete(key);
       } else {
         const perHit = Math.max(80, Math.floor(notes.injectMaxChars / selected.length));
+        const contextLines = scope === 'group'
+          ? collectJudgeLines(this.config, peerId, messageId, { includeCurrent: false })
+          : undefined;
         this.pendingNoteInjections.set(key, {
           query,
           at: Date.now(),
@@ -838,6 +924,7 @@ export class SessionManager {
           hits: selected,
           // 打分要看模型实际看到的那段，和 formatNotesHint 的截断保持一致
           snippets: selected.map((hit) => hit.text.replace(/\s+/g, ' ').trim().slice(0, perHit)),
+          ...(contextLines !== undefined && contextLines.length > 0 ? { contextLines } : {}),
         });
       }
       return formatNotesHint(hits, {
@@ -876,7 +963,7 @@ export class SessionManager {
    * 一轮结束时结算这轮注入的笔记：正常结束才记账并排队打分，异常结束的丢掉。
    * 打分异步进行，不等结果。
    */
-  settleNoteInjection(record: SessionRecord, ok: boolean): void {
+  settleNoteInjection(record: SessionRecord, ok: boolean, turn?: NoteTurnSummary): void {
     const pending = this.pendingNoteInjections.get(record.sessionKey);
     if (pending === undefined) return;
     this.pendingNoteInjections.delete(record.sessionKey);
@@ -896,12 +983,18 @@ export class SessionManager {
     const provider = replyJudge?.provider || route?.provider || this.config.provider;
     const model = replyJudge?.model || route?.model || this.config.model;
     if (!provider || !model) return;
+    const contextLimit = replyJudge?.contextMessages ?? 6;
+    const contextLines = pending.contextLines
+      ?? (record.scope === 'c2c' ? recentSessionLines(record.agent, contextLimit) : undefined);
     const policy = { minSamples: judge.minSamples, muteBelow: judge.muteBelow };
     void this.noteJudge.enqueue({
       provider,
       model,
       reasoningEffort: replyJudge?.reasoningEffort ?? '',
       query: pending.query,
+      ...(contextLines !== undefined && contextLines.length > 0 ? { contextLines } : {}),
+      ...(turn?.reply ? { reply: turn.reply } : {}),
+      ...(turn?.toolsUsed !== undefined && turn.toolsUsed.length > 0 ? { toolsUsed: turn.toolsUsed } : {}),
       notes: pending.hits.map((hit, i) => ({ file: hit.file, heading: hit.heading, text: pending.snippets[i] ?? '' })),
     }).then((scores) => {
       if (scores === undefined) return;
@@ -1264,7 +1357,8 @@ export class SessionManager {
 
     const record: SessionRecord = {
       sessionKey: key,
-      sessionId,
+      // 恢复失败时可能已换建会话，接收账本和出站查询必须跟随实际 agent。
+      sessionId: agent.session.id,
       agent,
       handle: handle ?? { agent, dispose: async () => {} },
       replyTarget,
@@ -1424,9 +1518,14 @@ export class SessionManager {
     const events = session.snapshotEvents?.() ?? session.events ?? [];
     const receipt = store.handoffs.read(record.sessionKey).received[persona];
     // 旧版曾在真正持久化前记接收；加载后没有交接事件时要补送，不能只信账本。
-    const hasDurableDelivery = events.some((event) => {
-      const data = (event.data ?? event.message ?? event) as { source?: unknown; content?: Array<{ text?: string }> };
-      return event.type === 'user/message' && isPersonaHandoffSource(data.source) && data.content?.some((block) => {
+    // 收件箱的 inserted 是持久化输入；宿主在消费它时先建立 system head，
+    // 不能在空 surface 上直接 append user/message。
+    const deliveredMessages = events.flatMap((event) => {
+      const data = (event.data ?? event.message ?? event) as { inserted?: unknown[] };
+      return event.type === 'agent/inbox/spliced' ? data.inserted ?? [] : event.type === 'user/message' ? [data] : [];
+    }) as Array<{ source?: unknown; content?: Array<{ text?: string }> }>;
+    const hasDurableDelivery = deliveredMessages.some((data) => {
+      return isPersonaHandoffSource(data.source) && data.content?.some((block) => {
         const text = block.text ?? '';
         return receipt !== undefined && (receipt.version === 0 || text.includes(`版本 ${receipt.version}；`))
           && (receipt.attemptId === undefined || text.includes(receipt.attemptId));
@@ -1434,13 +1533,12 @@ export class SessionManager {
     });
     const delivery = store.handoffs.delivery(record.sessionKey, persona, record.sessionId, !hasDurableDelivery);
     if (!delivery) return;
-    if (!session.append) throw new Error('当前宿主不支持交接写入会话');
+    if (!record.agent.send) throw new Error('当前宿主不支持交接持久化收件箱');
     // 会话已写入、接收账本尚未写入时崩溃：从正文识别已送达记录，避免再次追加。
-    const alreadyWritten = events.some((event) => {
-      const data = (event.data ?? event.message ?? event) as { source?: { plugin?: string }; content?: Array<{ text?: string }> };
+    const alreadyWritten = deliveredMessages.some((data) => {
       return isPersonaHandoffSource(data.source) && data.content?.some((block) => block.text === delivery.text);
     });
-    if (!alreadyWritten) await session.append('user/message', createPersonaHandoffMessage(delivery.text), { surfaceOp: 'append' });
+    if (!alreadyWritten) record.agent.send(createPersonaHandoffMessage(delivery.text), 'next-step', false);
     store.handoffs.acknowledge(record.sessionKey, persona, record.sessionId, delivery.version, delivery.attemptId);
   }
 

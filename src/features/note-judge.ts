@@ -8,10 +8,10 @@
  * 打分在回复发出之后异步跑，不拖慢回复；失败、超时、解析不出都只是少一个样本。
  */
 import { createUserMessage, BlockAssembler } from '@deepseek-ai/dsh-llm';
-import type { ContentBlock, GenerateOptions } from '@deepseek-ai/dsh-llm';
+import type { ContentBlock, GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { NoteJudgeConfig } from '../config.ts';
 import type { Logger } from '../types.ts';
-import { pickLowestEffort, type JudgeLlm } from './reply-judge.ts';
+import { pickLowestEffort, type JudgeLine, type JudgeLlm } from './reply-judge.ts';
 import { QQBOT_MESSAGE_SOURCE } from '../shared/message-source.ts';
 
 export interface JudgedNote {
@@ -21,7 +21,16 @@ export interface JudgedNote {
   text: string;
 }
 
-export interface NoteJudgeRequest {
+export interface NoteJudgeContext {
+  /** 最近的对话记录（旧→新；sender 省略表示机器人自己说的） */
+  contextLines?: readonly JudgeLine[];
+  /** 机器人本轮实际发出的回复（含文件配文） */
+  reply?: string;
+  /** 机器人本轮调用过的工具名 */
+  toolsUsed?: readonly string[];
+}
+
+export interface NoteJudgeRequest extends NoteJudgeContext {
   provider: string;
   model: string;
   /** 推理档位 id；空或缺省 = 自动选这个模型支持的最低档 */
@@ -32,6 +41,11 @@ export interface NoteJudgeRequest {
 }
 
 const QUERY_MAX_CHARS = 400;
+const CONTEXT_LINE_MAX_CHARS = 180;
+const CONTEXT_MAX_LINES = 8;
+const REPLY_MAX_CHARS = 500;
+/** 部分上游在 off/low 档仍会吐出上千思考 token，输出其实只要十几个 token，留足余量防截断 */
+const JUDGE_MAX_TOKENS = 4096;
 /** 排队上限：上游卡住时不让待评项无限堆积，超出的直接丢（少几个样本无妨） */
 const MAX_PENDING = 20;
 
@@ -39,21 +53,53 @@ const MAX_PENDING = 20;
 const PRIOR_SAMPLES = 3;
 const PRIOR_SCORE = 0.5;
 
+type ModelEffortList = ReadonlyArray<{ id: string; name: string }>;
+
+function clock(ts: number): string {
+  const d = new Date(ts);
+  return [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, '0')).join(':');
+}
+
+function formatContextLines(lines: readonly JudgeLine[]): string {
+  return lines.slice(-CONTEXT_MAX_LINES).map((line) => {
+    const who = line.sender === undefined ? '[bot]' : line.sender;
+    const text = line.text.replace(/\s+/g, ' ').trim().slice(0, CONTEXT_LINE_MAX_CHARS);
+    return line.timestamp > 0 ? `${clock(line.timestamp)} ${who}: ${text}` : `${who}: ${text}`;
+  }).join('\n');
+}
+
 export function buildNoteJudgeSystem(): string {
   return [
-    '你在评估一个聊天机器人的长期记忆检索。下面给出用户发来的一条消息，和系统自动检索出来、附在消息前给机器人看的几段笔记。',
-    '判断每段笔记和这条消息的话题相关度：',
-    '- 2：直接相关，回这条消息时用得上这段内容。',
-    '- 1：同一个话题的背景，可有可无。',
-    '- 0：无关，只是碰巧撞上了几个相同的词。',
-    '只看话题是否对得上，不评价笔记写得好不好。拿不准就给低分。',
+    '你在评估一个聊天机器人的长期记忆检索。下面给出最近的对话背景、用户发来的当前消息、机器人本轮的实际回复（及调用的工具），以及系统自动检索出来附给机器人看的几段笔记。',
+    '结合对话上下文和机器人的实际回复，判断每段笔记在这一轮有没有帮上忙：',
+    '- 2：直接有用。回复里用到了其中的事实、设定、偏好、梗或文件路径；或这段笔记帮机器人听懂了前文指代/群内黑话，或顺着它继续调工具深查；或行为准则/说话风格/踩坑提醒类笔记正好切中本轮场景并在回复中体现。',
+    '- 1：间接相关。属于同一话题、同一人物/群梗或当前场景的有效背景与避坑参考，虽然回复没直接引述，但有参考价值。',
+    '- 0：无关噪音。只是碰巧撞上了相同的字词、编号或目录前缀，和当前对话的话题、场景、回复方式都对不上。',
+    '注意看最近聊天记录里的前文指代（如「那个」「发出来看看」），不要只盯用户最后一句字面词；真对不上话题就给 0。',
     '只输出 JSON，不要解释，按笔记编号顺序给分：{"scores":[2,0]}',
   ].join('\n');
 }
 
-export function buildNoteJudgePrompt(query: string, notes: readonly JudgedNote[]): string {
+export function buildNoteJudgePrompt(
+  query: string,
+  notes: readonly JudgedNote[],
+  extra?: NoteJudgeContext,
+): string {
+  const sections: string[] = [];
+  if (extra?.contextLines !== undefined && extra.contextLines.length > 0) {
+    sections.push(`最近的对话背景：\n${formatContextLines(extra.contextLines)}`);
+  }
+  sections.push(`用户消息：\n${query.replace(/\s+/g, ' ').trim().slice(0, QUERY_MAX_CHARS)}`);
+  if (extra?.toolsUsed !== undefined && extra.toolsUsed.length > 0) {
+    sections.push(`机器人本轮调用的工具：${extra.toolsUsed.slice(0, 12).join(', ')}`);
+  }
+  const replyText = extra?.reply?.replace(/\s+/g, ' ').trim() ?? '';
+  if (replyText !== '') {
+    sections.push(`机器人本轮回复：\n${replyText.slice(0, REPLY_MAX_CHARS)}`);
+  }
   const rows = notes.map((note, i) => `#${i + 1} ${note.file} › ${note.heading}\n${note.text.replace(/\s+/g, ' ').trim()}`);
-  return `用户消息：\n${query.replace(/\s+/g, ' ').trim().slice(0, QUERY_MAX_CHARS)}\n\n检索到的笔记（共 ${notes.length} 段）：\n${rows.join('\n\n')}`;
+  sections.push(`检索到的笔记（共 ${notes.length} 段）：\n${rows.join('\n\n')}`);
+  return sections.join('\n\n');
 }
 
 /**
@@ -88,9 +134,10 @@ export function shouldMute(
   return smoothedRelevance(stat.relevanceSum, stat.judged) < policy.muteBelow;
 }
 
-/** 调模型给注入的笔记打分；串行排队，推理档位按 provider/model 缓存 */
+/** 调模型给注入的笔记打分；串行排队，模型支持的推理档位按 provider/model 缓存 */
 export class NoteJudge {
-  private readonly efforts = new Map<string, Promise<string | undefined>>();
+  private readonly modelEfforts = new Map<string, Promise<ModelEffortList | undefined>>();
+  private readonly loggedEffortNotes = new Set<string>();
   private tail: Promise<unknown> = Promise.resolve();
   private pending = 0;
 
@@ -114,28 +161,52 @@ export class NoteJudge {
     const signal = AbortSignal.timeout(this.config().timeoutMs);
     try {
       const configured = request.reasoningEffort?.trim() ?? '';
-      const effort = configured !== '' ? configured : await this.effortFor(request.provider, request.model, signal);
+      const effort = await this.resolveEffort(request.provider, request.model, configured, signal);
       const options: GenerateOptions = {
         provider: request.provider,
         model: request.model,
         ...(effort !== undefined ? { reasoningEffort: effort as GenerateOptions['reasoningEffort'] } : {}),
         system: buildNoteJudgeSystem(),
         messages: [createUserMessage({
-          content: [{ type: 'text', text: buildNoteJudgePrompt(request.query, request.notes) }],
+          content: [{
+            type: 'text',
+            text: buildNoteJudgePrompt(request.query, request.notes, {
+              contextLines: request.contextLines,
+              reply: request.reply,
+              toolsUsed: request.toolsUsed,
+            }),
+          }],
           source: QQBOT_MESSAGE_SOURCE,
         })],
-        // 档位没关干净时思考会吃掉 completion 额度，留够余量让 JSON 写得出来
-        maxTokens: 1024,
+        maxTokens: JUDGE_MAX_TOKENS,
         signal,
       };
       const assembler = new BlockAssembler();
-      for await (const chunk of this.llm.stream(options)) assembler.push(chunk);
+      let finishReason: Extract<StreamChunk, { type: 'finish' }>['reason'] | undefined;
+      for await (const chunk of this.llm.stream(options)) {
+        assembler.push(chunk);
+        if (chunk.type === 'finish') finishReason = chunk.reason;
+      }
+      if (finishReason?.kind === 'error') {
+        this.logger.warn(`note-judge: 打分失败 (${finishReason.failure.code}): ${finishReason.failure.message}`);
+        return undefined;
+      }
+      if (finishReason?.kind === 'aborted') {
+        this.logger.warn(`note-judge: 打分超时或中断: ${finishReason.failure.message}`);
+        return undefined;
+      }
       const text = assembler.blocks()
         .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
         .map((block) => block.text)
         .join(' ');
       const scores = parseNoteScores(text, request.notes.length);
-      if (scores === undefined) this.logger.warn(`note-judge: 解析不出打分: ${text.slice(0, 120)}`);
+      if (scores === undefined) {
+        if (finishReason?.kind === 'max-tokens') {
+          this.logger.warn(`note-judge: 思考耗尽 maxTokens，未产出完整打分: ${text.slice(0, 120)}`);
+        } else {
+          this.logger.warn(`note-judge: 解析不出打分: ${text.slice(0, 120)}`);
+        }
+      }
       return scores;
     } catch (err) {
       this.logger.warn(`note-judge: 打分失败: ${err instanceof Error ? err.message : String(err)}`);
@@ -143,22 +214,67 @@ export class NoteJudge {
     }
   }
 
-  private effortFor(provider: string, model: string, signal: AbortSignal): Promise<string | undefined> {
+  /**
+   * 校验并挑选该 provider/model 实际支持的推理档位：
+   * - 非推理模型（efforts 为空）一律不传 reasoningEffort，防止 UNSUPPORTED_REASONING_EFFORT；
+   * - 已配置档位且目标模型声明支持时保留原值（如 opencode-go 下用 low 避免 off:null 回退满血思考）；
+   * - 已配置档位但目标模型不支持（如回退到无 off 的 Gemini 路由）时，降级到该模型的最低可用档。
+   */
+  private async resolveEffort(
+    provider: string,
+    model: string,
+    configured: string,
+    signal: AbortSignal,
+  ): Promise<string | undefined> {
+    const efforts = await this.effortsFor(provider, model, signal);
+    if (efforts === undefined) return configured !== '' ? configured : undefined;
+    if (efforts.length === 0) {
+      if (configured !== '') {
+        this.logOnce(`${provider}/${model}:none:${configured}`, `note-judge: ${provider}/${model} 不支持推理档位，忽略配置的 "${configured}"`);
+      }
+      return undefined;
+    }
+    if (configured !== '') {
+      if (efforts.some((e) => e.id === configured)) return configured;
+      const fallback = pickLowestEffort(efforts);
+      this.logOnce(
+        `${provider}/${model}:fallback:${configured}`,
+        `note-judge: ${provider}/${model} 不支持推理档位 "${configured}"（支持 [${efforts.map((e) => e.id).join(', ')}]），改用 ${fallback ?? '(provider 默认)'}`,
+      );
+      return fallback;
+    }
+    return pickLowestEffort(efforts);
+  }
+
+  private effortsFor(provider: string, model: string, signal: AbortSignal): Promise<ModelEffortList | undefined> {
+    if (this.llm.resolveModelInfo === undefined) return Promise.resolve(undefined);
     const key = `${provider}/${model}`;
-    let cached = this.efforts.get(key);
+    let cached = this.modelEfforts.get(key);
     if (cached === undefined) {
-      cached = this.resolveLowest(provider, model, signal);
-      this.efforts.set(key, cached);
+      cached = this.fetchModelEfforts(key, provider, model, signal);
+      this.modelEfforts.set(key, cached);
     }
     return cached;
   }
 
-  private async resolveLowest(provider: string, model: string, signal: AbortSignal): Promise<string | undefined> {
+  private async fetchModelEfforts(
+    cacheKey: string,
+    provider: string,
+    model: string,
+    signal: AbortSignal,
+  ): Promise<ModelEffortList | undefined> {
     try {
-      const info = await this.llm.resolveModelInfo?.(provider, model, signal);
-      return pickLowestEffort(info?.reasoning?.efforts ?? []);
+      const info = await this.llm.resolveModelInfo!(provider, model, signal);
+      return info?.reasoning?.efforts ?? [];
     } catch {
+      this.modelEfforts.delete(cacheKey);
       return undefined;
     }
+  }
+
+  private logOnce(key: string, message: string): void {
+    if (this.loggedEffortNotes.has(key)) return;
+    this.loggedEffortNotes.add(key);
+    this.logger.info(message);
   }
 }

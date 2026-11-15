@@ -119,17 +119,35 @@ export class ReplyJudge {
           source: QQBOT_MESSAGE_SOURCE,
         })],
         // 思考会吃掉 completion 额度：档位没关干净时，上下文一长 JSON 就写不出来、正文回空串
-        maxTokens: 1024,
+        maxTokens: 2048,
         signal,
       };
       const assembler = new BlockAssembler();
-      for await (const chunk of this.llm.stream(options)) assembler.push(chunk);
+      let finishReason: Extract<StreamChunk, { type: 'finish' }>['reason'] | undefined;
+      for await (const chunk of this.llm.stream(options)) {
+        assembler.push(chunk);
+        if (chunk.type === 'finish') finishReason = chunk.reason;
+      }
+      if (finishReason?.kind === 'error') {
+        this.logger.warn(`reply-judge: 打分失败 (${finishReason.failure.code}): ${finishReason.failure.message}`);
+        return undefined;
+      }
+      if (finishReason?.kind === 'aborted') {
+        this.logger.warn(`reply-judge: 打分超时或中断: ${finishReason.failure.message}`);
+        return undefined;
+      }
       const text = assembler.blocks()
         .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
         .map((block) => block.text)
         .join(' ');
       const desire = parseDesire(text);
-      if (desire === undefined) this.logger.warn(`reply-judge: 解析不出打分: ${text.slice(0, 120)}`);
+      if (desire === undefined) {
+        if (finishReason?.kind === 'max-tokens') {
+          this.logger.warn(`reply-judge: 思考耗尽 maxTokens，未产出完整打分: ${text.slice(0, 120)}`);
+        } else {
+          this.logger.warn(`reply-judge: 解析不出打分: ${text.slice(0, 120)}`);
+        }
+      }
       return desire;
     } catch (err) {
       this.logger.warn(`reply-judge: 打分失败: ${err instanceof Error ? err.message : String(err)}`);

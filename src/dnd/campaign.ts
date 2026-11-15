@@ -165,6 +165,8 @@ export interface ReactorOption {
   manual?: boolean;
   /** NPC/怪物由 DM 决定，不生成可被群成员点击的反应按钮。 */
   npc?: boolean;
+  /** 仅真实入站消息/按钮生成；旧存档没有凭证时必须重新确认。 */
+  authorization?: string;
 }
 
 interface PendingBase {
@@ -178,8 +180,10 @@ interface PendingBase {
   target: string;
   reactors: ReactorOption[];
   declined: string[];
-  /** 按钮上点了要用的（本人已确认），效果还没结算 */
+  /** 本人明确选择要用，效果还没结算；授权绑定这个窗口和具体技能。 */
   claimed: ReactorOption[];
+  /** 入站重复投递不能在玩家改选后复活旧授权。 */
+  reactionReplyIds?: string[];
   used: Array<{ by: string; name: string; effect: string }>;
 }
 
@@ -196,6 +200,10 @@ export interface PendingAttack extends PendingBase {
   /** 这一骰的修正和优劣势：重掷要按原样再掷一次（旧存档没有，按 total - natural 算） */
   modifier?: number;
   advantage?: 'none' | 'advantage' | 'disadvantage';
+  /** 精灵精准重掷时保持三骰取高 */
+  elvenAccuracy?: boolean;
+  /** 重击阈值（缺省 20；咒剑诅咒等为 19） */
+  critThreshold?: number;
   ac: number;
   crit: boolean;
   /** 掷好的伤害（抗性之前）；没中时没有 */
@@ -277,6 +285,38 @@ export interface BattleCell {
   room: string;
 }
 
+export interface CombatLedgerEntry {
+  round: number;
+  seq?: number;
+  text: string;
+}
+
+export interface RehearsalSnapshot {
+  characters: Character[];
+  battlemaps?: Record<string, BattleMap>;
+  npcs: Record<string, NpcState>;
+  spawned: string[];
+  enteredFrom?: Record<string, string>;
+  temporaryMonsters?: string[];
+}
+
+export interface HexbladeCurse {
+  caster: string;
+  target: string;
+}
+
+export interface LastCombatSummary {
+  at: number;
+  rounds: number;
+  rehearsal?: boolean;
+  restored?: boolean;
+  participants: string[];
+  defeated: string[];
+  survivingMonsters: Array<{ name: string; hp: number; maxHp: number; conditions: string[]; wound: string }>;
+  fallenParty: Array<{ name: string; hp: number; maxHp: number; conditions: string[] }>;
+  ledger: CombatLedgerEntry[];
+}
+
 export interface InitiativeState {
   round: number;
   /** 当前行动者在 order 里的下标 */
@@ -295,6 +335,8 @@ export interface InitiativeState {
   /** 当前回合冲刺过的人（移动力翻倍）；和 moved 一起清 */
   dashed?: string[];
   disengaged?: string[];
+  /** 武士「战斗英姿」：本回合内武器攻击具优势，回合结束自动清除 */
+  fightingSpirit?: string[];
   /** 护盾术持续到施法者下回合开始，不只保护触发它的那一次攻击。 */
   shielded?: string[];
   /** 同一时间只有一笔：落账前不能推进，所以不需要队列 */
@@ -309,6 +351,13 @@ export interface InitiativeState {
    * 以前靠 DM 逐个喊「点结束回合」，一场突袭要等五六个人各点一次按钮。
    */
   surprised?: string[];
+  /** 本场曾经进入过先攻表的全部角色（含中途 join 或中途 leave 的角色），供收尾摘要对账 */
+  allParticipants?: string[];
+  /** 本场完整战斗账本（按轮次记录，供战斗代理收尾交接补齐未播报回合） */
+  ledger?: CombatLedgerEntry[];
+  /** 梦境/幻境/切磋演练模式：战后自动恢复战前角色状态与房间场地图 */
+  rehearsal?: boolean;
+  rehearsalSnapshot?: RehearsalSnapshot;
 }
 
 export interface CampaignSummary {
@@ -378,9 +427,14 @@ export interface Campaign {
   battlemaps?: Record<string, BattleMap>;
   /** 每个房间最近一次是从哪个房间进来的：开战时队伍默认站在那扇门边 */
   enteredFrom?: Record<string, string>;
+  /** 激活中的咒剑诅咒（1 分钟，战后或休息自动清除） */
+  hexbladeCurses?: HexbladeCurse[];
+  /** 最近一场结束战斗的结构化摘要与账本（仅用于战后交接，不计入剧情哈希） */
+  lastCombat?: LastCombatSummary;
 }
 
 const MAX_LOG = 30;
+const MAX_COMBAT_LEDGER = 200;
 const MAX_SNAPSHOTS = 40;
 const MAX_SUMMARIES = 10;
 /** 一条进度/结团摘要的上限：每次开团都整条注入 */
@@ -460,9 +514,17 @@ export function parseCampaign(json: string): Campaign | undefined {
   };
 }
 
+export function pushCombatLedger(c: Campaign, text: string, seq?: number): void {
+  if (c.initiative === undefined) return;
+  const ledger = (c.initiative.ledger ??= []);
+  ledger.push({ round: c.initiative.round, ...(seq !== undefined ? { seq } : {}), text });
+  if (ledger.length > MAX_COMBAT_LEDGER) ledger.splice(0, ledger.length - MAX_COMBAT_LEDGER);
+}
+
 export function pushLog(c: Campaign, line: string): void {
   c.log.push(line);
   if (c.log.length > MAX_LOG) c.log.splice(0, c.log.length - MAX_LOG);
+  pushCombatLedger(c, line);
 }
 
 export function findCharacter(c: Campaign, name: string): Character | undefined {
@@ -582,6 +644,10 @@ export function removeCharacter(c: Campaign, name: string): Character {
   if (isOut(ch)) recordNpcDeath(c, ch);
   c.characters = c.characters.filter((x) => x !== ch);
   if (c.initiative !== undefined) removeFromInitiative(c.initiative, ch.name);
+  if (c.hexbladeCurses !== undefined) {
+    c.hexbladeCurses = c.hexbladeCurses.filter((x) => x.caster !== ch.name && x.target !== ch.name);
+    if (c.hexbladeCurses.length === 0) delete c.hexbladeCurses;
+  }
   return ch;
 }
 
@@ -675,6 +741,19 @@ export function applyDamage(c: Campaign, name: string, amount: number, options: 
     }
   }
   pushLog(c, `${ch.name} 受到 ${dmg} 点伤害（${hpTrail(ch, before)}）${events.length > 0 ? `，${events.join('、')}` : ''}`);
+  if (events.includes('死亡') && c.hexbladeCurses !== undefined) {
+    const triggered = c.hexbladeCurses.filter((x) => x.target === ch.name);
+    c.hexbladeCurses = c.hexbladeCurses.filter((x) => x.target !== ch.name);
+    if (c.hexbladeCurses.length === 0) delete c.hexbladeCurses;
+    for (const curse of triggered) {
+      const caster = findCharacter(c, curse.caster);
+      if (caster !== undefined && !isOut(caster) && caster.hp > 0 && canReact(caster)) {
+        const healed = heal(c, caster.name, hexbladeKillHeal(caster));
+        const gained = healed.after - healed.before;
+        events.push(gained > 0 ? `咒剑诅咒：${caster.name} 恢复 ${gained} HP` : `咒剑诅咒触发（${caster.name} HP 已满）`);
+      }
+    }
+  }
   return { name: ch.name, before, after: ch.hp, maxHp: ch.maxHp, tempHp: ch.tempHp, absorbed, events, ...woundOf(ch) };
 }
 
@@ -831,9 +910,18 @@ export interface InitiativeRoll {
  * `bonus` 是开战时就已生效的额外先攻值（灵敏之赐 1d8、警觉 +5、状态加成），按角色名给骰子表达式，
  * 由这里掷进去——否则「d20 + 敏调」的半成品会被当成最终结果，玩家事后发现少算了也只能认。
  */
+export interface StartInitiativeOptions {
+  /** 梦境/幻境/切磋演练模式：保存完整战前快照，战斗结束时自动恢复角色状态与房间场地图 */
+  rehearsal?: boolean;
+  /** 演练专用临时生命上限（仅 rehearsal=true 时生效，快照先保存真实数值） */
+  rehearsalHp?: Record<string, number>;
+  /** 演练专用临时怪物名单（结束时自动移除角色卡） */
+  temporaryMonsters?: string[];
+}
+
 export function startInitiative(
   c: Campaign, roller: Roller = cryptoRoller, names?: string[], room?: string, bonus: Record<string, string> = {},
-  surprisedNames: string[] = [],
+  surprisedNames: string[] = [], options: StartInitiativeOptions = {},
 ): InitiativeRoll[] {
   const members = names === undefined || names.length === 0 ? combatants(c, room) : names.map((n) => requireCharacter(c, n));
   if (members.length === 0) throw new Error('没有可以参战的角色');
@@ -841,6 +929,30 @@ export function startInitiative(
   const surprised = [...new Set(surprisedNames.map((n) => requireCharacter(c, n).name))];
   const outsider = surprised.filter((n) => !members.some((m) => m.name === n));
   if (outsider.length > 0) throw new Error(`surprised 里的 ${outsider.join('、')} 不在参战者里`);
+  const rehearsal = options.rehearsal === true;
+  if (!rehearsal && (options.rehearsalHp !== undefined || options.temporaryMonsters !== undefined)) {
+    throw new Error('rehearsal_hp / temporary_monsters 只在 rehearsal=true 的演练战斗中使用');
+  }
+  const tempMonsters = rehearsal
+    ? [...new Set((options.temporaryMonsters ?? []).map((n) => requireCharacter(c, n).name))]
+    : [];
+  const hpOverrides = rehearsal && options.rehearsalHp !== undefined
+    ? Object.entries(options.rehearsalHp).map(([rawName, hp]) => ({ ch: requireCharacter(c, rawName), hp: clampInt(hp, 1, 999) }))
+    : [];
+  const rehearsalSnapshot: RehearsalSnapshot | undefined = rehearsal
+    ? structuredClone({
+      characters: c.characters,
+      ...(c.battlemaps !== undefined ? { battlemaps: c.battlemaps } : {}),
+      npcs: c.npcs,
+      spawned: c.spawned,
+      ...(c.enteredFrom !== undefined ? { enteredFrom: c.enteredFrom } : {}),
+      ...(tempMonsters.length > 0 ? { temporaryMonsters: tempMonsters } : {}),
+    })
+    : undefined;
+  for (const { ch, hp } of hpOverrides) {
+    ch.maxHp = hp;
+    ch.hp = hp;
+  }
   const rolls = members.map((ch) => {
     const r = rollD20(initBonusOf(ch), 'none', roller);
     const expr = bonus[ch.name];
@@ -854,10 +966,16 @@ export function startInitiative(
     };
   });
   rolls.sort((a, b) => b.init - a.init || b.tiebreak - a.tiebreak);
-  c.initiative = { round: 1, turn: 0, order: rolls.map(({ name, init }) => ({ name, init })) };
+  c.initiative = {
+    round: 1,
+    turn: 0,
+    order: rolls.map(({ name, init }) => ({ name, init })),
+    allParticipants: rolls.map(({ name }) => name),
+    ...(rehearsal ? { rehearsal: true, rehearsalSnapshot } : {}),
+  };
   if (surprised.length > 0) c.initiative.surprised = surprised;
-  c.begun = true;
-  pushLog(c, `进入战斗：${rolls.map((r) => `${r.name}(${r.init})`).join(' > ')}${surprised.length > 0 ? `；受惊：${surprised.join('、')}` : ''}`);
+  if (!rehearsal) c.begun = true;
+  pushLog(c, `进入${rehearsal ? '演练' : ''}战斗：${rolls.map((r) => `${r.name}(${r.init})`).join(' > ')}${surprised.length > 0 ? `；受惊：${surprised.join('、')}` : ''}`);
   return rolls.map(({ name, init, detail }) => ({ name, init, detail }));
 }
 
@@ -916,32 +1034,71 @@ export function skipSurprised(c: Campaign): { skipped: string[]; newRound: boole
   return { skipped, newRound };
 }
 
+export interface JoinInitiativeOptions {
+  rehearsalHp?: Record<string, number>;
+  temporaryMonsters?: string[];
+}
+
 /**
  * 战斗进行中加入新的参战者（赶到的队友、刚刷出来的怪）：只给他们掷先攻并插进现有顺序，
  * 不重掷别人、不重置轮数——重开一场会把正在进行的回合和整张先攻表都打乱。
  * 插在当前行动者前面的，本轮已经错过，下一轮才轮到。
  */
-export function joinInitiative(c: Campaign, names: string[], roller: Roller = cryptoRoller): InitiativeRoll[] {
+export function joinInitiative(
+  c: Campaign, names: string[], roller: Roller = cryptoRoller,
+  bonus: Record<string, string> = {}, options: JoinInitiativeOptions = {},
+): InitiativeRoll[] {
   const state = requireInitiative(c);
   if (names.length === 0) throw new Error('join 要给 participants');
   const members = [...new Set(names.map((n) => requireCharacter(c, n)))];
   const already = members.filter((ch) => state.order.some((e) => e.name === ch.name));
   if (already.length > 0) throw new Error(`${already.map((ch) => ch.name).join('、')} 已经在先攻表里了`);
+  const rehearsal = state.rehearsal === true;
+  if (!rehearsal && (options.rehearsalHp !== undefined || options.temporaryMonsters !== undefined)) {
+    throw new Error('rehearsal_hp / temporary_monsters 只在 rehearsal=true 的演练战斗中使用');
+  }
+  const tempMonsters = rehearsal
+    ? [...new Set((options.temporaryMonsters ?? []).map((n) => requireCharacter(c, n).name))]
+    : [];
+  const hpOverrides = rehearsal && options.rehearsalHp !== undefined
+    ? Object.entries(options.rehearsalHp).map(([rawName, hp]) => ({ ch: requireCharacter(c, rawName), hp: clampInt(hp, 1, 999) }))
+    : [];
+  // 先在活体卡上应用演练临时血量（战前快照 rehearsalSnapshot 保持不变，结束时仍能还原真实状态）
+  for (const { ch, hp } of hpOverrides) {
+    ch.maxHp = hp;
+    ch.hp = hp;
+    ch.conditions = ch.conditions.filter((cond) => cond !== '死亡' && cond !== '昏迷');
+  }
   const out = members.filter((ch) => isOut(ch));
   if (out.length > 0) throw new Error(`${out.map((ch) => ch.name).join('、')} 已经倒下，不能入战`);
+  if (rehearsal && tempMonsters.length > 0 && state.rehearsalSnapshot !== undefined) {
+    state.rehearsalSnapshot.temporaryMonsters = [
+      ...new Set([...(state.rehearsalSnapshot.temporaryMonsters ?? []), ...tempMonsters]),
+    ];
+  }
   const rolls = members.map((ch) => {
     const r = rollD20(initBonusOf(ch), 'none', roller);
-    return { name: ch.name, init: r.total, detail: r.detail };
+    const expr = bonus[ch.name];
+    const extra = expr === undefined ? undefined : rollExpression(expr, roller);
+    const flat = initBonusOf(ch) + (extra?.total ?? 0);
+    return {
+      name: ch.name,
+      init: r.total + (extra?.total ?? 0),
+      detail: extra === undefined ? r.detail : `${r.detail} + ${expr} ${extra.detail}`,
+      tiebreak: flat,
+    };
   });
-  for (const r of rolls) {
+  const sorted = [...rolls].sort((a, b) => b.init - a.init || b.tiebreak - a.tiebreak);
+  for (const r of sorted) {
     // 同点数排在已有的人后面：先在场的先动
     let idx = state.order.findIndex((e) => e.init < r.init);
     if (idx === -1) idx = state.order.length;
     state.order.splice(idx, 0, { name: r.name, init: r.init });
     if (idx <= state.turn) state.turn++;
   }
-  pushLog(c, `加入战斗：${rolls.map((r) => `${r.name}(${r.init})`).join('、')}`);
-  return rolls;
+  state.allParticipants = [...new Set([...(state.allParticipants ?? []), ...state.order.map((e) => e.name)])];
+  pushLog(c, `加入${rehearsal ? '演练' : ''}战斗：${sorted.map((r) => `${r.name}(${r.init})`).join('、')}`);
+  return sorted.map(({ name, init, detail }) => ({ name, init, detail }));
 }
 
 /**
@@ -1023,6 +1180,7 @@ export function nextTurn(c: Campaign): { round: number; current: InitiativeEntry
   delete state.moved;
   delete state.dashed;
   delete state.disengaged;
+  delete state.fightingSpirit;
   delete state.counterAttacks;
   let newRound = stepTurn(state);
   const skip = skipSurprised(c);
@@ -1037,16 +1195,68 @@ export function nextTurn(c: Campaign): { round: number; current: InitiativeEntry
   return { round: state.round, current, newRound, skipped: skip.skipped };
 }
 
-/** 结束战斗：清空先攻，移除已死亡的怪物 */
-export function endInitiative(c: Campaign): { rounds: number; defeated: string[] } {
-  const rounds = c.initiative?.round ?? 0;
-  c.initiative = undefined;
+export interface EndInitiativeResult {
+  rounds: number;
+  defeated: string[];
+  survivingMonsters: Array<{ name: string; hp: number; maxHp: number; conditions: string[]; wound: string }>;
+  rehearsal?: boolean;
+  restored?: boolean;
+}
+
+/** 结束战斗：记录本场完整结果与账本，清空先攻，移除已死亡的怪物（演练模式则自动还原战前状态与场地图） */
+export function endInitiative(c: Campaign, options: { keepChanges?: boolean } = {}): EndInitiativeResult {
+  const state = c.initiative;
+  const rounds = state?.round ?? 0;
+  const participants = [...new Set([...(state?.allParticipants ?? []), ...(state?.order.map((e) => e.name) ?? [])])];
+  const rooms = fightRooms(c);
   const dead = c.characters.filter((ch) => ch.kind === 'monster' && isOut(ch));
   const defeated = dead.map((ch) => ch.name);
+  const survivingMonsters = c.characters
+    .filter((ch) => ch.kind === 'monster' && !isOut(ch) && (participants.includes(ch.name) || (ch.room !== undefined && rooms.has(ch.room))))
+    .map((ch) => ({ name: ch.name, hp: ch.hp, maxHp: ch.maxHp, conditions: [...ch.conditions], wound: woundLabel(ch) }));
+  const fallenParty = c.characters
+    .filter((ch) => ch.kind !== 'monster' && (ch.hp === 0 || isOut(ch) || ch.conditions.includes('昏迷')) && (participants.includes(ch.name) || rooms.has(roomOf(c, ch) ?? '')))
+    .map((ch) => ({ name: ch.name, hp: ch.hp, maxHp: ch.maxHp, conditions: [...ch.conditions] }));
+  const rehearsal = state?.rehearsal === true;
+  const snap = state?.rehearsalSnapshot;
+  const restored = rehearsal && snap !== undefined && options.keepChanges !== true;
+  const ledger = [...(state?.ledger ?? [])];
+
+  c.initiative = undefined;
+  delete c.hexbladeCurses;
+  c.lastCombat = {
+    at: Date.now(),
+    rounds,
+    ...(rehearsal ? { rehearsal: true, restored } : {}),
+    participants,
+    defeated,
+    survivingMonsters,
+    fallenParty,
+    ledger,
+  };
+
+  if (restored) {
+    const tempSet = new Set(snap.temporaryMonsters ?? []);
+    const participantSet = new Set(participants);
+    c.characters = structuredClone(snap.characters).filter((ch) => {
+      if (tempSet.has(ch.name)) return false;
+      if (ch.kind === 'monster' && ch.npcId === undefined && ch.srd === undefined && participantSet.has(ch.name) && /梦境|演练|幻境|幻象|加练/.test(ch.notes ?? '')) return false;
+      return true;
+    });
+    if (snap.battlemaps !== undefined) c.battlemaps = structuredClone(snap.battlemaps);
+    else delete c.battlemaps;
+    c.npcs = structuredClone(snap.npcs);
+    c.spawned = [...snap.spawned];
+    if (snap.enteredFrom !== undefined) c.enteredFrom = structuredClone(snap.enteredFrom);
+    else delete c.enteredFrom;
+    pushLog(c, `演练战斗结束（${rounds} 轮）${defeated.length > 0 ? `，演练击败 ${defeated.join('、')}` : ''}，战前角色状态与房间场地图已自动还原`);
+    return { rounds, defeated, survivingMonsters, rehearsal: true, restored: true };
+  }
+
   for (const ch of dead) recordNpcDeath(c, ch);
   c.characters = c.characters.filter((ch) => !(ch.kind === 'monster' && isOut(ch)));
   pushLog(c, `战斗结束（${rounds} 轮）${defeated.length > 0 ? `，击败 ${defeated.join('、')}` : ''}`);
-  return { rounds, defeated };
+  return { rounds, defeated, survivingMonsters, ...(rehearsal ? { rehearsal: true, restored: false } : {}) };
 }
 
 // ── 移动 ──
@@ -1390,6 +1600,11 @@ export function assertCanAct(c: Campaign, ch: Character, options: ActOptions = {
   if (state === undefined) return;
   const current = state.order[state.turn];
   if (current !== undefined && current.name !== ch.name) {
+    if (!inInitiative(c, ch.name)) {
+      throw new Error(
+        `现在是 ${current.name} 的回合，${ch.name} 不能主动行动（且 ${ch.name} 还不在先攻表里：若中途参战请先调用 dnd_initiative action=join participants=["${ch.name}"] 掷先攻并摆位；场外被动/知识检定传 reaction=true）。`,
+      );
+    }
     throw new Error(
       `现在是 ${current.name} 的回合，${ch.name} 不能主动行动。${current.name} 行动完先调用 dnd_initiative next；`
       + '借机攻击/反应传 reaction=true。',
@@ -1422,6 +1637,7 @@ export function gotoTurn(c: Campaign, name: string, round?: number): InitiativeE
   delete state.moved;
   delete state.dashed;
   delete state.disengaged;
+  delete state.fightingSpirit;
   if (round !== undefined && round >= 1) state.round = Math.trunc(round);
   pushLog(c, `先攻指针调整到第 ${state.round} 轮 ${ch.name}`);
   return state.order[idx]!;
@@ -1457,9 +1673,10 @@ export function weaponDamage(ch: Character, weapon: Weapon): string {
   return mod === 0 ? weapon.damage : `${weapon.damage}${mod > 0 ? '+' : '-'}${Math.abs(mod)}`;
 }
 
-// 战斗风格写进 traits，由工具自动结算；模型不用每次记着手动加 bonus / 重投
+// 战斗风格与专长写进 traits，由工具自动结算；模型不用每次记着手动加 bonus / 重投
 export const GREAT_WEAPON_FIGHTING = '巨武器战斗';
 export const ARCHERY = '箭术';
+export const ELVEN_ACCURACY = '精灵精准';
 const TRAIT_ALIASES: Record<string, string> = {
   'great weapon fighting': GREAT_WEAPON_FIGHTING,
   巨武器: GREAT_WEAPON_FIGHTING,
@@ -1467,12 +1684,56 @@ const TRAIT_ALIASES: Record<string, string> = {
   archery: ARCHERY,
   箭术战斗风格: ARCHERY,
   弓术: ARCHERY,
+  'elven accuracy': ELVEN_ACCURACY,
+  精灵精准专长: ELVEN_ACCURACY,
 };
 
 /** 把别名统一成工具认的特性名（「巨武器战斗风格」→「巨武器战斗」） */
 export function normalizeTrait(trait: string): string {
   const t = trait.trim();
   return TRAIT_ALIASES[t.toLowerCase()] ?? t;
+}
+
+/** 精灵精准：优先看结构化 traits，旧角色卡未填 traits 时从备注兜底识别 */
+export function hasElvenAccuracy(ch: Character): boolean {
+  if (ch.traits !== undefined) return ch.traits.includes(ELVEN_ACCURACY);
+  return /精灵精准|Elven Accuracy/i.test(ch.notes ?? '');
+}
+
+/** 用敏捷/智力/感知/魅力进行的攻击检定具优势时可触发精灵精准（三骰取高） */
+export function usesElvenAccuracy(ch: Character, ability: Ability | undefined): boolean {
+  return ability !== undefined && ability !== 'str' && hasElvenAccuracy(ch);
+}
+
+/** 武士「战斗英姿」临时生命值：3/10/15 级战士对应 5/10/15 点（兼职优先按 className 中的战士等级） */
+export function fightingSpiritTempHp(ch: Character): number {
+  const match = /战士(?:[（(][^）)]*[）)])?\s*(\d+)/.exec(ch.className ?? '')
+    ?? /(\d+)\s*级[^\n]*武士/.exec(ch.notes ?? '');
+  const fighterLevel = match !== null ? Number(match[1]) : ch.level;
+  if (fighterLevel >= 15) return 15;
+  if (fighterLevel >= 10) return 10;
+  return 5;
+}
+
+/** 咒剑诅咒：每个施法者同时维持一个诅咒目标 */
+export function setHexbladeCurse(c: Campaign, caster: string, target: string): HexbladeCurse {
+  const casterCh = requireCharacter(c, caster);
+  const targetCh = requireCharacter(c, target);
+  const entry: HexbladeCurse = { caster: casterCh.name, target: targetCh.name };
+  c.hexbladeCurses = [...(c.hexbladeCurses ?? []).filter((x) => x.caster !== casterCh.name), entry];
+  return entry;
+}
+
+export function hexbladeCurseOn(c: Campaign | undefined, caster: string, target: string): HexbladeCurse | undefined {
+  return c?.hexbladeCurses?.find((x) => x.caster === caster && x.target === target);
+}
+
+/** 咒剑诅咒目标死亡时的治疗量：邪术师等级 + 魅力调整值（至少 1） */
+export function hexbladeKillHeal(caster: Character): number {
+  const match = /邪术师(?:[（(][^）)]*[）)])?\s*(\d+)/.exec(caster.className ?? '')
+    ?? /邪术师\s*(\d+)\s*级/.exec(caster.notes ?? '');
+  const warlockLevel = match !== null ? Number(match[1]) : caster.level;
+  return Math.max(1, warlockLevel + abilityModifier(caster.abilities.cha));
 }
 
 export function isRangedWeapon(weapon: Weapon): boolean {
@@ -1568,6 +1829,7 @@ export function rest(
   roller: Roller = cryptoRoller,
 ): RestResult[] {
   if (c.initiative !== undefined) throw new Error('战斗中不能休息');
+  delete c.hexbladeCurses;
   const members = names === undefined || names.length === 0
     ? c.characters.filter((ch) => ch.kind !== 'monster' && !isOut(ch))
     : names.map((n) => requireCharacter(c, n));
@@ -1668,7 +1930,7 @@ export function addSummary(c: Campaign, text: string, now = Date.now()): void {
 
 /** 元数据变化不代表剧情推进；备团计划也不能混进已发生事实。 */
 export function campaignState(c: Campaign): string {
-  const { summaries, handoff, preparation, active, updatedAt, sessionStartedAt, rollSeq, ...state } = c;
+  const { summaries, handoff, preparation, lastCombat, active, updatedAt, sessionStartedAt, rollSeq, ...state } = c;
   return createHash('sha256').update(JSON.stringify(state)).digest('hex');
 }
 
@@ -1750,9 +2012,17 @@ export function summarize(c: Campaign, adv: Adventure): string {
   if (c.initiative !== undefined) {
     const s = c.initiative;
     const order = s.order.map((e, i) => (i === s.turn ? `▶${e.name}(${e.init})` : `${e.name}(${e.init})`)).join(' > ');
-    lines.push(`战斗第 ${s.round} 轮：${order}`);
+    lines.push(`${s.rehearsal === true ? '【演练模式·战后自动还原状态与场地图】' : ''}战斗第 ${s.round} 轮：${order}`);
     lines.push(...battleLines(c, (id) => findRoom(graph, id)?.name ?? id));
     if (s.reacted?.length) lines.push(`已用反应：${s.reacted.join('、')}`);
+    if (s.fightingSpirit?.length) lines.push(`战斗英姿生效：${s.fightingSpirit.join('、')}（本回合武器攻击自动具优势）`);
+    if (c.hexbladeCurses?.length) {
+      lines.push(`咒剑诅咒生效：${c.hexbladeCurses.map((x) => {
+        const caster = findCharacter(c, x.caster);
+        const bonus = caster === undefined ? 0 : proficiencyBonus(caster.level);
+        return `${x.caster}→${x.target}（19-20 重击，伤害自动 +${bonus}，勿在 damage 重复填常数）`;
+      }).join('；')}`);
+    }
     if (s.shielded?.length) lines.push(`护盾术生效：${s.shielded.join('、')}（到各自下回合开始）`);
     if (s.disengaged?.length) lines.push(`本回合已撤离：${s.disengaged.join('、')}`);
     if (s.counterAttacks?.length) lines.push(`待还击（反应已扣）：${s.counterAttacks.map((r) => `${r.by}→${r.target}·${r.name}`).join('、')}，原攻击落账后 dnd_check attack reaction=true；不再另扣反应。`);
@@ -1773,33 +2043,61 @@ export function summarize(c: Campaign, adv: Adventure): string {
  * markdown：站位画成代码块里的字符网格（只有 markdown 消息等宽）；纯文本消息退回坐标列表。
  * 探索进度、出口这些 /dnd map 已经有的不在这里重复。
  */
-/** format=image：站位已经在战斗图上了，文字里不再列坐标和字符网格 */
+/** format=image：战斗图下方只保留敌人伤势与先攻（我方血量合在图例里，不刷长串资源与异地角色） */
 export function playerStatus(c: Campaign, adv: Adventure, viewer?: string, format: 'text' | 'markdown' | 'image' = 'text'): string {
   const lines: string[] = [];
   const graph = roomGraph(adv);
-  const room = findRoom(graph, c.currentRoom);
-  const site = siteOfRoom(adv, c.currentRoom);
-  lines.push(`📍 ${adv.sites.length > 1 && site !== undefined ? `${site.name} · ` : ''}${room?.name ?? c.currentRoom}`);
-  const positions = partyPositions(c);
-  for (const [roomId, members] of positions) {
-    const where = positions.size > 1 ? `${findRoom(graph, roomId)?.name ?? roomId}：` : '';
-    lines.push(`${where}${members.map((ch) => `${ch.name} ${ch.hp}/${ch.maxHp}${ch.conditions.length > 0 ? `[${ch.conditions.join(',')}]` : ''}${resourceTag(ch)}`).join('；')}`);
-  }
-  const foes = c.characters.filter((ch) => ch.kind === 'monster' && !isOut(ch) && positions.has(ch.room ?? ''));
-  if (foes.length > 0) lines.push(`敌人：${foes.map((ch) => `${ch.name}（${woundLabel(ch)}${ch.conditions.length > 0 ? `，${ch.conditions.join(',')}` : ''}）`).join('、')}`);
-  if (c.initiative !== undefined) {
+  if (format === 'image' && c.initiative !== undefined) {
     const s = c.initiative;
+    const activeRooms = fightRooms(c);
+    if (activeRooms.size === 0) activeRooms.add(c.currentRoom);
+    const foes = c.characters.filter(
+      (ch) => ch.kind === 'monster' && !isOut(ch)
+        && (inInitiative(c, ch.name) || (!hiddenFromPlayers(ch) && activeRooms.has(ch.room ?? ''))),
+    );
+    if (foes.length > 0) {
+      lines.push(`敌人：${foes.map((ch) => `${ch.name}（${woundLabel(ch)}${ch.conditions.length > 0 ? `，${ch.conditions.join(',')}` : ''}）`).join('、')}`);
+    }
     lines.push(`⚔ 第 ${s.round} 轮：${s.order.map((e, i) => (i === s.turn ? `▶${e.name}` : e.name)).join(' → ')}`);
-    // 藏起来的怪只是位置保密：名字已经在先攻表里了
-    const visible = (ch: Character): boolean => !hiddenFromPlayers(ch);
-    const roomName = (id: string): string => findRoom(graph, id)?.name ?? id;
-    const grid = format === 'markdown' ? battleGridLines(c, roomName, visible) : undefined;
-    if (format !== 'image') lines.push(...(grid ?? battleLines(c, roomName, visible)));
-    const mine = viewer === undefined ? [] : c.characters.filter((ch) => ch.playerId === viewer && !isOut(ch) && cellOf(c, ch) !== undefined);
-    for (const ch of mine) lines.push(distancesFrom(c, ch.name, visible));
     if (s.pending !== undefined) lines.push(`⏳ ${describePending(s.pending)}还没结算，等反应`);
     if (s.movement !== undefined) lines.push(`⏳ ${s.movement.target} 暂停移动，等借机反应`);
+    return lines.join('\n');
   }
+  const room = findRoom(graph, c.currentRoom);
+  const site = siteOfRoom(adv, c.currentRoom);
+  if (c.initiative === undefined) {
+    lines.push(`📍 ${adv.sites.length > 1 && site !== undefined ? `${site.name} · ` : ''}${room?.name ?? c.currentRoom}`);
+    const positions = partyPositions(c);
+    for (const [roomId, members] of positions) {
+      const where = positions.size > 1 ? `${findRoom(graph, roomId)?.name ?? roomId}：` : '';
+      lines.push(`${where}${members.map((ch) => `${ch.name} ${ch.hp}/${ch.maxHp}${ch.conditions.length > 0 ? `[${ch.conditions.join(',')}]` : ''}${resourceTag(ch)}`).join('；')}`);
+    }
+    const foes = c.characters.filter((ch) => ch.kind === 'monster' && !isOut(ch) && positions.has(ch.room ?? ''));
+    if (foes.length > 0) lines.push(`敌人：${foes.map((ch) => `${ch.name}（${woundLabel(ch)}${ch.conditions.length > 0 ? `，${ch.conditions.join(',')}` : ''}）`).join('、')}`);
+    return lines.join('\n');
+  }
+  const s = c.initiative;
+  const activeRooms = fightRooms(c);
+  if (activeRooms.size === 0) activeRooms.add(c.currentRoom);
+  const combatAllies = c.characters.filter((ch) => ch.kind !== 'monster' && (inInitiative(c, ch.name) || activeRooms.has(roomOf(c, ch) ?? '')));
+  if (combatAllies.length > 0) {
+    lines.push(`我方：${combatAllies.map((ch) => `${ch.name} ${ch.hp}/${ch.maxHp}${(ch.tempHp ?? 0) > 0 ? `(+${ch.tempHp})` : ''}`).join('、')}`);
+  }
+  const foes = c.characters.filter(
+    (ch) => ch.kind === 'monster' && !isOut(ch)
+      && (inInitiative(c, ch.name) || (!hiddenFromPlayers(ch) && activeRooms.has(ch.room ?? ''))),
+  );
+  if (foes.length > 0) lines.push(`敌人：${foes.map((ch) => `${ch.name}（${woundLabel(ch)}${ch.conditions.length > 0 ? `，${ch.conditions.join(',')}` : ''}）`).join('、')}`);
+  lines.push(`⚔ 第 ${s.round} 轮：${s.order.map((e, i) => (i === s.turn ? `▶${e.name}` : e.name)).join(' → ')}`);
+  // 藏起来的怪只是位置保密：名字已经在先攻表里了
+  const visible = (ch: Character): boolean => !hiddenFromPlayers(ch);
+  const roomName = (id: string): string => findRoom(graph, id)?.name ?? id;
+  const grid = format === 'markdown' ? battleGridLines(c, roomName, visible) : undefined;
+  lines.push(...(grid ?? battleLines(c, roomName, visible)));
+  const mine = viewer === undefined ? [] : c.characters.filter((ch) => ch.playerId === viewer && !isOut(ch) && cellOf(c, ch) !== undefined);
+  for (const ch of mine) lines.push(distancesFrom(c, ch.name, visible));
+  if (s.pending !== undefined) lines.push(`⏳ ${describePending(s.pending)}还没结算，等反应`);
+  if (s.movement !== undefined) lines.push(`⏳ ${s.movement.target} 暂停移动，等借机反应`);
   return lines.join('\n');
 }
 
@@ -1865,16 +2163,23 @@ export class CampaignStore {
    * 读取 → 修改 → 保存；fn 抛错时不保存。改动前的状态存一份快照，供 undo 回滚。
    * label 可以是函数：骰子编号在 fn 里才分配，标签要等它跑完再取。
    */
-  public update<T>(key: string, fn: (c: Campaign) => T, label: string | (() => string) = '改动', options: { allowPaused?: boolean } = {}): T {
+  public update<T>(
+    key: string,
+    fn: (c: Campaign) => T,
+    label: string | (() => string) = '改动',
+    options: { allowPaused?: boolean; recordHistory?: boolean } = {},
+  ): T {
     const c = this.load(key);
     if (c === undefined || (!c.active && !options.allowPaused)) throw new Error('这个群还没有进行中的团。让玩家发送 /dnd start 开团');
     const before = JSON.stringify(c);
     const seqBefore = c.rollSeq;
     const result = fn(c);
     if (JSON.stringify(c) !== before) {
-      // 只多掷了一骰（没有后果的检定）不占快照：快照有上限，别让它挤掉真正能撤的改动
+      // 只多掷了一骰（没有后果的检定）或纯反应窗口去重记录不占快照：快照有上限，别让它挤掉真正能撤的改动
       const onlyCounter = JSON.stringify({ ...c, rollSeq: seqBefore }) === before;
-      if (!onlyCounter) this.pushSnapshot(key, { at: Date.now(), label: typeof label === 'function' ? label() : label, state: before });
+      if (!onlyCounter && options.recordHistory !== false) {
+        this.pushSnapshot(key, { at: Date.now(), label: typeof label === 'function' ? label() : label, state: before }, c.initiative !== undefined);
+      }
       this.save(c);
     }
     return result;
@@ -1894,10 +2199,22 @@ export class CampaignStore {
     }
   }
 
-  private pushSnapshot(key: string, snapshot: Snapshot): void {
+  private pushSnapshot(key: string, snapshot: Snapshot, inCombat = false): void {
     const list = this.snapshots(key);
     list.push(snapshot);
-    if (list.length > MAX_SNAPSHOTS) list.splice(0, list.length - MAX_SNAPSHOTS);
+    while (list.length > MAX_SNAPSHOTS) {
+      // 战斗进行中保留最近一次开战前的基线快照，避免长战斗超过 40 步后丢掉开战前状态
+      let pinned = -1;
+      if (inCombat) {
+        for (let i = list.length - 1; i >= 0; i--) {
+          if (/^dnd_initiative\b.*\baction=start\b/.test(list[i]!.label)) {
+            pinned = i;
+            break;
+          }
+        }
+      }
+      list.splice(pinned === 0 ? 1 : 0, 1);
+    }
     this.writeSnapshots(key, list);
   }
 

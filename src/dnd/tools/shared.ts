@@ -24,7 +24,7 @@ type ReactorOption,UNDEAD_FORTITUDE,
 applyDamage,armorClass,assertDeclaredByOwner,attackModifier,changeInventory,describePending,findCharacter,initBonusOf,
 findWeapon,isOut,inInitiative,isSurprised,
 isRangedWeapon,
-isTwoHandedWeapon,outsideRooms,nextRollId,pushLog,
+isTwoHandedWeapon,outsideRooms,nextRollId,pushCombatLedger,pushLog,
 recordDeathFailures,resourceTag,reactionBlocked,
 requireCharacter,
 requireResource,
@@ -77,10 +77,11 @@ type Placement,canReact,mapOf,turnPositionNote
 } from '../battlefield.ts';
 import { areaName,terrainLine } from '../terrain.ts';
 import {
-assertWindowClosed,
+assertReactionAuthorized,assertWindowClosed,
 consumesReaction,
 declineReaction,findReactor,
 holdNotice,pendingHit,
+manualReactors,mergeReactors,
 pendingState,
 reactionsOf,
 refreshReactors,
@@ -183,7 +184,12 @@ export function signedRoll(expression: string, roller: Roller): { total: number;
 
 /** 这次攻击的伤害表达式；既没武器也没给 damage 时是 undefined */
 export function attackExpression(ch: Character, weapon: Weapon | undefined, extra: string | undefined): string | undefined {
-  return weapon !== undefined ? `${weaponDamage(ch, weapon)}${extra !== undefined ? `+${extra}` : ''}` : extra ?? ch.damage;
+  const clean = extra?.trim().replace(/^\+/, '');
+  if (weapon !== undefined) {
+    const suffix = clean !== undefined && clean !== '' ? `${clean.startsWith('-') ? '' : '+'}${clean}` : '';
+    return `${weaponDamage(ch, weapon)}${suffix}`;
+  }
+  return (clean !== undefined && clean !== '' ? clean : undefined) ?? ch.damage;
 }
 
 export function rollAttackDamage(ch: Character, weapon: Weapon | undefined, expression: string, crit: boolean, roller: Roller): { total: number; detail: string } {
@@ -465,7 +471,8 @@ export function parseWeapons(value: unknown): Weapon[] | undefined {
     if (name === undefined || damage === undefined) throw new Error('武器需要 name 和 damage');
     rollExpression(damage); // 只为校验表达式
     const weapon: Weapon = { name, damage };
-    if (w.ability === 'str' || w.ability === 'dex') weapon.ability = w.ability;
+    const ability = typeof w.ability === 'string' ? parseAbility(w.ability) : undefined;
+    if (ability !== undefined) weapon.ability = ability;
     const notes = str(w.notes);
     if (notes !== undefined) weapon.notes = notes;
     const magic = int(w.magic);
@@ -889,11 +896,13 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     return service.store.update(key, (c) => {
       seedChronicle(c, adventure);
       const before = markChronicle(c);
+      const wasRehearsal = c.initiative?.rehearsal === true;
       const result = fn(c, adventure);
-      // 停团写卡只记人物变化，不把新装备或等级当成剧情触发条件。
-      const story = c.active ? afterChange(c, adventure) : [];
+      const isRehearsal = wasRehearsal || c.initiative?.rehearsal === true;
+      // 停团写卡只记人物变化；演练/梦境战斗不触发真实剧情条件，也不把演练阵亡/击杀写进永久账本。
+      const story = c.active && !isRehearsal ? afterChange(c, adventure) : [];
       for (const line of story) pushLog(c, line);
-      recordChanges(before, c, adventure);
+      if (!isRehearsal) recordChanges(before, c, adventure);
       return (story.length > 0 && typeof result === 'string' ? `${result}\n【剧情】${story.join('；')}` : result) as T;
     }, () => `${exec.label ?? ''}${(exec.rolls ?? []).map((n) => ` #R${n}`).join('')}`, options);
   };
@@ -940,10 +949,10 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
    */
   const rerollAttack = (c: Campaign, p: PendingAttack, exec: Exec): string => {
     const modifier = p.modifier ?? p.total - p.natural;
-    const r = rollD20(modifier, p.advantage ?? 'none', service.roller);
+    const r = rollD20(modifier, p.advantage ?? 'none', service.roller, { elvenAccuracy: p.elvenAccuracy === true });
     const id = rollId(c, exec);
     const old = p.rollDetail;
-    Object.assign(p, { natural: r.natural, total: r.total, rollDetail: r.detail, crit: r.natural === 20 });
+    Object.assign(p, { natural: r.natural, total: r.total, rollDetail: r.detail, crit: r.natural >= (p.critThreshold ?? 20) });
     delete p.rawDamage;
     delete p.damageDetail;
     return `重掷 #R${id}：${old} 作废 → ${r.detail}`;
@@ -986,6 +995,19 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     if (p.kind === 'roll' && entry === undefined) {
       throw new Error(`待结算这笔掷骰的是 ${p.rolls.map((r) => r.name).join('、')}，没有 ${named.name}：target 填被改的那个掷骰人`);
     }
+    if (args.ask_reactions !== undefined) {
+      if (args.reaction !== undefined || args.decline !== undefined || args.settle === true || args.cancel === true) {
+        throw new Error('ask_reactions 只添加询问，不能同时消费反应或关闭窗口');
+      }
+      const options = manualReactors(c, args.ask_reactions);
+      if (options.length === 0) throw new Error('ask_reactions 至少指定一个 {by,name}');
+      if (options.some((o) => p.declined.includes(o.character) || p.used.some((u) => u.by === o.character))) {
+        throw new Error('已拒绝或已结算的反应不能由 DM 重新询问覆盖；改选要由本人发起');
+      }
+      const count = p.reactors.length;
+      p.reactors = mergeReactors(p.reactors, options);
+      return { text: `已添加反应询问：${options.map((o) => `${o.character}·${o.reaction}`).join('、')}。原骰子保持不变，先等本人明确选择；系统会提供 authorization，不能替他同意。`, reopened: p.reactors.length > count };
+    }
     if (args.cancel === true) {
       delete requireInitiative(c).pending;
       pushLog(c, `${describePending(p)}作废`);
@@ -1000,8 +1022,8 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       const name = str(reaction.name) ?? '反应';
       const reactor = findReactor(c, p, String(reaction.by ?? ''), name);
       const def = reactionsOf(reactor).find((r) => r.name === name);
-      const clicked = p.claimed.some((o) => o.character === reactor.name);
-      if (!clicked) assertDeclaredByOwner(reactor, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec) }, '反应');
+      assertReactionAuthorized(p, reactor, name, reaction.authorization);
+      if (args.declared_by !== undefined) assertDeclaredByOwner(reactor, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec) }, '反应');
       const spendKey = str(reaction.spend) ?? def?.resource;
       if (spendKey !== undefined) useResource(c, reactor.name, spendKey);
       const effects: string[] = [];
@@ -1089,6 +1111,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     if (p.kind === 'roll') {
       lines.push(...settleCheck(c, p));
     } else if (!pendingHit(p)) {
+      pushCombatLedger(c, `${p.attacker}→${p.target} 落账：未命中`, p.seq);
       lines.push(`${p.attacker}→${p.target} 落账：未命中，没有扣血。`);
     } else if (p.rawDamage !== undefined) {
       const raw = Math.max(0, p.rawDamage + p.damageMod);
@@ -1179,6 +1202,9 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       ...(onFail !== undefined ? { onFail } : {}),
       roller: service.roller,
     });
+    if (args.secret !== true) {
+      pushCombatLedger(c, `${source !== undefined ? `${source}→` : ''}${label}：${outcomes.map((o) => o.skipped !== undefined ? `${o.name}跳过` : `${o.name} ${o.detail ?? ''}${o.saved === undefined ? '' : (o.saved ? '成功' : '失败')}`).join('；')}`, id);
+    }
     lines.push(...saveOutcomeLines(outcomes));
     if (spentLine !== undefined) lines.push(spentLine);
     lines.push(args.secret === true ? HIDDEN_ROLL_NOTE : SECRET_NOTE);

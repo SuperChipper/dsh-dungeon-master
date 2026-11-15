@@ -17,6 +17,7 @@ import { OutboundBuffer, type QQBotSender } from './outbound-buffer.ts';
 import { formatToolResult, type ToolsRegistryLike, type ToolResultData } from './tool-presenter.ts';
 import { DND_TOOL_PREFIX } from '../dnd/dnd-tools.ts';
 import { getEngagementTracker } from '../features/reply-desire.ts';
+import { isAutoSteerTurnEnd } from './turn-steer.ts';
 import {
   parseEvent,
   extractTurnError,
@@ -75,6 +76,10 @@ class OutboundRouter {
   private readonly streamAttempts = new Map<string, string>();
   /** 每会话本轮已随 qqbot_send_file 发出的 caption（用于过滤复读），turn/end 清空 */
   private readonly captions = new Map<string, string[]>();
+  /** 每会话本轮已发出的可见正文片段，turn/end 汇总给笔记相关性打分 */
+  private readonly turnReplies = new Map<string, string[]>();
+  /** 每会话本轮调用过的工具名（按顺序去重），turn/end 汇总给笔记相关性打分 */
+  private readonly turnTools = new Map<string, string[]>();
   private readonly manager: SessionManager;
   private readonly bot: QQBotSender;
   private readonly config: ImQQBotConfig;
@@ -100,22 +105,25 @@ class OutboundRouter {
 
   /** 事件分发入口 */
   public route(session: SessionLike, raw: RawSessionEvent): void {
-    const event = parseEvent(raw);
-    if (event === undefined) return;
-
     const record = this.manager.findBySessionId(session.header.id);
     if (record === undefined) return;
+    const steerAborted = raw.type === 'assistant/message'
+      && this.manager.turnSteer?.isSteerAborted(session.header.id) === true;
+    this.manager.turnSteer?.onSessionEvent(session.header.id, raw);
     this.manager.combatAgents?.observe(record, raw);
+
+    const event = parseEvent(raw);
+    if (event === undefined) return;
 
     switch (event.type) {
       case 'assistant/chunk':
         this.onChunk(session.header.id, record, event);
         break;
       case 'assistant/message':
-        this.onMessage(session.header.id, record, event);
+        this.onMessage(session.header.id, record, event, steerAborted);
         break;
       case 'tool/call':
-        this.onToolCall(event);
+        this.onToolCall(session.header.id, event);
         break;
       case 'tool/result':
         this.onToolResult(session.header.id, record, event);
@@ -143,6 +151,7 @@ class OutboundRouter {
    */
   public routeStreamFrame(agentId: string, delta: StreamDelta): void {
     if (delta.kind === 'attempt-start') {
+      this.manager.turnSteer?.onStreamStart(agentId);
       this.streamAttempts.set(agentId, delta.attemptId);
       this.buffers.get(agentId)?.reset();
       return;
@@ -191,12 +200,21 @@ class OutboundRouter {
   }
 
   /** 完整 assistant 消息：有流式 buffer 则 flush，否则直接发送文本块 */
-  private onMessage(sessionId: string, record: SessionRecord, event: MessageEvent): void {
+  private onMessage(sessionId: string, record: SessionRecord, event: MessageEvent, steerAborted = false): void {
     if (event.usage !== undefined) this.logger.info(usageLogLine(record.sessionKey, event.usage, event.content));
 
     // 记下当前上下文大小，供 turn 结束后判断是否自动压缩（旧 sessionId 的迟到事件不算）
     if (event.usage !== undefined && record.sessionId === sessionId) {
       record.contextTokens = contextTokensOf(event.usage);
+    }
+
+    // 短时自动 steer 打断当前思考产生的半截消息不对外发送，留待合入补充消息后的下一轮统一回复
+    if (event.interrupted && steerAborted) {
+      const buf = this.buffers.get(sessionId);
+      if (buf !== undefined && !buf.abortOrResetForSteer()) {
+        this.buffers.delete(sessionId);
+      }
+      return;
     }
 
     const hasToolCall = event.content.some((b) => b.type === 'tool-call');
@@ -209,7 +227,8 @@ class OutboundRouter {
         this.buffers.delete(sessionId);
         return;
       }
-      this.noteBotSaid(record, buffer.text);
+      this.recordTurnReply(sessionId, buffer.text);
+      this.noteBotSaid(record, buffer.text, this.captions.get(sessionId));
       void buffer.flush();
       this.buffers.delete(sessionId);
       return;
@@ -225,7 +244,8 @@ class OutboundRouter {
       this.buffers.delete(sessionId);
       return;
     }
-    this.noteBotSaid(record, fullText);
+    this.recordTurnReply(sessionId, fullText);
+    this.noteBotSaid(record, fullText, this.captions.get(sessionId));
 
     void this.send(record, fullText, 'sendMarkdown', this.captionsOf(sessionId));
     this.buffers.delete(sessionId);
@@ -241,10 +261,25 @@ class OutboundRouter {
     this.logger.warn(`im-qqbot: 模型把工具调用写成了正文文字，未执行: ${names.join(', ')} session=${record.sessionKey}`);
   }
 
+  /** 记录本轮实际产出的可见正文（去伪工具块与配文复读），供 turn/end 笔记打分使用 */
+  private recordTurnReply(sessionId: string, rawText: string): void {
+    const cleaned = stripCaptionEcho(sanitizePseudoToolText(rawText), this.captions.get(sessionId) ?? []).trim();
+    if (!cleaned || isBlankReply(cleaned)) return;
+    let list = this.turnReplies.get(sessionId);
+    if (list === undefined) {
+      list = [];
+      this.turnReplies.set(sessionId, list);
+    }
+    list.push(cleaned);
+  }
+
   /** 模型打分要知道 bot 刚说过什么（群记忆里没有 bot 自己的话） */
-  private noteBotSaid(record: SessionRecord, text: string): void {
-    if (record.scope !== 'group' || this.config.replyDesire?.judge?.enabled !== true) return;
-    getEngagementTracker().noteBotSaid(record.peerId, sanitizePseudoToolText(text), Date.now());
+  private noteBotSaid(record: SessionRecord, text: string, captions: readonly string[] = []): void {
+    if (record.scope !== 'group') return;
+    if (this.config.replyDesire?.judge?.enabled !== true && this.config.notes?.judge?.enabled !== true) return;
+    const cleaned = stripCaptionEcho(sanitizePseudoToolText(text), captions);
+    if (!cleaned.trim() || isBlankReply(cleaned)) return;
+    getEngagementTracker().noteBotSaid(record.peerId, cleaned, Date.now());
   }
 
   /** 取本轮 caption 列表（不存在则创建；同一轮内始终是同一个数组） */
@@ -258,8 +293,16 @@ class OutboundRouter {
   }
 
   /** 工具调用：仅记录，不发送（避免刷屏，等待结果） */
-  private onToolCall(event: ToolCallEvent): void {
+  private onToolCall(sessionId: string, event: ToolCallEvent): void {
     this.toolCalls.set(event.callId, { name: event.name, args: event.arguments });
+    if (event.name) {
+      let tools = this.turnTools.get(sessionId);
+      if (tools === undefined) {
+        tools = [];
+        this.turnTools.set(sessionId, tools);
+      }
+      if (!tools.includes(event.name)) tools.push(event.name);
+    }
   }
 
   /** 工具结果：错误始终发送，成功结果按开关 */
@@ -271,7 +314,10 @@ class OutboundRouter {
     // caption 已随文件送达：记下来，过滤模型随后对它的复读
     if (event.error === undefined && call.name === SEND_FILE_TOOL_NAME) {
       const caption = captionFromArgs(call.args);
-      if (caption !== undefined) this.captionsOf(sessionId).push(caption);
+      if (caption !== undefined) {
+        this.captionsOf(sessionId).push(caption);
+        this.noteBotSaid(record, caption);
+      }
     }
 
     if (event.error === undefined && !this.config.showToolResults) return;
@@ -298,9 +344,20 @@ class OutboundRouter {
 
   /** 轮次结束：清理 buffer 与 attempt 跟踪状态，异常结束时告知用户 */
   private onTurnEnd(sessionId: string, record: SessionRecord, event: TurnEndEvent): void {
+    if (isAutoSteerTurnEnd(event.reason)) {
+      const buf = this.buffers.get(sessionId);
+      if (buf !== undefined && !buf.abortOrResetForSteer()) {
+        this.buffers.delete(sessionId);
+      }
+      this.streamAttempts.delete(sessionId);
+      this.logger.debug(`im-qqbot: turn/end (auto-steer) sessionId=${sessionId}`);
+      return;
+    }
+
     const buffer = this.buffers.get(sessionId);
     if (buffer !== undefined) {
       if (buffer.text.trim()) {
+        this.recordTurnReply(sessionId, buffer.text);
         void buffer.flush();
       } else {
         buffer.cancel();
@@ -308,8 +365,13 @@ class OutboundRouter {
       this.buffers.delete(sessionId);
     }
     this.streamAttempts.delete(sessionId);
-    const captionSent = (this.captions.get(sessionId)?.length ?? 0) > 0;
+    const sentCaptions = this.captions.get(sessionId) ?? [];
+    const captionSent = sentCaptions.length > 0;
     this.captions.delete(sessionId);
+    const replies = this.turnReplies.get(sessionId) ?? [];
+    this.turnReplies.delete(sessionId);
+    const toolsUsed = this.turnTools.get(sessionId) ?? [];
+    this.turnTools.delete(sessionId);
     if (record.sessionId === sessionId) delete record.voiceReplySentAt;
 
     // 对话窗口从回复结束时起算（回复慢时不至于还没说完窗口就过期）
@@ -319,10 +381,21 @@ class OutboundRouter {
     }
 
     const failure = extractTurnError(event.reason);
-    // 笔记注入等这一轮正常结束才算数：异常结束时模型未必看到了它
-    this.manager.settleNoteInjection(record, failure === undefined);
-    // 带配文的图已经发出去了，模型没话要补才交了白卷：对群里来说这一轮是正常结束的，不报错
+    // 带配文的图已经发出去了，模型没话要补才交了白卷：对群里和笔记结算来说这一轮都是正常结束的
     const saidItInCaption = failure?.code === EMPTY_RESPONSE_CODE && captionSent;
+    const ok = failure === undefined || saidItInCaption;
+    const replySummary = [
+      ...sentCaptions.map((c) => `[配文] ${c.trim()}`),
+      ...replies,
+    ].join('\n').trim();
+    if (ok && (replySummary !== '' || toolsUsed.length > 0)) {
+      this.manager.settleNoteInjection(record, true, {
+        ...(replySummary !== '' ? { reply: replySummary } : {}),
+        ...(toolsUsed.length > 0 ? { toolsUsed } : {}),
+      });
+    } else {
+      this.manager.settleNoteInjection(record, ok);
+    }
     if (saidItInCaption) this.logger.info(`im-qqbot: 配文已发出后的空回复，不报错 sessionId=${sessionId}`);
     if (failure !== undefined && !saidItInCaption && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
       void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError');

@@ -3,9 +3,10 @@ import type { MiddlewareContext } from '@tencent-connect/qqbot-nodejs';
 import { REPLY_JUDGE_DEFAULTS, type ImQQBotConfig } from '../config.ts';
 import type { SessionManager } from '../session/index.ts';
 import type { Logger } from '../types.ts';
+import * as groupMemory from '../features/group-memory.ts';
 import { getEngagementTracker } from '../features/reply-desire.ts';
 import { JudgeQueue } from '../features/reply-judge.ts';
-import { replyDecider, type JudgeDeps } from './reply-decider.ts';
+import { collectJudgeLines, replyDecider, type JudgeDeps } from './reply-decider.ts';
 
 const config = {
   debug: false,
@@ -157,5 +158,32 @@ describe('replyDecider', () => {
   it('bot 刚说完话，没和它聊过的人甩表情包：不接', async () => {
     getEngagementTracker().touch('g6', Date.now(), 60_000);
     expect(await run(makeCtx('g6', 'u1', STICKER, false, [{ content_type: 'image/png', filename: 'ABC.png' }]).ctx)).toBe(false);
+  });
+
+  it('collectJudgeLines 支持只取当前消息之前的群聊 + bot 对话（供笔记打分复用）', () => {
+    const gid = 'g-note-ctx';
+    const cfg = {
+      appId: 'app-ctx',
+      replyDesire: { judge: { ...REPLY_JUDGE_DEFAULTS, contextMessages: 6 } },
+    } as unknown as ImQQBotConfig;
+    const spy = vi.spyOn(groupMemory, 'readRecentGroupMessages').mockReturnValue([
+      { messageId: 'm1', senderId: 'u1', senderName: '阿明', content: '昨天那张海报改完了吗', timestamp: 1000 },
+      { messageId: 'm2', senderId: 'u2', senderName: '小红', content: '发出来看看', timestamp: 2000 },
+    ]);
+    getEngagementTracker().noteBotSaid(gid, '改完第三版了', 1500);
+
+    try {
+      const beforeOnly = collectJudgeLines(cfg, gid, 'm2', { includeCurrent: false });
+      expect(beforeOnly).toEqual([
+        { sender: '阿明', text: '昨天那张海报改完了吗', timestamp: 1000 },
+        { text: '改完第三版了', timestamp: 1500 },
+      ]);
+
+      const withCurrent = collectJudgeLines(cfg, gid, 'm2');
+      expect(withCurrent).toHaveLength(3);
+      expect(withCurrent[2]).toMatchObject({ sender: '小红', text: '发出来看看', timestamp: 2000 });
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

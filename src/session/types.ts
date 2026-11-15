@@ -39,7 +39,11 @@ export interface DshAgent {
     /** 最近一次请求头（取实际路由的 provider/model，用于查上下文窗口） */
     requestHeader?(): { config?: { provider?: string; model?: string } } | undefined;
   };
-  cancel(cause: { kind: string }): void;
+  /** 持久化输入到边界；交接使用 next-step 且不唤醒，系统头由宿主先建立。 */
+  send?(message: unknown, target: 'next-turn' | 'next-step', wakeup: boolean): void;
+  /** 在下一步边界插入输入并唤醒驱动器（工具执行期间 steer 用） */
+  steer?(message: unknown): void;
+  cancel(cause: { kind: string; reason?: string }, options?: { keepInbox?: boolean }): void;
   followup(message: unknown): void;
   whenIdle(): Promise<void>;
   /** 运行一个非 turn 维护任务（compact 等需要 idle 时串行执行的操作） */

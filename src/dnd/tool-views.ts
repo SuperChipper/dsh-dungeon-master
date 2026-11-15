@@ -18,8 +18,8 @@ const NARRATIVE_VIEWS: Record<string, { keys: string[]; description: string; typ
     description: 'Apply already-decided damage/healing, temporary HP or conditions during exploration. target for one, targets=[{name,...}] for an atomic batch. damage_roll/heal_roll roll once; per-target values override defaults. Do not use this to simulate attacks or resolve combat reactions; the combat agent owns those.',
   },
   dnd_initiative: {
-    keys: ['action', 'participants', 'room', 'bonus', 'surprised'],
-    description: 'Start combat for the combat agent. action=start; give participants, room and surprised as appropriate. Check each sheet: init_bonus is the fixed TOTAL, temporary dice go in bonus={name:"1d8"}; never add a fixed bonus twice. After success, narrate the opening and stop; the combat agent prepares positions and handles all turns/reactions automatically after your reply.',
+    keys: ['action', 'participants', 'room', 'bonus', 'surprised', 'rehearsal', 'rehearsal_hp', 'temporary_monsters'],
+    description: 'Start combat for the combat agent. action=start; give participants, room and surprised as appropriate. For dream/illusion/sparring fights that should not permanently alter HP, resources or the real room map, pass rehearsal=true (plus optional rehearsal_hp and temporary_monsters). Check each sheet: init_bonus is the fixed TOTAL, temporary dice go in bonus={name:"1d8"}; never add a fixed bonus twice. After success, narrate the opening and stop; the combat agent prepares positions and handles all turns/reactions automatically after your reply.',
   },
 };
 

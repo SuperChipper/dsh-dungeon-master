@@ -29,6 +29,9 @@ cordis.dev.yml
 /dnd/
 /tmp/
 /.qqbot-browser/
+# 仅跟踪插件自带的技能目录，忽略宿主/外部工具装进来的第三方 skills
+/skills/*
+!/skills/dnd-module-authoring/
 
 # ── 日志 / 系统 / 编辑器 ──
 *.log

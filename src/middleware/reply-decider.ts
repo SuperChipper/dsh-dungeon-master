@@ -39,17 +39,38 @@ export interface JudgeDeps {
   queue: JudgeQueue;
 }
 
-/** 给模型看的上下文：群记忆里截到当前消息为止，再按时间插进 bot 自己说过的话 */
-function judgeLines(config: ImQQBotConfig, groupId: string, messageId: string): JudgeLine[] {
-  const limit = config.replyDesire.judge.contextMessages;
+/**
+ * 给模型看的群聊上下文：群记忆里截到当前消息为止，再按时间插进 bot 自己说过的话。
+ * `includeCurrent = false` 时只取当前消息之前的背景（供笔记相关性打分复用，避免和当前消息重复）。
+ */
+export function collectJudgeLines(
+  config: ImQQBotConfig,
+  groupId: string,
+  messageId?: string,
+  options?: { includeCurrent?: boolean },
+): JudgeLine[] {
+  const includeCurrent = options?.includeCurrent ?? true;
+  const limit = config.replyDesire?.judge?.contextMessages ?? 8;
   const recent = readRecentGroupMessages(config.appId, groupId, limit + 10);
-  const cut = recent.findIndex((e) => e.messageId === messageId);
-  const upto = cut >= 0 ? recent.slice(0, cut + 1) : recent;
-  const lines: JudgeLine[] = upto.map((e) => {
+  const cut = messageId !== undefined ? recent.findIndex((e) => e.messageId === messageId) : -1;
+  const toLine = (e: (typeof recent)[number]): JudgeLine => {
     const { text, stickerId } = classifyMessage(e.content);
     const shown = text !== '' ? text : (stickerId !== undefined || (e.images?.length ?? 0) > 0 ? '[图片]' : '');
     return { sender: e.senderName ?? e.senderId.slice(-6), text: shown, timestamp: e.timestamp };
-  }).filter((line) => line.text !== '');
+  };
+
+  if (!includeCurrent) {
+    const beforeEntries = cut >= 0 ? recent.slice(0, cut) : recent;
+    const cutoffTs = cut >= 0 ? recent[cut]!.timestamp : Number.POSITIVE_INFINITY;
+    const userLines = beforeEntries.map(toLine).filter((line) => line.text !== '');
+    const bot = getEngagementTracker().botLines(groupId)
+      .filter((line) => line.timestamp <= cutoffTs)
+      .map((line) => ({ text: line.text, timestamp: line.timestamp }));
+    return [...userLines, ...bot].sort((a, b) => a.timestamp - b.timestamp).slice(-limit);
+  }
+
+  const upto = cut >= 0 ? recent.slice(0, cut + 1) : recent;
+  const lines = upto.map(toLine).filter((line) => line.text !== '');
   const current = lines[lines.length - 1];
   const bot = getEngagementTracker().botLines(groupId)
     .filter((line) => current === undefined || line.timestamp <= current.timestamp)
@@ -161,7 +182,7 @@ export function replyDecider(config: ImQQBotConfig, manager: SessionManager, log
       model,
       names,
       persona: persona?.prompt ?? config.groupPrompt,
-      lines: judgeLines(config, groupId, msg.messageId),
+      lines: collectJudgeLines(config, groupId, msg.messageId),
     });
     if (desire === undefined || desire < rd.threshold) {
       logger.info(`reply-desire: judge skip group=${groupId} desire=${desire?.toFixed(2) ?? 'n/a'}`);

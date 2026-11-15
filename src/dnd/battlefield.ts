@@ -132,6 +132,20 @@ export function setBattleMap(c: Campaign, room: string, input: unknown): { map: 
   return { map, misplaced };
 }
 
+/** 清除房间中临时手绘的场地图：模组自带底图则恢复模组版，否则清空 */
+export function clearBattleMap(c: Campaign, room: string, authored?: BattleMap): BattleMap | undefined {
+  if (authored !== undefined) {
+    const restored = structuredClone(authored);
+    (c.battlemaps ??= {})[room] = restored;
+    return restored;
+  }
+  if (c.battlemaps !== undefined) {
+    delete c.battlemaps[room];
+    if (Object.keys(c.battlemaps).length === 0) delete c.battlemaps;
+  }
+  return undefined;
+}
+
 /** 一个地点名对应的格子：同房间的人 → 地标 → 地形区域 */
 function spotCells(c: Campaign, room: string, query: string): { cells: Cell[]; blocking: boolean; label: string; who?: Character } | undefined {
   const ch = findCharacter(c, query);
@@ -330,7 +344,7 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
 
   const others = placedIn(c, from.room).filter(({ ch: o }) => o.name !== ch.name && o.name !== dragged?.name);
   const foes = others.filter(({ ch: o }) => isHostile(ch, o));
-  const reactors = foes.filter(({ ch: o }) => canReact(o) && !o.conditions.includes('失明') && reactionBlocked(c, o.name) === undefined
+  const reactors = foes.filter(({ ch: o }) => inInitiative(c, o.name) && canReact(o) && !o.conditions.includes('失明') && reactionBlocked(c, o.name) === undefined
     && !request.ignoredReactors?.includes(o.name));
   const reachOf = (other: Character): number => Math.max(MELEE_REACH_FEET, ...(other.weapons ?? []).map((w) => weaponReach(w, true) ?? 0));
   // 5e：能穿过友方的格子，不能穿过敌人的

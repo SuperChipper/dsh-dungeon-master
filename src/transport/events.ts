@@ -12,9 +12,10 @@ export interface RawSessionEvent {
   data: Record<string, unknown>;
 }
 
-/** turn/end 事件的 reason 结构（兼容 error/failure/顶层 message 三种形态） */
+/** turn/end 事件的 reason 结构（兼容 error/failure/顶层 message 及 aborted hook 结构） */
 export interface TurnEndReason {
   kind?: string;
+  reason?: { kind?: string; reason?: string };
   error?: { message?: string; code?: string };
   failure?: { message?: string; code?: string };
   message?: string;
@@ -39,6 +40,7 @@ export interface MessageUsage {
 export interface MessageEvent {
   type: 'assistant/message';
   content: Array<{ type: string; text?: string; name?: string }>;
+  interrupted?: boolean;
   usage?: MessageUsage;
 }
 
@@ -106,6 +108,7 @@ export function parseEvent(raw: RawSessionEvent): OutboundEvent | undefined {
 
     case 'assistant/message': {
       const data = raw.data as {
+        interrupted?: boolean;
         message?: { content?: MessageEvent['content'] };
         usage?: Partial<MessageUsage>;
       };
@@ -115,6 +118,7 @@ export function parseEvent(raw: RawSessionEvent): OutboundEvent | undefined {
       return {
         type: 'assistant/message',
         content: message.content,
+        ...(data.interrupted === true ? { interrupted: true } : {}),
         ...(typeof usage?.inputTokens === 'number'
           ? {
             usage: {

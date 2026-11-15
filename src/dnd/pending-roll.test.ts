@@ -10,7 +10,7 @@ import { AdventureLibrary } from './adventure.ts';
 import { type Campaign, CampaignStore, findCharacter, parseCampaign, playerStatus, upsertCharacter } from './campaign.ts';
 import { DndService } from './dnd-service.ts';
 import { registerDndTools } from './dnd-tools.ts';
-import { classifyReactionReply } from './pending-attack.ts';
+import { chooseReaction, classifyReactionReply } from './pending-attack.ts';
 import { DndTurnButtons } from './turn-buttons.ts';
 
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
@@ -54,6 +54,11 @@ function setup() {
   registerDndTools(ctx as never, { service, manager: manager as never, logger: logger as never, sendImage: vi.fn(), onPendingAttack });
   const call = async (name: string, args: Record<string, unknown>) => (await tools.get(name)!.execute(args, { agent: {} })).text;
   const campaign = (): Campaign => service.store.load(key)!;
+  const consent = (by: string, skill: string): string => service.store.update(key, (c) => {
+    const p = c.initiative!.pending ?? c.initiative!.movement!;
+    const existing = p.claimed.find((r) => r.character === by && r.reaction === skill)?.authorization;
+    return existing ?? chooseReaction(c, p, c.characters.find((ch) => ch.name === by)!.playerId!, by, skill)!.authorization!;
+  }, '测试：玩家本人明确选择');
   const ch = (name: string) => findCharacter(campaign(), name)!;
   /** 轮到奇塔露，对地精放一个感知豁免的法术 */
   const castOnGoblin = (extra: Record<string, unknown> = {}): Promise<string> => {
@@ -64,9 +69,9 @@ function setup() {
     });
   };
   const chronal = (target: string) => call('dnd_apply', {
-    target, declared_by: 'P5', reaction: { by: '奇塔露', name: '时间变幻', reroll: 'd20', spend: '时间变幻' },
+    target, declared_by: 'P5', reaction: { by: '奇塔露', name: '时间变幻', authorization: consent('奇塔露', '时间变幻'), reroll: 'd20', spend: '时间变幻' },
   });
-  return { rolls, service, key, call, campaign, ch, castOnGoblin, chronal, buttons, followup, record, onPendingAttack, sender };
+  return { consent, rolls, service, key, call, campaign, ch, castOnGoblin, chronal, buttons, followup, record, onPendingAttack, sender };
 }
 
 afterEach(() => {
@@ -139,9 +144,9 @@ describe('豁免和检定也能挂起', () => {
     const t = setup();
     t.rolls.push(13);
     await t.castOnGoblin({ hold_for: CHRONAL });
-    await expect(t.call('dnd_apply', { target: '地精', declared_by: 'P5', reaction: { by: '奇塔露', name: '时间变幻', ac_mod: 5 } })).rejects.toThrow(/ac_mod 只对攻击有用/);
+    await expect(t.call('dnd_apply', { target: '地精', declared_by: 'P5', reaction: { by: '奇塔露', name: '时间变幻', authorization: t.consent('奇塔露', '时间变幻'), ac_mod: 5 } })).rejects.toThrow(/ac_mod 只对攻击有用/);
     t.rolls.push(3);
-    const text = await t.call('dnd_apply', { target: '地精', declared_by: 'P5', reaction: { by: '奇塔露', name: '时间变幻', attack_mod: '+1d4' } });
+    const text = await t.call('dnd_apply', { target: '地精', declared_by: 'P5', reaction: { by: '奇塔露', name: '时间变幻', authorization: t.consent('奇塔露', '时间变幻'), attack_mod: '+1d4' } });
     expect(text).toMatch(/地精 感知豁免 16（原 13） → 成功/);
   });
 
@@ -149,7 +154,7 @@ describe('豁免和检定也能挂起', () => {
     const t = setup();
     t.rolls.push(13);
     await t.castOnGoblin({ hold_for: CHRONAL });
-    await expect(t.call('dnd_apply', { target: '地精', declared_by: 'P5', reaction: { by: '奇塔露', name: '时间变幻', reroll: '2d20' } })).rejects.toThrow(/只支持 "d20"/);
+    await expect(t.call('dnd_apply', { target: '地精', declared_by: 'P5', reaction: { by: '奇塔露', name: '时间变幻', authorization: t.consent('奇塔露', '时间变幻'), reroll: '2d20' } })).rejects.toThrow(/只支持 "d20"/);
   });
 });
 
@@ -360,7 +365,7 @@ describe('存档和玩家视角', () => {
     const t = setup();
     t.rolls.push(18);
     await t.castOnGoblin({ hold_for: [{ by: '奇塔露', name: '银光嘲弄' }] });
-    expect(classifyReactionReply(t.campaign(), 'P5', '银光嘲弄！')).toEqual({ kind: 'use', characters: ['奇塔露'] });
+    expect(classifyReactionReply(t.campaign(), 'P5', '银光嘲弄！')).toMatchObject({ kind: 'use', characters: ['奇塔露'] });
   });
 });
 
@@ -375,16 +380,27 @@ describe('战斗图代替字符网格', () => {
     return { ...t, sendImage };
   };
 
-  it('查看状态：能出图就发战斗图，血量和先攻附在图下，不再发字符网格', async () => {
+  it('查看状态：能出图就发战斗图，图下只保留敌人伤势、先攻与带我方血量的图例，不刷资源与距离', async () => {
     if (!(await hasSharp())) return;
     const t = await withMap();
+    t.service.store.update(t.key, (c) => {
+      upsertCharacter(c, { name: '留守港务官', kind: 'pc', room: 'nave', maxHp: 33 });
+    });
     expect(await t.buttons.sendStatus(t.key, { scope: 'group', targetId: 'G1' } as never, 'P2')).toBe(true);
     expect(t.sender.sendMarkdown).not.toHaveBeenCalled();
     const [, path, text] = t.sendImage.mock.calls[0] as [unknown, string, string];
     expect(path).toMatch(/\.jpg$/);
+    expect(text).toContain('敌人：狼（毫发无伤）');
     expect(text).toContain('⚔ 第 1 轮');
+    expect(text).toMatch(/🔵 .*K=Kriv\d+\/\d+/);
     expect(text).toContain('🧱 挡路：石台');
     expect(text).not.toContain('```');
+    expect(text).not.toContain('🎲');
+    expect(text).not.toContain('📍');
+    expect(text).not.toContain('{');
+    expect(text).not.toContain('留守港务官');
+    expect(text).not.toContain('到：');
+    expect(text).not.toContain('报位置用');
   });
 
   it('每轮只自动发一张战斗图：同一轮第二个 PC 的回合提示不再带图', async () => {

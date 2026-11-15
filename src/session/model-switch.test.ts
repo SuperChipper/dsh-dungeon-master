@@ -105,6 +105,32 @@ describe('SessionManager 换模型', () => {
     expect(appended).toEqual([]);
   });
 
+  it('旧日志恢复失败而换建会话时，记录实际 agent 的会话 ID', async () => {
+    const { self, record, agent } = harness();
+    const fresh = { ...agent, session: { ...agent.session, id: 'fresh-session' } };
+    const created = { agent: fresh, dispose: vi.fn(async () => {}) };
+    self.config = { cwd: 'C:/workspace' };
+    self.currentSessionId = () => 'broken-session';
+    self.resolvePersistedPreset = async () => undefined;
+    self.getEffectivePresetByKey = () => undefined;
+    self.composePreset = async () => ({});
+    self.syncExplicitRoute = vi.fn();
+    const setSessionId = vi.fn();
+    Object.assign(self.modelResolver as object, { getResumeRoute: () => undefined, setSessionId });
+    self.agents = {
+      get: vi.fn(() => undefined),
+      resume: vi.fn(async () => { throw new Error('stored log is corrupt'); }),
+      create: vi.fn().mockRejectedValueOnce(new Error('already exists')).mockResolvedValueOnce(created),
+    };
+    const result = await SessionManager.prototype.getOrCreate.call(
+      self as unknown as SessionManager, 'c2c', 'p', 'p', record.replyTarget,
+    );
+    expect(result.sessionId).toBe('fresh-session');
+    expect(result.agent.session.id).toBe(result.sessionId);
+    expect(setSessionId).toHaveBeenCalledOnce();
+    expect(result.handle).toBe(created);
+  });
+
   it('setModelOverride 写偏好并就地换路由，不抛错也不需要空闲', async () => {
     const { self, record, sessions } = harness();
     const setModelOverride = (SessionManager.prototype as unknown as {

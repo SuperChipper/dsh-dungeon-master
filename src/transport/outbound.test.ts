@@ -5,6 +5,7 @@ import type { SessionManager, SessionRecord } from '../session/index.ts';
 import type { ImQQBotConfig } from '../config.ts';
 import type { Logger, ReplyTarget } from '../types.ts';
 import { PeerSendQueue } from './peer-send-queue.ts';
+import { AUTO_STEER_CANCEL_REASON, TurnSteerTracker } from './turn-steer.ts';
 
 function createLogger(): Logger {
   return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
@@ -325,8 +326,8 @@ describe('OutboundRouter.routeStreamFrame', () => {
       expect(bot.sendMarkdown).toHaveBeenCalledWith(groupTarget, '顺便说下明天放假');
     });
 
-    it('配文发出后模型交白卷（EMPTY_RESPONSE）不报错；没发过配文的照常报', async () => {
-      const { outbound, bot } = setup({ record: createRecord(groupTarget) });
+    it('配文发出后模型交白卷（EMPTY_RESPONSE）不报错且正常结算笔记；没发过配文的照常报且不算成功', async () => {
+      const { outbound, bot, manager } = setup({ record: createRecord(groupTarget) });
       const emptyEnd = { type: 'turn/end', data: { reason: { kind: 'error', error: { code: 'EMPTY_RESPONSE', message: 'empty' } } } };
       const errors = () => vi.mocked(bot.sendMarkdown).mock.calls.filter(([, text]) => String(text).includes('本轮异常结束')).length;
 
@@ -334,11 +335,36 @@ describe('OutboundRouter.routeStreamFrame', () => {
       outbound.routeSessionEvent(sess, emptyEnd);
       await vi.advanceTimersByTimeAsync(0);
       expect(errors()).toBe(0);
+      expect(manager.settleNoteInjection).toHaveBeenLastCalledWith(
+        expect.anything(),
+        true,
+        { reply: `[配文] ${caption}`, toolsUsed: ['qqbot_send_file'] },
+      );
 
       // 上一轮的配文不算数
       outbound.routeSessionEvent(sess, emptyEnd);
       await vi.advanceTimersByTimeAsync(0);
       expect(errors()).toBe(1);
+      expect(manager.settleNoteInjection).toHaveBeenLastCalledWith(expect.anything(), false);
+    });
+
+    it('完成回复时把清洗后的实际回复与调用工具一并传给 settleNoteInjection', () => {
+      const { outbound, manager } = setup({ record: createRecord(groupTarget) });
+      outbound.routeSessionEvent(sess, {
+        type: 'tool/call',
+        data: { callId: 'n1', name: 'qqbot_notes_search', arguments: '{"query":"深渊巨口"}' },
+      });
+      outbound.routeSessionEvent(sess, { type: 'tool/result', data: { message: { source: { callId: 'n1' } } } });
+      outbound.routeSessionEvent(sess, {
+        type: 'assistant/message',
+        data: { message: { content: [{ type: 'text', text: '💭[::dnd_move::]{}[::/dnd_move::]深渊巨口海报在第三版存档里' }] } },
+      });
+      outbound.routeSessionEvent(sess, { type: 'turn/end', data: { reason: { kind: 'completed' } } });
+      expect(manager.settleNoteInjection).toHaveBeenLastCalledWith(
+        expect.anything(),
+        true,
+        { reply: '深渊巨口海报在第三版存档里', toolsUsed: ['qqbot_notes_search'] },
+      );
     });
 
     it('发完图只回一个句号收尾：不发出去', async () => {
@@ -487,5 +513,103 @@ describe('OutboundRouter.routeStreamFrame', () => {
 
     expect(bot.openStream).toHaveBeenCalledTimes(1);
     expect(session.update).toHaveBeenCalledWith('legacy');
+  });
+
+  describe('短时自动 steer 出站抑制与流式续写', () => {
+    const sess = { header: { id: 'sess-qq' } };
+    const steerAbortEnd = {
+      type: 'turn/end',
+      data: { reason: { kind: 'aborted', reason: { kind: 'hook', reason: AUTO_STEER_CANCEL_REASON } } },
+    };
+
+    it('群聊被打断时：丢弃半截草稿、不提前结算笔记，续轮完成后只发最终回复并结算一次', async () => {
+      const turnSteer = new TurnSteerTracker();
+      const { outbound, bot, manager } = setup({ record: createRecord(groupTarget) });
+      (manager as unknown as { turnSteer: TurnSteerTracker }).turnSteer = turnSteer;
+
+      // 第一轮开始思考并输出了半截正文，随后触发短时自动 steer 打断
+      outbound.routeStreamFrame('sess-qq', start('a1'));
+      outbound.routeStreamFrame('sess-qq', delta('a1', '好的，你直接砍向蛇头1……'));
+      const ownerAgent = {
+        status: 'running' as const,
+        session: { id: 'sess-qq' },
+        followup: vi.fn(),
+        cancel: vi.fn(),
+        whenIdle: async () => {},
+      };
+      await turnSteer.steerIntoTurn(ownerAgent, ownerAgent, () => true, '先开咒剑诅咒', new AbortController().signal, () => {});
+
+      // 宿主结算第一轮的半截消息与 aborted turn/end → 不应发送到群，也不应提前结算笔记
+      outbound.routeSessionEvent(sess, {
+        type: 'assistant/message',
+        data: { interrupted: true, message: { content: [{ type: 'text', text: '好的，你直接砍向蛇头1……' }] } },
+      });
+      outbound.routeSessionEvent(sess, steerAbortEnd);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(bot.sendMarkdown).not.toHaveBeenCalled();
+      expect(manager.settleNoteInjection).not.toHaveBeenCalled();
+
+      // 续轮正常完成 → 只发出合并后的最终回复并结算一次笔记
+      outbound.routeStreamFrame('sess-qq', start('a2'));
+      outbound.routeStreamFrame('sess-qq', delta('a2', '你先降下咒剑诅咒，随后挥剑斩向蛇头1！'));
+      outbound.routeSessionEvent(sess, {
+        type: 'assistant/message',
+        data: { message: { content: [{ type: 'text', text: '你先降下咒剑诅咒，随后挥剑斩向蛇头1！' }] } },
+      });
+      outbound.routeSessionEvent(sess, { type: 'turn/end', data: { reason: { kind: 'completed' } } });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(bot.sendMarkdown).toHaveBeenCalledTimes(1);
+      expect(bot.sendMarkdown).toHaveBeenCalledWith(groupTarget, '你先降下咒剑诅咒，随后挥剑斩向蛇头1！');
+      expect(manager.settleNoteInjection).toHaveBeenCalledTimes(1);
+      expect(manager.settleNoteInjection).toHaveBeenCalledWith(
+        expect.anything(),
+        true,
+        { reply: '你先降下咒剑诅咒，随后挥剑斩向蛇头1！' },
+      );
+    });
+
+    it('私聊已发出流式分片后被打断：保留流式气泡，续轮新内容原地重写同一条消息', async () => {
+      const turnSteer = new TurnSteerTracker();
+      const { outbound, bot, session, manager } = setup();
+      (manager as unknown as { turnSteer: TurnSteerTracker }).turnSteer = turnSteer;
+
+      outbound.routeStreamFrame('sess-qq', start('a1'));
+      outbound.routeStreamFrame('sess-qq', delta('a1', '半截旧回答'));
+      await vi.advanceTimersByTimeAsync(200);
+      expect(bot.openStream).toHaveBeenCalledTimes(1);
+      expect(session.update).toHaveBeenCalledWith('半截旧回答');
+
+      const ownerAgent = {
+        status: 'running' as const,
+        session: { id: 'sess-qq' },
+        followup: vi.fn(),
+        cancel: vi.fn(),
+        whenIdle: async () => {},
+      };
+      await turnSteer.steerIntoTurn(ownerAgent, ownerAgent, () => true, '补充条件', new AbortController().signal, () => {});
+
+      outbound.routeSessionEvent(sess, {
+        type: 'assistant/message',
+        data: { interrupted: true, message: { content: [{ type: 'text', text: '半截旧回答' }] } },
+      });
+      outbound.routeSessionEvent(sess, steerAbortEnd);
+      expect(session.complete).not.toHaveBeenCalled();
+
+      // 续轮输出新内容，复用同一流式会话重写并在结束时 complete 一次
+      outbound.routeStreamFrame('sess-qq', start('a2'));
+      outbound.routeStreamFrame('sess-qq', delta('a2', '结合补充后的完整回答'));
+      await vi.advanceTimersByTimeAsync(200);
+      outbound.routeSessionEvent(sess, {
+        type: 'assistant/message',
+        data: { message: { content: [{ type: 'text', text: '结合补充后的完整回答' }] } },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(bot.openStream).toHaveBeenCalledTimes(1);
+      expect(session.update).toHaveBeenLastCalledWith('结合补充后的完整回答');
+      expect(session.complete).toHaveBeenCalledTimes(1);
+      expect(bot.sendMarkdown).not.toHaveBeenCalled();
+    });
   });
 });

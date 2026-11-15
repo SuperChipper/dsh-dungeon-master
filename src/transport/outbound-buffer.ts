@@ -113,4 +113,18 @@ export class OutboundBuffer {
     this.writer?.abort();
     this.buffer = '';
   }
+
+  /**
+   * 自动 steer 打断当前思考时清理缓冲：
+   * - 若尚未向 QQ 发出任何流式分片（群聊或私聊首帧前），直接取消丢弃，后续走新消息的 replyTarget；
+   * - 若私聊已发出流式分片，保留已打开的流式会话并清空文本，下一轮新 attempt 原地重写同一气泡。
+   */
+  public abortOrResetForSteer(): boolean {
+    if (this.writer && !this.writer.shouldFallback) {
+      this.reset();
+      return true;
+    }
+    this.cancel();
+    return false;
+  }
 }

@@ -29,6 +29,9 @@ export interface Token {
   kind: 'pc' | 'npc' | 'monster';
   down: boolean;
   current: boolean;
+  hp: number;
+  maxHp: number;
+  tempHp: number;
 }
 
 /**
@@ -69,6 +72,9 @@ export function roomTokens(c: Campaign, room: string, visible: (ch: Character) =
     // 倒地（0 HP 在做死亡豁免）和死了都画成灰的：玩家一眼要看出谁需要救
     down: isOut(ch) || ch.hp <= 0,
     current: ch.name === current,
+    hp: ch.hp,
+    maxHp: ch.maxHp,
+    tempHp: ch.tempHp ?? 0,
   }));
 }
 

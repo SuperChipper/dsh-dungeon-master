@@ -43,6 +43,7 @@ import { getSenderAliases } from '../features/sender-alias.ts';
 import { isSelfMention, rememberSelfMentions, renderInboundMentions } from '../features/member-mention.ts';
 import type { MiddlewareContext } from '@tencent-connect/qqbot-nodejs';
 import { runInboundTurn } from './agent-turn.ts';
+import { getTurnSlot, isSteeredContext } from './turn-steer.ts';
 
 // ── 类型定义 ──
 
@@ -162,9 +163,11 @@ export async function handleInbound(
 
   // ── 组装 agentBody（下载结果经 mwState.downloadedFiles 提供） ──
   // 群里给模型看的发送者标签用群内短别名（#U3）；私聊只有一个对话者，引用块里称「对方」
+  const turnSlot = getTurnSlot(ctx);
+  const steered = isSteeredContext(ctx);
   const aliasOf = (id: string): string => getSenderAliases().aliasFor(config.appId, peerId, id);
   const label: SenderLabeler = scope === 'group' ? makeSenderLabeler(aliasOf) : () => '对方';
-  const assembled = await assembleAgentBody(bodyMsg, bodyState, scope, manager, history, historyImages, forwardImages, label);
+  const assembled = await assembleAgentBody(bodyMsg, bodyState, scope, manager, history, historyImages, forwardImages, label, steered);
   // 正文、历史、引用里的 <@openid> 统一换成 #U 编号，模型才认得出 @ 的是谁，也能照着 @ 回去
   if (scope === 'group') rememberSelfMentions((msg as { mentions?: unknown }).mentions);
   const agentBody = scope === 'group' && assembled
@@ -284,23 +287,29 @@ export async function handleInbound(
     source: { kind: 'user' as const },
   });
 
-  // 阻塞等待本轮 turn 收敛，避免后续消息在 turn 运行期间被 followup 打断
+  // 阻塞等待本轮 turn 收敛，避免后续消息在 turn 运行期间被 followup 打断（短时消息经 turnSlot 自动 steer）
   try {
-    await runInboundTurn(record.agent, message, ctx.signal, () => {
-      logger.info(`→ followup sent: key=${scope}:${peerId}`);
-      if (scope === 'group') {
-        clearGroupHistory(config.appId, msg.groupOpenid ?? msg.senderId);
-      }
-      if (isGroupTrigger) {
-        writeHistoryCursor(config.appId, peerId, { sessionId: record.sessionId, messageId: msg.messageId });
-      }
-    });
+    await runInboundTurn(
+      record.agent,
+      message,
+      ctx.signal,
+      () => {
+        logger.info(`→ ${steered ? 'steer' : 'followup'} sent: key=${scope}:${peerId}`);
+        if (scope === 'group') {
+          clearGroupHistory(config.appId, msg.groupOpenid ?? msg.senderId);
+        }
+        if (isGroupTrigger) {
+          writeHistoryCursor(config.appId, peerId, { sessionId: record.sessionId, messageId: msg.messageId });
+        }
+      },
+      { slot: turnSlot, tracker: manager.turnSteer },
+    );
   } catch (err) {
     logger.warn(`whenIdle rejected: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // 上下文超阈值时后台压缩（只针对 QQ 会话）
-  if (!ctx.signal.aborted) manager.maybeAutoCompact(record);
+  // 上下文超阈值时后台压缩（只针对 QQ 会话；steer 注入分支由外层回合统一收尾压缩）
+  if (!steered && !ctx.signal.aborted) manager.maybeAutoCompact(record);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -319,6 +328,7 @@ async function assembleAgentBody(
   historyImages: HistoryImage[],
   forwardImages: readonly TaggedForwardImage[],
   label: SenderLabeler,
+  steered = false,
 ): Promise<string | null> {
   const isGroup = scope === 'group';
   const wasMentioned = state.mention?.wasMentioned ?? false;
@@ -351,16 +361,68 @@ async function assembleAgentBody(
       + '你在那条里说「已经写好 / 已经记下 / 已经移动」的事都没有发生。需要的话现在用真正的工具调用重做，并在回复里如实更正；工具调用不要写进正文。';
   const migrationHint = manager.takeScheduleMigration(scope, peerId);
   const handoffHint = await manager.takeHandoff(scope, peerId);
-  // 共享笔记自动召回：用当前消息（含引用原文）检索，命中才注入
-  const notesHint = await manager.notesHint([userContent, state.quote?.text ?? state.quote?.entry?.content ?? ''].join('\n'), scope, peerId);
+  // 共享笔记自动召回：用当前消息（含真正被引用的原文，剥掉内部媒体路径/发送者标签等假阳性源）检索，命中才注入
+  const rawQuote = state.quote?.text || state.quote?.entry?.content || '';
+  const quotedForNotes = rawQuote ? (splitQuote(rawQuote).quote ?? state.quote?.entry?.content ?? '') : '';
+  const notesQuery = sanitizeNotesQuery([userContent, quotedForNotes].filter(Boolean).join('\n'));
+  const notesHint = await manager.notesHint(notesQuery, scope, peerId, msg.messageId, steered);
 
   const forwardHint = buildForwardHint(forwardImages);
   const replyStyleHint = buildReplyStyleHint(state.replyDesire as { mode?: string } | undefined);
+  const steerHint = steered
+    ? '[补充消息] 在上一条消息尚未回复完成时紧接着收到以下补充/跟进，请连同上面尚未回复的内容一并处理：'
+    : '';
 
-  const base = [dynamicCtx, stickerHints, forwardHint, notesHint, unsentHint, skippedHint, handoffHint, migrationHint, replyStyleHint, userMessage].filter(Boolean).join('\n');
+  const base = [dynamicCtx, stickerHints, forwardHint, notesHint, unsentHint, skippedHint, handoffHint, migrationHint, replyStyleHint, steerHint, userMessage].filter(Boolean).join('\n');
   const agentBody = buildAgentBody(base, history, isGroup, wasMentioned || implicit, label, historyImages);
 
   return agentBody;
+}
+
+/** 笔记检索查询里需要剥掉的平台/组装伪影（本地路径、合并标签、占位符等），防止误触发精确匹配强命中 */
+const NOTES_QUERY_NOISE: readonly RegExp[] = [
+  /<@!?[^>\s]+>/g,
+  /<faceType=[^>]*>/g,
+  /<attachmentType=[^>]*>/g,
+  /【表情[^】]*】/g,
+  /\[附件\d+\][^\n]*/g,
+  /\[图片#\d+:\s*[^\]]*\](?:\s*尺寸:\S+)?/g,
+  /\[群聊的聊天记录\]/g,
+  /\[聊天记录，共\s*\d+\s*条\]/g,
+  /^===\s*消息\s*\d+\s*===$/gm,
+  /^---\s*第\d+条\s*---$/gm,
+  /^\[(?:发送者|消息类型)\][^\n]*/gm,
+  /^\[(?:消息内容|关联消息)\]\s*/gm,
+  /（平台没给内容[^）]*）/g,
+  /（平台没给被引用的原文[^）]*）/g,
+  /\[Voice message(?:\s*\(\d+s\))?\]\s*/g,
+  /\[[^\]\n]*#[Uu]\d{1,4}\]\s*/g,
+  /\(@you\)/g,
+  /\[(?:图片|视频|文件|表情包|表情|动画表情)\]/g,
+];
+
+const LOCAL_FS_PATH = /(?:(?:file:\/\/\/)?[A-Za-z]:[\\/]|(?<![A-Za-z0-9_:/])\/(?:Users|home|tmp|var|opt|mnt|private)\/)[^\s\]"')<>，。；！？、`]+/g;
+
+/**
+ * 清洗送去检索笔记的查询文本：
+ * 1. 剥除转发/历史图片本地路径、原始附件标签、QQ 表情框、合并消息的 `[昵称 #U3]` 与 `(@you)`、纯媒体占位词；
+ * 2. 用户正文里粘贴的本机路径只保留末尾文件名，避免 `C:\Users\alice\Desktop\...` 目录前缀把带路径的笔记误判成强字面命中。
+ */
+export function sanitizeNotesQuery(raw: string): string {
+  let cleaned = raw;
+  for (const pattern of NOTES_QUERY_NOISE) {
+    cleaned = cleaned.replace(pattern, ' ');
+  }
+  cleaned = cleaned.replace(LOCAL_FS_PATH, (matched) => {
+    const parts = matched.split(/[\\/]+/).filter(Boolean);
+    const tail = parts[parts.length - 1] ?? '';
+    return /^[A-Za-z]:$/.test(tail) ? ' ' : ` ${tail} `;
+  });
+  return cleaned
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n');
 }
 
 /** 回复欲望放行的表情包：提示用表情包回应 / 跟着复读，而不是长篇文字 */

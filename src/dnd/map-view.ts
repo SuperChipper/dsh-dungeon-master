@@ -8,7 +8,7 @@ import { type Adventure, roomGraph, siteOfRoom } from './adventure.ts';
 import { renderBattleImage, roomTokens } from './battle-image.ts';
 import { hiddenFromPlayers, mapOf } from './battlefield.ts';
 import { renderBookMap } from './book-map.ts';
-import { type Campaign, explored, findCharacter, partyPositions, roomOf } from './campaign.ts';
+import { type Campaign, explored, findCharacter, isOut, partyPositions, roomOf } from './campaign.ts';
 import { findRoom } from './dungeon.ts';
 import { renderMapPng } from './map-render.ts';
 import { exitsLine } from './text-map.ts';
@@ -57,11 +57,23 @@ export function mapCaption(c: Campaign, adv: Adventure, kind: RenderedMap['kind'
   if (kind === 'battle') {
     const room = battleRoom(c);
     const tokens = roomTokens(c, room, (ch) => !hiddenFromPlayers(ch));
-    const group = (k: 'pc' | 'npc' | 'monster'): string => legendEntries(tokens.filter((t) => t.kind === k && !t.down)).join(' ');
+    const placedNames = new Set(tokens.map((t) => t.name));
+    const allyGroup = (k: 'pc' | 'npc'): string => {
+      const placed = tokens.filter((t) => t.kind === k && !t.down).map((t) => {
+        const hp = `${t.hp}/${t.maxHp}${t.tempHp > 0 ? `(+${t.tempHp})` : ''}`;
+        return t.label === t.name ? `${t.name}${hp}` : `${t.label}=${t.name}${hp}`;
+      });
+      const unplaced = (c.initiative?.order ?? [])
+        .map((e) => findCharacter(c, e.name))
+        .filter((ch): ch is NonNullable<typeof ch> => ch !== undefined && ch.kind === k && !isOut(ch) && ch.hp > 0 && !placedNames.has(ch.name) && roomOf(c, ch) === room)
+        .map((ch) => `${ch.name}${ch.hp}/${ch.maxHp}${(ch.tempHp ?? 0) > 0 ? `(+${ch.tempHp})` : ''}`);
+      return [...placed, ...unplaced].join(' ');
+    };
+    const monsterGroup = legendEntries(tokens.filter((t) => t.kind === 'monster' && !t.down)).join(' ');
     const lines = [
-      ...(group('pc') ? [`🔵 ${group('pc')}`] : []),
-      ...(group('npc') ? [`🟢 ${group('npc')}`] : []),
-      ...(group('monster') ? [`🔴 ${group('monster')}`] : []),
+      ...(allyGroup('pc') ? [`🔵 ${allyGroup('pc')}`] : []),
+      ...(allyGroup('npc') ? [`🟢 ${allyGroup('npc')}`] : []),
+      ...(monsterGroup ? [`🔴 ${monsterGroup}`] : []),
     ];
     const down = tokens.filter((t) => t.down).map((t) => t.name);
     if (down.length > 0) lines.push(`⚪ 倒地：${down.join('、')}`);
@@ -81,7 +93,6 @@ export function mapCaption(c: Campaign, adv: Adventure, kind: RenderedMap['kind'
     if (doors.length > 0 || hasOutside) {
       lines.push(`🚪 ${[...(doors.length > 0 ? [`棕色格是门：${doors.join('、')}`] : []), ...(hasOutside ? ['门外的格子也能站人'] : [])].join('；')}`);
     }
-    lines.push('报位置用 (列,行)，如 (6,8)');
     return lines.join('\n');
   }
   const lines: string[] = [];

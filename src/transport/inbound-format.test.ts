@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { QUOTE_MISSING_NOTE } from '../features/chat-record.ts';
 import type { ResolvedQuote } from '@tencent-connect/qqbot-nodejs';
-import { buildAgentBody, buildQuotePart, buildUserMessage } from './inbound.ts';
+import { buildAgentBody, buildQuotePart, buildUserMessage, sanitizeNotesQuery } from './inbound.ts';
+import { extractExactTerms, EXACT_STRONG_SCORE } from '../features/exact-match.ts';
 import { quoteSenderFill } from '../gateway/middleware-setup.ts';
 import { makeSenderLabeler } from '../features/message-format.ts';
 import { SELF_SENDER_ID, SelfSentIndex } from './self-sent.ts';
@@ -89,5 +90,39 @@ describe('quoteSenderFill', () => {
     const ctx = { state: { quote } };
     await quoteSenderFill({ get: () => undefined, set: () => {} })(ctx as never, async () => {});
     expect(ctx.state.quote).toBe(quote);
+  });
+});
+
+describe('sanitizeNotesQuery', () => {
+  it('剥除转发图片本地路径、原始附件标签、表情框与合并发送者标签，不触发假阳性强命中', () => {
+    const noisy = [
+      '[甲 #U3] 哈哈哈笑死 【表情: 狗头】 (@you)',
+      '[聊天记录，共 2 条]',
+      '1. 路人：看这张图 <attachmentType="image/png",name="a.png">',
+      '   [附件1] [图片#1: C:/Users/alice/Desktop/dsh-qqbot/media/9f0a.png] 尺寸:240x240',
+      '[图片]',
+    ].join('\n');
+    const cleaned = sanitizeNotesQuery(noisy);
+    expect(cleaned).toBe('哈哈哈笑死\n1. 路人：看这张图');
+    const { terms } = extractExactTerms(cleaned);
+    const strong = terms.filter((t) => t.weight >= EXACT_STRONG_SCORE);
+    expect(strong).toEqual([]);
+  });
+
+  it('保留用户正文主动写的 #U3、语音转写正文，以及粘贴路径的末尾文件名（去掉本机目录前缀）', () => {
+    const raw = [
+      '[Voice message (4s)] 记一下 #U3 的外号',
+      '顺便看下 c:\\Users\\alice\\.gemini\\antigravity\\brain\\00df\\dnd_live_test_checklist.md',
+    ].join('\n');
+    const cleaned = sanitizeNotesQuery(raw);
+    expect(cleaned).toContain('记一下 #U3 的外号');
+    expect(cleaned).toContain('dnd_live_test_checklist.md');
+    expect(cleaned).not.toContain('alice');
+    expect(cleaned).not.toContain('Users');
+    expect(cleaned).not.toContain('Voice message');
+  });
+
+  it('纯图片/表情占位清洗后为空串，不拿「图片」去搜笔记', () => {
+    expect(sanitizeNotesQuery('[图片] 【表情: 捂脸】 [表情包]')).toBe('');
   });
 });

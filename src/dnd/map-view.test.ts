@@ -33,11 +33,13 @@ describe('地图说明', () => {
     } as never;
     c.battlemaps = { [room]: { width: 5, height: 5, areas: [{ kind: 'object', x: 2, y: 2, name: '石棺' }, { kind: 'difficult', x: 0, y: 4, w: 2, name: '碎石' }] } };
     const text = mapCaption(c, adv, 'battle');
-    expect(text).toContain('🔵 艾=艾琳');
-    expect(text).toContain('🟢 修=修女');
+    expect(text).toContain('🔵 艾=艾琳10/10');
+    expect(text).toContain('🟢 修=修女10/10');
     expect(text).toContain('🔴 巨1=巨鼠1');
+    expect(text).not.toContain('巨鼠110/10');
     expect(text).toContain('⚪ 倒地：卡厄斯');
     expect(text).toContain('🧱 挡路：石棺；难行：碎石');
+    expect(text).not.toContain('报位置用');
   });
 
   it('探索地图：你们在哪、能去哪', () => {

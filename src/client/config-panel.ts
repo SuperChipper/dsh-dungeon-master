@@ -225,6 +225,7 @@ type ConfigWire = {
   sessionIdleTimeout?: number;
   textChunkLimit?: number;
   maxQueue?: number;
+  steerWindowMs?: number;
   processingTimeoutMs?: number;
   askTimeoutMs?: number;
   autoCompactTokens?: number;
@@ -797,6 +798,12 @@ export function ConfigPanel(): ReactNode {
       min: 1, max: 100, step: 1,
       help: '同时排队的消息数，超出会拒绝新消息',
       onChange: (v) => { patch('maxQueue', v); },
+    }),
+    createElement(NumberRow, {
+      label: '短时插话打断窗口（毫秒）', value: form.steerWindowMs ?? 10000,
+      min: 0, max: 300000, step: 1000,
+      help: '该时间窗内群聊显式 @bot 或私聊连发会自动打断当前思考并追加（steer）；0 = 关闭',
+      onChange: (v) => { patch('steerWindowMs', v); },
     }),
     createElement(NumberRow, {
       label: '单次处理超时（毫秒）', value: form.processingTimeoutMs ?? 1800000,

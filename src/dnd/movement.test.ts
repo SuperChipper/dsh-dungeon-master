@@ -1,3 +1,4 @@
+import { chooseReaction } from './pending-attack.ts';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,7 +7,7 @@ import { AdventureLibrary } from './adventure.ts';
 import { CampaignStore, requireCharacter, summarize, upsertCharacter } from './campaign.ts';
 import { DndService } from './dnd-service.ts';
 import { registerDndTools } from './dnd-tools.ts';
-import { buildReactionKeyboard, DndTurnButtons, ACK } from './turn-buttons.ts';
+import { buildReactionKeyboard, DndTurnButtons, ACK, reactionOptionKey } from './turn-buttons.ts';
 import { pendingReactionReply } from '../gateway/middleware-setup.ts';
 
 type Tool = { name: string; execute(args: unknown, exec: { agent?: unknown }): Promise<{ text: string }> };
@@ -37,14 +38,43 @@ function table() {
   });
   const call = async (name: string, args: object) => (await tools.get(name)!.execute(args, { agent: {} })).text;
   const campaign = () => service.store.load(key)!;
+  const consent = (by: string, skill: string): string => service.store.update(key, (c) => {
+    const p = c.initiative!.pending ?? c.initiative!.movement!;
+    const existing = p.claimed.find((r) => r.character === by && r.reaction === skill)?.authorization;
+    return existing ?? chooseReaction(c, p, c.characters.find((ch) => ch.name === by)!.playerId!, by, skill)!.authorization!;
+  }, '测试：玩家本人明确选择');
   const move = () => call('dnd_position', { action: 'move', name: '狼', x: 5, y: 0 });
-  const strike = (extra = {}) => call('dnd_check', { type: 'attack', character: '甲', target: '狼', weapon: '剑', reaction: true, declared_by: 'U1', ...extra });
+  const strike = (extra = {}) => call('dnd_check', { type: 'attack', character: '甲', target: '狼', weapon: '剑', reaction: true, declared_by: 'U1', authorization: campaign().initiative?.movement && !campaign().initiative!.movement!.used.some((r) => r.by === '甲') ? consent('甲', '借机攻击') : undefined, ...extra });
   const buttons = new DndTurnButtons(service, manager as never, { sendMarkdown: vi.fn() }, logger);
-  const press = (data: object, clicker = 'P1') => buttons.handleInteraction({ id: 'e', type: 11, version: 1, group_openid: 'G1', group_member_openid: clicker, data: { type: 11, resolved: { button_data: JSON.stringify({ t: 'dnd', ...data }) } } } as never);
-  return { service, key, rolls, roller, call, campaign, move, strike, manager, onPendingAttack, press, followup };
+  let eventId = 0;
+  const press = (data: { a?: string; i?: number }, clicker = 'P1') => {
+    const option = (campaign().initiative?.pending ?? campaign().initiative?.movement)?.reactors[data.i ?? -1];
+    return buttons.handleInteraction({ id: `e${++eventId}`, type: 11, version: 1, group_openid: 'G1', group_member_openid: clicker,
+      data: { type: 11, resolved: { button_data: JSON.stringify({ t: 'dnd', ...(data.a === 'react' && option ? { o: reactionOptionKey(option) } : {}), ...data }) } } } as never);
+  };
+  return { consent, service, key, rolls, roller, call, campaign, move, strike, manager, onPendingAttack, press, followup };
 }
 
 describe('借机是持久化的移动停止点', () => {
+  it('借机也不能只凭玩家编号授权；不用撤回已确认的借机且不掷骰扣反应', async () => {
+    const t = table();
+    await t.move();
+    const attack = (authorization?: string) => t.call('dnd_check', { type: 'attack', character: '甲', target: '狼', weapon: '剑', reaction: true, declared_by: 'U1', authorization });
+    const before = t.campaign();
+    await expect(attack()).rejects.toThrow('有效授权');
+    expect(t.campaign()).toEqual(before);
+    expect(t.roller).not.toHaveBeenCalled();
+    const seq = before.initiative!.movement!.seq;
+    expect(t.press({ a: 'react', r: seq, i: 0 })).toBe(ACK.ok);
+    const old = t.campaign().initiative!.movement!.claimed[0]!.authorization;
+    expect(t.press({ a: 'pass', r: seq })).toBe(ACK.ok);
+    const declined = t.campaign();
+    await expect(attack(old)).rejects.toThrow('借机窗口');
+    expect(t.campaign()).toEqual(declined);
+    expect(t.roller).not.toHaveBeenCalled();
+    expect(t.campaign().initiative!.reacted).toBeUndefined();
+  });
+
   it('在离开触及之前暂停，未走的路和移动力不提前写入；不能跳回合或假装攻击', async () => {
     const t = table();
     expect(await t.move()).toContain('移动待结算');
@@ -105,9 +135,9 @@ describe('借机是持久化的移动停止点', () => {
   it('移动借机的普通回复不需要 @，会被识别成窗口答复', async () => {
     const t = table();
     await t.move();
-    const reply = pendingReactionReply({ kind: 'group', groupOpenid: 'G1', senderId: 'P1', content: '打' } as never, t.manager as never);
+    const reply = pendingReactionReply({ kind: 'group', groupOpenid: 'G1', senderId: 'P1', content: '打', messageId: 'm1' } as never, t.manager as never, true);
     expect(reply?.note).toContain('系统 · 借机');
-    expect(reply?.note).toContain('工具会扣反应');
+    expect(reply?.note).toContain('authorization=');
   });
 
   it('撤离、失能、受惊、反应已用均不弹借机；10 尺外远离普通武器不触发', async () => {
@@ -146,7 +176,7 @@ describe('借机是持久化的移动停止点', () => {
     await t.call('dnd_check', { type: 'attack', character: '狼', target: '甲', reaction: true });
     expect(t.campaign().initiative!.pending).toBeDefined();
     expect(t.campaign().initiative!.movement).toBeDefined();
-    await t.call('dnd_apply', { target: '甲', declared_by: 'U1', reaction: { by: '甲', name: '护盾术', ac_mod: 5 }, settle: true });
+    await t.call('dnd_apply', { target: '甲', declared_by: 'U1', reaction: { by: '甲', name: '护盾术', authorization: t.consent('甲', '护盾术'), ac_mod: 5 }, settle: true });
     expect(requireCharacter(t.campaign(), '甲')).toMatchObject({ hp: 40, resources: { '1环法术位': { current: 1 } } });
     expect(t.campaign().initiative!.reacted).toEqual(['狼', '甲']);
     await t.call('dnd_apply', { target: '甲', settle: true });
@@ -182,7 +212,7 @@ describe('借机是持久化的移动停止点', () => {
     });
     t.rolls.push(10, 2);
     await t.call('dnd_check', { type: 'attack', character: '狼', target: '甲' });
-    await t.call('dnd_apply', { target: '甲', reaction: { by: '甲', name: '护盾术', ac_mod: 5 }, declared_by: 'U1', settle: true });
+    await t.call('dnd_apply', { target: '甲', reaction: { by: '甲', name: '护盾术', authorization: t.consent('甲', '护盾术'), ac_mod: 5 }, declared_by: 'U1', settle: true });
     t.rolls.push(10);
     const second = await t.call('dnd_check', { type: 'attack', character: '狼', target: '甲' });
     expect(second).toContain('未命中');
@@ -214,9 +244,9 @@ describe('借机是持久化的移动停止点', () => {
       c.initiative!.positions!.乙 = { x: 1, y: 1, room: c.currentRoom };
     });
     t.rolls.push(1);
-    // 天然 1 不会自动打开窗口，手动 hold 也能登记 NPC/特殊反应。
-    await t.call('dnd_check', { type: 'attack', character: '狼', target: '甲', hold: true });
-    await t.call('dnd_apply', { target: '甲', reaction: { by: '乙', name: '哨兵' }, declared_by: 'U2', settle: true });
+    // 天然 1 不会自动打开窗口，PC 特殊反应先用 hold_for 询问本人。
+    await t.call('dnd_check', { type: 'attack', character: '狼', target: '甲', hold_for: [{ by: '乙', name: '哨兵' }] });
+    await t.call('dnd_apply', { target: '甲', reaction: { by: '乙', name: '哨兵', authorization: t.consent('乙', '哨兵') }, declared_by: 'U2', settle: true });
     await t.call('dnd_check', { type: 'attack', character: '乙', target: '狼', weapon: '剑', reaction: true });
     expect(t.campaign().initiative!.reacted).toEqual(['乙']);
     await expect(t.call('dnd_check', { type: 'attack', character: '乙', target: '狼', weapon: '剑', reaction: true, declared_by: 'U2' })).rejects.toThrow('反应已经用过');

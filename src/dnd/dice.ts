@@ -102,14 +102,25 @@ export interface D20Result {
   detail: string;
 }
 
+export interface RollD20Options {
+  /** 精灵精准：用敏捷/智力/感知/魅力攻击且具优势时，掷三颗 d20 取最高 */
+  elvenAccuracy?: boolean;
+}
+
 /** 掷 d20 + 修正，处理优劣势 */
-export function rollD20(modifier: number, advantage: Advantage = 'none', roller: Roller = cryptoRoller): D20Result {
-  const rolls = advantage === 'none' ? [roller(20)] : [roller(20), roller(20)];
+export function rollD20(
+  modifier: number,
+  advantage: Advantage = 'none',
+  roller: Roller = cryptoRoller,
+  options?: RollD20Options,
+): D20Result {
+  const triple = advantage === 'advantage' && options?.elvenAccuracy === true;
+  const rolls = advantage === 'none' ? [roller(20)] : (triple ? [roller(20), roller(20), roller(20)] : [roller(20), roller(20)]);
   const natural = advantage === 'advantage'
     ? Math.max(...rolls)
     : (advantage === 'disadvantage' ? Math.min(...rolls) : rolls[0]!);
   const total = natural + modifier;
-  const tag = advantage === 'advantage' ? '优势' : (advantage === 'disadvantage' ? '劣势' : '');
+  const tag = triple ? '精灵精准' : (advantage === 'advantage' ? '优势' : (advantage === 'disadvantage' ? '劣势' : ''));
   const dice = rolls.length > 1 ? `d20${tag}[${rolls.join(',')}→${natural}]` : `d20[${natural}]`;
   const mod = modifier === 0 ? '' : ` ${modifier > 0 ? '+' : '-'} ${Math.abs(modifier)}`;
   return { natural, rolls, modifier, total, detail: `${dice}${mod} = ${total}` };

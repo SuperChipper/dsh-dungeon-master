@@ -7,6 +7,7 @@
  * 「任何 d20」的触发条件（30 尺、看得见、反应名额）硬编码只会天天误弹，交给 DM 判断。
  * 只靠守则提醒模型停手不管用，所以推进回合、再次攻击、提前落账都由工具拒绝。
  */
+import { randomUUID } from 'node:crypto';
 import {
   type Campaign,
   type Character,
@@ -18,6 +19,7 @@ import {
   type ReactorOption,
   describePending,
   findCharacter,
+  inInitiative,
   isOut,
   reactionBlocked,
   reactionWindow,
@@ -53,6 +55,7 @@ export function eligibleReactors(c: Campaign, attacker: Character, target: Chara
   const attackerCell = cellOf(c, attacker);
   return c.characters.flatMap((ch) => {
     if (ch.kind !== 'pc' || !canReact(ch) || roomOf(c, ch) !== room) return [];
+    if (c.initiative !== undefined && !inInitiative(c, ch.name)) return [];
     // 用过反应或受惊：反手一击、挡攻击这类都不行（天赋类「自己攻击时」的不占反应，不受影响）
     const free = reactionBlocked(c, ch.name) === undefined;
     return reactionsOf(ch).flatMap((r) => {
@@ -92,6 +95,9 @@ export function manualReactors(c: Campaign, value: unknown): ReactorOption[] {
     if (ch === undefined) throw new Error(`hold_for: 找不到角色「${by}」`);
     if (ch.kind !== 'pc' || ch.playerId === undefined) {
       throw new Error(`hold_for 只用来等玩家：${ch.name} 不是绑了玩家的 PC。NPC/怪物的反应由你决定，传 hold=true 后直接 dnd_apply reaction`);
+    }
+    if (c.initiative !== undefined && !inInitiative(c, ch.name)) {
+      throw new Error(`${ch.name} 不在当前战斗的参战名单（先攻表）里，不能加入反应；如确已中途参战请先调用 dnd_initiative join`);
     }
     if (!canReact(ch)) throw new Error(`${ch.name} 现在做不了反应`);
     const blocked = reactionBlocked(c, ch.name);
@@ -168,6 +174,8 @@ export function pendingSummaryLine(p: ReactionWindow): string {
   const used = p.used.map((u) => `${u.by}·${u.name}`).join('、');
   return `【待结算 #R${p.seq}】${pendingState(p)}。`
     + `${used.length > 0 ? `已用：${used}。` : ''}`
+    + `${p.declined.length > 0 ? `本人已拒绝/已跳过：${p.declined.join('、')}。` : ''}`
+    + p.claimed.map((r) => `本人已授权 ${r.character}·${r.reaction}（authorization="${r.authorization ?? '旧确认无凭证，请本人重新确认'}"，仅限本次窗口）。`).join('')
     + `${waiting.length > 0 ? `还在等：${waiting.join('、')}。` : ''}`
     + `落账用 dnd_apply target=${p.target} settle=true；落账前不能推进回合。`;
 }
@@ -185,7 +193,7 @@ export function holdNotice(p: PendingRoll): string {
     : `reaction 改数值（attack_mod 加减这一骰，或 reroll="d20" 重掷；target 填被改的那个掷骰人）`;
   return `【待结算 #R${p.seq}】这笔还没落账，别往下推进：${unsettled}。这条回复报骰子和成败（规则要求先知道成败再决定，DC/AC 数字照样不报），`
     + `问一句有没有人要用反应（可用：${optionsText(p)}），然后到此停下，不要写成后果已经发生。`
-    + `玩家回应后用 dnd_apply target=${p.target}：要用就传 ${fix}，不用就传 decline，都答复了传 settle=true。`
+    + `玩家回应后用 dnd_apply target=${p.target}：要用就传 ${fix}，并原样附上服务器消息的 authorization（玩家编号不等于同意）；不用已由服务器登记，都答复了传 settle=true。`
     + '落账前 next、再次攻击、豁免效果、移动都会被拒绝。';
 }
 
@@ -204,7 +212,36 @@ export function declineReaction(p: ReactionWindow, name: string): void {
   if (!p.reactors.some((r) => r.character === name)) {
     throw new Error(`${name} 不在这笔的可反应名单里（${optionsText(p)}）`);
   }
+  if (p.used.some((r) => r.by === name)) throw new Error(`${name} 的反应已经结算，不能改成不用`);
+  if (p.claimed.some((r) => r.character === name)) throw new Error(`${name} 本人已经选择反应，DM 不能替他改成不用；请等本人改选`);
   if (!p.declined.includes(name)) p.declined.push(name);
+}
+
+/** 只从真实玩家入站/按钮调用，不能让模型用 declared_by 自签授权。 */
+export function chooseReaction(c: Campaign, p: ReactionWindow, senderId: string, name: string, reaction?: string): ReactorOption | undefined {
+  const ch = requireCharacter(c, name);
+  if (ch.kind !== 'pc' || ch.playerId !== senderId) throw new Error('只能由角色的玩家本人选择反应');
+  const option = p.reactors.find((r) => r.character === ch.name && (reaction === undefined || r.reaction === reaction));
+  if (option === undefined) throw new Error(`${ch.name} 不在这笔的对应反应名单里`);
+  if (p.used.some((r) => r.by === ch.name)) throw new Error(`${ch.name} 的反应已经结算`);
+  p.claimed = p.claimed.filter((r) => r.character !== ch.name);
+  p.declined = p.declined.filter((n) => n !== ch.name);
+  if (reaction === undefined) {
+    p.declined.push(ch.name);
+    return undefined;
+  }
+  const grant = { ...option, authorization: randomUUID() };
+  p.claimed.push(grant);
+  return grant;
+}
+
+/** 在资源、随机数和反应名额发生变化之前检查，过期/撤回的排队调用不能扣账。 */
+export function assertReactionAuthorized(p: ReactionWindow, ch: Character, name: string, authorization: unknown): void {
+  if (p.declined.includes(ch.name)) throw new Error(`${ch.name} 本人已选择不用，不能结算反应或扣资源；需要本人重新确认`);
+  if (ch.kind !== 'pc' || ch.playerId === undefined) return;
+  if (typeof authorization !== 'string' || !p.claimed.some((r) => r.character === ch.name && r.reaction === name && r.authorization === authorization)) {
+    throw new Error(`${ch.name} 的「${name}」没有本次窗口的有效授权。请等本人点按钮或明确说使用；照系统消息传 authorization，declared_by 不能代替同意。遗漏的技能用 dnd_apply ask_reactions=[{by,name}] 询问，不要重掷原骰。`);
+  }
 }
 
 /** 这个玩家的角色 */
@@ -212,13 +249,27 @@ function charactersOf(c: Campaign, senderId: string): Character[] {
   return c.characters.filter((ch) => ch.playerId === senderId && !isOut(ch));
 }
 
-const DECLINE_REPLY = /^(不用|不用了|不反应|不了|没有|没|算了|跳过|过|pass|no)[。.!！~～]*$/i;
+function stripCharacterPrefix(text: string, characterName: string): string {
+  const short = characterName.trim().split(/\s+/)[0] ?? characterName;
+  for (const prefix of [characterName, short]) {
+    if (prefix.length > 0 && text.startsWith(prefix)) {
+      return text.slice(prefix.length).replace(/^[\s:：,，·]+/, '').trim();
+    }
+  }
+  return text;
+}
+
+const DECLINE_REPLY = /^(不用|不用了|不反应|这次不用|跳过反应|pass|no)[。.!！~～]*$/i;
 const GENERIC_REACTION = /反应|借机|尖刻言语|护盾术|导引打击|招架|反制法术|幸运点|重掷|重骰|时间变幻/;
 
 export interface ReactionReply {
-  kind: 'use' | 'decline';
+  kind: 'use' | 'decline' | 'question';
   /** 发这条消息的玩家在这笔名单里的角色；名单外的玩家为空 */
   characters: string[];
+  windowId?: number;
+  choices?: ReactorOption[];
+  grants?: ReactorOption[];
+  issue?: string;
 }
 
 /**
@@ -233,12 +284,60 @@ export function classifyReactionReply(c: Campaign, senderId: string, text: strin
   const mine = charactersOf(c, senderId);
   if (mine.length === 0) return undefined;
   const listed = [...new Set(p.reactors.map((r) => r.character))].filter((name) => mine.some((ch) => ch.name === name));
-  if (listed.length > 0 && DECLINE_REPLY.test(clean)) return { kind: 'decline', characters: listed };
+  if (listed.length > 0 && DECLINE_REPLY.test(clean)) return { kind: 'decline', characters: listed, windowId: p.seq };
   // DM 点名问的反应（时间变幻）不在角色卡的 reactions 里，名字从名单上认
   const named = mine.some((ch) => reactionsOf(ch).some((r) => clean.includes(r.name)))
     || p.reactors.some((r) => listed.includes(r.character) && clean.includes(r.reaction));
-  return named || GENERIC_REACTION.test(clean) || (p.kind === 'move' && listed.length > 0 && /^(打|攻击|借机攻击)[。.!！]*$/.test(clean))
-    ? { kind: 'use', characters: listed } : undefined;
+  const movementUse = p.kind === 'move' && listed.length > 0 && /^(打|攻击|借机攻击)[。.!！]*$/.test(clean);
+  if (!named && !GENERIC_REACTION.test(clean) && !movementUse) return undefined;
+  const hasQuestionMark = clean.includes('?') || clean.includes('？');
+  const myOptions = p.reactors.filter((r) => listed.includes(r.character));
+  if (!hasQuestionMark && myOptions.length === 1) {
+    const only = myOptions[0]!;
+    const at = clean.indexOf(only.reaction);
+    if (at >= 0) {
+      const before = stripCharacterPrefix(clean.slice(0, at).trim(), only.character);
+      const after = clean.slice(at + only.reaction.length).trim();
+      if (/^(我)?(这次|这下)?(不用|不开|不放|不交|不施放)$/.test(before) && /^(了|吧)?[。.!！~～]*$/.test(after)) {
+        return { kind: 'decline', characters: [only.character], windowId: p.seq };
+      }
+    }
+  }
+  const choices = myOptions.filter((r) => clean.includes(r.reaction) || movementUse);
+  // 技能名出现在规则提问/纠正里不是宣告；只接收完整、明确的短宣告。
+  const explicit = hasQuestionMark ? [] : choices.filter((r) => {
+    if (movementUse) return true;
+    const nameAt = clean.indexOf(r.reaction);
+    const before = stripCharacterPrefix(clean.slice(0, nameAt).trim(), r.character);
+    const after = clean.slice(nameAt + r.reaction.length).trim();
+    return /^(我)?(这次|这下)?(要|想|决定)?(用|使用|开|交|放|施放|发动)?$/.test(before)
+      && /^(吧|了|呗|挡一下|挡|减他|减命中|减伤害|减一下|重掷|重骰)?[。.!！~～]*$/.test(after);
+  });
+  return explicit.length === 1
+    ? { kind: 'use', characters: [explicit[0]!.character], windowId: p.seq, choices: explicit }
+    : { kind: 'question', characters: listed, windowId: p.seq };
+}
+
+export function recordReactionReply(c: Campaign, senderId: string, reply: ReactionReply, messageId: string): ReactionReply {
+  const p = reactionWindow(c);
+  if (p === undefined || p.seq !== reply.windowId) return { ...reply, grants: [] };
+  const sourceId = `message:${senderId}:${messageId}`;
+  if (p.reactionReplyIds?.includes(sourceId)) return { ...reply, kind: 'question', grants: [] };
+  (p.reactionReplyIds ??= []).push(sourceId);
+  // 讨论也去重：补询问后，旧消息重投不能突然变成对新选项的授权。
+  if (reply.kind === 'question') return { ...reply, grants: [] };
+  const grants: ReactorOption[] = [];
+  const accepted: string[] = [];
+  for (const name of reply.characters) {
+    if (p.used.some((r) => r.by === name)) continue;
+    const choice = reply.choices?.find((r) => r.character === name);
+    if (reply.kind === 'use' && choice === undefined) continue;
+    const grant = chooseReaction(c, p, senderId, name, reply.kind === 'use' ? choice!.reaction : undefined);
+    accepted.push(name);
+    if (grant !== undefined) grants.push(grant);
+  }
+  if (accepted.length === 0) return { ...reply, kind: 'question', grants, issue: '这次反应已经结算，不能事后改成不用；若确需回退，请核对后用 dnd_undo。' };
+  return { ...reply, characters: accepted, grants };
 }
 
 /** 接在玩家消息后面的系统标记：没带 (@you) 也算数，也不是新的回合行动 */
@@ -246,14 +345,19 @@ export function reactionReplyNote(c: Campaign, reply: ReactionReply): string {
   const p = reactionWindow(c)!;
   const who = reply.characters.join('、');
   const what = describePending(p);
+  if (reply.issue !== undefined) return `[系统 · 反应讨论] ${reply.issue}`;
+  if (reply.kind === 'question' || (reply.kind === 'use' && (reply.grants?.length ?? 0) === 0)) {
+    return `[系统 · 反应讨论] 这条涉及「${what}」，但没有新的使用授权。回答规则/澄清选择，不能凭这条扣资源或跳过反应。`;
+  }
   if (reply.kind === 'decline') {
-    return `[系统 · 待结算] 这条是在回答「${what}」那笔的反应询问，不是回合行动：用 dnd_apply target=${p.target} decline=["${who}"] 记下；都答复了再 settle=true。`;
+    return `[系统 · 待结算] ${who} 本人明确选择不用；已由服务器记下并撤销旧授权。这是「${what}」的答复，不是回合行动；都答复了再 dnd_apply target=${p.target} settle=true。`;
   }
   if (p.kind === 'move') {
-    return `[系统 · 借机] 这条在回应 ${p.target} 的移动，不是新回合行动：用 dnd_check character=反应者 type=attack target=${p.target} reaction=true declared_by=本人编号 结算借机；工具会扣反应。所有人答复并结算完后 dnd_apply target=${p.target} settle=true 继续移动。`;
+    const grant = reply.grants![0]!;
+    return `[系统 · 借机] 本人已授权「${grant.reaction}」：用 dnd_check character=${grant.character} type=attack target=${p.target} reaction=true authorization="${grant.authorization}" 结算；所有人答复并结算完后 dnd_apply target=${p.target} settle=true 继续移动。`;
   }
   return `[系统 · 待结算] 这条按对「${what}」那笔的反应处理（没带 @ 也算），不是新的回合行动，也不要 next：`
-    + `用 dnd_apply target=${p.target} reaction={by, name, attack_mod/ac_mod/damage_mod 或 reroll:"d20", spend} 改数值，declared_by 填他的编号。`;
+    + reply.grants!.map((g) => `用 dnd_apply target=${p.target} reaction={by:"${g.character}", name:"${g.reaction}", authorization:"${g.authorization}", attack_mod/ac_mod/damage_mod 或 reroll:"d20", spend} 改数值。`).join(' ');
 }
 
 /** 这个反应会不会占掉角色本轮的反应：导引打击这类是自己攻击时用的，不算 */
@@ -264,6 +368,8 @@ export function consumesReaction(c: Campaign, p: PendingRoll, by: string, name: 
 export function findReactor(c: Campaign, p: PendingRoll, name: string, reactionName: string): Character {
   const ch = findCharacter(c, name);
   if (ch === undefined) throw new Error(`找不到角色「${name}」`);
+  if (c.initiative !== undefined && !inInitiative(c, ch.name)) throw new Error(`${ch.name} 不在当前战斗的参战名单里，不能结算反应`);
+  if (p.declined.includes(ch.name)) throw new Error(`${ch.name} 本人已选择不用，不能结算反应或扣资源`);
   if (p.used.some((r) => r.by === ch.name && r.name === reactionName)) throw new Error(`${ch.name} 已经对这笔用过「${reactionName}」`);
   const blocked = consumesReaction(c, p, ch.name, reactionName) ? reactionBlocked(c, ch.name) : undefined;
   if (blocked !== undefined) throw new Error(blocked);

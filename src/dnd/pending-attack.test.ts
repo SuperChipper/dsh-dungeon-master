@@ -7,8 +7,8 @@ import { AdventureLibrary } from './adventure.ts';
 import { type Campaign, CampaignStore, findCharacter, playerStatus, upsertCharacter } from './campaign.ts';
 import { DndService } from './dnd-service.ts';
 import { registerDndTools } from './dnd-tools.ts';
-import { classifyReactionReply, eligibleReactors, reactionReplyNote, reactionsOf } from './pending-attack.ts';
-import { ACK, DndTurnButtons, buildReactionKeyboard } from './turn-buttons.ts';
+import { chooseReaction, classifyReactionReply, eligibleReactors, recordReactionReply, reactionReplyNote, reactionsOf } from './pending-attack.ts';
+import { ACK, DndTurnButtons, buildReactionKeyboard, reactionOptionKey } from './turn-buttons.ts';
 import { encodeButtonData } from '../features/button-utils.ts';
 import { pendingReactionReply } from '../gateway/middleware-setup.ts';
 
@@ -50,13 +50,22 @@ function setup() {
   registerDndTools(ctx as never, { service, manager: manager as never, logger: logger as never, sendImage: vi.fn(), onPendingAttack });
   const call = async (name: string, args: Record<string, unknown>) => (await tools.get(name)!.execute(args, { agent: {} })).text;
   const campaign = (): Campaign => service.store.load(key)!;
+  const consent = (by: string, skill: string): string => service.store.update(key, (c) => {
+    const p = c.initiative!.pending ?? c.initiative!.movement!;
+    const existing = p.claimed.find((r) => r.character === by && r.reaction === skill)?.authorization;
+    return existing ?? chooseReaction(c, p, c.characters.find((ch) => ch.name === by)!.playerId!, by, skill)!.authorization!;
+  }, '测试：玩家本人明确选择');
   const hp = (name: string): number => findCharacter(campaign(), name)!.hp;
   const biteKriv = (): Promise<string> => call('dnd_check', { type: 'attack', character: '狼', target: 'Kriv' });
-  const press = (data: object, clicker: string): number | undefined => buttons.handleInteraction({
-    id: 'e1', type: 11, version: 1, group_openid: 'G1', group_member_openid: clicker,
-    data: { type: 11, resolved: { button_data: JSON.stringify({ t: 'dnd', ...data }) } },
-  } as InteractionEvent);
-  return { rolls, service, key, call, campaign, hp, biteKriv, press, buttons, followup, sender, record, manager, onPendingAttack };
+  let eventId = 0;
+  const press = (data: { a?: string; i?: number }, clicker: string): number | undefined => {
+    const option = (campaign().initiative?.pending ?? campaign().initiative?.movement)?.reactors[data.i ?? -1];
+    return buttons.handleInteraction({
+      id: `e${++eventId}`, type: 11, version: 1, group_openid: 'G1', group_member_openid: clicker,
+      data: { type: 11, resolved: { button_data: JSON.stringify({ t: 'dnd', ...(data.a === 'react' && option ? { o: reactionOptionKey(option) } : {}), ...data }) } },
+    } as InteractionEvent);
+  };
+  return { consent, rolls, service, key, call, campaign, hp, biteKriv, press, buttons, followup, sender, record, manager, onPendingAttack };
 }
 
 afterEach(() => {
@@ -182,7 +191,7 @@ describe('反应改数值', () => {
     t.rolls.push(10, 3); // 10+6=16，刚好命中 AC 16
     await t.biteKriv();
     t.rolls.push(2);
-    const text = await t.call('dnd_apply', { target: 'Kriv', declared_by: 'P2', reaction: { by: 'Kriv', name: '尖刻言语', attack_mod: '-1d6', spend: '诗人激励' } });
+    const text = await t.call('dnd_apply', { target: 'Kriv', declared_by: 'P2', reaction: { by: 'Kriv', name: '尖刻言语', authorization: t.consent('Kriv', '尖刻言语'), attack_mod: '-1d6', spend: '诗人激励' } });
     expect(text).toContain('未命中');
     expect(text).toContain('都答复了');
     expect(findCharacter(t.campaign(), 'Kriv')!.resources!['诗人激励']!.current).toBe(2);
@@ -195,7 +204,7 @@ describe('反应改数值', () => {
     t.rolls.push(20, 5, 5); // 重击 2d6+4 = 14
     await t.biteKriv();
     t.rolls.push(4);
-    await t.call('dnd_apply', { target: 'Kriv', declared_by: 'P2', reaction: { by: 'Kriv', name: '尖刻言语', damage_mod: '-1d6', spend: '诗人激励' }, settle: true });
+    await t.call('dnd_apply', { target: 'Kriv', declared_by: 'P2', reaction: { by: 'Kriv', name: '尖刻言语', authorization: t.consent('Kriv', '尖刻言语'), damage_mod: '-1d6', spend: '诗人激励' }, settle: true });
     expect(t.hp('Kriv')).toBe(10); // 20 - (14-4)
     expect(t.campaign().log.some((l) => l.includes('恢复'))).toBe(false);
   });
@@ -204,7 +213,7 @@ describe('反应改数值', () => {
     const t = setup();
     t.rolls.push(12, 3); // 18 vs 16
     await t.biteKriv();
-    const text = await t.call('dnd_apply', { target: 'Kriv', declared_by: 'P2', reaction: { by: 'Kriv', name: '护盾术', ac_mod: 5, spend: '防御法杖充能' } });
+    const text = await t.call('dnd_apply', { target: 'Kriv', declared_by: 'P2', reaction: { by: 'Kriv', name: '护盾术', authorization: t.consent('Kriv', '护盾术'), ac_mod: 5, spend: '防御法杖充能' } });
     expect(text).not.toContain('AC 21');
     expect(text).toContain('未命中');
     await t.call('dnd_apply', { target: 'Kriv', settle: true });
@@ -224,7 +233,7 @@ describe('反应改数值', () => {
     expect(first).toContain('待结算');
     expect(t.campaign().initiative!.pending!.rawDamage).toBeUndefined();
     t.rolls.push(5);
-    const text = await t.call('dnd_apply', { target: '狼', declared_by: 'P4', reaction: { by: '刻德温', name: '导引打击', attack_mod: '+10', spend: '引导神力' } });
+    const text = await t.call('dnd_apply', { target: '狼', declared_by: 'P4', reaction: { by: '刻德温', name: '导引打击', authorization: t.consent('刻德温', '导引打击'), attack_mod: '+10', spend: '引导神力' } });
     expect(text).toContain('现在命中');
     await t.call('dnd_apply', { target: '狼', settle: true });
     expect(t.hp('狼')).toBe(25);
@@ -252,7 +261,7 @@ describe('反应改数值', () => {
     const t = setup();
     t.rolls.push(15, 3);
     await t.biteKriv();
-    await t.call('dnd_apply', { target: 'Kriv', declared_by: 'P2', reaction: { by: 'Kriv', name: '尖刻言语', damage_mod: '-1' }, settle: true });
+    await t.call('dnd_apply', { target: 'Kriv', declared_by: 'P2', reaction: { by: 'Kriv', name: '尖刻言语', authorization: t.consent('Kriv', '尖刻言语'), damage_mod: '-1' }, settle: true });
     expect(t.campaign().initiative!.reacted).toEqual(['Kriv']);
 
     // 同一轮再被打：Kriv 没反应可用了，直接落账
@@ -397,9 +406,9 @@ describe('反应按钮', () => {
     expect(t.followup).not.toHaveBeenCalled();
     expect(t.press({ a: 'react', r: seq, i: 0 }, 'P2')).toBe(ACK.ok);
     expect(t.followup.mock.calls[0]![0].content[0].text).toContain('不是新的回合行动');
-    expect(t.press({ a: 'react', r: seq, i: 1 }, 'P2')).toBe(ACK.duplicate);
+    expect(t.press({ a: 'react', r: seq, i: 0 }, 'P2')).toBe(ACK.duplicate);
     t.rolls.push(1);
-    expect(await t.call('dnd_apply', { target: 'Kriv', reaction: { by: 'Kriv', name: '尖刻言语', damage_mod: '-1d6', spend: '诗人激励' } })).toContain('都答复了');
+    expect(await t.call('dnd_apply', { target: 'Kriv', reaction: { by: 'Kriv', name: '尖刻言语', authorization: t.campaign().initiative!.pending!.claimed[0]!.authorization, damage_mod: '-1d6', spend: '诗人激励' } })).toContain('都答复了');
   });
 
   it('点了要用但还没结算效果时，不能提前落账', async () => {
@@ -484,16 +493,16 @@ describe('inbound 认反应', () => {
     return { ...t, c: t.campaign() };
   }
 
-  it('「我用尖刻言语」算反应；名单外玩家提到反应词也算（可能卡上没登记）', async () => {
+  it('「我用尖刻言语」是宣告；名单外玩家提到反应是讨论', async () => {
     const { c } = await pending();
-    expect(classifyReactionReply(c, 'P2', '我用尖刻言语')).toEqual({ kind: 'use', characters: ['Kriv'] });
+    expect(classifyReactionReply(c, 'P2', '我用尖刻言语')).toMatchObject({ kind: 'use', characters: ['Kriv'] });
     expect(classifyReactionReply(c, 'P2', '<@!123> 尖刻言语 减他')).toMatchObject({ kind: 'use' });
-    expect(classifyReactionReply(c, 'P3', '我有反应吗，能帮挡吗')).toEqual({ kind: 'use', characters: [] });
+    expect(classifyReactionReply(c, 'P3', '我有反应吗，能帮挡吗')).toMatchObject({ kind: 'question', characters: [] });
   });
 
   it('「不用」只认名单里的人，别人说算了不算回应', async () => {
     const { c } = await pending();
-    expect(classifyReactionReply(c, 'P2', '不用')).toEqual({ kind: 'decline', characters: ['Kriv'] });
+    expect(classifyReactionReply(c, 'P2', '不用')).toMatchObject({ kind: 'decline', characters: ['Kriv'] });
     expect(classifyReactionReply(c, 'P2', '不用了。')).toMatchObject({ kind: 'decline' });
     expect(classifyReactionReply(c, 'P3', '算了')).toBeUndefined();
   });
@@ -509,20 +518,180 @@ describe('inbound 认反应', () => {
 
   it('标记写明不是新回合、没带 @ 也算', async () => {
     const { c } = await pending();
-    const use = reactionReplyNote(c, { kind: 'use', characters: ['Kriv'] });
+    const reply = recordReactionReply(c, 'P2', classifyReactionReply(c, 'P2', '我用尖刻言语')!, 'm1');
+    const use = reactionReplyNote(c, reply);
     expect(use).toContain('不是新的回合行动');
     expect(use).toContain('没带 @ 也算');
-    expect(reactionReplyNote(c, { kind: 'decline', characters: ['Kriv'] })).toContain('decline=["Kriv"]');
+    expect(reactionReplyNote(c, { kind: 'decline', characters: ['Kriv'] })).toContain('撤销旧授权');
   });
 
   it('中间件入口：只有群消息、有待结算、认得出才给标记', async () => {
     const t = await pending();
-    const msg = (content: string, extra: object = {}) => ({ kind: 'group', groupOpenid: 'G1', senderId: 'P2', content, ...extra }) as never;
-    expect(pendingReactionReply(msg('我用尖刻言语'), t.manager as never)?.note).toContain('[系统 · 待结算]');
+    const msg = (content: string, extra: object = {}) => ({ kind: 'group', groupOpenid: 'G1', senderId: 'P2', content, messageId: 'm1', ...extra }) as never;
+    expect(pendingReactionReply(msg('我用尖刻言语'), t.manager as never, true)?.note).toContain('[系统 · 待结算]');
     expect(pendingReactionReply(msg('吃饭了'), t.manager as never)).toBeUndefined();
     expect(pendingReactionReply(msg('我用尖刻言语', { kind: 'c2c' }), t.manager as never)).toBeUndefined();
-    await t.call('dnd_apply', { target: 'Kriv', decline: ['Kriv'], settle: true });
+    pendingReactionReply(msg('不用', { messageId: 'm2' }), t.manager as never, true);
+    await t.call('dnd_apply', { target: 'Kriv', settle: true });
     expect(pendingReactionReply(msg('我用尖刻言语'), t.manager as never)).toBeUndefined();
+  });
+});
+
+describe('服务器反应授权', () => {
+  async function pending() {
+    const t = setup();
+    t.rolls.push(15, 3);
+    await t.biteKriv();
+    return t;
+  }
+  function reply(t: ReturnType<typeof setup>, content: string, messageId: string, senderId = 'P2') {
+    return pendingReactionReply({ kind: 'group', groupOpenid: 'G1', senderId, content, messageId } as never, t.manager as never, true);
+  }
+  function token(t: ReturnType<typeof setup>) {
+    return t.campaign().initiative!.pending!.claimed[0]!.authorization!;
+  }
+  const shield = (t: ReturnType<typeof setup>, authorization?: string) => t.call('dnd_apply', {
+    target: 'Kriv', declared_by: 'P2', reaction: { by: 'Kriv', name: '护盾术', ac_mod: 5, spend: '防御法杖充能', authorization },
+  });
+
+  it('玩家编号或规则提问不授权；含混群聊短答也不自动拒绝', async () => {
+    const t = await pending();
+    const before = t.campaign();
+    await expect(shield(t)).rejects.toThrow('有效授权');
+    for (const [i, text] of ['护盾术持续一回合的', '能用护盾术吗？', '我有反应吗，能帮挡吗'].entries()) {
+      expect(reply(t, text, `q${i}`)?.note).toContain('没有新的使用授权');
+    }
+    for (const text of ['没有', '没', '算了']) expect(reply(t, text, text)).toBeUndefined();
+    expect(reply(t, '我用护盾术', 'other', 'P3')).toBeDefined();
+    expect(t.campaign()).toMatchObject({ characters: before.characters, initiative: { pending: { claimed: [], declined: [] } } });
+    await expect(shield(t)).rejects.toThrow('有效授权');
+  });
+
+  it('复现日志竞态：明确宣告排队，随后点不用，旧调用不能扣账或掷骰', async () => {
+    const t = await pending();
+    expect(reply(t, '我用护盾术', 'm1')?.note).toContain('authorization:');
+    const old = token(t);
+    expect(t.press({ a: 'pass', r: t.campaign().initiative!.pending!.seq }, 'P2')).toBe(ACK.ok);
+    const before = t.campaign();
+    t.rolls.push(4, 2);
+    await expect(shield(t, old)).rejects.toThrow('已选择不用');
+    expect(t.campaign()).toEqual(before);
+    expect(t.rolls).toEqual([4, 2]);
+    expect(before.initiative!.pending!.claimed).toEqual([]);
+    expect(before.initiative!.reacted).toBeUndefined();
+    expect(findCharacter(before, 'Kriv')!.resources!.防御法杖充能!.current).toBe(2);
+  });
+
+  it('本人重新同意发新凭证，旧凭证和重复投递的消息不能复活或消费', async () => {
+    const t = await pending();
+    reply(t, '我用护盾术', 'm1');
+    const old = token(t);
+    reply(t, '不用', 'm2');
+    reply(t, '我用护盾术', 'm1');
+    expect(t.campaign().initiative!.pending!.claimed).toEqual([]);
+    reply(t, '我用护盾术', 'm3');
+    const current = token(t);
+    expect(current).not.toBe(old);
+    await expect(shield(t, old)).rejects.toThrow('有效授权');
+    await shield(t, current);
+    const after = t.campaign();
+    await expect(shield(t, current)).rejects.toThrow('已经对这笔用过');
+    expect(t.campaign()).toEqual(after);
+    expect(findCharacter(after, 'Kriv')!.resources!.防御法杖充能!.current).toBe(1);
+  });
+
+  it('授权不能换技能、不能被 DM decline 覆盖；本人改选技能撤销旧凭证', async () => {
+    const t = await pending();
+    reply(t, '我用尖刻言语', 'm1');
+    const old = token(t);
+    await expect(shield(t, old)).rejects.toThrow('有效授权');
+    await expect(t.call('dnd_apply', { target: 'Kriv', decline: ['Kriv'], settle: true })).rejects.toThrow('不能替他改成不用');
+    const seq = t.campaign().initiative!.pending!.seq;
+    expect(t.press({ a: 'react', r: seq, i: 1 }, 'P2')).toBe(ACK.ok);
+    expect(token(t)).not.toBe(old);
+    t.rolls.push(4);
+    await expect(t.call('dnd_apply', { target: 'Kriv', reaction: { by: 'Kriv', name: '尖刻言语', damage_mod: '-1d6', authorization: old } })).rejects.toThrow('有效授权');
+    expect(t.rolls).toEqual([4]);
+    await shield(t, token(t));
+  });
+
+  it('重掷后名单重排时，旧按钮不能把原来的技能选成另一个技能', async () => {
+    const t = await pending();
+    const p = t.campaign().initiative!.pending!;
+    const data = { t: 'dnd', a: 'react', r: p.seq, i: 0, o: reactionOptionKey(p.reactors[0]!) };
+    t.service.store.update(t.key, (c) => { c.initiative!.pending!.reactors.reverse(); });
+    expect(t.buttons.handleInteraction({ id: 'stale-option', type: 11, version: 1, group_openid: 'G1', group_member_openid: 'P2',
+      data: { type: 11, resolved: { button_data: JSON.stringify(data) } } } as InteractionEvent)).toBe(ACK.duplicate);
+    expect(t.campaign().initiative!.pending!.claimed).toEqual([]);
+    expect(t.press({ a: 'react', r: p.seq, i: 0 }, 'P2')).toBe(ACK.ok);
+    await shield(t, token(t));
+  });
+
+  it('不能在拒绝后用另一次检定的 use_reaction 绕过当前窗口授权', async () => {
+    const t = await pending();
+    reply(t, '不用', 'm1');
+    const before = t.campaign();
+    await expect(t.call('dnd_check', { type: 'check', character: 'Kriv', ability: '魅力', reaction: true, use_reaction: true, declared_by: 'P2', spend: '防御法杖充能' })).rejects.toThrow('待结算');
+    expect(t.campaign()).toEqual(before);
+  });
+
+  it('相同角色和技能的新窗口也不能重用旧凭证', async () => {
+    const t = await pending();
+    reply(t, '我用护盾术', 'm1');
+    const old = token(t);
+    reply(t, '不用', 'm2');
+    await t.call('dnd_apply', { target: 'Kriv', settle: true });
+    t.rolls.push(15, 3);
+    await t.biteKriv();
+    reply(t, '我用护盾术', 'm3');
+    await expect(shield(t, old)).rejects.toThrow('有效授权');
+    await shield(t, token(t));
+  });
+
+  it('遗漏的手动反应可以补询问，保持原骰子和窗口，仍须本人重新确认', async () => {
+    const t = await pending();
+    const before = t.campaign().initiative!.pending!;
+    expect(reply(t, '我用时间变幻', 'm1', 'P3')?.note).toContain('没有新的使用授权');
+    const ask = { target: 'Kriv', ask_reactions: [{ by: '卡厄斯', name: '时间变幻' }] };
+    expect(await t.call('dnd_apply', ask)).toContain('原骰子保持不变');
+    expect(t.campaign().initiative!.pending).toMatchObject({ seq: before.seq, natural: before.natural, total: before.total, rawDamage: before.rawDamage, claimed: [] });
+    expect(t.onPendingAttack).toHaveBeenCalledTimes(2);
+    await expect(t.call('dnd_apply', { target: 'Kriv', reaction: { by: '卡厄斯', name: '时间变幻', reroll: 'd20' }, declared_by: 'P3' })).rejects.toThrow('有效授权');
+    // 原消息重复投递不算对新增询问的确认。
+    reply(t, '我用时间变幻', 'm1', 'P3');
+    expect(t.campaign().initiative!.pending!.claimed).toEqual([]);
+    reply(t, '我用时间变幻', 'm2', 'P3');
+    t.rolls.push(5);
+    expect(await t.call('dnd_apply', { target: 'Kriv', reaction: { by: '卡厄斯', name: '时间变幻', reroll: 'd20', authorization: token(t) } })).toContain('重掷');
+    await expect(t.call('dnd_apply', { ...ask, settle: true })).rejects.toThrow('不能同时');
+  });
+
+  it('纯检测不生成授权；DM 补询问不能清除本人拒绝', async () => {
+    const t = await pending();
+    pendingReactionReply({ kind: 'group', groupOpenid: 'G1', senderId: 'P2', content: '我用护盾术', messageId: 'm1' } as never, t.manager as never);
+    expect(t.campaign().initiative!.pending!.claimed).toEqual([]);
+    reply(t, '不用', 'm2');
+    const before = t.campaign();
+    await expect(t.call('dnd_apply', { target: 'Kriv', ask_reactions: [{ by: 'Kriv', name: '时间变幻' }] })).rejects.toThrow('不能由 DM 重新询问覆盖');
+    expect(t.campaign()).toEqual(before);
+  });
+
+  it('按钮旧回调重投不能撤回后重新授权，旧存档确认需本人重选', async () => {
+    const t = await pending();
+    t.service.store.update(t.key, (c) => { c.initiative!.pending!.claimed = [{ character: 'Kriv', reaction: '护盾术' }]; });
+    await expect(shield(t)).rejects.toThrow('有效授权');
+    const seq = t.campaign().initiative!.pending!.seq;
+    expect(t.press({ a: 'react', r: seq, i: 1 }, 'P2')).toBe(ACK.ok);
+    const old = token(t);
+    expect(t.press({ a: 'react', r: seq, i: 1 }, 'P2')).toBe(ACK.duplicate);
+    expect(t.press({ a: 'pass', r: seq }, 'P2')).toBe(ACK.ok);
+    const replay = t.buttons.handleInteraction({ id: 'e1', type: 11, version: 1, group_openid: 'G1', group_member_openid: 'P2',
+      data: { type: 11, resolved: { button_data: JSON.stringify({ t: 'dnd', a: 'react', r: seq, i: 1 }) } } } as InteractionEvent);
+    expect(replay).toBe(ACK.duplicate);
+    const replayDuplicate = t.buttons.handleInteraction({ id: 'e2', type: 11, version: 1, group_openid: 'G1', group_member_openid: 'P2',
+      data: { type: 11, resolved: { button_data: JSON.stringify({ t: 'dnd', a: 'react', r: seq, i: 1 }) } } } as InteractionEvent);
+    expect(replayDuplicate).toBe(ACK.duplicate);
+    await expect(shield(t, old)).rejects.toThrow('已选择不用');
   });
 });
 
@@ -571,7 +740,7 @@ describe('哨兵：别人挨打时反手一记', () => {
     await place(t, [['狼', 5, 5], ['Kriv', 6, 5], ['刻德温', 5, 6]]);
     t.rolls.push(15, 3);
     await t.biteKriv();
-    const text = await t.call('dnd_apply', { target: 'Kriv', reaction: { by: '刻德温', name: '哨兵' }, declared_by: 'P4' });
+    const text = await t.call('dnd_apply', { target: 'Kriv', reaction: { by: '刻德温', name: '哨兵', authorization: t.consent('刻德温', '哨兵') }, declared_by: 'P4' });
     expect(text).toContain('新的攻击');
     expect(text).toContain('dnd_check character=刻德温');
     expect(t.hp('Kriv')).toBe(20); // 这笔还没落账

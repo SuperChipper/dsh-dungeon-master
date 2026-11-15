@@ -2,18 +2,21 @@
 import { roomGraph } from '../adventure.ts';
 import {
 assertCanAct,assertDeclaredByOwner,assertNoPending,
-assertCanEndTurn,endInitiative,gotoTurn,fightRooms,
+assertCanEndTurn,endInitiative,findCharacter,gotoTurn,fightRooms,
 joinInitiative,nextTurn,skipSurprised,requireCharacter,
 requireInitiative,startInitiative,spendReaction
 } from '../campaign.ts';
+import { combatParticipantCard } from '../combat-context.ts';
 import { findRoom,resolveRoom } from '../dungeon.ts';
 import {
 type AreaRequest,
 type MoveRequest,
 areaReport,battleGridLines,
 battleLines,
+clearBattleMap,
 distancesFrom,
 hiddenFromPlayers,
+mapOf,
 removePosition,
 setBattleMap,
 setPositions,unplaced
@@ -56,9 +59,27 @@ export function registerCombatTools(kit: ToolKit): void {
       bonus: {
         type: 'object',
         additionalProperties: { type: 'string' },
-        description: 'For start: initiative bonuses already in effect, {name: dice expression}, e.g. {"奇塔露":"1d8"} for 灵敏之赐 or {"卡厄斯":"5"}. Rolled into the total by the tool.',
+        description: 'For start or join: initiative bonuses already in effect, {name: dice expression}, e.g. {"奇塔露":"1d8"} for 灵敏之赐 or {"卡厄斯":"5"}. Rolled into the total by the tool.',
       },
       surprised: { type: 'array', items: { type: 'string' }, description: 'For start: participants who are surprised; the tool skips their first turn.' },
+      rehearsal: {
+        type: 'boolean',
+        description: 'For start: dream/illusion/sparring rehearsal fight. Snapshots party HP/resources/conditions, room battlemap and module state before combat, suppresses permanent chronicle/story triggers during the fight, and automatically restores everything and removes temporary_monsters on action=end.',
+      },
+      rehearsal_hp: {
+        type: 'object',
+        additionalProperties: { type: 'integer' },
+        description: 'For start or join when rehearsal=true: temporary starting HP inside the rehearsal/dream, e.g. {"丛云": 49}, restored to pre-rehearsal values when combat ends.',
+      },
+      temporary_monsters: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'For start or join when rehearsal=true: improvised dream/sparring monster names to auto-remove when the rehearsal ends.',
+      },
+      keep_changes: {
+        type: 'boolean',
+        description: 'For end on a rehearsal fight: keep HP/resource/map changes instead of restoring the pre-rehearsal snapshot (default false).',
+      },
       name: { type: 'string', description: 'For goto.' },
       round: { type: 'integer', description: 'For goto.' },
       declared_by: { type: 'string', description: 'For next on a PC turn: member id (the #U number in "[昵称 #U3]", pass "U3") of that PC\'s player, who said they are done.' },
@@ -77,9 +98,22 @@ export function registerCombatTools(kit: ToolKit): void {
         const room = roomArg === undefined ? undefined : resolveRoom(roomGraph(adventure), roomArg)?.id;
         if (roomArg !== undefined && room === undefined) throw new Error(`没有这个房间: ${roomArg}`);
         const surprised = strList(args.surprised) ?? [];
-        const rolls = startInitiative(c, service.roller, strList(args.participants), room, initiativeBonusArg(args.bonus), surprised);
+        const rehearsalHp: Record<string, number> = {};
+        if (args.rehearsal_hp !== null && typeof args.rehearsal_hp === 'object' && !Array.isArray(args.rehearsal_hp)) {
+          for (const [k, v] of Object.entries(args.rehearsal_hp as Record<string, unknown>)) {
+            const hp = int(v);
+            if (k.trim() && hp !== undefined && hp > 0) rehearsalHp[k.trim()] = hp;
+          }
+        }
+        const tempMonsters = strList(args.temporary_monsters);
+        const rolls = startInitiative(c, service.roller, strList(args.participants), room, initiativeBonusArg(args.bonus), surprised, {
+          rehearsal: args.rehearsal === true,
+          ...(Object.keys(rehearsalHp).length > 0 ? { rehearsalHp } : {}),
+          ...(tempMonsters !== undefined ? { temporaryMonsters: tempMonsters } : {}),
+        });
         const { skipped } = skipSurprised(c);
         const state = requireInitiative(c);
+        const rehearsalNote = state.rehearsal ? '\n【演练模式】已保存演练前快照；演练期间的地形、伤害与消耗在 dnd_initiative end 时自动恢复，不污染真实地图与账本。' : '';
         const surpriseNote = surprised.length === 0 ? ''
           : `\n【突袭】受惊的人第 1 轮整回合由工具跳过，跳过之前也不能反应：${surprised.join('、')}。不用叫他们点结束回合。`
             + (skipped.length > 0 ? `已跳过：${skipped.join('、')}。` : '');
@@ -89,20 +123,51 @@ export function registerCombatTools(kit: ToolKit): void {
         if (!delegated) turnChanged();
         const unused = Object.keys(initiativeBonusArg(args.bonus)).filter((n) => !rolls.some((r) => r.name === n));
         const warn = unused.length > 0 ? `\n【DM】bonus 里这几个名字不在参战者里，没算进去：${unused.join('、')}` : '';
-        return `先攻：\n${rolls.map((r, i) => `${i + 1}. ${r.name} ${r.detail}`).join('\n')}\n${delegated ? '【战斗委派】回复只叙述开场并停下。回复结束后战斗代理自动接手场地图、摆位和当前回合；不要再用主 DM 结算攻击或 next。' : field}${surpriseNote}\n第 ${state.round} 轮，${delegated ? `当前 ${state.order[state.turn]!.name}` : combatTurnPrompt(c, state.order[state.turn]!.name, { recentSenders: sendersOf(exec) })}${away}${warn}`;
+        return `先攻：\n${rolls.map((r, i) => `${i + 1}. ${r.name} ${r.detail}`).join('\n')}\n${delegated ? '【战斗委派】回复只叙述开场并停下。回复结束后战斗代理自动接手场地图、摆位和当前回合；不要再用主 DM 结算攻击或 next。' : field}${rehearsalNote}${surpriseNote}\n第 ${state.round} 轮，${delegated ? `当前 ${state.order[state.turn]!.name}` : combatTurnPrompt(c, state.order[state.turn]!.name, { recentSenders: sendersOf(exec) })}${away}${warn}`;
       }
       if (action === 'join') {
+        assertNoPending(c, '加入战斗');
         const rooms = fightRooms(c);
-        const rolls = joinInitiative(c, strList(args.participants) ?? [], service.roller);
+        const bonusMap = initiativeBonusArg(args.bonus);
+        const rehearsalHp: Record<string, number> = {};
+        if (args.rehearsal_hp !== null && typeof args.rehearsal_hp === 'object' && !Array.isArray(args.rehearsal_hp)) {
+          for (const [k, v] of Object.entries(args.rehearsal_hp as Record<string, unknown>)) {
+            const hp = int(v);
+            if (k.trim() && hp !== undefined && hp > 0) rehearsalHp[k.trim()] = hp;
+          }
+        }
+        const tempMonsters = strList(args.temporary_monsters);
+        const rolls = joinInitiative(c, strList(args.participants) ?? [], service.roller, bonusMap, {
+          ...(Object.keys(rehearsalHp).length > 0 ? { rehearsalHp } : {}),
+          ...(tempMonsters !== undefined ? { temporaryMonsters: tempMonsters } : {}),
+        });
         const state = requireInitiative(c);
         const current = state.order[state.turn]?.name;
         const away = positionNote(c, adventure, rolls.map((r) => r.name), rooms);
+        const unused = Object.keys(bonusMap).filter((n) => !rolls.some((r) => r.name === n));
+        const warn = unused.length > 0 ? `\n【DM】bonus 里这几个名字不在本次加入名单里，没算进去：${unused.join('、')}` : '';
+        const joinedSet = new Set(rolls.map((r) => r.name));
+        const thisRoundNames = state.order.slice(state.turn + 1).filter((e) => joinedSet.has(e.name)).map((e) => e.name);
+        const nextRoundNames = state.order.slice(0, state.turn).filter((e) => joinedSet.has(e.name)).map((e) => e.name);
+        const turnTiming = current === undefined
+          ? '调用 dnd_initiative next 轮到下一位。'
+          : [
+            `仍是 ${current} 的回合。`,
+            ...(thisRoundNames.length > 0 ? [`排在 ${current} 后面的 ${thisRoundNames.join('、')} 本轮稍后就能行动；`] : []),
+            ...(nextRoundNames.length > 0 ? [`排在 ${current} 前面的 ${nextRoundNames.join('、')} 本轮已错过顺位，下一轮才轮到主动回合（但从现在起已可正常触发反应与借机）。`] : []),
+          ].join('');
+        const joinedAllies = rolls
+          .map((r) => findCharacter(c, r.name))
+          .filter((ch): ch is NonNullable<typeof ch> => ch !== undefined && ch.kind !== 'monster');
+        const hydratedCards = joinedAllies.length > 0
+          ? `\n【新入战我方能力卡（开战快照曾精简，以此完整卡为准）】\n${JSON.stringify(joinedAllies.map((ch) => combatParticipantCard(c, ch)))}`
+          : '';
         return `加入战斗：${rolls.map((r) => `${r.name} ${r.detail}`).join('；')}\n第 ${state.round} 轮：${orderLine(c)}\n`
-          + (current === undefined
-            ? '调用 dnd_initiative next 轮到下一位。'
-            : `仍是 ${current} 的回合；排在 ${current} 前面的新成员本轮已错过，下一轮才行动。`)
+          + turnTiming
           + away
-          + (unplaced(c).length > 0 ? `\n【站位】还没摆位：${unplaced(c).join('、')}，用 dnd_position set。` : '');
+          + (unplaced(c).length > 0 ? `\n【站位】还没摆位：${unplaced(c).join('、')}，用 dnd_position set。` : '')
+          + warn
+          + hydratedCards;
       }
       if (action === 'next') {
         assertCanEndTurn(c, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec), dmOverride: args.dm_override === true });
@@ -119,10 +184,18 @@ export function registerCombatTools(kit: ToolKit): void {
       }
       if (action === 'end') {
         assertNoPending(c, '结束战斗');
-        const { rounds, defeated } = endInitiative(c);
+        const { rounds, defeated, restored } = endInitiative(c, { keepChanges: args.keep_changes === true });
         // 专用子级在工具落账后直接交回主 DM，省掉一次收尾模型请求。
         if (kit.manager.combatAgents?.isChild(recordOf(exec).agent)) exec.concludeTurn?.();
-        return `战斗结束，共 ${rounds} 轮。${defeated.length > 0 ? `击败：${defeated.join('、')}` : ''}`;
+        const parts = [`战斗结束，共 ${rounds} 轮。`];
+        if (defeated.length > 0) parts.push(`击败：${defeated.join('、')}。`);
+        if (c.lastCombat && c.lastCombat.survivingMonsters.length > 0) {
+          parts.push(`仍存活敌方：${c.lastCombat.survivingMonsters.map((m) => m.name).join('、')}。`);
+        }
+        if (restored) {
+          parts.push('【演练还原】已自动恢复演练前的角色状态、资源与房间场地图，并清理演练临时怪物。');
+        }
+        return parts.join('');
       }
       const graph = roomGraph(adventure);
       return [`第 ${requireInitiative(c).round} 轮：${orderLine(c)}`, ...battleLines(c, (id) => findRoom(graph, id)?.name ?? id)].join('\n');
@@ -148,9 +221,10 @@ export function registerCombatTools(kit: ToolKit): void {
     + 'area: before an area spell or breath (fireball, hypnotic pattern, lightning bolt), list who the '
     + 'shape covers so the placement is checked on the grid instead of guessed; tell the players honestly if an ally is in it. '
     + 'show: everyone\'s positions; with `from`, distances from that creature. remove: drop a mark '
-    + 'or placement (never remove someone who just stepped outside: move them `to` the corridor outside).',
+    + 'or placement (never remove someone who just stepped outside: move them `to` the corridor outside). '
+    + 'clear_terrain: clear an improvised/temporary arena map for the room, restoring the module\'s authored map if one exists.',
     {
-      action: { type: 'string', enum: ['terrain', 'set', 'move', 'area', 'show', 'remove'] },
+      action: { type: 'string', enum: ['terrain', 'clear_terrain', 'set', 'move', 'area', 'show', 'remove'] },
       shape: {
         type: 'string',
         enum: ['sphere', 'cube', 'line'],
@@ -237,6 +311,18 @@ export function registerCombatTools(kit: ToolKit): void {
         const grid = c.initiative === undefined ? undefined : battleGridLines(c, roomName);
         if (grid !== undefined) lines.push('', ...grid);
         return lines.join('\n');
+      }
+      if (action === 'clear_terrain') {
+        const roomArg = str(args.room);
+        const room = roomArg === undefined ? fightRoom(c) : resolveRoom(graph, roomArg)?.id;
+        if (room === undefined) throw new Error(`没有这个房间: ${roomArg}`);
+        const authored = findRoom(graph, room)?.battlemap;
+        const hadMap = mapOf(c, room) !== undefined;
+        const restored = clearBattleMap(c, room, authored);
+        if (!hadMap && restored === undefined) return `${roomName(room)} 当前没有保存的自定义场地图。`;
+        return restored !== undefined
+          ? `已清除 ${roomName(room)} 的临时场地图，并恢复模组预设场地图。`
+          : `已清除 ${roomName(room)} 的自定义场地图。`;
       }
       if (action === 'area') {
         const shape = str(args.shape);

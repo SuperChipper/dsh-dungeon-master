@@ -7,10 +7,11 @@ import type { DndCombatAgentConfig } from '../config.ts';
 import type { DshAgent, DshAgentHandle, DshAgentRegistry, SessionEventLike, SessionRecord } from '../session/types.ts';
 import type { Logger } from '../types.ts';
 import { GROUP_MESSAGE_FORMAT_PROMPT } from '../features/message-format.ts';
-import { summarize, type Campaign } from './campaign.ts';
+import { summarize, type Campaign, type Character, type CombatLedgerEntry, type Resource } from './campaign.ts';
 import type { DndService } from './dnd-service.ts';
 import { combatPartyContext } from './combat-context.ts';
 import type { DndToolView } from './tool-views.ts';
+import { isAutoSteerTurnEnd } from '../transport/turn-steer.ts';
 
 /** 不继承终端、文件、任意委派或剧情推进能力，群权限不因战斗委派扩大。 */
 export const COMBAT_TOOLS = [
@@ -43,6 +44,8 @@ export interface CombatRun {
   before: string;
   chronicleId: number;
   lastNarration?: string;
+  lastNarrationRound?: number;
+  narratedLedgerCount?: number;
   handoff?: string;
   usage: Record<string, Usage>;
   lastSeq: Record<string, number>;
@@ -82,12 +85,114 @@ export function recentCombatDialogue(agent: DshAgent, maxChars: number): string 
   return lines.join('\n');
 }
 
+interface PartySnapshotItem {
+  name: string;
+  hp: number;
+  maxHp: number;
+  tempHp: number;
+  conditions: string[];
+  resources?: Record<string, Resource>;
+  notes?: string;
+  inventory: string[];
+  gp: number;
+  room?: string;
+}
+
+function partySnapshotItemsFromCharacters(characters: readonly Character[]): PartySnapshotItem[] {
+  return characters.filter((ch) => ch.kind !== 'monster').map((ch) => ({
+    name: ch.name,
+    hp: ch.hp,
+    maxHp: ch.maxHp,
+    tempHp: ch.tempHp ?? 0,
+    conditions: [...(ch.conditions ?? [])],
+    ...(ch.resources !== undefined ? { resources: structuredClone(ch.resources) } : {}),
+    ...(ch.notes !== undefined ? { notes: ch.notes } : {}),
+    inventory: [...(ch.inventory ?? [])],
+    gp: ch.gp ?? 0,
+    ...(ch.room !== undefined ? { room: ch.room } : {}),
+  }));
+}
+
 function partyState(c: Campaign): string {
-  return JSON.stringify(c.characters.filter((ch) => ch.kind !== 'monster').map((ch) => ({
-    name: ch.name, hp: ch.hp, maxHp: ch.maxHp, tempHp: ch.tempHp,
-    conditions: ch.conditions, resources: ch.resources, notes: ch.notes,
-    inventory: ch.inventory, gp: ch.gp, room: ch.room,
-  })));
+  // 演练模式下 startInitiative 会在开战时把角色临时改成演练血量，交接基线应取真正的演练前快照
+  const source = c.initiative?.rehearsalSnapshot?.characters ?? c.characters;
+  return JSON.stringify(partySnapshotItemsFromCharacters(source));
+}
+
+function formatPartyDelta(beforeJson: string, c: Campaign): string {
+  let prevList: PartySnapshotItem[] | undefined;
+  try {
+    const parsed = JSON.parse(beforeJson) as unknown;
+    if (Array.isArray(parsed)) prevList = parsed as PartySnapshotItem[];
+  } catch { /* fallback below */ }
+  const current = partySnapshotItemsFromCharacters(c.characters);
+  if (prevList === undefined) {
+    return current.map((ch) => `${ch.name} HP ${ch.hp}/${ch.maxHp}${ch.tempHp > 0 ? `(+${ch.tempHp})` : ''}${ch.conditions.length > 0 ? ` [${ch.conditions.join('、')}]` : ''}`).join('；') || '无角色';
+  }
+  const prevByName = new Map(prevList.map((p) => [p.name, p]));
+  const currNames = new Set(current.map((ch) => ch.name));
+  const lines: string[] = [];
+  for (const curr of current) {
+    const prev = prevByName.get(curr.name);
+    if (prev === undefined) {
+      lines.push(`- 新增同伴 ${curr.name}：HP ${curr.hp}/${curr.maxHp}${curr.conditions.length > 0 ? ` [${curr.conditions.join('、')}]` : ''}`);
+      continue;
+    }
+    const diffs: string[] = [];
+    if (prev.hp !== curr.hp || prev.maxHp !== curr.maxHp) {
+      diffs.push(`HP ${prev.hp}/${prev.maxHp}→${curr.hp}/${curr.maxHp}`);
+    }
+    if ((prev.tempHp ?? 0) !== (curr.tempHp ?? 0)) {
+      diffs.push(`临时HP ${prev.tempHp ?? 0}→${curr.tempHp ?? 0}`);
+    }
+    const prevCond = prev.conditions ?? [];
+    if (JSON.stringify(prevCond) !== JSON.stringify(curr.conditions)) {
+      diffs.push(`状态 [${prevCond.join('、') || '无'}]→[${curr.conditions.join('、') || '无'}]`);
+    }
+    const resKeys = new Set([...Object.keys(prev.resources ?? {}), ...Object.keys(curr.resources ?? {})]);
+    const resDiffs: string[] = [];
+    for (const key of resKeys) {
+      const pr = prev.resources?.[key];
+      const cr = curr.resources?.[key];
+      if (pr?.current !== cr?.current || pr?.max !== cr?.max) {
+        resDiffs.push(`${key} ${pr ? `${pr.current}/${pr.max}` : '无'}→${cr ? `${cr.current}/${cr.max}` : '移除'}`);
+      }
+    }
+    if (resDiffs.length > 0) diffs.push(`资源 ${resDiffs.join('、')}`);
+    if ((prev.gp ?? 0) !== (curr.gp ?? 0)) diffs.push(`金币 ${prev.gp ?? 0}→${curr.gp ?? 0}`);
+    const prevInv = prev.inventory ?? [];
+    if (JSON.stringify(prevInv) !== JSON.stringify(curr.inventory)) {
+      const added = curr.inventory.filter((x) => !prevInv.includes(x));
+      const removed = prevInv.filter((x) => !curr.inventory.includes(x));
+      if (added.length > 0) diffs.push(`新增物品 [${added.join('、')}]`);
+      if (removed.length > 0) diffs.push(`消耗/移除物品 [${removed.join('、')}]`);
+      if (added.length === 0 && removed.length === 0) diffs.push(`物品数量变化`);
+    }
+    if ((prev.room ?? '') !== (curr.room ?? '')) diffs.push(`房间 ${prev.room ?? '随队'}→${curr.room ?? '随队'}`);
+    if ((prev.notes ?? '') !== (curr.notes ?? '')) diffs.push(`备注更新：${(curr.notes ?? '（清空）').slice(0, 240)}`);
+    if (diffs.length > 0) lines.push(`- ${curr.name}：${diffs.join('；')}`);
+  }
+  for (const prev of prevList) {
+    if (!currNames.has(prev.name)) lines.push(`- 已移除角色：${prev.name}`);
+  }
+  if (lines.length === 0) {
+    return c.lastCombat?.restored
+      ? '【演练已自动还原】所有角色 HP、资源、状态、物品及房间场地图已恢复到开战前快照，无永久损耗。'
+      : '队伍 HP、资源、状态与物品较开战前无净变化。';
+  }
+  return lines.join('\n');
+}
+
+function formatLedgerByRound(entries: readonly CombatLedgerEntry[]): string {
+  const groups = new Map<number, string[]>();
+  for (const entry of entries) {
+    const list = groups.get(entry.round) ?? [];
+    list.push(`${entry.seq !== undefined ? `[#R${entry.seq}] ` : ''}${entry.text}`);
+    groups.set(entry.round, list);
+  }
+  return [...groups.entries()]
+    .map(([round, list]) => `第 ${round} 轮：\n${list.map((line) => `  - ${line}`).join('\n')}`)
+    .join('\n');
 }
 
 function rowUsage(label: string, u: Usage): string {
@@ -198,10 +303,10 @@ export class DndCombatAgents {
       const found = this.service.active(main.sessionKey);
       const config = this.settings();
       if (existing !== undefined) {
-        if (existing.child.agent.status !== 'idle') return existing.child;
         existing.child.replyTarget = main.replyTarget;
         existing.child.lastActivity = main.lastActivity;
         existing.child.recentSenders = main.recentSenders;
+        if (existing.child.agent.status !== 'idle') return existing.child;
         if (found?.campaign.initiative !== undefined && found.campaign.createdAt === existing.run.campaignCreatedAt && config?.enabled) return existing.child;
         await this.finish(existing, found === undefined ? 'paused' : found.campaign.initiative ? 'interrupted' : 'completed');
         return main;
@@ -294,7 +399,7 @@ export class DndCombatAgents {
       run.lastSeq[record.sessionId] = event.seq;
     }
     if (event.type === 'assistant/message') {
-      const data = event.data as { usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }; message?: { source?: { provider?: string; model?: string }; content?: Array<{ type: string; text?: string }> } };
+      const data = event.data as { interrupted?: boolean; usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }; message?: { source?: { provider?: string; model?: string }; content?: Array<{ type: string; text?: string }> } };
       const usage = data.usage;
       const lane = record.sessionId === run.childSessionId ? 'combat' : 'main';
       const source = data.message?.source;
@@ -304,15 +409,23 @@ export class DndCombatAgents {
         u.requests++; u.input += usage.inputTokens ?? 0; u.output += usage.outputTokens ?? 0;
         u.cacheRead += usage.cacheReadTokens ?? 0; u.cacheWrite += usage.cacheWriteTokens ?? 0;
       }
-      if (lane === 'combat') {
+      if (lane === 'combat' && data.interrupted !== true) {
         const text = data.message?.content?.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('\n').trim();
-        if (text && text !== '。') run.lastNarration = text.slice(-2000);
+        if (text && text !== '。') {
+          run.lastNarration = text.slice(-2000);
+          const init = this.service.active(record.sessionKey)?.campaign.initiative;
+          if (init !== undefined) {
+            run.lastNarrationRound = init.round;
+            run.narratedLedgerCount = init.ledger?.length ?? 0;
+          }
+        }
       }
       this.checkpoint(run);
     }
     if (event.type === 'turn/end' && settling) { this.settling.delete(record.sessionId); this.checkpoint(settling); }
     if (event.type === 'turn/end' && active && record.agent === active.child.agent) {
       const reason = event.data.reason as { kind?: string } | undefined;
+      if (isAutoSteerTurnEnd(reason)) return;
       void record.agent.whenIdle().then(() => this.serial(record.sessionKey, async () => {
         if (this.disposed || this.active.get(record.sessionKey) !== active) return;
         const found = this.service.active(record.sessionKey);
@@ -328,13 +441,39 @@ export class DndCombatAgents {
     const { run, main } = active;
     const found = this.service.active(run.sessionKey) ?? this.service.saved(run.sessionKey);
     run.status = status; run.endedAt = Date.now();
+    const lastCombat = found?.campaign.lastCombat !== undefined && found.campaign.lastCombat.at >= run.startedAt
+      ? found.campaign.lastCombat
+      : undefined;
+    const fullLedger = lastCombat?.ledger ?? found?.campaign.initiative?.ledger ?? [];
+    const unreported = fullLedger.slice(Math.min(run.narratedLedgerCount ?? 0, fullLedger.length));
+    const outcomeBlock = lastCombat === undefined
+      ? undefined
+      : [
+          `【本场战斗结果摘要】共 ${lastCombat.rounds} 轮${lastCombat.rehearsal ? (lastCombat.restored ? '（梦境/演练模式，战后已自动还原真实状态与地图）' : '（演练模式，保留变更）') : ''}`,
+          `- 击败敌方：${lastCombat.defeated.join('、') || '无'}`,
+          `- 场上仍存活敌方（DM 机密数值，严禁向群内透露具体数字，只用伤势词描述）：${lastCombat.survivingMonsters.map((m) => `${m.name} HP ${m.hp}/${m.maxHp}${m.conditions.length > 0 ? ` [${m.conditions.join('、')}]` : ''}`).join('、') || '无（敌方全灭）'}`,
+          `- 本场倒地/阵亡我方：${lastCombat.fallenParty.map((p) => `${p.name}（HP ${p.hp}/${p.maxHp}${p.conditions.length > 0 ? `，${p.conditions.join('、')}` : ''}）`).join('、') || '无'}`,
+        ].join('\n');
+    const unreportedBlock = unreported.length === 0
+      ? undefined
+      : [
+          `【未向群内播报的战斗账本（共 ${unreported.length} 条；战斗代理已落账但尚未向玩家叙述）】`,
+          '接手后的第一条回复必须按下列真实账本补叙未播报回合的关键交锋、重击/倒地与最终胜负（怪物 AC/HP/DC 保密，不报具体剩余血量数字）：',
+          formatLedgerByRound(unreported),
+        ].join('\n');
+    const newChronicle = found
+      ? (found.campaign.chronicle ?? []).filter((e) => e.id > run.chronicleId).map((e) => e.text).join('\n')
+      : '';
     run.handoff = [
       '【系统 · 战斗代理交回 · DM 私有】',
       ...(status === 'paused' ? ['团已暂停。只确认保存，不推进回合或剧情；未结束的战斗留待下次开团。'] : []),
       status === 'completed' ? '战斗已结束。机械结算已经实时写入同一份团档，禁止重复扣血、扣资源、掷骰或再发奖励。只接续战后剧情，没确认的战利品按模组查证。' : '战斗代理已停止。先核对最新团况与待结算窗口，不能重做已落账行动，也不能当作战斗已结束。',
-      `交接前队伍：${run.before}`,
-      found ? `最新团况：\n${summarize(found.campaign, found.adventure)}\n最新队伍明细：${partyState(found.campaign)}\n新增账本：\n${(found.campaign.chronicle ?? []).filter((e) => e.id > run.chronicleId).map((e) => e.text).join('\n')}` : '团档不可用，必须先核实，不能推断结局。',
-      `战斗代理最后已发到群里的叙述（不必复述；叙述不覆盖团档）：${run.lastNarration ?? '无'}`,
+      ...(outcomeBlock !== undefined ? [outcomeBlock] : []),
+      found
+        ? `【战前→战后队伍变化】\n${formatPartyDelta(run.before, found.campaign)}\n最新团况：\n${summarize(found.campaign, found.adventure)}${newChronicle ? `\n新增账本：\n${newChronicle}` : ''}`
+        : `交接前队伍：${run.before}\n团档不可用，必须先核实，不能推断结局。`,
+      ...(unreportedBlock !== undefined ? [unreportedBlock] : []),
+      `战斗代理最后已发到群里的叙述${run.lastNarrationRound !== undefined ? `（第 ${run.lastNarrationRound} 轮）` : ''}（已播报内容不必复述；叙述不覆盖团档）：${run.lastNarration ?? '无'}`,
       '怪物 AC、HP、DC 和 DM 机密仍不进群消息；不要替玩家选择下一步。',
     ].join('\n');
     this.checkpoint(run);

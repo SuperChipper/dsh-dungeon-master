@@ -48,6 +48,11 @@ function harness(options: { scope?: ChatScope; unloaded?: boolean; fail?: boolea
         requestHeader: () => ({ config: { provider: 'actual-provider', model: 'actual-model' } }),
       },
       runMaintenance: vi.fn(async (task) => task(new AbortController().signal)),
+      send: vi.fn((message, target, wakeup) => {
+        expect(target).toBe('next-step');
+        expect(wakeup).toBe(false);
+        events.push({ type: 'agent/inbox/spliced', data: { target, start: 0, inserted: [message] }, seq: (events.at(-1)?.seq ?? 0) + 1 });
+      }),
       cancel: vi.fn(), followup: vi.fn(), whenIdle: async () => {},
     },
     handle: { agent: undefined as never, dispose: vi.fn(async () => {}) },
@@ -96,13 +101,13 @@ describe('人格交接生命周期', () => {
     expect(h.toEvents).toHaveLength(2);
     expect(JSON.stringify(h.toEvents[0])).toContain('肥龙自己的聊天历史');
     expect(JSON.stringify(h.toEvents[1])).toContain('同一聊天的跨人格交接');
-    expect(h.target.agent.session.append).toHaveBeenCalledWith('user/message', expect.objectContaining({ source: { kind: 'qqbot-persona-handoff', form: 'recall' } }), { surfaceOp: 'append' });
+    expect(h.target.agent.send).toHaveBeenCalledWith(expect.objectContaining({ source: { kind: 'qqbot-persona-handoff', form: 'recall' } }), 'next-step', false);
     expect(h.handoffs.read(h.key).received.dragon).toEqual({ sessionId: 'dragon-session', version: 1 });
     await h.manager.getOrCreate(scope, 'peer', 'owner', { scope, targetId: 'peer' });
     expect(h.toEvents).toHaveLength(2);
     // 新消息随后由入站 followup 提交，交接不能跑到它后面。
     h.target.agent.followup('你的新消息');
-    expect(h.target.agent.session.append).toHaveBeenCalledOnce();
+    expect(h.target.agent.send).toHaveBeenCalledOnce();
     expect(h.target.agent.followup).toHaveBeenCalledWith('你的新消息');
   });
 
@@ -145,9 +150,16 @@ describe('人格交接生命周期', () => {
     const h = harness();
     const session = Session.create(SessionId('f2e86374-ce41-401b-a241-fd899eebd642'));
     session.append('user/message', createUserMessage({ content: [{ type: 'text', text: '目标人格自己的历史' }], source: { kind: 'user' } }), { surfaceOp: 'append' });
-    h.target.agent = { ...h.target.agent, session };
+    const pending: ReturnType<typeof createUserMessage>[] = [];
+    h.target.agent = { ...h.target.agent, session, send: (message) => {
+      pending.push(message as ReturnType<typeof createUserMessage>);
+      session.append('agent/inbox/spliced', { target: 'next-step', start: 0, inserted: [message] } as never);
+    } };
     await h.manager.switchPersona('peer', 'dragon');
     await h.manager.getOrCreate('group', 'peer', 'owner', { scope: 'group', targetId: 'peer' });
+    expect(session.deriveMessages()).toHaveLength(1);
+    // 完整系统头与恢复生命周期由 check-persona-handoff-host.mjs 使用实际宿主验收。
+    for (const message of pending) session.append('user/message', message, { surfaceOp: 'append' });
     session.append('user/message', createUserMessage({ content: [{ type: 'text', text: '现在的新消息' }], source: { kind: 'user' } }), { surfaceOp: 'append' });
     const messages = session.deriveMessages();
     expect(messages).toHaveLength(3);
@@ -232,7 +244,7 @@ describe('人格交接生命周期', () => {
   it('会话写入交接失败时不记接收；写入成功而账本写入失败时重试也不重复追加', async () => {
     const h = harness();
     await h.manager.switchPersona('peer', 'dragon');
-    vi.mocked(h.target.agent.session.append!).mockImplementationOnce(() => { throw new Error('append failed'); });
+    vi.mocked(h.target.agent.send!).mockImplementationOnce(() => { throw new Error('append failed'); });
     await expect(h.manager.getOrCreate('group', 'peer', 'owner', { scope: 'group', targetId: 'peer' })).rejects.toThrow('append failed');
     expect(h.handoffs.read(h.key).received).toEqual({});
     const ack = vi.spyOn(h.handoffs, 'acknowledge').mockImplementationOnce(() => { throw new Error('receipt failed'); });

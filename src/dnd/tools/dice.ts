@@ -5,15 +5,15 @@ type PendingAttack,
 type PendingCheck,applyDamage,
 armorClass,assertCanAct,assertDeclaredByOwner,assertNoPending,attackModifier,
 changeCondition,checkModifier,deathSave,findCharacter,
-findWeapon,grantTempHp,heal,requireCharacter,
-requireInitiative,requireResource,useResource,weaponAttackModifier,spendReaction
+findWeapon,grantTempHp,heal,hexbladeCurseOn,inInitiative,pushCombatLedger,requireCharacter,
+requireInitiative,requireResource,usesElvenAccuracy,useResource,weaponAttackModifier,spendReaction
 } from '../campaign.ts';
-import { ABILITY_NAMES,type Ability,type Skill,SKILLS,parseAbility,parseSkill,skillLabel } from '../rules.ts';
+import { ABILITY_NAMES,type Ability,type Skill,SKILLS,parseAbility,parseSkill,proficiencyBonus,skillLabel } from '../rules.ts';
 import {
 attackRangeNote,canReact,cellOf,distanceFeet,weaponReach
 } from '../battlefield.ts';
 import {
-eligibleReactors,holdNotice,
+assertReactionAuthorized,eligibleReactors,holdNotice,
 manualReactors,
 mergeReactors
 } from '../pending-attack.ts';
@@ -121,6 +121,10 @@ export function registerDiceTools(kit: ToolKit): void {
       },
       damage_type: { type: 'string', description: 'For attack/save damage: damage type, e.g. 光耀/穿刺/火焰 (radiant beats Undead Fortitude).' },
       advantage: { type: 'string', enum: ['none', 'advantage', 'disadvantage'] },
+      crit_on: {
+        type: 'integer',
+        description: 'For type=attack: minimum natural d20 for a critical hit (18-20), e.g. 19 for Champion / Hexblade\'s Curse. Applied automatically when 咒剑诅咒 is recorded via dnd_resource.',
+      },
       bonus: {
         type: 'integer',
         description: 'Extra situational flat modifier (e.g. cover). Magic weapons, fighting styles and expertise on the '
@@ -176,9 +180,10 @@ export function registerDiceTools(kit: ToolKit): void {
       reaction: {
         type: 'boolean',
         description: 'A roll you (the DM) call for outside the actor\'s own declaration: contested checks, '
-          + 'opportunity attacks, reactions, a perception or knowledge check off-turn. Reaction attacks spend the actor\'s reaction and require the owner\'s declared_by (or their reaction button). Passive saves/checks do not spend a reaction by default.',
+          + 'opportunity attacks, reactions, a perception or knowledge check off-turn. PC opportunity attacks spend a reaction and require the one-use server authorization from the owner\'s explicit choice. Passive saves/checks do not spend a reaction by default.',
       },
       use_reaction: { type: 'boolean', description: 'Explicitly spend a reaction for a save/check feature. reaction=true attack already spends it automatically. Passive/off-turn checks alone do not cost one.' },
+      authorization: { type: 'string', description: 'For a PC opportunity attack: copy the one-use authorization from the server player/button notice for this movement window. declared_by is not consent. Sentinel counterattacks already authorized through dnd_apply need no second token.' },
       dm_override: {
         type: 'boolean',
         description: 'Roll for a PC whose player has not spoken because another player explicitly delegated it '
@@ -256,6 +261,9 @@ export function registerDiceTools(kit: ToolKit): void {
           throw new Error(`先处理 ${movement.target} 的借机窗口，只能由名单中的角色对移动者进行借机攻击`);
         }
         if (args.reaction === true && state !== undefined) {
+          if (!inInitiative(c, ch.name)) {
+            throw new Error(`${ch.name} 不在当前战斗的参战名单（先攻表）里，不能发动反应攻击；如确已中途参战请先调用 dnd_initiative action=join`);
+          }
           if (!canReact(ch)) throw new Error(`${ch.name} 现在做不了反应`);
           const weaponName = str(args.weapon);
           const weapon = weaponName === undefined || (ch.kind !== 'pc' && (ch.weapons?.length ?? 0) === 0) ? undefined : findWeapon(ch, weaponName);
@@ -266,17 +274,28 @@ export function registerDiceTools(kit: ToolKit): void {
           }
           const counter = state.counterAttacks?.find((r) => r.by === ch.name && r.target === target.name);
           const prepaid = counter !== undefined;
-          const clicked = movement?.claimed.some((r) => r.character === ch.name) === true;
-          if (!prepaid && !clicked) assertDeclaredByOwner(ch, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec) }, '反应攻击');
+          const chosen = !prepaid && movement !== undefined
+            ? movement.claimed.find((r) => r.character === ch.name && r.authorization === args.authorization)
+            : undefined;
+          if (!prepaid && movement !== undefined) {
+            assertReactionAuthorized(movement, ch, chosen?.reaction ?? '借机攻击', args.authorization);
+          }
+          if (!prepaid && movement === undefined && ch.kind === 'pc' && ch.playerId !== undefined) {
+            // 不能绕过窗口，直接用 reaction=true + 玩家编号替本人宣告。
+            const blocked = state.reacted?.includes(ch.name);
+            throw new Error(blocked ? `${ch.name} 的反应已经用过` : 'PC 反应攻击需要本次借机窗口授权，或已授权的还击；declared_by 不能代替同意');
+          }
+          if (args.declared_by !== undefined) assertDeclaredByOwner(ch, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec) }, '反应攻击');
           if (prepaid) state.counterAttacks = state.counterAttacks?.filter((r) => r !== counter);
           else spendReaction(c, ch.name);
           if (movement !== undefined) {
-            movement.used.push({ by: ch.name, name: '借机攻击', effect: '已宣告并消耗反应' });
+            movement.used.push({ by: ch.name, name: chosen?.reaction ?? '借机攻击', effect: '已宣告并消耗反应' });
             movement.claimed = movement.claimed.filter((r) => r.character !== ch.name);
           }
         }
       }
       if (args.use_reaction === true && !(type === 'attack' && args.reaction === true)) {
+        assertNoPending(c, '单独消耗反应；当前窗口请用带 authorization 的 dnd_apply reaction 处理');
         assertDeclaredByOwner(ch, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec) }, '反应');
         spendReaction(c, ch.name);
       }
@@ -307,14 +326,35 @@ export function registerDiceTools(kit: ToolKit): void {
         const label = weapon?.name ?? (cardAttack ? weaponName : undefined);
         const override = str(args.ability);
         const ability = override !== undefined ? parseAbility(override) : (weapon === undefined ? undefined : weapon.ability ?? 'str');
+        const attackAbility = ability ?? (ch.attackBonus !== undefined ? undefined : (ch.abilities.dex > ch.abilities.str ? 'dex' : 'str'));
+        const spiritAdv = c.initiative?.fightingSpirit?.includes(ch.name) === true && (weapon !== undefined || (ch.kind !== 'pc' && override === undefined));
+        const effectiveAdv = spiritAdv ? (adv === 'disadvantage' ? 'none' : 'advantage') : adv;
+        const spiritNote = spiritAdv && adv !== 'advantage' ? '（战斗英姿）' : '';
+        const elvenAccuracy = usesElvenAccuracy(ch, attackAbility);
         const modifier = weapon !== undefined ? weaponAttackModifier(ch, weapon, ability) : attackModifier(ch, ability);
         const id = rollId(c, exec);
-        const roll = rollD20(modifier + bonus, adv, service.roller);
-        const crit = roll.natural === 20;
+        const roll = rollD20(modifier + bonus, effectiveAdv, service.roller, { elvenAccuracy });
+        const cursed = hexbladeCurseOn(c, ch.name, target.name) !== undefined
+          || (target.conditions.some((cond) => cond.includes('咒剑诅咒')) && ch.resources?.['咒剑诅咒'] !== undefined);
+        const rawCritOn = int(args.crit_on);
+        const critThreshold = Math.min(rawCritOn !== undefined ? Math.max(18, Math.min(20, rawCritOn)) : 20, cursed ? 19 : 20);
+        const crit = roll.natural >= critThreshold;
         const targetAc = armorClass(c, target);
         const hit = crit || (roll.natural !== 1 && roll.total >= targetAc);
-        const lines = [`${ch.name}${label !== undefined ? `（${label}）` : ''} 攻击 ${target.name}：${roll.detail}${extraNote}${target.kind === 'monster' ? '' : ` vs AC ${targetAc}`} → ${crit ? '重击！' : (hit ? '命中' : (roll.natural === 1 ? '天然 1，失手' : '未命中'))} #R${id}${spentNote}`];
-        const extra = str(args.damage);
+        const verdictText = crit ? '重击！' : (hit ? '命中' : (roll.natural === 1 ? '天然 1，失手' : '未命中'));
+        const lines = [`${ch.name}${label !== undefined ? `（${label}）` : ''} 攻击 ${target.name}：${roll.detail}${spiritNote}${extraNote}${target.kind === 'monster' ? '' : ` vs AC ${targetAc}`} → ${verdictText} #R${id}${spentNote}`];
+        let extra = str(args.damage);
+        let curseNote = '';
+        const curseBonus = cursed ? proficiencyBonus(ch.level) : 0;
+        const hasBaseDamage = weapon !== undefined || extra !== undefined || ch.damage !== undefined;
+        if (curseBonus > 0 && hasBaseDamage) {
+          if (extra !== undefined && /^\+?\d+$/.test(extra) && Number(extra) === curseBonus) {
+            curseNote = `（含咒剑诅咒 +${curseBonus}）`;
+          } else {
+            extra = extra !== undefined ? `${extra}+${curseBonus}` : String(curseBonus);
+            curseNote = `（含咒剑诅咒 +${curseBonus}）`;
+          }
+        }
         const expression = attackExpression(ch, weapon, extra);
         const defense = parseDefense(args.defense);
         const damageType = str(args.damage_type);
@@ -326,10 +366,13 @@ export function registerDiceTools(kit: ToolKit): void {
         const hold = c.initiative !== undefined && (wantHold || (expression !== undefined && roll.natural !== 1 && auto.length > 0));
         if (hold) {
           const dmg = hit && expression !== undefined ? rollAttackDamage(ch, weapon, expression, crit, service.roller) : undefined;
-          if (dmg !== undefined) lines.push(`伤害（还没扣）${dmg.detail}`);
+          if (dmg !== undefined) lines.push(`伤害（还没扣）${dmg.detail}${curseNote}`);
+          pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote} → ${verdictText}（待反应）`, id);
           const p: PendingAttack = {
             kind: 'attack', seq: id, at: Date.now(), attacker: ch.name, target: target.name, natural: roll.natural, rollDetail: roll.detail,
-            total: roll.total, modifier: roll.modifier, advantage: adv, ac: targetAc, crit, reactors,
+            total: roll.total, modifier: roll.modifier, advantage: effectiveAdv, ac: targetAc, crit, reactors,
+            ...(elvenAccuracy ? { elvenAccuracy: true } : {}),
+            ...(critThreshold < 20 ? { critThreshold } : {}),
             attackMod: 0, acMod: 0, damageMod: 0, declined: [], claimed: [], used: [],
             ...(weapon !== undefined ? { weapon: weapon.name } : {}),
             ...(extra !== undefined ? { extraDamage: extra } : {}),
@@ -343,15 +386,19 @@ export function registerDiceTools(kit: ToolKit): void {
           deps.onPendingAttack?.(recordOf(exec));
         } else if (hit) {
           if (expression === undefined) {
+            pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote} → ${verdictText}`, id);
             lines.push('没有伤害表达式：传 weapon（角色卡上的武器），或用 dnd_roll 掷伤害（重击时骰子翻倍）再 dnd_apply 扣血。');
           } else {
             const dmg = rollAttackDamage(ch, weapon, expression, crit, service.roller);
             const amount = saveDamage(dmg.total, false, 'half', defense);
-            lines.push(`伤害 ${dmg.detail}${defense !== undefined ? `，${DEFENSE_NAMES[defense]} → ${amount}` : ''}`);
+            pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote} → ${verdictText}，伤害 ${dmg.detail}${curseNote}`, id);
+            lines.push(`伤害 ${dmg.detail}${curseNote}${defense !== undefined ? `，${DEFENSE_NAMES[defense]} → ${amount}` : ''}`);
             lines.push(...settleAttackDamage(c, ch.name, target.name, dmg.total, crit, damageType, defense, onHit, service.roller));
           }
+        } else {
+          pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote} → ${verdictText}`, id);
         }
-        const rangeNote = attackRangeNote(c, ch, target, { ...(weapon !== undefined ? { weapon } : {}), reaction: args.reaction === true, advantage: adv });
+        const rangeNote = attackRangeNote(c, ch, target, { ...(weapon !== undefined ? { weapon } : {}), reaction: args.reaction === true, advantage: effectiveAdv });
         if (rangeNote !== undefined) lines.push(rangeNote);
         lines.push(SECRET_NOTE);
         return lines.join('\n');
@@ -432,10 +479,12 @@ export function registerDiceTools(kit: ToolKit): void {
         description: 'For a pending roll. `target` names whose roll it changes (attack: the one attacked; save/check: the roller). '
           + 'e.g. cutting words {by:"Kriv",name:"尖刻言语",attack_mod:"-1d6",spend:"诗人激励"}; shield '
           + '{by:"Kriv",name:"护盾术",ac_mod:5,spend:"防御法杖充能"}; guided strike {by:"刻德温",name:"导引打击",attack_mod:"+10",spend:"引导神力"}; '
-          + 'chronal shift {by:"奇塔露",name:"时间变幻",reroll:"d20",spend:"时间变幻"}.',
+          + 'chronal shift {by:"奇塔露",name:"时间变幻",reroll:"d20",spend:"时间变幻"}. '
+          + 'PCs require authorization copied from the server notice after their real button click or explicit message. It binds this window and skill, and is revoked by a later refusal. Questions and declared_by are not consent.',
         properties: {
           by: { type: 'string' },
           name: { type: 'string' },
+          authorization: { type: 'string', description: 'One-use server authorization for this PC, exact skill and pending window; copy from player/button notice.' },
           attack_mod: { type: 'string', description: 'Added to the pending d20 total (attack roll, or the `target`\'s save/check), e.g. "-1d6" or "+10". The tool rolls it.' },
           ac_mod: { type: 'integer', description: 'Attacks only: added to the target AC, e.g. 5.' },
           damage_mod: { type: 'string', description: 'Added to the damage, e.g. "-1d6". The tool rolls it.' },
@@ -450,6 +499,11 @@ export function registerDiceTools(kit: ToolKit): void {
         required: ['by', 'name'],
         additionalProperties: false,
       },
+      ask_reactions: {
+        type: 'array',
+        description: 'Add a missed/manual PC reaction option to the CURRENT pending roll without rerolling or spending. Use [{by:"奇塔露",name:"时间变幻"}], then stop and wait for the owner. Cannot override a refusal or be combined with reaction/decline/settle/cancel. For a future roll use dnd_check hold_for instead.',
+        items: { type: 'object', properties: { by: { type: 'string' }, name: { type: 'string' } }, required: ['by', 'name'], additionalProperties: false },
+      },
       decline: {
         type: 'array',
         items: { type: 'string' },
@@ -458,15 +512,16 @@ export function registerDiceTools(kit: ToolKit): void {
       },
       settle: { type: 'boolean', description: 'Apply the pending roll. Refused while someone has not answered (no time limit).' },
       cancel: { type: 'boolean', description: 'Drop the pending roll without applying it. Spent resources stay spent; if it should not have happened at all, use dnd_undo roll=.' },
-      declared_by: { type: 'string', description: 'For reaction by a PC: member id of the player who said so (the #U number, pass "U3").' },
+      declared_by: { type: 'string', description: 'Optional ownership cross-check (the #U member id). Does not grant reaction consent; PC reaction.authorization is required.' },
     },
     [],
     (args, exec) => mutate(exec, (c) => {
-      if (args.targets !== undefined && (args.settle === true || args.cancel === true || args.reaction !== undefined || args.decline !== undefined)) {
+      if (args.targets !== undefined && (args.settle === true || args.cancel === true || args.reaction !== undefined || args.decline !== undefined || args.ask_reactions !== undefined)) {
         throw new Error('批量 targets 不能和反应/待结算混用；先处理停止点');
       }
-      if (args.settle === true || args.cancel === true || args.reaction !== undefined || args.decline !== undefined) {
+      if (args.settle === true || args.cancel === true || args.reaction !== undefined || args.decline !== undefined || args.ask_reactions !== undefined) {
         if (c.initiative?.pending === undefined && c.initiative?.movement !== undefined) {
+          if (args.ask_reactions !== undefined) throw new Error('移动借机名单由路径和触及范围计算；ask_reactions 只用于待结算骰子');
           if (args.reaction !== undefined) throw new Error('移动借机用 dnd_check type=attack reaction=true 结算，不用 dnd_apply reaction 改数值');
           const text = resolveMovement(c, args);
           if (c.initiative?.movement !== undefined) deps.onPendingAttack?.(recordOf(exec));
