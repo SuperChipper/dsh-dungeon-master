@@ -17,6 +17,10 @@ cordis.patch.local.yml
 /tmp/
 /output/
 /.qqbot-browser/
+# 仅打包插件自带的 dnd-module-authoring 文档，排除外部装入的 skills 与本机私有脚本
+/skills/*
+!/skills/dnd-module-authoring/
+/skills/dnd-module-authoring/scripts/
 AGENTS.md
 package-lock.json
 pnpm-lock.yaml

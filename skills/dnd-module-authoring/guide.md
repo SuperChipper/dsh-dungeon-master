@@ -1,9 +1,9 @@
 # 跑团模组编写指南
 
 这份指南讲怎么把一本冒险模组（或者你自己的剧本）写成 bot 能跑的 JSON。
-类型定义在 `src/dnd/adventure.ts` 和 `src/dnd/dungeon.ts`，这里讲的是怎么用。
+类型定义在 `src/dnd/adventure.ts`、`src/dnd/dungeon.ts` 和 `src/dnd/terrain.ts`，这里讲的是怎么用。
 
-> **版权**：商业模组（官方冒险、付费 PDF）转出来的 JSON 只放在本机的 `<dnd 根目录>/adventures/`，
+> **版权**：商业模组（官方冒险、付费 PDF）转出来的 JSON 与地图只放在本机的 `<dnd 根目录>/adventures/`，
 > 不要提交进仓库、不要分享。文本用自己的话转述，不要整段照抄朗读框。
 
 ## 1. 放在哪
@@ -12,30 +12,43 @@
 
 | 写法 | 适合 |
 |---|---|
-| `adventures/<id>.json` | 小模组，一个文件写完 |
-| `adventures/<id>/adventure.json` + `adventures/<id>/sites/*.json` | 大模组，每个场景一个文件，方便分批写 |
+| `adventures/<id>.json` | 小模组，一个文件写完（不能挂本地地图图片） |
+| `adventures/<id>/adventure.json` + `adventures/<id>/sites/*.json` | 中型模组，每个场景一个文件，方便分批写 |
+| `adventures/<id>/build/*.json` → 合并成 `adventure.json` | 长篇模组（几十个场景，NPC、线索、地图也要按章分片维护） |
 
-拆文件时 `adventure.json` 可以不写 `sites`（或只写一部分），`sites/` 下的文件按文件名排序后追加进去。
+拆文件时 `adventure.json` 可以不写 `sites`（或只写一部分），`sites/` 下的 `.json` 按文件名排序后追加进去。
+目录形式的模组里，加载器只读 `adventure.json` 和 `sites/*.json`，同目录下放离线备团资料（`text-en/`、`text-zh/`、`img/`、`data/`、`译名对照表.md`、`build/`）互不干扰，`img/` 里的图片还能直接给场景地图和战斗底图引用。
 旧的单地城格式（`dungeons/*.json`）还能用，会被当成只有一个场景的模组。
 
-加载规则：
+长篇模组用 `build/` 分片时，推荐按文件名定顺序：`00-core.json` 放顶层字段，`10-*.json`、`20-*.json` 按章放 `chapters` / `sites` / `npcs` / `leads` / `quests` / `flags`，`60-maps.json` 放场景地图矩形，`61-battlemaps.json` 放战斗场地图。合并脚本除拼接同名顶层数组外，支持三个增量键最省事：
+
+- `addRooms: { "<场景id>": [房间...] }`：大地下城分几个文件往已定义的场景里追加房间。
+- `siteMaps: { "<场景id>": [地图...] }`：把玩家版地图和房间像素框单独挂到场景的 `maps` 上。
+- `roomBattlemaps: { "<房间id>": 场地图 }`：批量挂房间战斗图（房间已手写 `battlemap` 时不覆盖）。
+
+加载与本地校验规则：
 
 - 文件改了会自动重新读（按修改时间），不用重启 bot；但正在跑的团只在下一回合看到新内容。
 - 结构错误：这个模组不加载，日志里有 `im-qqbot: 模组 xxx 加载失败: 原因`。
-- 可疑但不致命的地方（没人设置的 flag、线索太少的场景）：照样加载，日志里打 `im-qqbot: 模组 xxx: 警告`。
+- 可疑但不致命的地方（没人设置的 flag、发布人 `offers` 漏列任务、线索太少的场景）：照样加载，日志里打 `im-qqbot: 模组 xxx: 警告`。
+- 不用起 bot 也能在插件目录一行跑完结构与警告校验：
+  ```bash
+  node -e "import('./src/dnd/adventure.ts').then(({ AdventureLibrary }) => new AdventureLibrary({ adventures: '../dnd/adventures' }, console).list())"
+  ```
 - 群里发 `/dnd dungeons` 能看到加载成功的模组；`/dnd new <id>` 开团。
 
 ## 2. 拆书的顺序
 
 一本模组按这个顺序拆最不容易漏：
 
-1. **先读背景和概览**，写 `truth`（DM 才知道的真相：反派是谁、要什么、东西真正在哪）和 `chapters`。
+0. **先备资料与定译名**（改编长篇时）：先把章节文本、干净的玩家版地图（去掉房间编号和暗门「S」标记的图，放进 `adventures/<id>/img/`）和一份固定译名对照表备齐，专有名词从头到尾用同一套译法。
+1. **读背景和概览**，写 `truth`（DM 才知道的真相：反派是谁、要什么、东西真正在哪）和 `chapters`。
 2. **每章定玩法**：线性（伏击→巢穴）、城镇枢纽（地点 + NPC + 传闻 + 任务）、沙盒（大地图多据点）、地城。
-3. **每个场景**：通用规则（General Features）→ `features`；地图 → 房间坐标和出口；
+3. **每个场景**：通用规则（General Features）→ `features`；玩家版地图与房间像素框 → `site.maps`；房间坐标和出口 → `rooms`；
    朗读框 → `playerView`；正文拆成遭遇（`encounter`）、检定和宝物（`dmNotes`）、条件变化（`triggers`）。
    会打仗的房间顺手把方格图写成 `battlemap`（第 5 节），不写就由 DM 开战时现画。
-4. **抽实体**：NPC 表 → `npcs`；「X 知道什么」侧栏 → `knowledge`；传闻 → 带 `leads` 的 `facts`；任务 → `quests`。
-5. **画线索图**：每个关键地点至少两条线索指过去（校验会对少于两条的打警告）。
+4. **抽实体**：NPC 表 → `npcs`（具名反派和可能被俘审问的人，把「知道什么」和「不知道什么」都写进 `knows`）；「X 知道什么」侧栏 → `knowledge`；传闻 → 带 `leads` 的 `facts`；任务 → `quests`。
+5. **画线索图**：每个隐藏的关键场景（写了 `knownWhen` 的）至少两条线索指过去，少于两条会打警告。
 6. **最后补 flag**：所有条件里用到的状态都要在 `flags` 里声明，而且要有触发器/信息/任务奖励去设置它。
 
 书里元素和字段的对照：
@@ -47,13 +60,14 @@
 | 章节、本章目标 | `chapters[].goal` / `dmGuide` |
 | 地图上的一个地点 | `sites[]` |
 | General Features（光照、声音、地形） | `site.features` |
+| 书里的玩家版地图（无编号、无暗门标记） | `site.maps` |
 | 编号区域 | `rooms[]` |
 | 区域的战斗方格图（墙、门、柱子、碎石、水渠） | `room.battlemap` |
 | 朗读框 | `room.playerView`（转述） |
 | 区域正文的 DC、陷阱、宝物、怪物动机 | `room.dmNotes` |
 | 粗体怪物名 | `room.encounter`（具名的头目写成 NPC） |
 | Developments（如果……就……） | `room.triggers` |
-| 状态变了之后的描述（水放干了、强盗被清掉） | `room.variants` |
+| 状态变了之后的描述或 DM 笔记（水放干了、强盗被清掉） | `room.variants` |
 | 暗门 | `exit.hidden: true` |
 | 要爬、要游、要跳的通道 | `exit.check` |
 | 锁着、要钥匙或口令的门 | `exit.requires` + `lockedText` |
@@ -72,14 +86,16 @@
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `id` / `name` | ✓ | |
+| `credits` | | 来源或重用许可说明（如 SRD 5.1 CC BY 4.0） |
+| `levels` | | `{ "start": 1, "end": 5 }`，只是说明 |
+| `partySize` | | 模组按几人写的遭遇，缺省 `4`（官方模组默认）。本桌在场 PC 多于这个人数时，`dnd_move` 刷怪会自动提醒 DM 上调上限（小怪不超过 `PC 数 × 1.5` 只，首领 HP 不超过模组卡 `× 1.5`） |
 | `truth` | | DM 机密，每回合注入，写短 |
 | `hook` | | 开团时念给玩家（`/dnd new` 直接发到群里） |
-| `opening` | | 进第一个场景前 DM 带玩家做的事，一步一条（互相介绍、和委托人的交情、行进队形……）。新团先停在开场，DM 做完这些再 `dnd_story action=begin` 进第一个场景；开场期间不注入第一个房间的 DM 笔记，免得提前说漏 |
-| `start` | ✓ | 开局所在房间 id；这个房间的 `encounter` 在开场结束时刷出（适合开场伏击） |
-| `chapters` / `sites` / `npcs` / `leads` / `quests` / `flags` | | `sites` 至少一个 |
-| `levels` | | `{ "start": 1, "end": 5 }`，只是说明 |
-| `routes` | | 写了就只能沿路在场景间移动；不写则所有已知场景互通 |
-| `milestones` | | `{ "level": 2, "when": 条件, "text": "说明" }`，满足时提示一次 |
+| `opening` | | 进第一个场景前 DM 带玩家做的事，一步一条（互相介绍、和委托人的交情、行进队形……）。**所有新团都会先停在开场阶段**：没写 `opening` 时走默认两步（角色介绍 + 行进队形），若有 PC 还没留过背景钩子还会顺带提示 `dnd_hook add`；写了 `opening` 就替换默认步骤。开场期间不注入第一个房间的 DM 笔记，做完调 `dnd_story action=begin` 才进起始场景 |
+| `start` | ✓ | 开局所在房间 id；这个房间的 `encounter` 在 `begin` 结束开场时刷出（适合开场伏击） |
+| `chapters` / `sites` / `npcs` / `leads` / `quests` / `flags` | | `sites` 至少一个，其余缺省为空数组 |
+| `routes` | | `[{ "from": "场景a", "to": "场景b", "days": 3, "note": "..." }]`，双向连通。写了就只能沿路在已知场景间移动（地城只能从 `entry` 出发，城镇从哪都能走）；不写则所有已知场景互通 |
+| `milestones` | | `[{ "level": 2, "when": 条件, "text": "说明" }]`，满足时提示一次 |
 
 ### 章节
 
@@ -96,10 +112,11 @@
 | `features` | 通用规则，首次抵达和每回合注入 |
 | `arrival` | 首次抵达时念给玩家 |
 | `summary` | DM 一两句概述 |
-| `knownWhen` | 满足前玩家不知道这个地方；不写 = 一开始就知道。线索 `points.site` 指向它时也会变成已知 |
+| `knownWhen` | 满足前玩家不知道这个地方；不写 = 一开始就知道。线索 `points.site`（或 `points.room` 落在本场景）揭示后也会变成已知 |
 | `knowledge` | 场景里无名群体知道的事 |
+| `maps` | 书里的玩家版地图：`[{ image, reveal?: "fog"\|"full", rooms: { 房间id: [x,y,宽,高] 或 [[x,y,宽,高], ...] } }]`。`image` 相对模组目录（**只有目录形式的模组能用**，单文件模组会打警告跳过；不能越出模组目录），要用**无房间号、无暗门标记的玩家版图**。`fog`（默认）只露去过的房间、边缘羽化并裁剪画布（不泄露全层有多大），连着房间的走廊可作为第 2 个矩形写进同一房间下，队伍红点画在**第一个矩形**中心；`full` 整张不裁（城镇、区域图），本场景未标进 `rooms` 的小地点也会回退发这张 `full` 图。有可用地图时 `dnd_map` 与 `/dnd map` 优先发它（需装 `sharp`），不再画方框示意图 |
 
-**dungeon**：房间要写坐标 `x y w h`（网格，地图用）和 `exits`，只能走相邻房间，离开场景要回到 `entry`。
+**dungeon**：房间要写坐标 `x y w h`（网格，示意图回退用）和 `exits`，只能走相邻房间，离开场景要回到 `entry`。
 **hub**：地点不用写坐标和出口（自动排成网格），已知地点之间随便走，从任何地点都能出发去别的场景；
 地点可以用 `knownWhen` 藏起来，用 `shop: { "sells": "...", "maxPrice": 25 }` 标成店铺。`knownWhen` 只能用在城镇地点，入口不能藏。
 
@@ -109,16 +126,15 @@
 |---|---|
 | `playerView` | 可以说给玩家的描述（短，3 句以内） |
 | `dmNotes` | DC、陷阱、宝物、怪物战术；工具结果和注入里都有 |
-| （场景）`maps` | 书里的玩家版地图：`[{ image, reveal?: "fog"\|"full", rooms: { 房间 id: [x,y,宽,高] 或几个矩形 } }]`，image 相对模组目录。fog 只露去过的房间并裁剪，full 整张发（城镇、区域图）；dnd_map 有它就不画示意图 |
 | `exits` | `[{ to, label, hidden?, check?, requires?, lockedText?, oneWay? }]`；只写一边就双向连通。传送阵、滑道、陷坑这种回不去的写 `oneWay: true`，否则玩家能从落点反着走回来 |
 | `encounter` | 首次进入时刷出的怪物，见下 |
-| `battlemap` | 战斗场地图（5 尺一格的墙、门、障碍），见第 5 节；不写就由 DM 开战时画。可带 `art: { image, left, top, cell, shade? }` 用书里的地图做底图：格子 (0,0) 左上角在原图 (left, top)，一格 cell 像素；shade 里的格子（不属于这间屋的部分）出图涂黑、规则上算墙。dnd_map 战斗中发的图就用它 |
+| `battlemap` | 战斗场地图（5 尺一格的墙、门、障碍，可挂原书底图 `art`），见第 5 节；不写就由 DM 开战时画 |
 | `triggers` / `variants` | 见第 4 节 |
 | `npcs` | 住在这里的 NPC id（`npc.home` 指过来的也算） |
 | `knowledge` | 只在这个房间的群体知道的事 |
 
 出口检定：`"check": { "skill": "运动", "dc": 10, "fail": "失败的后果" }`（或 `ability: "力量"`）。
-工具给每个移动的人掷骰，没过的留在原地，`fail` 交给 DM 用 `dnd_apply` 结算。技能和属性中英文都行。
+工具给每个移动的人掷骰，没过的留在原地，`fail` 交给 DM 用 `dnd_apply` 结算（桌上若已先用 `dnd_check` 投过这道检定，DM 传 `check_done` 骰子编号即可跳过重掷）。技能和属性中英文都行。
 
 ### 怪物（encounter / spawn / NPC 的 stat）
 
@@ -127,8 +143,8 @@
   "attackBonus": 4, "damage": "1d6+2", "abilities": { "dex": 14 }, "notes": "灵巧脱逃……" }
 ```
 
-`srd` 是 dnd5eapi.co 的 index，DM 可以用 `dnd_srd` 查全文。不在 SRD 的怪物自己把数据填全。
-`count > 1` 时自动编号（地精1、地精2）。`traits: ["不死坚韧"]` 由工具自动处理。
+房间 `encounter` 和触发器 `spawn` 直接按上面写的数值刷怪，运行时不联网拉数据，所以 `hp`、`ac`、`initBonus`、`attackBonus`、`damage` 都要填齐；`srd` 是 dnd5eapi.co 的 index，留在卡上供 DM 用 `dnd_srd` 查完整动作与法术。不在 SRD 的怪物把数据填全即可。
+`count > 1` 时自动编号（地精1、地精2）。`traits: ["不死坚韧"]` 由工具自动结算。
 
 ### NPC
 
@@ -140,13 +156,13 @@
 | `voice` / `motive` / `faction` | 扮演提示 |
 | `home.room` | 平时在哪 |
 | `attitude` | `friendly | indifferent | hostile` |
-| `stat` | `{ "srd": "bugbear" }` 或完整怪物数据；不写 = 平民 |
-| `knows` | 能透露的信息（`facts`） |
-| `offers` | 发布的任务 id |
+| `stat` | `{ "srd": "bugbear" }`（上场时在线拉 SRD）或完整怪物数据；不写 = 平民 |
+| `knows` | 必填数组（没有写 `[]`），能透露的信息（`facts`）。`knows` 非空时 `dnd_lookup npc` 会约束 DM「这几条之外他不知道别的」 |
+| `offers` | 发布的任务 id（任务写了 `giver` 时这里也要列上，漏了会打警告） |
 | `canJoin` | 会入队 |
 
-NPC 只在两种情况下建角色卡：入队（`dnd_story npc join=true`，跟着队伍走）、和队伍打起来
-（`fight=true`，留在自己房间、进那个房间的先攻）。光聊天的 NPC 不建卡。
+NPC 只在两种情况下建角色卡：入队（`dnd_story action=npc join=true`，跟着队伍走）、和队伍打起来
+（`fight=true`，留在自己房间、进那个房间的先攻）；被俘或带伤上场时可传 `hp=<当前血量>`（不传默认满血）。光聊天的 NPC 不建卡。
 **具名头目写成 NPC 时，开打要 `fight=true` 才会进先攻**，在 `dmNotes` 里提醒一句。
 
 ### 信息（facts）与知识块
@@ -184,10 +200,10 @@ NPC 只在两种情况下建角色卡：入队（`dnd_story npc join=true`，跟
 - 默认只触发一次，`"once": false` 可重复。
 - 一条 Development 一个触发器；后续步骤用 `requires` 串起来（先放第一波水，才能放第二波）。
 
-**变体**：条件满足时换一套描述，后面的覆盖前面的。
+**变体**：条件满足时换一套玩家描述或 DM 笔记（`playerView` / `dmNotes` 可只写其一），后面的覆盖前面的。
 
 ```json
-"variants": [{ "when": "flood-1", "playerView": "东边的水池已经见底……" }]
+"variants": [{ "when": "flood-1", "playerView": "东边的水池已经见底……", "dmNotes": "池底露出暗格，调查 DC 12。" }]
 ```
 
 **条件**写法（用在 `requires`、`knownWhen`、`completeWhen`、`when` 等处）：
@@ -204,10 +220,7 @@ NPC 只在两种情况下建角色卡：入队（`dnd_story npc join=true`，跟
 
 ## 5. 战斗场地图（battlemap）
 
-房间的 `x y w h` 只管大地图上画在哪，打仗用不上。战斗时的站位、寻路、借机和 `/dnd status` 里的示意图
-用的是另一张 5 尺一格的场地图。房间上写了 `battlemap`，这个房间第一次开战时就拷进存档；
-没写的话，DM 开战时会被要求用 `dnd_position terrain` 照房间描述现画一张（格式一样），也存进存档。
-以后再在这个房间打仗，用的都是存档里的那张。
+房间的 `x y w h` 只管方框示意图画在哪，打仗用不上。战斗时的站位、寻路、借机、范围法术和战斗图使用的是另一张 5 尺一格的场地图。房间上写了 `battlemap`，第一次在这个房间开战时就拷进团档；没写的话，DM 开战时会被要求用 `dnd_position terrain` 照房间描述现画一张，也存进团档。以后再在这个房间打仗，用的都是团档里的那张。
 
 ```json
 "battlemap": {
@@ -225,7 +238,7 @@ NPC 只在两种情况下建角色卡：入队（`dnd_story npc join=true`，跟
 }
 ```
 
-玩家在 `/dnd status` 里看到的是这样（K、1 是摆上去的人）：
+装有 `sharp` 时，`dnd_map` 和战斗中的 `/dnd status` 会把场地图渲染成带网格坐标、站位圆片和图例的图片发给玩家；DM（模型）在工具结果里看到的则是下面的字符网格（没装 `sharp` 时玩家侧也会退回字符网格）：
 
 ```
      0  1  2  3  4  5  6  7  8  9
@@ -240,7 +253,7 @@ NPC 只在两种情况下建角色卡：入队（`dnd_story npc join=true`，跟
 - 坐标和战斗里一致：左上角 `(0,0)`，x 向东（右）、y 向南（下）。`width` / `height` 最大 40。
 - `areas` 是矩形，`w` / `h` 默认 1，**后写的盖住先写的**：先画整面墙，再在墙上开门。没盖到的格子是空地。
 
-| `kind` | 图上 | 规则 |
+| `kind` | 字符图上 | 规则 |
 |---|---|---|
 | `wall` | `#` | 走不进、挡视线（隔着打会提醒 DM） |
 | `object` | 小写字母 | 同上，必须有 `name`（熔炉、石柱、矿车） |
@@ -248,17 +261,31 @@ NPC 只在两种情况下建角色卡：入队（`dnd_story npc join=true`，跟
 | `door` | `+` | 能走的门洞；`to` 写通往的房间 id |
 | `outside` | `:` | 门外的走廊或隔壁一角；站在那里还算这个房间，距离和借机照常算 |
 
+### 挂书里的底图（`battlemap.art`）
+
+目录形式的模组可以给 `battlemap` 加上 `art`，让发给玩家的战斗图直接裁原书的玩家版地图做底图（移动、借机、视线规则仍只看 `areas` 和 `shade`）：
+
+```json
+"art": {
+  "image": "img/mine-player.webp",
+  "left": 312.5, "top": 148.0, "cell": 49.6,
+  "shade": [[0, 0, 3, 6]]
+}
+```
+
+- `image` 相对模组目录；`left`、`top` 是格子 `(0,0)` 左上角在原图上的**像素坐标**，`cell` 是一格对应的**原图像素数**（≥ 8，可写小数对齐原图网格线）。
+- `shade` 是 `[x, y, 宽, 高]` 的**场地图格子坐标**（不是像素），标出裁剪框里不属于本房间的区域（隔壁未探索房间、外围岩体）：出图时涂黑，规则上自动算作墙，但 `areas` 里画在上面的 `door` / `outside` 仍然优先通行。
+- 从原书地图批量生成场地图草稿时，可以只标外墙和 `art`：只要 `areas` 里还没有门、石柱这类非墙地形，开战时系统会提示 DM 按房间描述用 `dnd_position terrain` 补上——**保持 `width` 和 `height` 不变重画时，原有的 `art` 底图和 `shade` 会自动保留**。
+
 写的时候注意：
 
 - **门外留两三格 `outside`**。玩家常说「退到门外」「守在门口」，图上没有门外就只能把人从站位上拿掉。
 - **门的 `to` 和房间出口对上**。队伍从哪个房间进来，开战时 DM 就被提示把 PC 摆在 `to` 等于那个房间的门边。
-  `to` 写错（指向不存在的房间）模组会加载失败。
-- **宽度尽量不超过 22 格**。15 格以内一格画 3 个字符，16–22 格一格 2 个字符，整张都画得出来；
-  再宽就只截人在的那一块。书上的地图如果是 10 尺一格，记得换成 5 尺一格（格数翻倍）。
+  `to` 写错（指向不存在的房间，或指向本房间自己）会报错。
+- **没有底图时宽度尽量不超过 22 格**。字符网格在 15 格以内一格画 3 个字符，16–22 格一格 2 个字符，整张都画得出来；再宽就只截有人那一块。书上的地图如果是 10 尺一格，记得换成 5 尺一格（格数翻倍，`art.cell` 减半）。
 - **怪物开场站哪不在这里写**，放进 `dmNotes`（「丧尸散在大厅各处，焰颅浮在熔炉上方」），DM 开战时照着摆。
-- **改模组不会覆盖已经开过战的存档**：存档里已经有这个房间的图了。要换新图，让 DM 用 `dnd_position terrain` 重画，
-  或者删掉存档 `battlemaps` 里那个房间。
-- 越界、`object` 没写名字、`to` 指向不存在的房间，模组会加载失败，日志里写明是哪个房间哪一项。
+- **改模组不会自动覆盖已经开过战的存档**：那个房间的场地图已经拷进团档了，而团档受保护不能手改 JSON。想让旧团换上模组里的新预设图，让 DM 调 `dnd_position action=clear_terrain`（清除存档里的图并恢复模组预设 `battlemap`），或直接 `dnd_position action=terrain` 重画。
+- 越界、`object` 没写名字、`to` 指向不存在的房间、`art.shade` 超出宽高，模组都会加载失败，日志里写明是哪个房间哪一项。
 
 ## 6. 写作建议
 
@@ -266,10 +293,11 @@ NPC 只在两种情况下建角色卡：入队（`dnd_story npc join=true`，跟
   `playerView` 里不要写埋伏的预兆或要检定才看得出的东西，模型会照着念出来。
 - `dmNotes` 里要等检定或近看才能说的内容，开头写清楚「以下要等……才能说」，模型更不容易剧透。
 - `dmNotes` 里写清楚检定（技能 + DC + 后果），DM 才不会临场编。
+- 具名反派、俘虏的 `knows` 不要留空：除了他知道的情报，把**他不知道什么**（如「只跟信使接头，没见过幕后主使，也不知道老巢在哪」）也写成一条 `fact`；否则审问时 DM 容易现编口供把主线带偏。
 - 暗门用 `hidden` 出口，不要只写在笔记里，否则地图和移动都不知道它存在。
 - 不在书里的东西不要补：DM 规则要求它不编暗道和捷径，模组里没写的路就是走不通。
-- 被俘、受伤的 NPC 入队时卡是满血的，在 `dmNotes` 提醒 DM 用 `dnd_apply` 调到书里的状态。
-- 写完先看日志里的警告，再用 `/dnd new <id> blank` 在测试群跑一遍。
+- 被俘、受伤的 NPC 入队或开战时，在 `dmNotes` 标清当前血量，提醒 DM 用 `dnd_story action=npc join=true hp=1`（不传 `hp` 默认满血）。
+- 写完先跑一遍加载校验看警告，再用 `/dnd new <id> blank` 在测试群跑一遍。
 
 ## 7. 最小示例
 
@@ -300,7 +328,8 @@ NPC 只在两种情况下建角色卡：入队（`dnd_story npc join=true`，跟
       "home": { "room": "camp-tavern" }, "attitude": "friendly",
       "knows": [
         { "id": "mine-rumor", "text": "矿坑在北边山腰上。", "via": "ask", "leads": ["mine-map"] },
-        { "id": "vault-word", "text": "铁门口令是「灰岩」。", "via": "persuade", "dc": 13, "set": ["vault-open"] }
+        { "id": "vault-word", "text": "铁门口令是「灰岩」。", "via": "persuade", "dc": 13, "set": ["vault-open"] },
+        { "id": "miner-limit", "text": "只听见矿坑深处有怪声，没进过金库里面，不知道是谁在背后操纵工头。", "via": "ask" }
       ] }
   ],
   "leads": [{ "id": "mine-map", "text": "矿坑在北边山腰", "points": { "site": "mine" } }],
