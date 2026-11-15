@@ -859,6 +859,10 @@ export class SessionManager {
     this.logger.info(`clearFailoverRoute: ${had ? '已清除' : '本来就没有'}，${records.length} 个会话回到各自的默认路由`);
     return records.length;
   }
+
+  getFailoverRoute(): ModelRoute | undefined {
+    return this.modelResolver.getFailover();
+  }
   async listAvailableModels(): Promise<ModelEntry[]> {
     return this.modelResolver.listModels();
   }

@@ -110,7 +110,7 @@ class OutboundRouter {
     const steerAborted = raw.type === 'assistant/message'
       && this.manager.turnSteer?.isSteerAborted(session.header.id) === true;
     this.manager.turnSteer?.onSessionEvent(session.header.id, raw);
-    this.manager.combatAgents?.observe(record, raw);
+    const recoveringCombat = this.manager.combatAgents?.observe(record, raw) === true;
 
     const event = parseEvent(raw);
     if (event === undefined) return;
@@ -129,7 +129,7 @@ class OutboundRouter {
         this.onToolResult(session.header.id, record, event);
         break;
       case 'turn/end':
-        this.onTurnEnd(session.header.id, record, event);
+        this.onTurnEnd(session.header.id, record, event, recoveringCombat);
         break;
     }
   }
@@ -343,7 +343,7 @@ class OutboundRouter {
   }
 
   /** 轮次结束：清理 buffer 与 attempt 跟踪状态，异常结束时告知用户 */
-  private onTurnEnd(sessionId: string, record: SessionRecord, event: TurnEndEvent): void {
+  private onTurnEnd(sessionId: string, record: SessionRecord, event: TurnEndEvent, recoveringCombat = false): void {
     if (isAutoSteerTurnEnd(event.reason)) {
       const buf = this.buffers.get(sessionId);
       if (buf !== undefined && !buf.abortOrResetForSteer()) {
@@ -397,7 +397,7 @@ class OutboundRouter {
       this.manager.settleNoteInjection(record, ok);
     }
     if (saidItInCaption) this.logger.info(`im-qqbot: 配文已发出后的空回复，不报错 sessionId=${sessionId}`);
-    if (failure !== undefined && !saidItInCaption && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
+    if (failure !== undefined && !saidItInCaption && !recoveringCombat && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
       void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError');
     }
 

@@ -2,14 +2,19 @@
 
 > [简体中文](./CHANGELOG.md)
 
-This file records significant dsh-qqbot updates from a product perspective, focusing on user-visible changes.
+This file records significant `dsh-dungeon-master` updates from a product perspective, focusing on user-visible changes.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.6.0] - 2026-11-16
 
 ### Added
 
+- **D&D 5e AI Dungeon Master (`/dnd` and 17 `dnd_*` tools)**: adventure modules (dungeon & town hub modes), character sheets with unified spell/feature/item kit buttons, SRD lookup, grid battlefield pathfinding & AoE coverage, fog-of-war player maps and PNG/emoji battlemaps, chronicle ledger, backstory hooks, check-in roster, and snapshot undo.
+- **Structured 5e condition engine & turn ledger**: automatic PHB condition, exhaustion (1–6), concentration, and combat state modifiers (advantage/disadvantage, AC/save dice, speed zeroing, prone half-speed stand-up, rage/petrified resistance) with single-line turn ledgers and `ignore_state_mods` escape hatches.
+- **Staged reaction windows & targeted undo**: multi-stage reaction prompts (`foe_attacks`/`attacked`, `enemy_crit`, `damaged`) with one-time server authorization tokens; `dnd_undo` supports `steps`, `#R` roll IDs, and initial placement rollback without wiping combat initiative.
+- **Dedicated combat subagent, automatic channel failover & rehearsal sandbox**: optional isolated combat subagent handoff with automatic post-combat delta/ledger summaries; automatically switches to the `modelFailover` backup route on 429 quota or upstream errors (or hands back cleanly to the main DM with failure reasons while suppressing raw error spam in chat), plus `rehearsal=true` dream/sparring fights that restore pre-combat state on completion.
+- **Module authoring skill (`dnd-module-authoring`)**: bundled agent skill and guide for authoring adventure modules.
 - **DSH plugin management**: install, enable/disable, and configure `dsh-dungeon-master` from the DSH Web Plugins page and the bundle detail form, without hand-editing profile files.
 - **More editable settings**: group reply probability, group history size, session idle timeout, owner openid, and file-access allowlist / sensitive paths.
 - **Automatic sticker collection**: the bot decides — based on how it feels about an image — whether to call `qqbot_save_sticker`; the tool deduplicates by content hash, updates `stickers/index.json`, and injects the new sticker into later turns' catalog, so the fixed persona table no longer needs manual edits.

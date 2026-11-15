@@ -27,6 +27,20 @@ interface Usage {
   cacheWrite: number;
 }
 
+export interface CombatRoute {
+  provider: string;
+  model: string;
+}
+
+export interface CombatFallbackState {
+  /** 全局故障转移已激活的目标路由（若主源已切走，新开战直接走备用源） */
+  activeFailover?: CombatRoute;
+  /** 备用路由（主源启动失败或 turn/end 报 429 QUOTA 等错误时自动切过去续接） */
+  backup?: CombatRoute;
+}
+
+const PRIMARY_COOLDOWN_MS = 30 * 60_000;
+
 export interface CombatRun {
   version: 1;
   id: string;
@@ -46,6 +60,8 @@ export interface CombatRun {
   lastNarration?: string;
   lastNarrationRound?: number;
   narratedLedgerCount?: number;
+  fallbackFrom?: string;
+  error?: string;
   handoff?: string;
   usage: Record<string, Usage>;
   lastSeq: Record<string, number>;
@@ -55,6 +71,9 @@ interface ActiveCombat {
   main: SessionRecord;
   child: SessionRecord;
   run: CombatRun;
+  switchedToBackup?: boolean;
+  lastPrompt?: string;
+  pendingTurnEnd?: Promise<void>;
 }
 
 function eventsOf(agent: DshAgent): readonly SessionEventLike[] {
@@ -83,6 +102,46 @@ export function recentCombatDialogue(agent: DshAgent, maxChars: number): string 
     if (left <= 0) break;
   }
   return lines.join('\n');
+}
+
+function buildCombatPrompt(campaign: Campaign, dialogueAgent: DshAgent, contextChars: number, fromCombatChild = false): string {
+  const rulings = (campaign.chronicle ?? []).filter((e) => e.kind === 'ruling').map((e) => `#${e.id} ${e.text}`).join('\n');
+  const label = fromCombatChild
+    ? '最近战斗对话（仅是对话材料；旧状态以最新团况覆盖，不把提议当成已执行）：'
+    : '最近主会话（仅是对话材料；旧状态以最新团况覆盖，不把提议当成已执行）：';
+  return [
+    '【开战交接 · 仅供裁定，不要转发】',
+    `本桌已记录约定：\n${rulings || '无；不要自行补充。'}`,
+    combatPartyContext(campaign),
+    label,
+    recentCombatDialogue(dialogueAgent, contextChars),
+  ].join('\n\n');
+}
+
+function extractReplayPrompt(agent: DshAgent, fallbackPrompt?: string): string {
+  let hadToolCalls = false;
+  let foundUserText: string | undefined;
+  for (const event of [...eventsOf(agent)].reverse()) {
+    if (event.type === 'assistant/message') break;
+    if (event.type === 'tool/result') hadToolCalls = true;
+    if (event.type !== 'user/message' || foundUserText !== undefined) continue;
+    const data = (event.data ?? event) as {
+      content?: Array<{ type: string; text?: string }>;
+      source?: { kind?: string };
+      message?: { content?: Array<{ type: string; text?: string }>; source?: { kind?: string } };
+    };
+    const message = data.message ?? data;
+    const source = message.source ?? data.source;
+    if (source?.kind !== undefined && source.kind !== 'user') continue;
+    const text = message.content?.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('\n').trim();
+    if (!text || text.startsWith('Current runtime context.')) continue;
+    foundUserText = text;
+  }
+  const base = foundUserText
+    ?? fallbackPrompt
+    ?? '[系统 · 备用通道恢复] 上一轮请求因上游接口异常未完成。请先核对最新团况与待结算状态，继续主持当前战斗回合。';
+  if (!hadToolCalls) return base;
+  return `[系统 · 备用通道续接] 上一通道在执行中途报错断开，部分工具结果已实时写入团档。请先核对最新【团况 · DM 视角】与待结算窗口，已落账的站位/检定/扣血切勿重复执行，只继续未完成的部分：\n${base}`;
 }
 
 interface PartySnapshotItem {
@@ -211,6 +270,7 @@ export class DndCombatAgents {
   private readonly failed = new Set<string>();
   private disposed = false;
   private readonly starting = new Set<string>();
+  private primaryCooldown?: { key: string; until: number; reason: string };
 
   public constructor(
     private readonly agents: DshAgentRegistry,
@@ -219,7 +279,57 @@ export class DndCombatAgents {
     private readonly syncTools: (record: SessionRecord) => void,
     private readonly logger: Logger,
     private readonly directory = join(service.store.root, '..', 'combat-runs'),
+    private readonly fallback?: () => CombatFallbackState | undefined,
   ) {}
+
+  private resolveRoutes(configured: CombatRoute): { initial: CombatRoute; backup?: CombatRoute; preSwitchReason?: string } {
+    const fb = this.fallback?.();
+    const rawBackup = fb?.backup;
+    const backup = rawBackup && rawBackup.provider.trim() && rawBackup.model.trim()
+      && (rawBackup.provider !== configured.provider || rawBackup.model !== configured.model)
+      ? { provider: rawBackup.provider.trim(), model: rawBackup.model.trim() }
+      : undefined;
+    if (!backup) return { initial: configured };
+    if (fb?.activeFailover && fb.activeFailover.provider === backup.provider && fb.activeFailover.model === backup.model) {
+      return { initial: backup, preSwitchReason: `${configured.provider}/${configured.model} (全局故障转移生效中)` };
+    }
+    const primaryKey = `${configured.provider}/${configured.model}`;
+    if (this.primaryCooldown && this.primaryCooldown.key === primaryKey && Date.now() < this.primaryCooldown.until) {
+      return { initial: backup, preSwitchReason: `${primaryKey} (近期报错冷却中: ${this.primaryCooldown.reason})` };
+    }
+    return { initial: configured, backup };
+  }
+
+  private markPrimaryCooldown(route: CombatRoute, reason: string): void {
+    const config = this.settings();
+    if (!config) return;
+    if (config.provider.trim() === route.provider && config.model.trim() === route.model) {
+      this.primaryCooldown = { key: `${route.provider}/${route.model}`, until: Date.now() + PRIMARY_COOLDOWN_MS, reason };
+    }
+  }
+
+  private makeSetup(sessionKey: string, getPrompt: () => string): (scope: Context) => void {
+    return (scope: Context): void => {
+      const tools = scope.get('tools') as { restrict?: (filter: { allow: readonly string[] }) => unknown; guard?: (guard: (exec: { name: string; arguments?: unknown }) => string | undefined) => unknown } | undefined;
+      const prompt = scope.get('systemPrompt') as {
+        section?: (section: { name: string; order: number; text: string; complete: boolean; interpolate: boolean }) => unknown;
+      } | undefined;
+      if (!tools?.restrict || !tools.guard || !prompt?.section) throw new Error('宿主不支持战斗代理的工具隔离或完整提示词');
+      tools.restrict({ allow: COMBAT_TOOLS });
+      tools.guard((exec) => {
+        if (!COMBAT_TOOLS.includes(exec.name as typeof COMBAT_TOOLS[number])) return '战斗代理只能使用授权的跑团工具';
+        if (!this.service.active(sessionKey)?.campaign.initiative) return '战斗已结束或暂停，等待主 DM 接手，不再执行战斗操作';
+        if (exec.name === 'dnd_initiative' && (exec.arguments as { action?: string })?.action === 'start') return '这场战斗已有先攻表，不可重开战斗';
+        return undefined;
+      });
+      // runtime-context 每次团况变化都会重发整份快照，固定交接放在稳定前缀里，避免每次重复几千 token。
+      // 交接含玩家原话，不作模板插值；{{...}} 保持字面文本。
+      prompt.section({
+        name: 'qqbot:combat-agent', order: 0, complete: true, interpolate: false,
+        text: `${this.service.combatInstructions()}\n${GROUP_MESSAGE_FORMAT_PROMPT}\n\n${getPrompt()}`,
+      });
+    };
+  }
 
   private file(key: string): string { return join(this.directory, `${key.replace(/[^a-zA-Z0-9_-]/g, '_')}.json`); }
 
@@ -281,9 +391,18 @@ export class DndCombatAgents {
         return;
       }
       if (target.agent.status !== 'idle') return;
-      target.agent.followup(createUserMessage({ content: [{ type: 'text', text: `[系统 · 战斗接管] 主 DM 已掷先攻并叙述开场。缺少场地图/站位时先按下列场地准备，不重掷先攻；随后只结算当前怪物回合，轮到 PC 或有反应就停。\n${field}` }], source: { kind: 'user' } }));
+      const handoffPrompt = `[系统 · 战斗接管] 主 DM 已掷先攻并叙述开场。缺少场地图/站位时先按下列场地准备，不重掷先攻；随后只结算当前怪物回合，轮到 PC 或有反应就停。\n${field}`;
+      const active = this.active.get(main.sessionKey);
+      if (active) active.lastPrompt = handoffPrompt;
+      target.agent.followup(createUserMessage({ content: [{ type: 'text', text: handoffPrompt }], source: { kind: 'user' } }));
       await target.agent.whenIdle();
-      return target;
+      await this.active.get(main.sessionKey)?.pendingTurnEnd;
+      const current = this.current(main.sessionKey);
+      if (current !== undefined && current !== target) {
+        await current.agent.whenIdle();
+        await this.active.get(main.sessionKey)?.pendingTurnEnd;
+      }
+      return this.current(main.sessionKey);
     }).finally(() => this.starting.delete(main.sessionKey));
   }
   public isChild(agent: DshAgent): boolean { return this.findAgent(agent) !== undefined; }
@@ -326,54 +445,55 @@ export class DndCombatAgents {
         this.logger.warn(`im-qqbot: 战斗代理 provider/model 为空，继续由主 DM 主持 key=${main.sessionKey}`);
         return main;
       }
+      const { initial, backup, preSwitchReason } = this.resolveRoutes({ provider, model });
       let run = this.load(main.sessionKey);
-      const restore = run?.status === 'active' && run.mainSessionId === main.sessionId && run.campaignCreatedAt === found.campaign.createdAt;
+      let restore = run?.status === 'active' && run.mainSessionId === main.sessionId && run.campaignCreatedAt === found.campaign.createdAt;
+      let switchedToBackup = preSwitchReason !== undefined;
       if (!restore || run === undefined) {
-        const rulings = (found.campaign.chronicle ?? []).filter((e) => e.kind === 'ruling').map((e) => `#${e.id} ${e.text}`).join('\n');
         run = {
           version: 1, id: randomUUID(), sessionKey: main.sessionKey, mainSessionId: main.sessionId,
-          childSessionId: randomUUID(), campaignCreatedAt: found.campaign.createdAt, startedAt: Date.now(), status: 'active', provider, model,
+          childSessionId: randomUUID(), campaignCreatedAt: found.campaign.createdAt, startedAt: Date.now(), status: 'active',
+          provider: initial.provider, model: initial.model,
+          ...(preSwitchReason ? { fallbackFrom: preSwitchReason } : {}),
           reasoningEffort: config.reasoningEffort.trim() || undefined,
-          prompt: ['【开战交接 · 仅供裁定，不要转发】', `本桌已记录约定：\n${rulings || '无；不要自行补充。'}`,
-            combatPartyContext(found.campaign),
-            '最近主会话（仅是对话材料；旧状态以最新团况覆盖，不把提议当成已执行）：', recentCombatDialogue(main.agent, config.contextChars),
-          ].join('\n\n'),
+          prompt: buildCombatPrompt(found.campaign, main.agent, config.contextChars),
           before: partyState(found.campaign), chronicleId: found.campaign.chronicle?.at(-1)?.id ?? 0, usage: {}, lastSeq: {},
         };
       }
+      const setup = this.makeSetup(main.sessionKey, () => run!.prompt);
+      const spawn = async (route: CombatRoute, allowResume: boolean): Promise<DshAgentHandle> => {
+        const options = { agentOptions: { provider: route.provider, model: route.model, reasoningEffort: run!.reasoningEffort }, setup };
+        return allowResume
+          ? await this.agents.resume({ resumeSessionId: run!.childSessionId, ...options })
+          : await this.agents.create({ sessionId: run!.childSessionId, meta: { parentSession: main.sessionId, cwd: main.agent.session.header?.cwd ?? process.cwd() }, ...options });
+      };
       let handle: DshAgentHandle | undefined;
       try {
-        const setup = (scope: Context): void => {
-          const tools = scope.get('tools') as { restrict?: (filter: { allow: readonly string[] }) => unknown; guard?: (guard: (exec: { name: string; arguments?: unknown }) => string | undefined) => unknown } | undefined;
-          const prompt = scope.get('systemPrompt') as {
-            section?: (section: { name: string; order: number; text: string; complete: boolean; interpolate: boolean }) => unknown;
-          } | undefined;
-          if (!tools?.restrict || !tools.guard || !prompt?.section) throw new Error('宿主不支持战斗代理的工具隔离或完整提示词');
-          tools.restrict({ allow: COMBAT_TOOLS });
-          tools.guard((exec) => {
-            if (!COMBAT_TOOLS.includes(exec.name as typeof COMBAT_TOOLS[number])) return '战斗代理只能使用授权的跑团工具';
-            if (!this.service.active(main.sessionKey)?.campaign.initiative) return '战斗已结束或暂停，等待主 DM 接手，不再执行战斗操作';
-            if (exec.name === 'dnd_initiative' && (exec.arguments as { action?: string })?.action === 'start') return '这场战斗已有先攻表，不可重开战斗';
-            return undefined;
-          });
-          // runtime-context 每次团况变化都会重发整份快照，固定交接放在稳定前缀里，避免每次重复几千 token。
-          // 交接含玩家原话，不作模板插值；{{...}} 保持字面文本。
-          prompt.section({
-            name: 'qqbot:combat-agent', order: 0, complete: true, interpolate: false,
-            text: `${this.service.combatInstructions()}\n${GROUP_MESSAGE_FORMAT_PROMPT}\n\n${run!.prompt}`,
-          });
-        };
-        const options = { agentOptions: { provider: run.provider, model: run.model, reasoningEffort: run.reasoningEffort }, setup };
-        handle = restore
-          ? await this.agents.resume({ resumeSessionId: run.childSessionId, ...options })
-          : await this.agents.create({ sessionId: run.childSessionId, meta: { parentSession: main.sessionId, cwd: main.agent.session.header?.cwd ?? process.cwd() }, ...options });
+        try {
+          handle = await spawn({ provider: run.provider, model: run.model }, restore);
+        } catch (primaryErr) {
+          const errMsg = primaryErr instanceof Error ? primaryErr.message.slice(0, 200) : String(primaryErr).slice(0, 200);
+          this.markPrimaryCooldown({ provider: run.provider, model: run.model }, errMsg);
+          const canRetryBackup = backup !== undefined && !switchedToBackup
+            && (backup.provider !== run.provider || backup.model !== run.model);
+          if (!canRetryBackup) throw primaryErr;
+          const prevLabel = `${run.provider}/${run.model}`;
+          this.logger.warn(`im-qqbot: 战斗代理主通道 ${prevLabel} 启动失败 (${errMsg})，切至备用通道 ${backup.provider}/${backup.model} key=${main.sessionKey}`);
+          run.fallbackFrom = `${prevLabel} (${errMsg})`;
+          run.provider = backup.provider;
+          run.model = backup.model;
+          run.childSessionId = randomUUID();
+          restore = false;
+          switchedToBackup = true;
+          handle = await spawn(backup, false);
+        }
         if (this.disposed || generation !== (this.generations.get(main.sessionKey) ?? 0)) { await handle.dispose(); return main; }
         const child: SessionRecord = { ...main, sessionId: run.childSessionId, agent: handle.agent, handle, agentPreset: undefined, contextTokens: undefined };
-        this.active.set(main.sessionKey, { main, child, run });
+        this.active.set(main.sessionKey, { main, child, run, switchedToBackup });
         this.syncTools(main);
         this.syncTools(child);
         this.save(run);
-        this.logger.info(`im-qqbot: 战斗代理${restore ? '恢复' : '接管'} key=${main.sessionKey} child=${child.sessionId} model=${run.provider}/${run.model}`);
+        this.logger.info(`im-qqbot: 战斗代理${restore ? '恢复' : '接管'} key=${main.sessionKey} child=${child.sessionId} model=${run.provider}/${run.model}${run.fallbackFrom ? ` (fallback from ${run.fallbackFrom})` : ''}`);
         return child;
       } catch (err) {
         this.active.delete(main.sessionKey);
@@ -381,6 +501,7 @@ export class DndCombatAgents {
         this.failed.add(main.sessionKey);
         this.syncTools(main);
         run.status = 'failed'; run.endedAt = Date.now();
+        run.error = err instanceof Error ? err.message.slice(0, 300) : String(err).slice(0, 300);
         this.checkpoint(run);
         this.logger.warn(`im-qqbot: 战斗代理不可用，主 DM 继续 key=${main.sessionKey}: ${String(err)}`);
         return main;
@@ -388,14 +509,20 @@ export class DndCombatAgents {
     });
   }
 
-  /** 出站已按同一 SessionRecord 发到群；这里只记账并在安全的 idle 边界交回主 DM。 */
-  public observe(record: SessionRecord, event: { type: string; seq?: number; data: Record<string, unknown> }): void {
+  /**
+   * 出站已按同一 SessionRecord 发到群；这里只记账并在安全的 idle 边界交回主 DM 或切换备用通道。
+   * 返回 true 表示本次子代理 turn/end 报错已由战斗路由接管恢复（切备用模型或交回主 DM），出站层不必再向群内刷原始报错。
+   */
+  public observe(record: SessionRecord, event: { type: string; seq?: number; data: Record<string, unknown> }): boolean {
     const active = this.active.get(record.sessionKey);
     const settling = this.settling.get(record.sessionId);
     const run = active?.run ?? settling;
-    if (!run) return;
+    if (!run) return false;
     if (event.seq !== undefined) {
-      if ((run.lastSeq[record.sessionId] ?? -1) >= event.seq) return;
+      if ((run.lastSeq[record.sessionId] ?? -1) >= event.seq) {
+        const dupReason = event.type === 'turn/end' ? (event.data.reason as { kind?: string } | undefined) : undefined;
+        return Boolean(active && record.agent === active.child.agent && (dupReason?.kind === 'error' || dupReason?.kind === 'failed'));
+      }
       run.lastSeq[record.sessionId] = event.seq;
     }
     if (event.type === 'assistant/message') {
@@ -424,16 +551,92 @@ export class DndCombatAgents {
     }
     if (event.type === 'turn/end' && settling) { this.settling.delete(record.sessionId); this.checkpoint(settling); }
     if (event.type === 'turn/end' && active && record.agent === active.child.agent) {
-      const reason = event.data.reason as { kind?: string } | undefined;
-      if (isAutoSteerTurnEnd(reason)) return;
-      void record.agent.whenIdle().then(() => this.serial(record.sessionKey, async () => {
+      const reason = event.data.reason as { kind?: string; message?: string; error?: { message?: string; code?: string }; failure?: { message?: string; code?: string } } | undefined;
+      if (isAutoSteerTurnEnd(reason)) return false;
+      const isFailure = reason?.kind === 'error' || reason?.kind === 'failed';
+      const task = record.agent.whenIdle().then(() => this.serial(record.sessionKey, async () => {
         if (this.disposed || this.active.get(record.sessionKey) !== active) return;
         const found = this.service.active(record.sessionKey);
-        if (reason?.kind === 'error' || reason?.kind === 'failed') await this.finish(active, 'failed');
+        if (isFailure) {
+          const errObj = reason?.error ?? reason?.failure;
+          const code = errObj?.code ? ` (${errObj.code})` : '';
+          const msg = (errObj?.message ?? reason?.message ?? '').trim();
+          const errText = `${reason!.kind}${code}${msg ? `: ${msg.slice(0, 300)}` : ''}`;
+          this.markPrimaryCooldown({ provider: active.run.provider, model: active.run.model }, errText);
+          const rawBackup = this.fallback?.()?.backup;
+          const backup = rawBackup && rawBackup.provider.trim() && rawBackup.model.trim()
+            && (rawBackup.provider.trim() !== active.run.provider || rawBackup.model.trim() !== active.run.model)
+            ? { provider: rawBackup.provider.trim(), model: rawBackup.model.trim() }
+            : undefined;
+          if (found?.campaign.initiative && !active.switchedToBackup && backup !== undefined) {
+            try {
+              await this.switchToBackup(active, found.campaign, backup, errText);
+              return;
+            } catch (switchErr) {
+              const switchMsg = switchErr instanceof Error ? switchErr.message.slice(0, 160) : String(switchErr).slice(0, 160);
+              active.run.error = `${errText}；备用通道 ${backup.provider}/${backup.model} 启动失败: ${switchMsg}`;
+              await this.finish(active, 'failed');
+              return;
+            }
+          }
+          active.run.error = active.run.fallbackFrom
+            ? `主通道 ${active.run.fallbackFrom}；备用通道 ${active.run.provider}/${active.run.model} ${errText}`
+            : errText;
+          await this.finish(active, 'failed');
+        }
         else if (!found) await this.finish(active, 'paused');
         else if (!found.campaign.initiative) await this.finish(active, 'completed');
-      })).catch((err: unknown) => this.logger.warn(`im-qqbot: 战斗交接失败: ${String(err)}`));
+      })).catch((err: unknown) => this.logger.warn(`im-qqbot: 战斗交接失败: ${String(err)}`))
+        .finally(() => { if (active.pendingTurnEnd === task) active.pendingTurnEnd = undefined; });
+      active.pendingTurnEnd = task;
+      return isFailure;
     }
+    return false;
+  }
+
+  private async switchToBackup(active: ActiveCombat, campaign: Campaign, backup: CombatRoute, errText: string): Promise<void> {
+    const oldChild = active.child;
+    const prevLabel = `${active.run.provider}/${active.run.model}`;
+    const replayPrompt = extractReplayPrompt(oldChild.agent, active.lastPrompt);
+    const hasChildDialogue = eventsOf(oldChild.agent).some((e) => e.type === 'assistant/message');
+    const contextChars = this.settings()?.contextChars ?? 8000;
+    active.run.prompt = buildCombatPrompt(
+      campaign,
+      hasChildDialogue ? oldChild.agent : active.main.agent,
+      contextChars,
+      hasChildDialogue,
+    );
+    active.run.fallbackFrom = `${prevLabel} (${errText})`;
+    active.run.provider = backup.provider;
+    active.run.model = backup.model;
+    active.run.childSessionId = randomUUID();
+    delete active.run.error;
+    const setup = this.makeSetup(active.run.sessionKey, () => active.run.prompt);
+    const handle = await this.agents.create({
+      sessionId: active.run.childSessionId,
+      meta: { parentSession: active.main.sessionId, cwd: active.main.agent.session.header?.cwd ?? process.cwd() },
+      agentOptions: { provider: backup.provider, model: backup.model, reasoningEffort: active.run.reasoningEffort },
+      setup,
+    });
+    const newChild: SessionRecord = {
+      ...active.main,
+      replyTarget: oldChild.replyTarget,
+      lastActivity: oldChild.lastActivity,
+      recentSenders: oldChild.recentSenders,
+      sessionId: active.run.childSessionId,
+      agent: handle.agent,
+      handle,
+      agentPreset: undefined,
+      contextTokens: undefined,
+    };
+    active.child = newChild;
+    active.switchedToBackup = true;
+    active.lastPrompt = replayPrompt;
+    this.syncTools(newChild);
+    this.save(active.run);
+    await oldChild.handle.dispose().catch(() => {});
+    this.logger.warn(`im-qqbot: 战斗代理通道异常 (${errText})，已自动切至备用通道 ${backup.provider}/${backup.model} key=${active.run.sessionKey} child=${newChild.sessionId}`);
+    newChild.agent.followup(createUserMessage({ content: [{ type: 'text', text: replayPrompt }], source: { kind: 'user' } }));
   }
 
   private async finish(active: ActiveCombat, status: CombatRun['status']): Promise<void> {
@@ -467,7 +670,9 @@ export class DndCombatAgents {
     run.handoff = [
       '【系统 · 战斗代理交回 · DM 私有】',
       ...(status === 'paused' ? ['团已暂停。只确认保存，不推进回合或剧情；未结束的战斗留待下次开团。'] : []),
-      status === 'completed' ? '战斗已结束。机械结算已经实时写入同一份团档，禁止重复扣血、扣资源、掷骰或再发奖励。只接续战后剧情，没确认的战利品按模组查证。' : '战斗代理已停止。先核对最新团况与待结算窗口，不能重做已落账行动，也不能当作战斗已结束。',
+      status === 'completed'
+        ? '战斗已结束。机械结算已经实时写入同一份团档，禁止重复扣血、扣资源、掷骰或再发奖励。只接续战后剧情，没确认的战利品按模组查证。'
+        : `战斗代理已停止${run.error ? `（原因：${run.error}；此原因仅供 DM 知悉，勿把原始报错 JSON 发进群）` : ''}。先核对最新团况与待结算窗口，不能重做已落账行动，也不能当作战斗已结束。`,
       ...(outcomeBlock !== undefined ? [outcomeBlock] : []),
       found
         ? `【战前→战后队伍变化】\n${formatPartyDelta(run.before, found.campaign)}\n最新团况：\n${summarize(found.campaign, found.adventure)}${newChronicle ? `\n新增账本：\n${newChronicle}` : ''}`
@@ -488,13 +693,15 @@ export class DndCombatAgents {
       this.settling.set(main.sessionId, run);
       main.agent.followup(createUserMessage({ content: [{ type: 'text', text: run.handoff }], source: { kind: 'user' } }));
     }
-    this.logger.info(`im-qqbot: 战斗代理交回 key=${run.sessionKey} status=${status} ${Object.entries(run.usage).map(([k, u]) => rowUsage(k, u)).join(' | ')}`);
+    this.logger.info(`im-qqbot: 战斗代理交回 key=${run.sessionKey} status=${status}${run.error ? ` reason=${run.error}` : ''} ${Object.entries(run.usage).map(([k, u]) => rowUsage(k, u)).join(' | ')}`);
   }
 
   public report(key: string): string {
     const run = this.active.get(key)?.run ?? [...this.settling.values()].find((r) => r.sessionKey === key) ?? this.load(key);
     if (!run) return '还没有战斗代理记录。启用后，开战后的下一次玩家消息或回合按钮会交给战斗模型。';
     return [`战斗代理：${run.status}｜${run.provider}/${run.model}`,
+      ...(run.fallbackFrom ? [`已回退自：${run.fallbackFrom}`] : []),
+      ...(run.error ? [`失败原因：${run.error}`] : []),
       `记录：${run.id.slice(0, 8)}｜子会话 ${run.childSessionId.slice(0, 8)}`,
       ...Object.entries(run.usage).map(([label, usage]) => rowUsage(label, usage)),
       '包含战斗代理与战后主 DM 交接回复；不含开战前主会话，缓存单列，金额按渠道账单计算。',

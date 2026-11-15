@@ -7,7 +7,7 @@ import { SessionManager, dndStateText } from '../session/session-manager.ts';
 import type { DshAgent, SessionRecord } from '../session/types.ts';
 import { AdventureLibrary } from './adventure.ts';
 import { CampaignStore, endInitiative, startInitiative, upsertCharacter } from './campaign.ts';
-import { COMBAT_TOOLS, DndCombatAgents, recentCombatDialogue } from './combat-agent.ts';
+import { COMBAT_TOOLS, DndCombatAgents, recentCombatDialogue, type CombatFallbackState } from './combat-agent.ts';
 import { DndService } from './dnd-service.ts';
 import { registerDndTools } from './dnd-tools.ts';
 import { DndToolScope } from './tool-scope.ts';
@@ -58,9 +58,10 @@ function harness() {
   };
   const agents = { create: vi.fn(make), resume: vi.fn(make), get: vi.fn() };
   const sync = vi.fn();
-  const createRouter = () => new DndCombatAgents(agents as never, service, () => settings, sync, logger, join(directory, 'runs'));
+  let fallbackState: CombatFallbackState | undefined;
+  const createRouter = () => new DndCombatAgents(agents as never, service, () => settings, sync, logger, join(directory, 'runs'), () => fallbackState);
   const router = createRouter();
-  return { directory, service, key, logger, main, settings, agents, children, restrictions, prompts, contexts, guards, router, sync, createRouter };
+  return { directory, service, key, logger, main, settings, agents, children, restrictions, prompts, contexts, guards, router, sync, createRouter, setFallback: (next?: CombatFallbackState) => { fallbackState = next; } };
 }
 
 function usage(seq: number, model = 'deepseek-v4.1-flash') {
@@ -313,12 +314,16 @@ describe('战斗代理交接、恢复和用量', () => {
     expect(h.main.agent.followup).not.toHaveBeenCalled();
   });
 
-  it('运行失败交回当前状态，保留进行中的先攻，不把它说成胜利', async () => {
+  it('运行失败交回当前状态，保留进行中的先攻，不把它说成胜利，并记录失败原因', async () => {
     const h = harness();
     const child = await h.router.select(h.main);
-    h.router.observe(child, { type: 'turn/end', data: { reason: { kind: 'error' } } });
+    h.router.observe(child, { type: 'turn/end', data: { reason: { kind: 'error', error: { code: 'QUOTA', message: '429 GoUsageLimitError' } } } });
     await vi.waitFor(() => expect(h.main.agent.followup).toHaveBeenCalledOnce());
-    expect(JSON.stringify(vi.mocked(h.main.agent.followup).mock.calls)).toContain('不能当作战斗已结束');
+    const followupText = JSON.stringify(vi.mocked(h.main.agent.followup).mock.calls);
+    expect(followupText).toContain('不能当作战斗已结束');
+    expect(followupText).toContain('QUOTA');
+    expect(followupText).toContain('429 GoUsageLimitError');
+    expect(h.router.report(h.key)).toContain('失败原因：error (QUOTA): 429 GoUsageLimitError');
     expect(h.service.active(h.key)!.campaign.initiative).toBeDefined();
     expect(await h.router.select(h.main)).toBe(h.main);
   });
@@ -393,5 +398,57 @@ it('SessionManager 的玩家和按钮入口都直接路由子级', async () => {
   await manager.sendDndFollowup(h.main, { text: '玩家点了结束回合' });
   expect(child.agent.followup).toHaveBeenCalledWith({ text: '玩家点了结束回合' });
   expect(h.main.agent.followup).not.toHaveBeenCalled();
+  await h.router.dispose();
+});
+
+it('主通道 turn/end 报 429 QUOTA 时自动切备用通道重放提示，下场开战在冷却期内直接走备用通道，主备均败才交回主 DM', async () => {
+  const h = harness();
+  h.setFallback({ backup: { provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' } });
+  const child1 = await h.router.select(h.main);
+  (child1.agent.session.events as unknown[]).push({
+    type: 'user/message',
+    data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '[系统 · 战斗接管] 布置场地并推进首轮' }] },
+  });
+  const handled = h.router.observe(child1, {
+    type: 'turn/end',
+    seq: 13,
+    data: { reason: { kind: 'error', error: { code: 'QUOTA', message: 'OpenCode Go usage limit reached' } } },
+  });
+  expect(handled).toBe(true);
+  await vi.waitFor(() => expect(h.agents.create).toHaveBeenCalledTimes(2));
+
+  // 已自动切到 commandcode 子代理，未交回主 DM
+  expect(h.main.agent.followup).not.toHaveBeenCalled();
+  expect(h.children[0]!.dispose).toHaveBeenCalledOnce();
+  const secondCreateOpts = h.agents.create.mock.calls[1]![0] as { agentOptions?: { provider?: string; model?: string } };
+  expect(secondCreateOpts.agentOptions).toMatchObject({ provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' });
+  const child2 = h.router.current(h.key)!;
+  expect(child2).toBeDefined();
+  expect(child2.sessionId).not.toBe(child1.sessionId);
+  expect(JSON.stringify(vi.mocked(child2.agent.followup).mock.calls)).toContain('布置场地并推进首轮');
+  expect(h.router.report(h.key)).toContain('commandcode/deepseek/deepseek-v4.1-flash');
+  expect(h.router.report(h.key)).toContain('已回退自：opencode-go/deepseek-v4.1-flash');
+
+  // 若备用通道也继续报错，不再死循环，而是把两侧失败原因交回主 DM
+  const handled2 = h.router.observe(child2, {
+    type: 'turn/end',
+    seq: 5,
+    data: { reason: { kind: 'error', error: { code: 'TRANSPORT', message: 'upstream 502' } } },
+  });
+  expect(handled2).toBe(true);
+  await vi.waitFor(() => expect(h.main.agent.followup).toHaveBeenCalledOnce());
+  expect(h.agents.create).toHaveBeenCalledTimes(2);
+  const handoff = JSON.stringify(vi.mocked(h.main.agent.followup).mock.calls);
+  expect(handoff).toContain('OpenCode Go usage limit reached');
+  expect(handoff).toContain('upstream 502');
+
+  // 下一场新战斗开启时，主通道仍在冷却期内，直接以备用通道启动
+  h.service.store.update(h.key, (c) => endInitiative(c));
+  await h.router.select(h.main);
+  h.service.store.update(h.key, (c) => startInitiative(c, () => 12));
+  const child3 = await h.router.select(h.main);
+  expect(child3).not.toBe(h.main);
+  const thirdCreateOpts = h.agents.create.mock.calls[2]![0] as { agentOptions?: { provider?: string; model?: string } };
+  expect(thirdCreateOpts.agentOptions).toMatchObject({ provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' });
   await h.router.dispose();
 });

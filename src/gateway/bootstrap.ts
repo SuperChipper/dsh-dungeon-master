@@ -607,7 +607,25 @@ export async function bootstrapGateway(
       manager.dndToolScope = toolScope;
       manager.combatAgents = new DndCombatAgents(
         agents, dndService, () => config.dnd?.combatAgent,
-        (record) => toolScope.sync(record), logger,
+        (record) => toolScope.sync(record), logger, undefined,
+        () => {
+          const activeFailover = manager.getFailoverRoute();
+          const fo = config.modelFailover;
+          if (!fo?.enabled) return activeFailover ? { activeFailover } : undefined;
+          const cur = config.dnd?.combatAgent;
+          const pProv = fo.primaryProvider.trim() || (config.provider ?? '').trim();
+          const pMod = fo.primaryModel.trim() || (config.model ?? '').trim();
+          const bProv = fo.backupProvider.trim();
+          const bMod = fo.backupModel.trim();
+          const isBackupConfiguredAsPrimary = cur?.provider.trim() === bProv && cur?.model.trim() === bMod;
+          const cand = isBackupConfiguredAsPrimary
+            ? (pProv && pMod ? { provider: pProv, model: pMod } : undefined)
+            : (bProv && bMod ? { provider: bProv, model: bMod } : undefined);
+          const backup = cand && (cand.provider !== cur?.provider.trim() || cand.model !== cur?.model.trim())
+            ? cand
+            : undefined;
+          return { activeFailover, backup };
+        },
       );
       dndService.onStateChange = (key) => manager.syncDndTools(key);
       // 不是 QQ 会话的 agent 也不带跑团工具：每个 agent 出现时先全藏，QQ 会话建好记录后再按团的状态放开。

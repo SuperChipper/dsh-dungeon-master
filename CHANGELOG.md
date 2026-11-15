@@ -2,14 +2,19 @@
 
 > [English](./CHANGELOG_EN.md)
 
-本文件从产品视角记录 dsh-qqbot 的重要更新，聚焦用户可感知的变化。
+本文件从产品视角记录 `dsh-dungeon-master` 的重要更新，聚焦用户可感知的变化。
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
-## [Unreleased]
+## [0.6.0] - 2026-11-16
 
 ### 新功能
 
+- **D&D 5e 群聊跑团系统（`/dnd` 与 17 个 `dnd_*` 工具）**：支持模组加载（地城与城镇双模式）、角色卡与法术/职业能力表管理、SRD 查询、网格战场寻路与 AOE 覆盖计算、迷雾玩家地图与 Emoji/PNG 战棋地图渲染、剧情账本（Chronicle）与背景钩子、签到开团及快照回滚。
+- **结构化状态引擎与回合账本**：完整支持 PHB 14 种状态、6 级力竭与常见战斗状态（祝福术、护盾信仰、加速术、狂暴、闪避、隐形、专注联动等）的自动优劣势、AC/豁免骰、速度归零、倒地半速自动起身与抗性结算；工具返回自动附带单行「当前回合账本」，所有自动规则均提供 `ignore_state_mods` 逃生阀。
+- **分段反应窗口与精准回滚**：支持命中前（`foe_attacks` / `attacked`）、暴击确认（`enemy_crit`）、受伤后（`damaged`）分段反应询问与一次性服务端授权校验；`dnd_undo` 支持按步骤序号 `steps`、掷骰编号 `#R` 或角色开局站位精准撤销，不误伤开战先攻。
+- **专用战斗子代理、自动备用通道回退与演练沙箱**：开战后可将战斗结算委派给独立子会话模型（主会话锁定为等待视图，战后自动汇总未播报账本与队伍净变化交回主 DM）；当主通道遇到 429 配额或连接异常且已启用 `modelFailover` 时自动无缝切至备用通道续接，无备用通道或主备均失败时抑制原始 JSON 刷群并向主 DM 透出原因；`dnd_initiative(rehearsal=true)` 支持梦境/切磋沙箱战后自动还原。
+- **模组制作 Skill（`dnd-module-authoring`）**：内置面向 AI Agent 的模组编写指南与隔离打包规范。
 - **`qqbot_booru_fetch` 搜图工具**：按 tag（如 `shinosawa_hiro rating:general -ai-generated`）在 safebooru 上取一张 `latest`/`random` 的图，自动去重（`media/fanart/seen.json`，发出去的那张由 send-file 回调记为已发）、校验文件头与大小、落地到 `tmp/fanart/yuri-<id>.<ext>` 并返回路径，直接喂给 `qqbot_send_file`。角色新图推送这类定时任务不用再每轮手搓下载脚本。danbooru 本体对这台机器走 Cloudflare 质询（API/cdn 全 403），safebooru 是同一套 tag 语法的镜像且同图同字节，故统一走它。
 - **纳入 DSH 插件管理**：可在 DSH Web 的「插件」页安装、启停 `dsh-dungeon-master`，并在组合包详情页直接调整配置，无需手改 profile 文件。
 - **配置项扩展**：新增群聊未 @ 回复概率、群历史条数、会话闲置超时、主人 openid、文件访问白名单/敏感路径等可编辑项。
