@@ -13,6 +13,7 @@ import {
   type InitiativeState,
   type Weapon,
   type ReactorOption,
+  changeCondition,
   findCharacter,
   isOut,
   isRangedWeapon,
@@ -23,6 +24,12 @@ import {
   requireInitiative,
   roomOf,
 } from './campaign.ts';
+import {
+  ensureTurnState,
+  hasCondition,
+  isIncapacitated,
+  movementSpeedInfo,
+} from './conditions.ts';
 import {
   type BattleMap,
   type Cell,
@@ -46,9 +53,6 @@ export const DEFAULT_SPEED = 30;
 const MELEE_REACH_FEET = 5;
 const MAX_COORD = 99;
 
-/** 这些状态下做不了反应，不会打借机 */
-const CANNOT_REACT = ['昏迷', '麻痹', '石化', '失能', '震慑'];
-
 export function distanceFeet(a: Pick<BattleCell, 'x' | 'y'>, b: Pick<BattleCell, 'x' | 'y'>): number {
   return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y)) * CELL_FEET;
 }
@@ -64,7 +68,7 @@ function isHostile(a: Character, b: Character): boolean {
 }
 
 export function canReact(ch: Character): boolean {
-  return !isOut(ch) && ch.hp > 0 && !ch.conditions.some((cond) => CANNOT_REACT.includes(cond));
+  return !isOut(ch) && ch.hp > 0 && !isIncapacitated(ch);
 }
 
 /** 房间字段不能成为绕过战场路线、借机和出口位置的捷径。 */
@@ -259,6 +263,10 @@ export interface MoveRequest {
   drag?: string;
   /** 撤离动作：这次移动不触发借机 */
   disengage?: boolean;
+  /** 倒地时保持爬行（不自动扣半速起身，每格按双倍移动力计算） */
+  crawl?: boolean;
+  /** 特例豁免移动类状态限制（如自由行动戒指） */
+  ignoreStateMods?: boolean;
   /** 反应/他人回合里的移动：不计入本回合移动力 */
   reaction?: boolean;
   /** 工具层移动必须暂停；纯路径查询仍可取得完整路线。不能由模型跳过。 */
@@ -320,18 +328,39 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
   if (from === undefined) throw new Error(`${ch.name} 还没摆位，先 dnd_position set`);
   const map = mapOf(c, from.room);
   const reaction = request.reaction === true;
-  if (request.disengage === true) state.disengaged = [...new Set([...(state.disengaged ?? []), ch.name])];
+  if (request.disengage === true) {
+    state.disengaged = [...new Set([...(state.disengaged ?? []), ch.name])];
+    if (!reaction) {
+      const ts = ensureTurnState(c);
+      if (ts?.actor === ch.name) ts.actionUsed ??= '撤离';
+    }
+  }
   const disengaged = state.disengaged?.includes(ch.name) === true;
 
   if (request.dash === true && !reaction) {
     const dashed = state.dashed ?? [];
     if (!dashed.includes(ch.name)) dashed.push(ch.name);
     state.dashed = dashed;
+    const ts = ensureTurnState(c);
+    if (ts?.actor === ch.name) ts.actionUsed ??= '冲刺';
   }
   const isDashed = state.dashed?.includes(ch.name) === true;
-  const baseSpeed = ch.speed ?? DEFAULT_SPEED;
+  const moveInfo = request.ignoreStateMods === true
+    ? { baseSpeed: ch.speed ?? DEFAULT_SPEED, zeroSpeed: false, zeroReasons: [] as string[], notes: [] as string[], fearSources: [] as string[], hasUnboundFear: false }
+    : movementSpeedInfo(ch, DEFAULT_SPEED);
+  const rawBaseSpeed = ch.speed ?? DEFAULT_SPEED;
+  const baseSpeed = moveInfo.zeroSpeed ? rawBaseSpeed : moveInfo.baseSpeed;
   const speed = baseSpeed * (isDashed ? 2 : 1);
-  const used = reaction ? 0 : state.moved?.[ch.name] ?? 0;
+  const usedBefore = reaction ? 0 : state.moved?.[ch.name] ?? 0;
+  const isProne = !reaction && request.ignoreStateMods !== true && hasCondition(ch, '倒地');
+  const crawling = isProne && request.crawl === true;
+  const ts = ensureTurnState(c);
+  const autoStandUp = isProne && !crawling && ts?.stoodUp !== true;
+  const standCost = autoStandUp ? Math.floor(baseSpeed / 2) : 0;
+  if (autoStandUp && request.interrupt === true && usedBefore + standCost > speed) {
+    throw new Error(`${ch.name} 处于「倒地」，起身需先消耗一半速度（${standCost} 尺），但本回合只剩 ${Math.max(0, speed - usedBefore)}/${speed} 尺移动力；若冲刺请传 dash=true，若倒地爬行请传 crawl=true`);
+  }
+  const used = usedBefore + standCost;
 
   const dragged = request.drag === undefined ? undefined : requireCharacter(c, request.drag);
   if (dragged !== undefined) {
@@ -344,7 +373,8 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
 
   const others = placedIn(c, from.room).filter(({ ch: o }) => o.name !== ch.name && o.name !== dragged?.name);
   const foes = others.filter(({ ch: o }) => isHostile(ch, o));
-  const reactors = foes.filter(({ ch: o }) => inInitiative(c, o.name) && canReact(o) && !o.conditions.includes('失明') && reactionBlocked(c, o.name) === undefined
+  const moverInvisible = request.ignoreStateMods !== true && hasCondition(ch, '隐形') && !hasCondition(ch, '妖火');
+  const reactors = moverInvisible ? [] : foes.filter(({ ch: o }) => inInitiative(c, o.name) && canReact(o) && !hasCondition(o, '失明') && reactionBlocked(c, o.name) === undefined
     && !request.ignoredReactors?.includes(o.name));
   const reachOf = (other: Character): number => Math.max(MELEE_REACH_FEET, ...(other.weapons ?? []).map((w) => weaponReach(w, true) ?? 0));
   // 5e：能穿过友方的格子，不能穿过敌人的
@@ -352,7 +382,7 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
   const taken = (at: Cell): boolean => others.some(({ cell }) => cell.x === at.x && cell.y === at.y);
   const provokesOn = (a: Cell, b: Cell): number => disengaged ? 0
     : reactors.filter(({ ch: other, cell }) => distanceFeet(a, cell) <= reachOf(other) && distanceFeet(b, cell) > reachOf(other)).length;
-  const factor = dragged === undefined ? 1 : 2;
+  const factor = (dragged === undefined ? 1 : 2) * (crawling ? 2 : 1);
 
   let dest: Cell;
   let path: Cell[];
@@ -427,6 +457,20 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
     throw new Error(`走到 (${dest.x},${dest.y}) 就不贴着 ${keep!.name} 了；不给坐标、传 to + keep_adjacent，工具会挑贴着他的格子`);
   }
 
+  if (!reaction && request.ignoreStateMods !== true && moveInfo.fearSources.length > 0) {
+    for (const srcName of moveInfo.fearSources) {
+      const srcCh = findCharacter(c, srcName);
+      const srcCell = srcCh === undefined ? undefined : cellOf(c, srcCh);
+      if (srcCh !== undefined && srcCell !== undefined && srcCell.room === from.room) {
+        const startDist = distanceFeet(from, srcCell);
+        const closer = path.some((step, i) => i > 0 && distanceFeet(step, srcCell) < startDist);
+        if (closer) {
+          throw new Error(`${ch.name} 正对 ${srcCh.name} 处于「恐慌」状态，不能主动移向恐惧源（若免疫或强制位移请传 ignore_state_mods=true 或用 set）`);
+        }
+      }
+    }
+  }
+
   let opportunity: MoveResult['opportunity'];
   if (request.interrupt === true && !disengaged) {
     const triggers: Array<{ stop: number; character: string; reaction: string }> = [];
@@ -457,6 +501,8 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
         ignoredReactors: [...new Set([...(request.ignoredReactors ?? []), ...here.map((t) => t.character)])],
         ...(request.drag !== undefined ? { drag: request.drag } : {}),
         ...(request.keepAdjacent !== undefined ? { keepAdjacent: request.keepAdjacent } : {}),
+        ...(request.crawl === true ? { crawl: true } : {}),
+        ...(request.ignoreStateMods === true ? { ignoreStateMods: true } : {}),
       } };
       path = path.slice(0, first + 1);
       dest = path.at(-1)!;
@@ -502,13 +548,19 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
     }
   }
   const moved = state.moved ?? {};
-  if (!reaction) moved[ch.name] = (moved[ch.name] ?? 0) + feet;
+  const notes: string[] = [...moveInfo.notes];
+  if (autoStandUp) {
+    changeCondition(c, ch.name, '倒地', false);
+    if (ts !== undefined && ts.actor === ch.name) ts.stoodUp = true;
+    notes.push(`已自动花费 ${standCost} 尺移动力从倒地起身并解除「倒地」（若本意是保持倒地爬行，请 dnd_undo 后传 crawl=true）`);
+  } else if (crawling) {
+    notes.push(`${ch.name} 保持倒地爬行（每格算双倍耗速）`);
+  }
+  if (!reaction) moved[ch.name] = (moved[ch.name] ?? 0) + standCost + feet;
   state.moved = moved;
 
-  const notes: string[] = [];
-  if (ch.conditions.includes('倒地')) notes.push(`${ch.name} 还倒地：爬行每尺算两尺；站起来花一半速度，再 dnd_apply 解除倒地`);
-  const stuck = ch.conditions.filter((cond) => ['擒抱', '束缚', '麻痹', '石化', '昏迷'].includes(cond));
-  if (stuck.length > 0) notes.push(`${ch.name} 处于${stuck.join('、')}，速度应为 0`);
+  if (moveInfo.hasUnboundFear) notes.push(`${ch.name} 处于恐慌：不能主动移向恐惧源`);
+  if (moveInfo.zeroReasons.length > 0) notes.push(`${ch.name} 处于${moveInfo.zeroReasons.join('、')}，速度应为 0`);
   const area = map === undefined ? undefined : areaAt(map, dest);
   return {
     name: ch.name,

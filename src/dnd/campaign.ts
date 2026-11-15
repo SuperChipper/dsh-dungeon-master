@@ -27,9 +27,26 @@ import {
 } from './dungeon.ts';
 import { ABILITIES, type Ability, type Skill, abilityModifier, parseAbility, parseSkill, proficiencyBonus, SKILLS } from './rules.ts';
 import { type MoveRequest, battleGridLines, battleLines, canReact, cellOf, distancesFrom, hiddenFromPlayers } from './battlefield.ts';
+import {
+  type ActiveState,
+  type TurnActionState,
+  actionRestriction,
+  breakConcentration,
+  concentratingOn,
+  effectiveMaxHp,
+  exhaustionLevel,
+  isIncapacitated,
+  normalizeCondition,
+  removeActiveState,
+  stateAcBonus,
+  tickActiveStatesOnTurnChange,
+  upsertActiveState,
+} from './conditions.ts';
 import { pendingSummaryLine } from './pending-attack.ts';
 import type { BattleMap } from './terrain.ts';
 import { type NpcState, afterChange, describeCondition, evalCondition, locationKnown, roomView, storySummaryLines } from './story.ts';
+
+export type { ActiveState, TurnActionState };
 
 export type CharacterKind = 'pc' | 'npc' | 'monster';
 
@@ -54,6 +71,8 @@ export interface Character {
   tempHp: number;
   ac: number;
   conditions: string[];
+  /** 结构化生效状态（含持续轮数、专注归属、动态命中/AC加值）；旧存档缺省时自动从 conditions 推导 */
+  activeStates?: ActiveState[];
   /** 怪物/NPC 的命中加值与伤害（PC 按属性+熟练算） */
   attackBonus?: number;
   damage?: string;
@@ -118,12 +137,18 @@ export interface InitiativeEntry {
   init: number;
 }
 
-/** foe_attacks：敌人打队友时（尖刻言语）；attacked：自己被打时（护盾术）；attacking：自己攻击没中时（导引打击） */
+/**
+ * foe_attacks：敌人打队友时（尖刻言语）；attacked：自己被命中且非重击时（护盾术）；
+ * attacking：自己攻击没中时（导引打击）；damaged：自己确认受伤害后（迷雾逃生、炼狱叱喝）；
+ * enemy_crit：敌人打出重击时（时间变幻）
+ */
 export interface ReactionDef {
   name: string;
-  when?: 'foe_attacks' | 'attacked' | 'attacking';
-  /** 用掉的资源；卡上这项用完了就不问他 */
+  when?: 'foe_attacks' | 'attacked' | 'attacking' | 'damaged' | 'enemy_crit';
+  /** 用掉的资源；卡上这项不够 cost 就不问他 */
   resource?: string;
+  /** 每次使用消耗的资源点数（缺省 1；如防御法杖施放护盾术为 2） */
+  cost?: number;
   /** 够得着的距离（尺），量的是「反应者到自己那次攻击的发起者」；不填 = 不按距离筛 */
   range?: number;
   /**
@@ -146,6 +171,12 @@ const INFERRED_REACTIONS: Array<{ pattern: RegExp; def: ReactionDef }> = [
   { pattern: /尖刻言语|Cutting Words/i, def: { name: '尖刻言语', when: 'foe_attacks', resource: '诗人激励', range: 60 } },
   { pattern: /护盾术/, def: { name: '护盾术', when: 'attacked' } },
   { pattern: /导引打击|Guided Strike/i, def: { name: '导引打击', when: 'attacking', resource: '引导神力' } },
+  // 时间变幻平时不每刀都弹，敌人重击时自动挂起防秒杀；普通检定/豁免仍由 DM 用 hold_for 挂起
+  { pattern: /时间变幻|Chronal Shift/i, def: { name: '时间变幻', when: 'enemy_crit', resource: '时间变幻', range: 30 } },
+  { pattern: /迷雾逃生|Misty Escape/i, def: { name: '迷雾逃生', when: 'damaged', resource: '迷雾逃生' } },
+  { pattern: /炼狱叱喝|Hellish Rebuke/i, def: { name: '炼狱叱喝', when: 'damaged', range: 60 } },
+  { pattern: /吸收元素|Absorb Elements/i, def: { name: '吸收元素', when: 'damaged' } },
+  { pattern: /直觉闪避|Uncanny Dodge/i, def: { name: '直觉闪避', when: 'damaged' } },
   // 哨兵：5 尺内有人打别人时反打一记。是不算命中与否的新攻击，所以不看 hit
   { pattern: /哨兵|Sentinel/i, def: { name: '哨兵', when: 'foe_attacks', range: 5, counter: true } },
   // 长柄大师：拿着长柄武器时，敌人「进入」触及范围就借机（不是离开）
@@ -184,7 +215,7 @@ interface PendingBase {
   claimed: ReactorOption[];
   /** 入站重复投递不能在玩家改选后复活旧授权。 */
   reactionReplyIds?: string[];
-  used: Array<{ by: string; name: string; effect: string }>;
+  used: Array<{ by: string; name: string; effect: string; spendKey?: string; spendAmount?: number; consumedReaction?: boolean }>;
 }
 
 /** 掷完骰、还没落账的一次攻击 */
@@ -204,6 +235,8 @@ export interface PendingAttack extends PendingBase {
   elvenAccuracy?: boolean;
   /** 重击阈值（缺省 20；咒剑诅咒等为 19） */
   critThreshold?: number;
+  /** 目标处于 5 尺内麻痹/昏迷：确认命中时自动转为重击（不改变命中判定本身） */
+  autoCritOnHit?: boolean;
   ac: number;
   crit: boolean;
   /** 掷好的伤害（抗性之前）；没中时没有 */
@@ -355,6 +388,8 @@ export interface InitiativeState {
   allParticipants?: string[];
   /** 本场完整战斗账本（按轮次记录，供战斗代理收尾交接补齐未播报回合） */
   ledger?: CombatLedgerEntry[];
+  /** 当前行动者本回合的结构化动作槽与起身记录（回合切换自动重置） */
+  turnState?: TurnActionState;
   /** 梦境/幻境/切磋演练模式：战后自动恢复战前角色状态与房间场地图 */
   rehearsal?: boolean;
   rehearsalSnapshot?: RehearsalSnapshot;
@@ -729,7 +764,8 @@ export function applyDamage(c: Campaign, name: string, amount: number, options: 
     }
   }
   if (ch.hp === 0 && rest > 0) {
-    if (ch.kind !== 'pc' || overflow >= ch.maxHp) {
+    const effMax = effectiveMaxHp(ch);
+    if (ch.kind !== 'pc' || overflow >= effMax) {
       if (setCondition(ch, '死亡', true)) events.push('死亡');
     } else if (before > 0) {
       if (setCondition(ch, '昏迷', true)) events.push('昏迷');
@@ -738,6 +774,18 @@ export function applyDamage(c: Campaign, name: string, amount: number, options: 
     } else {
       // 已经昏迷的 PC 再受伤：记一次死亡豁免失败（重击由调用方再记一次）
       events.push(...addDeathFailures(ch, 1));
+    }
+  }
+  if (dmg > 0) {
+    if (ch.hp === 0 || isIncapacitated(ch)) {
+      events.push(...breakConcentration(c, ch.name, '失去行动能力'));
+    } else {
+      const conc = concentratingOn(c, ch.name);
+      if (conc.length > 0) {
+        const dc = Math.max(10, Math.floor(dmg / 2));
+        const spells = [...new Set(conc.map((x) => x.state.name))].join('、');
+        events.push(`专注受击（${spells}）：需过体质专注豁免 DC ${dc}`);
+      }
     }
   }
   pushLog(c, `${ch.name} 受到 ${dmg} 点伤害（${hpTrail(ch, before)}）${events.length > 0 ? `，${events.join('、')}` : ''}`);
@@ -762,16 +810,17 @@ function hpTrail(ch: Character, before: number): string {
   return ch.kind === 'monster' ? woundLabel(ch) : `${before}→${ch.hp}/${ch.maxHp}`;
 }
 
-/** 治疗：不超过最大 HP；从 0 恢复时清掉昏迷/稳定 */
+/** 治疗：不超过有效最大 HP（力竭 4 级减半）；从 0 恢复时清掉昏迷/稳定 */
 export function heal(c: Campaign, name: string, amount: number): HpChange {
   const ch = requireCharacter(c, name);
   if (ch.conditions.includes('死亡')) throw new Error(`${ch.name} 已经死亡，普通治疗无效`);
   const before = ch.hp;
-  ch.hp = Math.min(ch.maxHp, ch.hp + Math.max(0, Math.trunc(amount)));
+  const effMax = effectiveMaxHp(ch);
+  ch.hp = Math.min(effMax, ch.hp + Math.max(0, Math.trunc(amount)));
   const events: string[] = [];
   if (before === 0 && ch.hp > 0) {
-    setCondition(ch, '昏迷', false);
-    setCondition(ch, '稳定', false);
+    removeActiveState(ch, '昏迷');
+    removeActiveState(ch, '稳定');
     delete ch.deathSaves;
     events.push('苏醒');
   }
@@ -788,12 +837,23 @@ export function grantTempHp(c: Campaign, name: string, amount: number): HpChange
 
 export function changeCondition(c: Campaign, name: string, condition: string, on: boolean): Character {
   const ch = requireCharacter(c, name);
-  const value = condition.trim();
-  if (value.length === 0) throw new Error('状态名不能为空');
-  if (!on && value === '死亡' && ch.conditions.includes('死亡')) {
+  const norm = normalizeCondition(condition);
+  if (norm.length === 0) throw new Error('状态名不能为空');
+  if (!on && norm === '死亡' && ch.conditions.includes('死亡')) {
     throw new Error('不能手动解除「死亡」。判错了要回滚用 dnd_undo；不死坚韧之类的特性工具会自动处理');
   }
-  if (setCondition(ch, value, on)) pushLog(c, `${ch.name} ${on ? '获得' : '解除'}状态「${value}」`);
+  if (on) {
+    const had = ch.conditions.some((x) => normalizeCondition(x) === norm);
+    const { broken } = upsertActiveState(c, ch, {
+      name: condition,
+      ...(norm === '闪避' ? { source: ch.name, expires: 'start_of_source_turn' } : {}),
+    });
+    if (!had) pushLog(c, `${ch.name} 获得状态「${norm}」`);
+    for (const line of broken) pushLog(c, line);
+  } else {
+    const removed = removeActiveState(ch, condition);
+    for (const r of removed) pushLog(c, `${ch.name} 解除状态「${r}」`);
+  }
   return ch;
 }
 
@@ -971,6 +1031,7 @@ export function startInitiative(
     turn: 0,
     order: rolls.map(({ name, init }) => ({ name, init })),
     allParticipants: rolls.map(({ name }) => name),
+    ...(rolls[0] !== undefined ? { turnState: { actor: rolls[0].name, attacks: 0 } } : {}),
     ...(rehearsal ? { rehearsal: true, rehearsalSnapshot } : {}),
   };
   if (surprised.length > 0) c.initiative.surprised = surprised;
@@ -1000,8 +1061,20 @@ export function spendReaction(c: Campaign, name: string): void {
   c.initiative.rebrief = true;
 }
 
+/** 退回本轮误扣的反应名额（1/1），供改判退费或未最终受伤自动回退使用 */
+export function restoreReaction(c: Campaign, name: string): boolean {
+  const ch = requireCharacter(c, name);
+  if (c.initiative === undefined) throw new Error('反应名额只在战斗中记账');
+  const had = c.initiative.reacted?.includes(ch.name) === true;
+  if (c.initiative.reacted !== undefined) {
+    c.initiative.reacted = c.initiative.reacted.filter((n) => n !== ch.name);
+    if (c.initiative.reacted.length === 0) delete c.initiative.reacted;
+  }
+  return had;
+}
+
 export function armorClass(c: Campaign | undefined, ch: Character): number {
-  return ch.ac + (c?.initiative?.shielded?.includes(ch.name) === true ? 5 : 0);
+  return ch.ac + (c?.initiative?.shielded?.includes(ch.name) === true ? 5 : 0) + stateAcBonus(ch);
 }
 
 /** 指针往后挪一格；回到表头算新一轮。新一轮开始时突袭已经结束 */
@@ -1031,6 +1104,8 @@ export function skipSurprised(c: Campaign): { skipped: string[]; newRound: boole
     if (stepTurn(state)) newRound = true;
   }
   if (skipped.length > 0) pushLog(c, `受惊跳过：${skipped.join('、')}`);
+  const active = state.order[state.turn]?.name;
+  if (active !== undefined) state.turnState = { actor: active, attacks: 0 };
   return { skipped, newRound };
 }
 
@@ -1172,6 +1247,7 @@ export function nextRollId(c: Campaign): number {
 export function nextTurn(c: Campaign): { round: number; current: InitiativeEntry; newRound: boolean; skipped: string[] } {
   assertNoPending(c, '推进回合');
   const state = requireInitiative(c);
+  const prevActor = state.order[state.turn]?.name;
   for (const entry of [...state.order]) {
     const ch = findCharacter(c, entry.name);
     if (ch === undefined || isOut(ch)) removeFromInitiative(state, entry.name);
@@ -1185,13 +1261,15 @@ export function nextTurn(c: Campaign): { round: number; current: InitiativeEntry
   let newRound = stepTurn(state);
   const skip = skipSurprised(c);
   newRound ||= skip.newRound;
-  // 反应到自己回合开始时恢复
+  // 反应到自己回合开始时恢复，并结算持续轮数与回合开始/结束状态
   const current = state.order[state.turn]!;
   if (state.shielded !== undefined) state.shielded = state.shielded.filter((name) => name !== current.name);
   if (state.reacted !== undefined) {
     state.reacted = state.reacted.filter((n) => n !== current.name);
     if (state.reacted.length === 0) delete state.reacted;
   }
+  const expired = tickActiveStatesOnTurnChange(c, prevActor, current.name);
+  for (const line of expired) pushLog(c, line);
   return { round: state.round, current, newRound, skipped: skip.skipped };
 }
 
@@ -1255,6 +1333,16 @@ export function endInitiative(c: Campaign, options: { keepChanges?: boolean } = 
 
   for (const ch of dead) recordNpcDeath(c, ch);
   c.characters = c.characters.filter((ch) => !(ch.kind === 'monster' && isOut(ch)));
+  for (const ch of c.characters) {
+    if (ch.activeStates !== undefined) {
+      const endNames = ch.activeStates
+        .filter((s) => s.expires === 'end_of_combat' || s.name === '闪避')
+        .map((s) => s.name);
+      for (const name of endNames) removeActiveState(ch, name);
+    } else if (ch.conditions.includes('闪避')) {
+      removeActiveState(ch, '闪避');
+    }
+  }
   pushLog(c, `战斗结束（${rounds} 轮）${defeated.length > 0 ? `，击败 ${defeated.join('、')}` : ''}`);
   return { rounds, defeated, survivingMonsters, ...(rehearsal ? { rehearsal: true, restored: false } : {}) };
 }
@@ -1565,6 +1653,8 @@ export interface ActOptions {
    * 跳过「只能由本人宣告」，但仍然受回合顺序限制。用之前必须在回复里写明是谁委托的。
    */
   dmOverride?: boolean;
+  /** 特例豁免结构化状态的硬拦截（如自由行动戒指、特殊专长） */
+  ignoreStateMods?: boolean;
   /**
    * 最近真正给 bot 发过消息的人。传入时 declaredBy 必须在里面：
    * 模型照抄角色卡上的 openid 也冒充不了没说话的玩家。
@@ -1594,6 +1684,10 @@ export function assertDeclaredByOwner(ch: Character, options: ActOptions, what: 
  */
 export function assertCanAct(c: Campaign, ch: Character, options: ActOptions = {}): void {
   if (options.reaction === true) return;
+  if (options.ignoreStateMods !== true) {
+    const blocked = actionRestriction(ch);
+    if (blocked !== undefined) throw new Error(`${blocked}（若特殊规则允许请传 ignore_state_mods=true）`);
+  }
   // 委托来的行动（玩家自己说「让 Kriv 去谈」）和强制位移不查本人，但仍然只能在轮到他的回合里主动行动
   if (options.dmOverride !== true) assertDeclaredByOwner(ch, options, '行动');
   const state = c.initiative;
@@ -1638,6 +1732,7 @@ export function gotoTurn(c: Campaign, name: string, round?: number): InitiativeE
   delete state.dashed;
   delete state.disengaged;
   delete state.fightingSpirit;
+  state.turnState = { actor: ch.name, attacks: 0 };
   if (round !== undefined && round >= 1) state.round = Math.trunc(round);
   pushLog(c, `先攻指针调整到第 ${state.round} 轮 ${ch.name}`);
   return state.order[idx]!;
@@ -1844,6 +1939,10 @@ export function rest(
       }
     }
     if (kind === 'short') {
+      if (ch.activeStates !== undefined) {
+        const timed = ch.activeStates.filter((s) => s.roundsLeft !== undefined || s.expires !== undefined).map((s) => s.name);
+        for (const t of timed) removeActiveState(ch, t);
+      }
       const dice = Math.max(0, Math.trunc(spendFor.get(ch) ?? 0));
       if (dice > 0) {
         if (ch.hitDie === undefined) throw new Error(`${ch.name} 没记录生命骰，先 dnd_character update hit_die（如 d10）`);
@@ -1862,17 +1961,33 @@ export function rest(
         }
         ch.hitDiceUsed = (ch.hitDiceUsed ?? 0) + dice;
         const before = ch.hp;
-        if (!ch.conditions.includes('死亡')) ch.hp = Math.min(ch.maxHp, ch.hp + healed);
-        lines.push(`生命骰 ${rolls.join(' ')} = ${healed}，HP ${before}→${ch.hp}/${ch.maxHp}（剩 ${ch.level - ch.hitDiceUsed} 颗）`);
+        const effMax = effectiveMaxHp(ch);
+        if (!ch.conditions.includes('死亡')) ch.hp = Math.min(effMax, ch.hp + healed);
+        lines.push(`生命骰 ${rolls.join(' ')} = ${healed}，HP ${before}→${ch.hp}/${effMax}（剩 ${ch.level - ch.hitDiceUsed} 颗）`);
       }
     } else {
+      if (ch.activeStates !== undefined) {
+        const timed = ch.activeStates.filter((s) => s.roundsLeft !== undefined || s.expires !== undefined).map((s) => s.name);
+        for (const t of timed) removeActiveState(ch, t);
+      }
+      const exh = exhaustionLevel(ch);
+      if (exh > 0) {
+        removeActiveState(ch, '力竭');
+        if (exh > 1) {
+          upsertActiveState(c, ch, { name: `力竭:${exh - 1}` });
+          lines.push(`力竭减轻为 ${exh - 1} 级`);
+        } else {
+          lines.push('解除力竭');
+        }
+      }
       const before = ch.hp;
-      ch.hp = ch.maxHp;
+      const effMax = effectiveMaxHp(ch);
+      ch.hp = effMax;
       ch.tempHp = 0;
       delete ch.deathSaves;
-      setCondition(ch, '昏迷', false);
-      setCondition(ch, '稳定', false);
-      if (before < ch.maxHp) lines.push(`HP ${before}→${ch.maxHp}`);
+      removeActiveState(ch, '昏迷');
+      removeActiveState(ch, '稳定');
+      if (before < effMax) lines.push(`HP ${before}→${effMax}`);
       if ((ch.hitDiceUsed ?? 0) > 0) {
         const regained = Math.min(ch.hitDiceUsed ?? 0, Math.max(1, Math.floor(ch.level / 2)));
         ch.hitDiceUsed = (ch.hitDiceUsed ?? 0) - regained;
@@ -2246,7 +2361,7 @@ export function snapshotRolls(label: string): number[] {
   return [...label.matchAll(/#R(\d+)\b/g)].map((m) => Number(m[1]));
 }
 
-/** 这些改动推进过回合：按骰子撤销越过它们时要 DM 再确认一次 */
+/** 这些改动推进过回合、有人中途入战/换房间，或已经结过下一轮检定：按骰子撤销越过它们时要 DM 再确认一次 */
 export function crossesTurn(label: string): boolean {
-  return /^dnd_initiative .*action=(next|goto|end)\b|^按钮 结束回合/.test(label);
+  return /^dnd_initiative .*action=(next|goto|end|join|start)\b|^按钮 结束回合|^dnd_move\b|^dnd_check\b/.test(label);
 }

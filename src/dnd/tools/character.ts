@@ -1,21 +1,25 @@
 /** 角色卡与资源：dnd_character、dnd_resource、dnd_rest。 */
 import type { Adventure } from '../adventure.ts';
 import {
-type Campaign,type CharacterInput,type CharacterKind,assertNoPending,changeInventory,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isOut,fightRooms,leaveInitiative,removeCharacter,requireCharacter,requireResource,rest,
+type Campaign,type CharacterInput,type CharacterKind,assertNoPending,changeInventory,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isOut,fightRooms,leaveInitiative,reactionBlocked,removeCharacter,requireCharacter,requireResource,rest,
+restoreReaction,
 restoreResource,
 roomOf,
 setHexbladeCurse,
-setResource,upsertCharacter,
+setResource,spendReaction,upsertCharacter,
 useResource
 } from '../campaign.ts';
 import {
 npcAlive
 } from '../story.ts';
-import { ABILITIES,type Ability,proficiencyBonus } from '../rules.ts';
+import { ABILITIES,type Ability,abilityModifier,proficiencyBonus } from '../rules.ts';
+import {
+DEFAULT_CONCENTRATION_STATES,breakConcentration,ensureTurnState,normalizeCondition,upsertActiveState
+} from '../conditions.ts';
 import { resolveSrdQuery,zhTable } from '../srd-lookup.ts';
 import { type CardSpell,mergeSpells,resolveSpells } from '../spell-links.ts';
 import { hookHint } from '../hooks.ts';
-import { assertCombatExit } from '../battlefield.ts';
+import { assertCombatExit, canReact } from '../battlefield.ts';
 import {
 parseReactions,str,
 int,
@@ -26,7 +30,7 @@ parseSkills,
 parseSpellInputs,
 parseWeapons,
 parseAbilities,srdList,requireSrd,srdMonsterInput,
-numberedNames,type ToolKit
+numberedNames,combatLedgerSuffix,type ToolKit
 } from './shared.ts';
 
 /** 暂停时可备好 PC 卡，但不能借写卡改战场或访问敌方数据。 */
@@ -90,14 +94,16 @@ export function registerCharacterTools(kit: ToolKit): void {
       reactions: {
         type: 'array',
         description: 'Reactions that can change an attack; attacks pause for the player when one applies (replaces the list). '
-          + 'when: foe_attacks (a foe hits an ally or self: 尖刻言语), attacked (self is hit: 护盾术), attacking (own attack misses: 导引打击). '
-          + 'resource: what it spends; once that runs out the player is not asked.',
+          + 'when: foe_attacks (a foe hits an ally or self: 尖刻言语), attacked (self is hit before damage: 护盾术), '
+          + 'damaged (after taking damage is confirmed: 迷雾逃生, 炼狱叱喝), enemy_crit (a foe lands a crit: 时间变幻), '
+          + 'attacking (own attack misses: 导引打击). resource: what it spends; cost: units spent per use (default 1, e.g. 2 for Staff of Defense Shield).',
         items: {
           type: 'object',
           properties: {
             name: { type: 'string' },
-            when: { type: 'string', enum: ['foe_attacks', 'attacked', 'attacking'] },
+            when: { type: 'string', enum: ['foe_attacks', 'attacked', 'attacking', 'damaged', 'enemy_crit'] },
             resource: { type: 'string' },
+            cost: { type: 'integer', description: 'Resource units spent per reaction (default 1).' },
             range: { type: 'integer', description: 'Trigger range in feet (e.g. 哨兵 5, 长柄大师 10).' },
             counter: { type: 'boolean', description: 'Reaction grants a separate counterattack (e.g. 哨兵); record it with dnd_apply reaction, then dnd_check attack reaction=true after settling.' },
             enter: { type: 'boolean', description: 'Triggers when an enemy enters reach (长柄大师); movement pauses at this boundary.' },
@@ -116,17 +122,23 @@ export function registerCharacterTools(kit: ToolKit): void {
       expertise: { type: 'array', items: { type: 'string' }, description: 'Skills with expertise (double proficiency), e.g. ["巧手","隐匿"].' },
       spells: {
         type: 'array',
-        description: 'Spells the character knows or has prepared, replacing the list. Fill it whenever a caster\'s sheet is '
-          + 'written or levels up: players open it from the 「我的法术」 turn button, each with a wiki link. The English '
-          + 'wiki link is checked when written; give `en` when the Chinese name is not an SRD spell (脆弱诅咒 → Hex).',
+        description: 'Spells AND class/item abilities on the character\'s sheet, replacing the list. Players open it from the '
+          + '「法术/能力」 turn button. For spells (kind="spell" or omitted), give level (0-9) and `en` when the Chinese name '
+          + 'is not in the SRD table (脆弱诅咒 → Hex). For class features/actions or magic item abilities, pass kind="feature" '
+          + 'or "item" (level optional, no English wiki check) with optional action/resource/cost/summary so players see their full kit.',
         items: {
           type: 'object',
           properties: {
             name: { type: 'string', description: 'Chinese name as the table says it.' },
-            level: { type: 'integer', description: '0 for cantrips.' },
-            en: { type: 'string', description: 'English name, when the Chinese one is not in the SRD table.' },
+            level: { type: 'integer', description: '0 for cantrips; 1-9 for leveled spells; optional (default 0) when kind is feature/item.' },
+            kind: { type: 'string', enum: ['spell', 'feature', 'item'], description: 'Default "spell"; pass "feature" for class actions/features or "item" for item charges.' },
+            action: { type: 'string', enum: ['action', 'bonus', 'reaction', 'free', 'passive'], description: 'Action economy cost.' },
+            resource: { type: 'string', description: 'Linked resource key in dnd_resource (displays live current/max).' },
+            cost: { type: 'integer', description: 'Units of resource spent per use (default 1).' },
+            summary: { type: 'string', description: 'Concise 1-line summary for players.' },
+            en: { type: 'string', description: 'English spell name, when the Chinese spell is not in the SRD table.' },
           },
-          required: ['name', 'level'],
+          required: ['name'],
           additionalProperties: false,
         },
       },
@@ -333,7 +345,17 @@ export function registerCharacterTools(kit: ToolKit): void {
       character: { type: 'string' },
       resource: { type: 'string' },
       amount: { type: 'integer', description: 'use/restore: how much (default 1 / refill). For lay on hands, the HP spent.' },
-      target: { type: 'string', description: 'For use on targeted class features (e.g. "咒剑诅咒"): the target creature name. Enables automatic 19-20 crit, +proficiency damage, and on-kill healing.' },
+      target: { type: 'string', description: 'For use on targeted class features (e.g. "咒剑诅咒") or single-target apply_state: the target creature name.' },
+      targets: { type: 'array', items: { type: 'string' }, description: 'For use with apply_state on multiple creatures (e.g. 祝福术 on 3 allies, 灾祸术 on foes).' },
+      apply_state: {
+        type: 'string',
+        description: 'For use: atomically attach a structured active state/buff (e.g. "祝福术", "灾祸术", "护盾信仰", "加速术", "狂暴", "神圣武器", "闪避", "妖火"). Automatically applies attack/save/AC/speed modifiers, concentration management and round countdowns.',
+      },
+      concentration: { type: 'boolean', description: 'For apply_state: whether this effect requires concentration (auto-breaks previous concentration). Auto-detected for standard spells like 祝福术/护盾信仰/加速术.' },
+      rounds: { type: 'integer', description: 'For apply_state: duration in combat rounds (default 10 for 1-minute buffs); auto-ticks on the caster\'s turn.' },
+      hit_bonus: { type: 'integer', description: 'For apply_state: flat attack bonus while active (神圣武器 auto-computes max(1, CHA mod) if omitted).' },
+      ac_bonus: { type: 'integer', description: 'For apply_state: flat AC bonus while active (护盾信仰/加速术 auto-apply +2 if omitted).' },
+      action_cost: { type: 'string', enum: ['action', 'bonus', 'reaction', 'free'], description: 'Optional turn action-economy slot spent in combat (records 主动作/附赠动作 and warns on duplicate usage).' },
       temp_hp: { type: 'integer', description: 'Optional temporary HP override for features like "战斗英姿" (computed automatically from fighter level if omitted).' },
       max: { type: 'integer', description: 'For set.' },
       current: { type: 'integer', description: 'For set: current value (default: full for a new resource).' },
@@ -343,8 +365,17 @@ export function registerCharacterTools(kit: ToolKit): void {
     (args, exec) => mutate(exec, (c) => {
       const name = String(args.character ?? '');
       const key = String(args.resource ?? '');
-      if (/^(反应|reaction)$/i.test(key.trim())) throw new Error('反应由战斗工具按 0/1 自动记账，在自己下回合开始恢复；不要用 dnd_resource 重复创建、消耗或恢复。用 dnd_character show 查看');
       const action = String(args.action);
+      if (/^(反应|reaction)$/i.test(key.trim())) {
+        if (action === 'restore') {
+          if (!c.active || c.initiative === undefined) throw new Error('反应名额只在战斗中记账，当前不在战斗中');
+          assertNoPending(c, '恢复反应名额');
+          const ch = requireCharacter(c, name);
+          const had = restoreReaction(c, ch.name);
+          return had ? `已退回 ${ch.name} 本轮的反应名额（1/1）` : `${ch.name} 本轮的反应本来就是可用状态（1/1）`;
+        }
+        throw new Error('反应由战斗工具按 0/1 自动记账，在自己下回合开始恢复；不要用 dnd_resource 创建或手动消耗（仅误扣退费时可用 action=restore resource="反应"）。用 dnd_character show 查看');
+      }
       if (!c.active && (action !== 'set' || requireCharacter(c, name).kind !== 'pc')) {
         throw new Error('停团时只能用 dnd_resource set 配置 PC 资源；消耗和恢复请开团后操作');
       }
@@ -375,21 +406,106 @@ export function registerCharacterTools(kit: ToolKit): void {
         }
         const result = useResource(c, ch.name, key, int(args.amount) ?? 1);
         const baseLine = `${ch.name}「${result.key}」${result.before}→${result.resource.current}/${result.resource.max}`;
+        const keyTrim = result.key.trim();
+        const rawApplyState = str(args.apply_state);
+        const normApplyState = rawApplyState !== undefined ? normalizeCondition(rawApplyState) : undefined;
+        const isSacredWeapon = /^(神圣武器|Sacred Weapon)$/i.test(keyTrim) || normApplyState === '神圣武器';
+        const isActionSurge = /^(动作如潮|Action Surge)$/i.test(keyTrim);
+        const isFightingSpirit = /^(战斗英姿|Fighting Spirit)$/i.test(keyTrim);
+        const isRageResource = /^(狂暴|Rage)$/i.test(keyTrim);
+
+        // 当前行动者回合内自动追踪主动作/附赠动作槽位并提示重复消耗
+        const warnings: string[] = [];
+        const onOwnTurn = c.initiative !== undefined && c.initiative.order[c.initiative.turn]?.name === ch.name;
+        const ts = onOwnTurn ? ensureTurnState(c) : undefined;
+        const explicitCost = str(args.action_cost) as 'action' | 'bonus' | 'reaction' | 'free' | undefined;
+        const inferredCost: 'action' | 'bonus' | 'reaction' | 'free' | undefined = explicitCost
+          ?? (isActionSurge ? 'free' : undefined)
+          ?? (isFightingSpirit || curseTarget !== undefined || isRageResource || normApplyState === '狂暴' || normApplyState === '护盾信仰' || /^(回气|Second Wind)$/i.test(keyTrim) ? 'bonus' : undefined)
+          ?? (isSacredWeapon ? 'action' : undefined);
+
+        if (isActionSurge) {
+          if (ts !== undefined) {
+            delete ts.actionUsed;
+            ts.attacks = 0;
+          }
+          return `${baseLine}；动作如潮生效，本回合获得额外一个主动作（主动作与攻击计数已刷新）${combatLedgerSuffix(c)}`;
+        }
+        if (ts !== undefined && inferredCost === 'action') {
+          if (ts.actionUsed !== undefined || ts.attacks > 0) {
+            warnings.push(`【动作经济提醒】${ch.name} 本回合此前已使用主动作（${ts.actionUsed ?? `已攻击×${ts.attacks}`}），请核对是否有动作如潮或特殊规则支持`);
+          }
+          ts.actionUsed = normApplyState ?? keyTrim;
+        } else if (ts !== undefined && inferredCost === 'bonus') {
+          if (ts.bonusUsed !== undefined) {
+            warnings.push(`【动作经济提醒】${ch.name} 本回合此前已使用过附赠动作（${ts.bonusUsed}），每回合通常只有 1 个附赠动作`);
+          }
+          ts.bonusUsed = normApplyState ?? keyTrim;
+        }
+        const warnSuffix = warnings.length > 0 ? `\n${warnings.join('\n')}` : '';
+
         if (curseTarget !== undefined) {
           setHexbladeCurse(c, ch.name, curseTarget.name);
           const prof = proficiencyBonus(ch.level);
           const killHeal = hexbladeKillHeal(ch);
-          return `${baseLine}；已对「${curseTarget.name}」施加咒剑诅咒（攻击该目标天然 19-20 重击、命中伤害自动 +${prof}，请勿在 damage 重复填常数；目标死亡恢复 ${killHeal} HP）`;
+          return `${baseLine}；已对「${curseTarget.name}」施加咒剑诅咒（攻击该目标天然 19-20 重击、命中伤害自动 +${prof}，请勿在 damage 重复填常数；目标死亡恢复 ${killHeal} HP）${warnSuffix}${combatLedgerSuffix(c)}`;
         }
-        if (/^(战斗英姿|Fighting Spirit)$/i.test(result.key.trim())) {
+        if (isFightingSpirit) {
           const gain = int(args.temp_hp) ?? fightingSpiritTempHp(ch);
           const hpChange = grantTempHp(c, ch.name, gain);
           if (c.initiative !== undefined) {
             c.initiative.fightingSpirit = [...new Set([...(c.initiative.fightingSpirit ?? []), ch.name])];
           }
-          return `${baseLine}；获得 ${gain} 点临时 HP（当前临时 HP ${hpChange.tempHp}）${c.initiative !== undefined ? '，本回合武器攻击自动具有优势（含精灵精准三骰取高）' : ''}`;
+          return `${baseLine}；获得 ${gain} 点临时 HP（当前临时 HP ${hpChange.tempHp}）${c.initiative !== undefined ? '，本回合武器攻击自动具有优势（含精灵精准三骰取高）' : ''}${warnSuffix}${combatLedgerSuffix(c)}`;
         }
-        return baseLine;
+        if (isSacredWeapon) {
+          const hitBonus = int(args.hit_bonus) ?? Math.max(1, abilityModifier(ch.abilities.cha));
+          const rounds = int(args.rounds) ?? 10;
+          upsertActiveState(c, ch, { name: '神圣武器', source: ch.name, roundsLeft: rounds, hitBonus });
+          return `${baseLine}；已激活「神圣武器」（持续 ${rounds} 轮，攻击检定自动 +${hitBonus}）${warnSuffix}${combatLedgerSuffix(c)}`;
+        }
+
+        const effectiveApplyState = normApplyState ?? (isRageResource ? '狂暴' : undefined);
+        if (effectiveApplyState !== undefined && effectiveApplyState.length > 0) {
+          const isConc = typeof args.concentration === 'boolean'
+            ? args.concentration
+            : DEFAULT_CONCENTRATION_STATES.has(effectiveApplyState);
+          const targetNames = strList(args.targets) ?? (str(args.target) !== undefined ? [str(args.target)!] : [ch.name]);
+          const targetChars = targetNames.map((n) => requireCharacter(c, n));
+          const broken = isConc ? breakConcentration(c, ch.name, `改换专注为「${effectiveApplyState}」`) : [];
+          const rounds = int(args.rounds) ?? (isConc || effectiveApplyState === '狂暴' ? 10 : (effectiveApplyState === '闪避' ? 1 : undefined));
+          const expires = effectiveApplyState === '闪避' ? 'start_of_source_turn' as const : undefined;
+          const hitBonus = int(args.hit_bonus);
+          const acBonus = int(args.ac_bonus);
+          for (const tCh of targetChars) {
+            const up = upsertActiveState(c, tCh, {
+              name: effectiveApplyState,
+              source: ch.name,
+              ...(isConc ? { concentration: true } : {}),
+              ...(rounds !== undefined ? { roundsLeft: rounds } : {}),
+              ...(expires !== undefined ? { expires } : {}),
+              ...(hitBonus !== undefined ? { hitBonus } : {}),
+              ...(acBonus !== undefined ? { acBonus } : {}),
+            }, { replaceConcentration: false });
+            broken.push(...up.broken);
+          }
+          const metaDesc = [
+            isConc ? '需专注' : '',
+            rounds !== undefined ? `持续${rounds}轮` : '',
+            hitBonus !== undefined ? `命中${hitBonus >= 0 ? '+' : ''}${hitBonus}` : '',
+            acBonus !== undefined ? `AC${acBonus >= 0 ? '+' : ''}${acBonus}` : (effectiveApplyState === '护盾信仰' || effectiveApplyState === '加速术' ? 'AC+2' : ''),
+          ].filter(Boolean).join('，');
+          const brokenSuffix = broken.length > 0 ? `；${broken.join('；')}` : '';
+          return `${baseLine}；已对「${targetChars.map((x) => x.name).join('、')}」挂载状态「${effectiveApplyState}」${metaDesc ? `（${metaDesc}）` : ''}${brokenSuffix}${warnSuffix}${combatLedgerSuffix(c)}`;
+        }
+
+        if (c.initiative !== undefined && /^(时间变幻|迷雾逃生|炼狱叱喝|直觉闪避|风暴之怒|偏转飞弹)$/i.test(keyTrim)) {
+          if (canReact(ch) && reactionBlocked(c, ch.name) === undefined) {
+            spendReaction(c, ch.name);
+            return `${baseLine}；已同步记下本轮反应已消耗（0/1）${warnSuffix}${combatLedgerSuffix(c)}`;
+          }
+        }
+        return `${baseLine}${warnSuffix}${combatLedgerSuffix(c)}`;
       }
       const result = restoreResource(c, name, key, int(args.amount));
       return `${requireCharacter(c, name).name}「${result.key}」${result.before}→${result.resource.current}/${result.resource.max}`;

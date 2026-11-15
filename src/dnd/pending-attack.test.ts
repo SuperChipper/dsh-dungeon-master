@@ -749,3 +749,169 @@ describe('哨兵：别人挨打时反手一记', () => {
     expect(pendingAttack.used.at(-1)?.name).toBe('哨兵');
   });
 });
+
+describe('2026-11-15 角斗场反应与回滚加固', () => {
+  it('多充能反应 cost：充能不足不弹窗，触发时一次扣足并显示余量；护盾术挡不下时显式警告', async () => {
+    const t = setup();
+    await t.call('dnd_character', {
+      action: 'update',
+      name: 'Kriv',
+      reactions: [
+        { name: '尖刻言语', when: 'foe_attacks', resource: '诗人激励' },
+        { name: '护盾术', when: 'attacked', resource: '防御法杖充能', cost: 2 },
+      ],
+    });
+    t.service.store.update(t.key, (c) => {
+      findCharacter(c, 'Kriv')!.resources!['防御法杖充能'] = { current: 9, max: 10, reset: 'long' };
+    });
+
+    // 16 + 6 = 22 vs AC 16：护盾术 +5 到 21 仍挡不住，必须带【算账核对】提醒
+    t.rolls.push(16, 4);
+    const overHit = await t.biteKriv();
+    expect(overHit).toContain('【算账核对】');
+    expect(overHit).toContain('单靠「护盾术」挡不下这一击');
+    await t.call('dnd_apply', { target: 'Kriv', decline: ['Kriv'], settle: true });
+
+    // 12 + 6 = 18 vs AC 16：护盾术能挡住，不报挡不下警告，且一次扣掉 2 点充能（9→7/10）
+    t.rolls.push(12, 3);
+    const blockable = await t.biteKriv();
+    expect(blockable).not.toContain('单靠「护盾术」挡不下这一击');
+    const usedText = await t.call('dnd_apply', {
+      target: 'Kriv',
+      declared_by: 'P2',
+      reaction: { by: 'Kriv', name: '护盾术', authorization: t.consent('Kriv', '护盾术'), ac_mod: 5 },
+    });
+    expect(usedText).toContain('9→7/10');
+    expect(findCharacter(t.campaign(), 'Kriv')!.resources!['防御法杖充能']!.current).toBe(7);
+    const settled = await t.call('dnd_apply', { target: 'Kriv', settle: true });
+    expect(settled).toContain('本笔反应汇总');
+
+    // 只剩 1 点充能时（< cost 2），不再向玩家询问护盾术
+    await t.call('dnd_initiative', { action: 'next' }); // 轮到 Kriv，自动恢复反应与卸除上轮护盾术
+    await t.call('dnd_initiative', { action: 'goto', name: '狼' });
+    t.service.store.update(t.key, (c) => {
+      const res = findCharacter(c, 'Kriv')!.resources!;
+      res['诗人激励']!.current = 0;
+      res['防御法杖充能']!.current = 1;
+    });
+    t.rolls.push(12, 3);
+    expect(await t.biteKriv()).not.toContain('待结算');
+  });
+
+  it('受伤后反应（迷雾逃生）排在改命中反应之后：尖刻言语改未命中不吞反应，仍命中才重开询问', async () => {
+    const t = setup();
+    // 兼容旧存档把迷雾逃生写成 when=attacked 的情况
+    t.service.store.update(t.key, (c) => {
+      const ch = findCharacter(c, '卡厄斯')!;
+      ch.ac = 16;
+      ch.reactions = [{ name: '迷雾逃生', when: 'attacked', resource: '迷雾逃生' }];
+      ch.resources = { 迷雾逃生: { current: 1, max: 1, reset: 'short' } };
+    });
+
+    // 第 1 击：11+6=17 vs AC 16，先只问 Kriv·尖刻言语，不提前弹出迷雾逃生
+    t.rolls.push(11, 4);
+    const first = await t.call('dnd_check', { type: 'attack', character: '狼', target: '卡厄斯' });
+    expect(first).toContain('Kriv·尖刻言语');
+    expect(first).not.toContain('迷雾逃生');
+
+    // Kriv 尖刻言语 -3 把 17 减到 14（未命中）：直接落账，卡厄斯迷雾逃生与反应名额完好无损
+    t.rolls.push(3);
+    await t.call('dnd_apply', {
+      target: '卡厄斯',
+      reaction: { by: 'Kriv', name: '尖刻言语', authorization: t.consent('Kriv', '尖刻言语'), attack_mod: '-1d6', spend: '诗人激励' },
+    });
+    const missSettle = await t.call('dnd_apply', { target: '卡厄斯', settle: true });
+    expect(missSettle).toContain('未命中');
+    expect(missSettle).toContain('Kriv「尖刻言语」');
+    expect(findCharacter(t.campaign(), '卡厄斯')!.resources!['迷雾逃生']!.current).toBe(1);
+    expect(t.campaign().initiative!.reacted).toEqual(['Kriv']);
+
+    // 下一轮重置 Kriv 反应，再测 Kriv 选择不用时自动解锁卡厄斯·迷雾逃生
+    t.service.store.update(t.key, (c) => { delete c.initiative!.reacted; });
+    t.rolls.push(12, 4);
+    await t.call('dnd_check', { type: 'attack', character: '狼', target: '卡厄斯' });
+    const unlock = await t.call('dnd_apply', { target: '卡厄斯', decline: ['Kriv'], settle: true });
+    expect(unlock).toContain('命中已确认，现在询问受伤后反应：卡厄斯·迷雾逃生');
+    expect(t.campaign().initiative!.pending).toBeDefined();
+    expect(t.onPendingAttack).toHaveBeenCalledTimes(3);
+  });
+
+  it('备注推断时间变幻只在敌人重击时自动挂起；手动扣时间变幻同步消耗反应，且支持 restore 反应退费', async () => {
+    const t = setup();
+    t.service.store.update(t.key, (c) => {
+      findCharacter(c, 'Kriv')!.reactions = [];
+      const ch = findCharacter(c, '卡厄斯')!;
+      ch.notes = '预言/时间法师：时间变幻 2/2';
+      ch.resources = { 时间变幻: { current: 2, max: 2, reset: 'long' } };
+    });
+
+    // 普通命中不弹时间变幻，避免每刀骚扰
+    t.rolls.push(15, 3);
+    expect(await t.biteKriv()).not.toContain('待结算');
+
+    // 天然 20 重击自动挂起询问卡厄斯·时间变幻
+    t.rolls.push(20, 4, 4);
+    const critText = await t.biteKriv();
+    expect(critText).toContain('卡厄斯·时间变幻');
+    await t.call('dnd_apply', { target: 'Kriv', decline: ['卡厄斯'], settle: true });
+
+    // 手动 dnd_resource use 时间变幻 会同步记下本轮反应已用，且误扣可 restore 反应退回
+    const manualUse = await t.call('dnd_resource', { action: 'use', character: '卡厄斯', resource: '时间变幻' });
+    expect(manualUse).toContain('已同步记下本轮反应已消耗');
+    expect(t.campaign().initiative!.reacted).toContain('卡厄斯');
+
+    const refunded = await t.call('dnd_resource', { action: 'restore', character: '卡厄斯', resource: '反应' });
+    expect(refunded).toContain('已退回 卡厄斯 本轮的反应名额');
+    expect(t.campaign().initiative!.reacted).toBeUndefined();
+  });
+
+  it('文字回复「用，直接放在伤害骰上」「用，攻击鉴定」在唯一选项时直接签发授权', async () => {
+    const t = setup();
+    t.rolls.push(15, 3);
+    await t.call('dnd_check', { type: 'attack', character: '狼', target: '卡厄斯' }); // Kriv 只有尖刻言语一个选项
+    const c = t.campaign();
+    expect(classifyReactionReply(c, 'P2', '<@!999> 用，直接放在伤害骰上')).toMatchObject({
+      kind: 'use',
+      choices: [{ character: 'Kriv', reaction: '尖刻言语' }],
+    });
+    expect(classifyReactionReply(c, 'P2', '<@!999> 用，攻击鉴定')).toMatchObject({
+      kind: 'use',
+      choices: [{ character: 'Kriv', reaction: '尖刻言语' }],
+    });
+    // 多选项时带技能名 + 修饰说明同样签发授权，但纯疑问句不授权
+    await t.call('dnd_apply', { target: '卡厄斯', cancel: true });
+    t.rolls.push(12, 3);
+    await t.biteKriv(); // Kriv 有尖刻言语 + 护盾术两个选项
+    const both = t.campaign();
+    expect(classifyReactionReply(both, 'P2', '用尖刻言语，直接放在伤害骰上')).toMatchObject({
+      kind: 'use',
+      choices: [{ character: 'Kriv', reaction: '尖刻言语' }],
+    });
+    expect(classifyReactionReply(both, 'P2', '用护盾术能挡下吗')).toMatchObject({ kind: 'question' });
+  });
+
+  it('dnd_undo roll= 越过中途 join 或后续检定时要求二次确认，并提示紧邻前置走位/扣资源', async () => {
+    const t = setup();
+    t.service.store.update(t.key, (c) => {
+      findCharacter(c, 'Kriv')!.reactions = [];
+      upsertCharacter(c, { name: '新队友', player: 'new', playerId: 'P9', maxHp: 20, ac: 15 });
+    });
+    await t.call('dnd_position', { action: 'set', placements: [{ name: '狼', x: 0, y: 0 }, { name: 'Kriv', x: 2, y: 0 }] });
+    await t.call('dnd_position', { action: 'move', name: '狼', x: 1, y: 0 });
+    t.rolls.push(15, 3);
+    const r1 = await t.biteKriv();
+    const id = /#R(\d+)/.exec(r1)![1]!;
+    t.rolls.push(18);
+    await t.call('dnd_initiative', { action: 'join', participants: ['新队友'] });
+
+    // 越过队友入战先攻，未传 confirm 时必须拦截确认
+    const ask = await t.call('dnd_undo', { action: 'undo', roll: `R${id}` });
+    expect(ask).toContain('confirm=true');
+    expect(t.campaign().initiative!.order.some((e) => e.name === '新队友')).toBe(true);
+
+    // confirm=true 执行后，提示紧邻该骰之前的同回合前置走位尚未回退
+    const done = await t.call('dnd_undo', { action: 'undo', roll: `R${id}`, confirm: true });
+    expect(done).toContain('【前置步骤提醒】');
+    expect(done).toContain('dnd_position action=move');
+  });
+});

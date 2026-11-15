@@ -28,7 +28,7 @@ isTwoHandedWeapon,outsideRooms,nextRollId,pushCombatLedger,pushLog,
 recordDeathFailures,resourceTag,reactionBlocked,
 requireCharacter,
 requireResource,
-requireInitiative,roomOf,spawnEncounter,
+requireInitiative,restoreReaction,restoreResource,roomOf,spawnEncounter,
 spendReaction,
 spawnMonsters,upsertCharacter,
 useResource,
@@ -71,7 +71,8 @@ updateNpc
 } from '../story.ts';
 import { ABILITIES,ABILITY_NAMES,type Ability,type Skill,SKILLS,parseAbility,parseSkill,skillLabel } from '../rules.ts';
 import { type SrdEntry,type SrdKind,candidatesText,resolveSrdQuery,zhTable } from '../srd-lookup.ts';
-import { type SpellInput,type UrlCheck,spellLine } from '../spell-links.ts';
+import { type AbilityActionKind,type CardEntryKind,type SpellInput,type UrlCheck,spellLine } from '../spell-links.ts';
+import { effectiveMaxHp,formatCharacterStates,turnLedgerLine } from '../conditions.ts';
 import {
 type Placement,canReact,mapOf,turnPositionNote
 } from '../battlefield.ts';
@@ -80,13 +81,14 @@ import {
 assertReactionAuthorized,assertWindowClosed,
 consumesReaction,
 declineReaction,findReactor,
-holdNotice,pendingHit,
+holdNotice,isDamagedReaction,pendingHit,
 manualReactors,mergeReactors,
 pendingState,
 reactionsOf,
 refreshReactors,
 requirePending,
 rollPassed,
+unlockDamagedReactors,
 waitingOn
 } from '../pending-attack.ts';
 import {
@@ -165,8 +167,9 @@ export function parseReactions(value: unknown): ReactionDef[] | undefined {
     const name = typeof o.name === 'string' ? o.name.trim() : '';
     if (name.length === 0) throw new Error('reactions 每一项要有 name');
     const def: ReactionDef = { name };
-    if (o.when === 'foe_attacks' || o.when === 'attacked' || o.when === 'attacking') def.when = o.when;
+    if (o.when === 'foe_attacks' || o.when === 'attacked' || o.when === 'attacking' || o.when === 'damaged' || o.when === 'enemy_crit') def.when = o.when;
     if (typeof o.resource === 'string' && o.resource.trim().length > 0) def.resource = o.resource.trim();
+    if (typeof o.cost === 'number' && Number.isFinite(o.cost) && o.cost > 0) def.cost = Math.trunc(o.cost);
     if (typeof o.range === 'number' && Number.isFinite(o.range) && o.range > 0) def.range = Math.trunc(o.range);
     if (o.counter === true) def.counter = true;
     if (o.enter === true) def.enter = true;
@@ -398,12 +401,19 @@ export function weaponTags(w: Weapon): string {
   return tags.length > 0 ? `［${tags.join('，')}］` : '';
 }
 
+/** 战斗中附加在工具结果尾部的单行权威回合账本 */
+export function combatLedgerSuffix(c: Campaign): string {
+  const line = turnLedgerLine(c, { armorClass, canReact, reactionBlocked });
+  return line === undefined ? '' : `\n${line}`;
+}
+
 /** who：把角色卡上绑定的 openid 换成给模型看的成员编号 */
 export function sheet(ch: Character, who: (openid: string) => string = (id) => id, campaign?: Campaign): string {
   const abilities = ABILITIES.map((a) => `${ABILITY_NAMES[a]}${ch.abilities[a]}`).join(' ');
+  const effMax = effectiveMaxHp(ch);
   const lines = [
     `${ch.name}${ch.player ? `〈${ch.player}${ch.playerId ? ` ${who(ch.playerId)}` : ''}〉` : ''}｜${ch.kind === 'pc' ? 'PC' : (ch.kind === 'npc' ? 'NPC' : '怪物')}${ch.className ? ` ${ch.className}` : ''} ${ch.level} 级`,
-    `HP ${ch.hp}/${ch.maxHp}${ch.tempHp > 0 ? ` +${ch.tempHp}` : ''}  AC ${armorClass(campaign, ch)}${campaign?.initiative?.shielded?.includes(ch.name) ? `（基础 ${ch.ac}；护盾术 +5，到自己下回合开始）` : ''}${ch.speed !== undefined ? `  速度 ${ch.speed}` : ''}`,
+    `HP ${ch.hp}/${ch.maxHp}${effMax < ch.maxHp ? `（力竭有效上限 ${effMax}）` : ''}${ch.tempHp > 0 ? ` +${ch.tempHp}` : ''}  AC ${armorClass(campaign, ch)}${campaign?.initiative?.shielded?.includes(ch.name) ? `（基础 ${ch.ac}；护盾术 +5，到自己下回合开始）` : ''}${ch.speed !== undefined ? `  速度 ${ch.speed}` : ''}`,
     abilities,
     `固定先攻 ${initBonusOf(ch) >= 0 ? '+' : ''}${initBonusOf(ch)}${ch.initBonus === undefined ? '（敏捷；备注中的额外被动不会自动计入）' : '（角色卡总加值，开战时不要重复添加）'}`,
   ];
@@ -419,7 +429,8 @@ export function sheet(ch: Character, who: (openid: string) => string = (id) => i
   if ((ch.spells?.length ?? 0) > 0) lines.push(spellLine(ch.spells!));
   const hooks = (ch.hooks ?? []).filter((h) => h.closed !== true);
   if (hooks.length > 0) lines.push(`背景钩子 ${hooks.length} 条（dnd_hook list）`);
-  if (ch.conditions.length > 0) lines.push(`状态：${ch.conditions.join('、')}`);
+  const formattedStates = campaign !== undefined ? formatCharacterStates(campaign, ch) : (ch.conditions.join('、') || '无');
+  if (formattedStates !== '无') lines.push(`状态：${campaign !== undefined && ch.activeStates === undefined && formattedStates === ch.conditions.join('、') ? ch.conditions.join('、') : formattedStates}`);
   if (ch.deathSaves !== undefined) lines.push(`死亡豁免：成功 ${ch.deathSaves.successes}/3 失败 ${ch.deathSaves.failures}/3`);
   const resources = Object.entries(ch.resources ?? {}).map(([k, r]) => `${k} ${r.current}/${r.max}（${{ short: '短休回满', long: '长休回满', none: '不回复' }[r.reset]}）`);
   if (campaign?.initiative !== undefined && inInitiative(campaign, ch.name)) resources.push(`反应 ${campaign.initiative.reacted?.includes(ch.name) || !canReact(ch) || isSurprised(campaign, ch.name) ? 0 : 1}/1（自己下回合开始恢复）`);
@@ -449,16 +460,41 @@ export function parseSkills(values: string[] | undefined): Skill[] | undefined {
   });
 }
 
+const ENTRY_KINDS = new Set<CardEntryKind>(['spell', 'feature', 'item']);
+const ACTION_KINDS = new Set<AbilityActionKind>(['action', 'bonus', 'reaction', 'free', 'passive']);
+
 export function parseSpellInputs(value: unknown, field: string): SpellInput[] {
-  if (!Array.isArray(value)) throw new Error(`${field} 要是数组，如 [{name:"魔能爆", level:0}]`);
+  if (!Array.isArray(value)) throw new Error(`${field} 要是数组，如 [{name:"魔能爆", level:0}] 或 [{name:"战斗英姿", kind:"feature", action:"bonus"}]`);
   return value.map((raw, i) => {
     const o = (raw ?? {}) as Record<string, unknown>;
     const name = typeof o.name === 'string' ? o.name.trim() : '';
-    const level = typeof o.level === 'number' && Number.isInteger(o.level) ? o.level : NaN;
     if (name === '') throw new Error(`${field}[${i}] 缺 name`);
-    if (!(level >= 0 && level <= 9)) throw new Error(`${field}[${i}]「${name}」的 level 要是 0-9（戏法填 0）`);
+    const kindRaw = typeof o.kind === 'string' ? o.kind.trim() : undefined;
+    if (kindRaw !== undefined && !ENTRY_KINDS.has(kindRaw as CardEntryKind)) {
+      throw new Error(`${field}[${i}]「${name}」的 kind 只能是 spell / feature / item`);
+    }
+    const kind = kindRaw as CardEntryKind | undefined;
+    const isNonSpell = kind === 'feature' || kind === 'item';
+    const level = typeof o.level === 'number' && Number.isInteger(o.level) ? o.level : (isNonSpell && o.level === undefined ? 0 : NaN);
+    if (!(level >= 0 && level <= 9)) throw new Error(`${field}[${i}]「${name}」的 level 要是 0-9（戏法填 0；职业/物品能力可省略）`);
+    const actionRaw = typeof o.action === 'string' ? o.action.trim() : undefined;
+    if (actionRaw !== undefined && !ACTION_KINDS.has(actionRaw as AbilityActionKind)) {
+      throw new Error(`${field}[${i}]「${name}」的 action 只能是 action / bonus / reaction / free / passive`);
+    }
+    const resource = typeof o.resource === 'string' && o.resource.trim() !== '' ? o.resource.trim() : undefined;
+    const cost = typeof o.cost === 'number' && Number.isInteger(o.cost) && o.cost > 0 ? o.cost : undefined;
+    const summary = typeof o.summary === 'string' && o.summary.trim() !== '' ? o.summary.trim() : undefined;
     const en = typeof o.en === 'string' && o.en.trim() !== '' ? o.en.trim() : undefined;
-    return { name, level, ...(en !== undefined ? { en } : {}) };
+    return {
+      name,
+      level,
+      ...(kind !== undefined ? { kind } : {}),
+      ...(actionRaw !== undefined ? { action: actionRaw as AbilityActionKind } : {}),
+      ...(resource !== undefined ? { resource } : {}),
+      ...(cost !== undefined ? { cost } : {}),
+      ...(summary !== undefined ? { summary } : {}),
+      ...(en !== undefined ? { en } : {}),
+    };
   });
 }
 
@@ -738,7 +774,7 @@ export function combatTurnPrompt(c: Campaign, name: string, extra: { recentSende
   else if (extra.force === true) state.rebrief = true;
   const position = turnPositionNote(c, name);
   const reaction = ch?.kind === 'pc' ? `\n反应 ${canReact(ch) && reactionBlocked(c, ch.name) === undefined ? 1 : 0}/1` : '';
-  return `${turnPrompt(ch, name, { full, absent })}${reaction}${position.length > 0 ? `\n${position}` : ''}`;
+  return `${turnPrompt(ch, name, { full, absent })}${reaction}${position.length > 0 ? `\n${position}` : ''}${combatLedgerSuffix(c)}`;
 }
 
 export const srdLists = new Map<SrdKind, SrdEntry[]>();
@@ -935,7 +971,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
   const saveOutcomeLines = (outcomes: readonly SaveOutcome[]): string[] => outcomes.map((o) => {
     if (o.skipped !== undefined) return `- ${o.name}：${o.skipped}，跳过`;
     const verdict = o.saved === undefined ? '' : ` → ${o.saved ? '成功' : '失败'}`;
-    const nat = o.natural === 20 ? '（天然 20）' : (o.natural === 1 ? '（天然 1）' : '');
+    const nat = o.detail?.startsWith('自动失败') ? '' : (o.natural === 20 ? '（天然 20）' : (o.natural === 1 ? '（天然 1）' : ''));
     const dmg = o.damage === undefined
       ? ''
       : `，${o.defense !== undefined ? `${DEFENSE_NAMES[o.defense]} ` : ''}受 ${o.damage}${o.change !== undefined ? `；${hpLine(o.change)}` : ''}`;
@@ -1025,7 +1061,9 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       assertReactionAuthorized(p, reactor, name, reaction.authorization);
       if (args.declared_by !== undefined) assertDeclaredByOwner(reactor, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec) }, '反应');
       const spendKey = str(reaction.spend) ?? def?.resource;
-      if (spendKey !== undefined) useResource(c, reactor.name, spendKey);
+      const rawAmount = int(reaction.spend_amount) ?? def?.cost ?? 1;
+      const spendAmount = Math.max(1, rawAmount);
+      const spent = spendKey === undefined ? undefined : useResource(c, reactor.name, spendKey, spendAmount);
       const effects: string[] = [];
       const reroll = str(reaction.reroll);
       if (reroll !== undefined) {
@@ -1058,15 +1096,23 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       }
       const counter = def?.counter === true && p.kind === 'attack';
       const effect = effects.join('，') || (counter ? '反手打回去' : '无数值变化');
-      p.used.push({ by: reactor.name, name, effect });
+      const consumedReaction = consumesReaction(c, p, reactor.name, name);
+      p.used.push({
+        by: reactor.name,
+        name,
+        effect,
+        ...(spent !== undefined ? { spendKey: spent.key, spendAmount } : {}),
+        ...(consumedReaction ? { consumedReaction: true } : {}),
+      });
       p.claimed = p.claimed.filter((o) => o.character !== reactor.name);
-      if (consumesReaction(c, p, reactor.name, name)) {
+      if (consumedReaction) {
         const state = requireInitiative(c);
         spendReaction(c, reactor.name);
         if (counter) (state.counterAttacks ??= []).push({ by: reactor.name, target: p.attacker, name });
       }
       pushLog(c, `${reactor.name} 用「${name}」（${effect}）`);
-      lines.push(`${reactor.name} 用「${name}」：${effect}${spendKey !== undefined ? `，用掉「${spendKey}」` : ''}`);
+      const spentSuffix = spent !== undefined ? `，用掉「${spent.key}」${spent.before}→${spent.resource.current}/${spent.resource.max}` : '';
+      lines.push(`${reactor.name} 用「${name}」：${effect}${spentSuffix}`);
       if (counter) {
         lines.push(`${name} 是一次新的攻击，不改这笔的数字：这笔落账之后，用 dnd_check character=${reactor.name} type=attack target=${p.attacker} reaction=true 结算还击（还击不打中也不影响这笔）。`);
       }
@@ -1086,13 +1132,27 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       const attacker = requireCharacter(c, p.attacker);
       const weapon = p.weapon === undefined ? undefined : findWeapon(attacker, p.weapon);
       const expression = attackExpression(attacker, weapon, p.extraDamage);
+      const effectiveCrit = p.crit || p.autoCritOnHit === true;
       if (expression === undefined) {
         lines.push('命中，但没有伤害表达式：落账后用 dnd_roll 掷伤害（重击骰子翻倍）再 dnd_apply 扣血。');
       } else {
-        const dmg = rollAttackDamage(attacker, weapon, expression, p.crit, service.roller);
+        const dmg = rollAttackDamage(attacker, weapon, expression, effectiveCrit, service.roller);
         p.rawDamage = dmg.total;
         p.damageDetail = dmg.detail;
-        lines.push(`现在命中${p.crit ? '（重击）' : ''}，伤害 ${dmg.detail}`);
+        lines.push(`现在命中${effectiveCrit ? '（重击）' : ''}，伤害 ${dmg.detail}`);
+      }
+    }
+
+    // 改命中反应全部答复后，若最终仍命中且有伤害，解锁受伤后反应（迷雾逃生、炼狱叱喝等）
+    if (p.kind === 'attack' && waitingOn(p).length === 0) {
+      const postDamage = unlockDamagedReactors(c, p);
+      if (postDamage.length > 0) {
+        p.at = Date.now();
+        reopened = true;
+        lines.push(pendingState(p));
+        lines.push(`命中已确认，现在询问受伤后反应：${postDamage.map((r) => `${r.character}·${r.reaction}`).join('、')}。先停下等本人答复，再 settle=true 落账。`);
+        lines.push(SECRET_NOTE);
+        return { text: lines.join('\n'), reopened };
       }
     }
 
@@ -1108,22 +1168,43 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
 
     assertWindowClosed(p);
     delete requireInitiative(c).pending;
+    // 兜底：若受伤后反应曾被提前记账，但后续反应使本次攻击未命中或 0 伤害，自动退回其资源与反应名额
+    if (p.kind === 'attack' && (!pendingHit(p) || (p.rawDamage !== undefined && Math.max(0, p.rawDamage + p.damageMod) <= 0))) {
+      for (const u of [...p.used]) {
+        const ch = findCharacter(c, u.by);
+        const def = ch === undefined ? undefined : reactionsOf(ch).find((r) => r.name === u.name);
+        if (!isDamagedReaction({ name: u.name, ...(def?.when !== undefined ? { when: def.when } : {}) })) continue;
+        if (u.spendKey !== undefined && ch !== undefined) restoreResource(c, ch.name, u.spendKey, u.spendAmount ?? 1);
+        if (u.consumedReaction) restoreReaction(c, u.by);
+        p.used = p.used.filter((item) => item !== u);
+        lines.push(`本次未造成伤害，已自动退回 ${u.by} 的「${u.name}」${u.spendKey !== undefined ? `资源（${u.spendKey}）与` : ''}反应名额。`);
+      }
+    }
+    const usedNote = p.used.length > 0
+      ? `（反应明细：${p.used.map((u) => `${u.by}「${u.name}」${u.effect}`).join('；')}）`
+      : '';
+    if (p.used.length > 0 && reaction === undefined) {
+      lines.push(`本笔反应汇总：${p.used.map((u) => `${u.by}「${u.name}」${u.effect}`).join('；')}（回复群聊时务必报出反应骰点数，勿漏报）`);
+    }
     if (p.kind === 'roll') {
       lines.push(...settleCheck(c, p));
     } else if (!pendingHit(p)) {
-      pushCombatLedger(c, `${p.attacker}→${p.target} 落账：未命中`, p.seq);
+      pushCombatLedger(c, `${p.attacker}→${p.target} 落账：未命中${usedNote}`, p.seq);
       lines.push(`${p.attacker}→${p.target} 落账：未命中，没有扣血。`);
     } else if (p.rawDamage !== undefined) {
+      const effectiveCrit = p.crit || p.autoCritOnHit === true;
       const raw = Math.max(0, p.rawDamage + p.damageMod);
       const amount = saveDamage(raw, false, 'half', p.defense);
+      if (usedNote.length > 0) pushCombatLedger(c, `${p.attacker}→${p.target} 落账：受 ${amount}${usedNote}`, p.seq);
       lines.push(`${p.attacker}→${p.target} 落账：${p.defense !== undefined ? `${DEFENSE_NAMES[p.defense]} ` : ''}受 ${amount}`);
-      lines.push(...settleAttackDamage(c, p.attacker, p.target, raw, p.crit, p.damageType, p.defense, p.onHit, service.roller));
+      lines.push(...settleAttackDamage(c, p.attacker, p.target, raw, effectiveCrit, p.damageType, p.defense, p.onHit, service.roller));
     } else {
-      lines.push(`${p.attacker}→${p.target} 落账：命中${p.crit ? '（重击）' : ''}，用 dnd_roll 掷伤害再 dnd_apply 扣血。`);
+      const effectiveCrit = p.crit || p.autoCritOnHit === true;
+      lines.push(`${p.attacker}→${p.target} 落账：命中${effectiveCrit ? '（重击）' : ''}，用 dnd_roll 掷伤害再 dnd_apply 扣血。`);
     }
     lines.push('继续结算这个回合；这一只行动完了再 next。');
     lines.push(SECRET_NOTE);
-    return { text: lines.join('\n'), reopened };
+    return { text: `${lines.join('\n')}${combatLedgerSuffix(c)}`, reopened };
   };
 
   /**
@@ -1147,7 +1228,9 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     const spent = spendKey === undefined ? undefined : useResource(c, spender, spendKey);
     const rolled = rollSaveEffect(c, {
       targets, ability, dc, damage, damageType, onSave, ...(onFail !== undefined ? { onFail } : {}),
-      advantage: advantageOf(args.advantage), bonus: int(args.bonus), bonusDice: str(args.bonus_dice), roller: service.roller,
+      advantage: advantageOf(args.advantage), bonus: int(args.bonus), bonusDice: str(args.bonus_dice),
+      ignoreStateMods: args.ignore_state_mods === true,
+      roller: service.roller,
     });
     const id = rollId(c, exec);
     const label = `${ABILITY_NAMES[ability]}豁免`;
@@ -1208,7 +1291,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     lines.push(...saveOutcomeLines(outcomes));
     if (spentLine !== undefined) lines.push(spentLine);
     lines.push(args.secret === true ? HIDDEN_ROLL_NOTE : SECRET_NOTE);
-    return lines.join('\n');
+    return `${lines.join('\n')}${combatLedgerSuffix(c)}`;
   };
 
   /** 注册过的工具名：按会话隐藏工具时要整份名单（见 tool-scope.ts） */

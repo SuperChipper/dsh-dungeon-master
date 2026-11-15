@@ -16,9 +16,18 @@ export function combatParticipantCard(campaign: Campaign, ch: Character) {
     initiative: { fixed: initBonusOf(ch), source: ch.initBonus === undefined ? '敏捷调整值' : 'init_bonus 固定总加值', rolled: initiative?.init },
     attackBonus: ch.attackBonus, damage: ch.damage, weapons,
     traits: ch.traits, reactions: ch.reactions,
-    spells: ch.spells?.map(({ name, level }) => ({ name, level })),
+    spells: ch.spells?.map(({ name, level, kind, action, resource, cost, summary }) => ({
+      name, level,
+      ...(kind !== undefined ? { kind } : {}),
+      ...(action !== undefined ? { action } : {}),
+      ...(resource !== undefined ? { resource } : {}),
+      ...(cost !== undefined ? { cost } : {}),
+      ...(summary !== undefined ? { summary } : {}),
+    })),
     resources: ch.resources, hitDie: ch.hitDie, hitDiceUsed: ch.hitDiceUsed,
-    conditions: ch.conditions, deathSaves: ch.deathSaves, notes: ch.notes,
+    conditions: ch.conditions,
+    ...(ch.activeStates !== undefined ? { activeStates: ch.activeStates } : {}),
+    deathSaves: ch.deathSaves, notes: ch.notes,
     inventory: ch.inventory, room: ch.room,
   };
 }
@@ -53,7 +62,7 @@ export function combatPartyContext(campaign: Campaign): string {
   });
   return [
     '【角色能力与被动 · 开战时快照】',
-    '下列基础命中、伤害和固定先攻只按结构化字段计算；备注里的职业被动、专长与临时效果不会被程序自动识别（已结构化支持的：巨武器战斗、箭术、精灵精准、不死坚韧；dnd_resource use「战斗英姿」自动给临时 HP 与本回合优势，「咒剑诅咒」自动记 19-20 重击与熟练加伤）。',
+    '下列基础命中、伤害和固定先攻只按结构化字段计算；备注里的职业被动、专长与临时效果不会被程序自动识别（已结构化支持的：14种PHB状态与力竭自动优劣势/速度/专注管理、巨武器战斗、箭术、精灵精准、不死坚韧；dnd_resource use 支持「战斗英姿」「咒剑诅咒」「神圣武器」「动作如潮」及 apply_state 结构化增益如祝福术/护盾信仰/加速术/狂暴）。',
     'participating=false 的角色未参战，不进入反应与借机名单；若中途入战须先 dnd_initiative join（返回结果会自动附上新参战我方的完整能力卡）。',
     '核对参战者的 notes、traits、reactions、装备和本桌约定；先攻已掷出的 rolled 与最新先攻表为准，不重掷。',
     '固定总先攻可用 dnd_character update init_bonus 持久保存；灵敏之赐等临时骰只在开战/中途入战时传 bonus，不写成固定值，也不重复添加已包含的加值。',

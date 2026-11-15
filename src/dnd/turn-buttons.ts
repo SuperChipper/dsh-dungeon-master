@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { Adventure } from './adventure.ts';
 import { type Campaign, type ReactionWindow, describePending, findCharacter, nextTurn, playerStatus, reactionWindow } from './campaign.ts';
-import { chooseReaction, reactionReplyNote, waitingOn } from './pending-attack.ts';
+import { chooseReaction, reactionsOf, reactionReplyNote, waitingOn } from './pending-attack.ts';
 import { type CheckIn, arrivalNotice, checkInHint, createCheckIn, isComplete, kickoffMessage, markArrived, rosterOf, rosterText } from './check-in.ts';
 import type { DndService } from './dnd-service.ts';
 import { combatTurnPrompt } from './dnd-tools.ts';
@@ -72,8 +72,8 @@ export function buildTurnKeyboard(name: string, round: number): InlineKeyboard {
           buttons: [
             // 原来攻击 / 施法 / 其他行动三个，只差预填的一个动词；一行四个按钮在手机上全被截成「其他…」「我的…」
             commandButton('dnd-act', '行动', `${name} `),
-            // 原来是预填 /dnd search 的「查询」：玩家得自己记得法术名再打字，战斗里没人用
-            callbackButton('dnd-spells', '我的法术', 0, encodeButtonData({ t: 'dnd', a: 'spells', n: name })),
+            // 原来是预填 /dnd search 的「查询」：玩家得自己记得法术名再打字，战斗里没人用；统一列法术与职业/物品能力
+            callbackButton('dnd-spells', '法术/能力', 0, encodeButtonData({ t: 'dnd', a: 'spells', n: name })),
           ],
         },
       ],
@@ -477,7 +477,10 @@ export class DndTurnButtons {
       const ch = found.campaign.characters.find((x) => x.kind === 'pc' && x.playerId !== undefined && x.playerId === clicker)
         ?? findCharacter(found.campaign, String(button.n ?? ''));
       if (ch === undefined) return ACK.failed;
-      void this.sender.sendMarkdown(record.replyTarget, spellListText(ch.name, ch.spells ?? [], ch.resources))
+      void this.sender.sendMarkdown(
+        record.replyTarget,
+        spellListText(ch.name, ch.spells ?? [], ch.resources, { includeFallback: true, reactions: reactionsOf(ch) }),
+      )
         .catch((err: unknown) => this.logger.warn(`im-qqbot: 法术清单发送失败: ${err instanceof Error ? err.message : String(err)}`));
       return ACK.ok;
     }

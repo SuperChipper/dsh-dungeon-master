@@ -31,7 +31,7 @@ strList,
 initiativeBonusArg,fightRoom,
 battlemapHint,
 positionNote,
-orderLine,combatTurnPrompt,type ToolKit
+orderLine,combatTurnPrompt,combatLedgerSuffix,type ToolKit
 } from './shared.ts';
 
 export function registerCombatTools(kit: ToolKit): void {
@@ -288,6 +288,8 @@ export function registerCombatTools(kit: ToolKit): void {
       dash: { type: 'boolean', description: 'For move: the mover took the Dash action; movement doubles for this turn.' },
       drag: { type: 'string', description: 'For move: drag this adjacent creature along (costs double, ends right behind).' },
       disengage: { type: 'boolean', description: 'For move: the mover took Disengage; no opportunity attacks.' },
+      crawl: { type: 'boolean', description: 'For move while 倒地 (prone): crawl along the ground (costs double movement, keeps 倒地) instead of automatically spending half speed to stand up first.' },
+      ignore_state_mods: { type: 'boolean', description: 'For move: bypass automatic condition restrictions (speed=0, prone auto-stand, fear source block) when a special feature/immunity overrides standard 5e rules.' },
       from: { type: 'string', description: 'For show: list distances from this creature.' },
       declared_by: { type: 'string', description: 'For move of a PC: member id of the player who declared it (the #U number, pass "U3").' },
       reaction: { type: 'boolean', description: 'For move: movement off-turn (a reaction, a feature); not counted against this turn\'s speed.' },
@@ -356,6 +358,7 @@ export function registerCombatTools(kit: ToolKit): void {
           reaction: args.reaction === true,
           dmOverride: args.dm_override === true,
           recentSenders: sendersOf(exec),
+          ignoreStateMods: args.ignore_state_mods === true,
         });
         if (args.reaction === true) requireInitiative(c).rebrief = true;
         if (args.use_reaction === true) {
@@ -380,9 +383,11 @@ export function registerCombatTools(kit: ToolKit): void {
         if (feet !== undefined) request.feet = feet;
         if (args.dash === true) request.dash = true;
         if (args.disengage === true) request.disengage = true;
+        if (args.crawl === true) request.crawl = true;
+        if (args.ignore_state_mods === true) request.ignoreStateMods = true;
         const result = beginMovement(c, ch.name, request);
         if (c.initiative?.movement !== undefined) deps.onPendingAttack?.(recordOf(exec));
-        return result;
+        return `${result}${combatLedgerSuffix(c)}`;
       }
       if (action === 'remove') {
         assertNoPending(c, '删除站位');

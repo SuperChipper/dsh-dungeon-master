@@ -9,12 +9,12 @@ export interface DndToolDefinition {
 
 const NARRATIVE_VIEWS: Record<string, { keys: string[]; description: string; types?: string[] }> = {
   dnd_check: {
-    keys: ['character', 'type', 'skill', 'ability', 'dc', 'targets', 'on_save', 'on_fail_conditions', 'defense', 'damage', 'damage_type', 'advantage', 'bonus', 'bonus_dice', 'spend', 'secret', 'declared_by', 'dm_override'],
+    keys: ['character', 'type', 'skill', 'ability', 'dc', 'targets', 'on_save', 'on_fail_conditions', 'defense', 'damage', 'damage_type', 'advantage', 'bonus', 'bonus_dice', 'spend', 'secret', 'concentration', 'ignore_state_mods', 'declared_by', 'dm_override'],
     types: ['skill', 'ability', 'save', 'death'],
     description: 'Exploration skill/ability checks, saves, traps and death saves; roll honestly, keep DCs secret. For a save effect use targets, dc and damage (rolled once), with per-target bonus_dice/defense and failure conditions. Player-declared actions need declared_by; spend consumes before rolling. Attacks, reactions and combat positioning belong to the combat agent: start with dnd_initiative, then stop and let it take over.',
   },
   dnd_apply: {
-    keys: ['target', 'targets', 'damage', 'damage_roll', 'heal', 'heal_roll', 'temp_hp', 'damage_type', 'defense', 'crit', 'add_conditions', 'remove_conditions'],
+    keys: ['target', 'targets', 'damage', 'damage_roll', 'heal', 'heal_roll', 'temp_hp', 'damage_type', 'defense', 'crit', 'add_conditions', 'remove_conditions', 'ignore_state_mods'],
     description: 'Apply already-decided damage/healing, temporary HP or conditions during exploration. target for one, targets=[{name,...}] for an atomic batch. damage_roll/heal_roll roll once; per-target values override defaults. Do not use this to simulate attacks or resolve combat reactions; the combat agent owns those.',
   },
   dnd_initiative: {

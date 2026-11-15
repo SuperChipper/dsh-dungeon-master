@@ -117,13 +117,14 @@ export function registerSaveTools(kit: ToolKit): void {
     + 'changes, newest first. undo: revert in one go, either to just before a roll (`roll`, preferred: the roll and '
     + 'everything after it, its damage, conditions and spent resources included) or the newest `steps` changes. Never '
     + 'fake a rollback by healing dead monsters or restarting initiative. Also use it when a player takes back a choice '
-    + 'that was already resolved, or a reaction was missed (e.g. "不用神恩了" after the boosted attack landed): undo the '
-    + 'roll, then re-resolve; refunding only the slot while keeping its damage is wrong.',
+    + 'that was already resolved (e.g. "不用神恩了" after the boosted attack landed): undo the roll, then re-resolve; '
+    + 'refunding only the slot while keeping its damage is wrong. For a missed reaction on the CURRENT pending roll use '
+    + 'dnd_apply ask_reactions instead of undoing; do not undo across another player\'s join or settled subsequent rolls unless the whole table agrees.',
     {
       action: { type: 'string', enum: ['list', 'undo'] },
       roll: { type: 'string', description: 'For undo: the roll id from a dnd_check result, e.g. "R12". Reverts to just before it.' },
       steps: { type: 'integer', description: 'For undo without roll: how many changes to revert (see list).' },
-      confirm: { type: 'boolean', description: 'For undo roll=: required when the rollback also crosses a turn change (next/goto/end).' },
+      confirm: { type: 'boolean', description: 'For undo roll=: required when the rollback crosses a turn change, mid-combat join/move, or subsequent rolls.' },
     },
     ['action'],
     (args, exec) => {
@@ -140,15 +141,28 @@ export function registerSaveTools(kit: ToolKit): void {
             throw new Error(`撤销记录里找不到 #R${Number.isFinite(n) ? n : rollArg}：没有后果的检定不留记录（不用撤，按对的结果重新判），太早的已经被挤掉了。用 action=list 看能撤到哪。`);
           }
           steps = list.length - at;
-          // 存档只能整份往回退：这一骰之后的改动会一起退掉。越过回合推进时先让 DM 看清楚再确认
+          // 存档只能整份往回退：这一骰之后的改动会一起退掉。越过回合推进、队友入战或后续检定时先让 DM 看清楚再确认
           if (list.slice(at + 1).some((s) => crossesTurn(s.label)) && args.confirm !== true) {
             const span = list.slice(at).reverse().map((s, i) => `${i + 1}. ${s.label}`).join('\n');
-            return `撤回 #R${n} 要连带退掉这 ${steps} 步，中间推进过回合：\n${span}\n确认整段都退，就再调一次 dnd_undo action=undo roll=R${n} confirm=true；只想改其中一步就别撤，用 dnd_apply 修。`;
+            return `撤回 #R${n} 要连带退掉这 ${steps} 步，中间推进过回合、有人入战/换房间或已结过后续检定：\n${span}\n确认整段都退，就再调一次 dnd_undo action=undo roll=R${n} confirm=true；只想改局部状态就别整段撤，用 dnd_apply 或 dnd_resource restore 修。`;
           }
         }
         const undone = service.store.undo(key, steps);
+        const preSteps: string[] = [];
+        if (rollArg !== undefined) {
+          const remain = service.store.snapshots(key);
+          for (let i = remain.length - 1; i >= 0 && preSteps.length < 3; i--) {
+            const label = remain[i]!.label;
+            if (crossesTurn(label) || snapshotRolls(label).length > 0) break;
+            if (/^dnd_(position\s+action=move|resource\s+action=use)\b/.test(label)) preSteps.push(label);
+            else break;
+          }
+        }
+        const preHint = preSteps.length > 0
+          ? `\n\n【前置步骤提醒】紧邻该骰之前的同回合前置操作尚未回退（新→旧）：\n${preSteps.map((l) => `- ${l}`).join('\n')}\n若它们属于刚才那次被撤行动的前置走位/扣资源，请顺手调 dnd_undo action=undo steps=${preSteps.length} 一并退回。`
+          : '';
         const { campaign, adventure } = service.require(key);
-        return `已撤销 ${undone.length} 步：\n${undone.map((l, i) => `${i + 1}. ${l}`).join('\n')}\n\n现在的团况：\n${summarize(campaign, adventure)}`;
+        return `已撤销 ${undone.length} 步：\n${undone.map((l, i) => `${i + 1}. ${l}`).join('\n')}${preHint}\n\n现在的团况：\n${summarize(campaign, adventure)}`;
       }
       const list = service.store.snapshots(key).slice(-15).reverse();
       if (list.length === 0) return '没有可以撤销的改动。';

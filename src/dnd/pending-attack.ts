@@ -15,6 +15,7 @@ import {
   type PendingCheck,
   type PendingD20,
   type PendingRoll,
+  type ReactionDef,
   type ReactionWindow,
   type ReactorOption,
   describePending,
@@ -31,11 +32,17 @@ import { canReact, cellOf, distanceFeet } from './battlefield.ts';
 
 export { reactionsOf };
 
-function hasResource(ch: Character, key: string | undefined): boolean {
+function hasResource(ch: Character, key: string | undefined, cost = 1): boolean {
   if (key === undefined) return true;
   const resource = ch.resources?.[key];
   // 卡上没记这项资源就不拦：只是没登记，不等于用完了
-  return resource === undefined || resource.current > 0;
+  return resource === undefined || resource.current >= Math.max(1, cost);
+}
+
+/** 确认受到伤害后才触发的反应（兼容旧存档里把迷雾逃生/炼狱叱喝写成 when=attacked 的角色卡） */
+export function isDamagedReaction(r: { name: string; when?: ReactionDef['when'] }): boolean {
+  return r.when === 'damaged'
+    || /^(迷雾逃生|炼狱叱喝|吸收元素|风暴之怒|直觉闪避|Misty Escape|Hellish Rebuke|Absorb Elements|Uncanny Dodge)$/i.test(r.name.trim());
 }
 
 export interface AttackOutcome {
@@ -46,25 +53,40 @@ export interface AttackOutcome {
 
 /**
  * 此刻能对这次攻击做点什么的 PC。只看绑了玩家的 PC：NPC 和怪物的反应由 DM 决定，
- * 不该为它们停下来等群里的人。天然 1 改不了，重击挡不掉（尖刻言语还能减伤害）。
+ * 不该为它们停下来等群里的人。天然 1 改不了，重击挡不掉护盾（尖刻言语减伤、时间变幻重掷、受伤后反击仍可触发）。
+ * 当场上还有改命中反应（尖刻言语/护盾术）未决时，受伤后反应（迷雾逃生等）延后到确认命中后再问，避免提前扣掉反应结果最后未命中。
  */
-export function eligibleReactors(c: Campaign, attacker: Character, target: Character, outcome: AttackOutcome): ReactorOption[] {
+export function eligibleReactors(
+  c: Campaign,
+  attacker: Character,
+  target: Character,
+  outcome: AttackOutcome,
+  stage: 'initial' | 'damaged' = 'initial',
+): ReactorOption[] {
   if (outcome.natural === 1) return [];
   const room = roomOf(c, target);
   const enemyAttack = (attacker.kind === 'monster') !== (target.kind === 'monster');
   const attackerCell = cellOf(c, attacker);
-  return c.characters.flatMap((ch) => {
-    if (ch.kind !== 'pc' || !canReact(ch) || roomOf(c, ch) !== room) return [];
-    if (c.initiative !== undefined && !inInitiative(c, ch.name)) return [];
+  const preDamage: ReactorOption[] = [];
+  const postDamage: ReactorOption[] = [];
+  for (const ch of c.characters) {
+    if (ch.kind !== 'pc' || !canReact(ch) || roomOf(c, ch) !== room) continue;
+    if (c.initiative !== undefined && !inInitiative(c, ch.name)) continue;
     // 用过反应或受惊：反手一击、挡攻击这类都不行（天赋类「自己攻击时」的不占反应，不受影响）
     const free = reactionBlocked(c, ch.name) === undefined;
-    return reactionsOf(ch).flatMap((r) => {
-      if (r.enter === true) return [];
-      if (!hasResource(ch, r.resource)) return [];
+    for (const r of reactionsOf(ch)) {
+      if (r.enter === true) continue;
+      if (!hasResource(ch, r.resource, r.cost)) continue;
       if (r.range !== undefined) {
         // 没摆位就不按距离筛：宁可多问一句，也别把够得着的人漏掉
         const mine = cellOf(c, ch);
-        if (mine !== undefined && attackerCell !== undefined && distanceFeet(mine, attackerCell) > r.range) return [];
+        if (mine !== undefined && attackerCell !== undefined && distanceFeet(mine, attackerCell) > r.range) continue;
+      }
+      if (isDamagedReaction(r)) {
+        if (free && ch.name === target.name && outcome.hit) {
+          postDamage.push({ character: ch.name, reaction: r.name });
+        }
+        continue;
       }
       const when = r.when ?? 'foe_attacks';
       const fits = when === 'attacking'
@@ -72,12 +94,16 @@ export function eligibleReactors(c: Campaign, attacker: Character, target: Chara
         : r.counter === true
           // 哨兵这类「反手一击」：看的是有人对别人出手，不看有没有打中
           ? free && enemyAttack && attacker.kind === 'monster' && ch.name !== attacker.name && ch.name !== target.name
-          : when === 'attacked'
-            ? free && ch.name === target.name && outcome.hit && !outcome.crit
-            : free && enemyAttack && attacker.kind === 'monster' && outcome.hit;
-      return fits ? [{ character: ch.name, reaction: r.name }] : [];
-    });
-  });
+          : when === 'enemy_crit'
+            ? free && enemyAttack && attacker.kind === 'monster' && outcome.crit
+            : when === 'attacked'
+              ? free && ch.name === target.name && outcome.hit && !outcome.crit
+              : free && enemyAttack && attacker.kind === 'monster' && outcome.hit;
+      if (fits) preDamage.push({ character: ch.name, reaction: r.name });
+    }
+  }
+  if (stage === 'damaged') return postDamage;
+  return preDamage.length > 0 ? preDamage : postDamage;
 }
 
 /**
@@ -191,10 +217,16 @@ export function holdNotice(p: PendingRoll): string {
   const fix = p.kind === 'attack'
     ? 'reaction 改数值（attack_mod/ac_mod/damage_mod，或 reroll="d20" 重掷）'
     : `reaction 改数值（attack_mod 加减这一骰，或 reroll="d20" 重掷；target 填被改的那个掷骰人）`;
+  const shieldWarn = p.kind === 'attack'
+    && !p.crit
+    && p.reactors.some((r) => /^(护盾术|Shield)$/i.test(r.reaction))
+    && p.total + p.attackMod >= p.ac + p.acMod + 5
+    ? '【算账核对】本次攻击总值不低于护盾术 +5 后的防御等级，单靠「护盾术」挡不下这一击（只能为本轮后续攻击提供 +5 AC，或配合减命中反应）；严禁在回复中误导玩家说护盾术能把这一击挡下！'
+    : '';
   return `【待结算 #R${p.seq}】这笔还没落账，别往下推进：${unsettled}。这条回复报骰子和成败（规则要求先知道成败再决定，DC/AC 数字照样不报），`
     + `问一句有没有人要用反应（可用：${optionsText(p)}），然后到此停下，不要写成后果已经发生。`
     + `玩家回应后用 dnd_apply target=${p.target}：要用就传 ${fix}，并原样附上服务器消息的 authorization（玩家编号不等于同意）；不用已由服务器登记，都答复了传 settle=true。`
-    + '落账前 next、再次攻击、豁免效果、移动都会被拒绝。';
+    + `${shieldWarn}落账前 next、再次攻击、豁免效果、移动都会被拒绝。`;
 }
 
 /**
@@ -289,9 +321,14 @@ export function classifyReactionReply(c: Campaign, senderId: string, text: strin
   const named = mine.some((ch) => reactionsOf(ch).some((r) => clean.includes(r.name)))
     || p.reactors.some((r) => listed.includes(r.character) && clean.includes(r.reaction));
   const movementUse = p.kind === 'move' && listed.length > 0 && /^(打|攻击|借机攻击)[。.!！]*$/.test(clean);
-  if (!named && !GENERIC_REACTION.test(clean) && !movementUse) return undefined;
-  const hasQuestionMark = clean.includes('?') || clean.includes('？');
+  const hasQuestionMark = /[?？]|(吗|呢)[。.!！~～]*$|能不能|可以吗|要不要|是不是/.test(clean);
   const myOptions = p.reactors.filter((r) => listed.includes(r.character));
+  const singleOptionBody = myOptions.length === 1 ? stripCharacterPrefix(clean, myOptions[0]!.character) : '';
+  const singleOptionUse = !hasQuestionMark && myOptions.length === 1
+    && /^(我)?(这次|这下)?(要|想|决定)?(用|使用|开|交|放|施放|发动)(?=[!！。.，,、：:\s~～]|$)/.test(singleOptionBody);
+  const multiOptionBareUse = !hasQuestionMark && myOptions.length > 1
+    && /^(我)?(这次|这下)?(要|想|决定)?(用|使用|开|交|放|施放|发动)(?=[!！。.，,、：:\s~～]|$)/.test(clean);
+  if (!named && !GENERIC_REACTION.test(clean) && !movementUse && !singleOptionUse && !multiOptionBareUse) return undefined;
   if (!hasQuestionMark && myOptions.length === 1) {
     const only = myOptions[0]!;
     const at = clean.indexOf(only.reaction);
@@ -302,16 +339,21 @@ export function classifyReactionReply(c: Campaign, senderId: string, text: strin
         return { kind: 'decline', characters: [only.character], windowId: p.seq };
       }
     }
+    if (singleOptionUse && at < 0) {
+      return { kind: 'use', characters: [only.character], windowId: p.seq, choices: [only] };
+    }
   }
   const choices = myOptions.filter((r) => clean.includes(r.reaction) || movementUse);
-  // 技能名出现在规则提问/纠正里不是宣告；只接收完整、明确的短宣告。
+  // 技能名出现在规则提问/纠正里不是宣告；接收明确短宣告及附带修饰目标说明（如「用尖刻言语，直接放在伤害骰上」）。
   const explicit = hasQuestionMark ? [] : choices.filter((r) => {
     if (movementUse) return true;
     const nameAt = clean.indexOf(r.reaction);
     const before = stripCharacterPrefix(clean.slice(0, nameAt).trim(), r.character);
     const after = clean.slice(nameAt + r.reaction.length).trim();
-    return /^(我)?(这次|这下)?(要|想|决定)?(用|使用|开|交|放|施放|发动)?$/.test(before)
-      && /^(吧|了|呗|挡一下|挡|减他|减命中|减伤害|减一下|重掷|重骰)?[。.!！~～]*$/.test(after);
+    const validBefore = /^(我)?(这次|这下)?(要|想|决定)?(用|使用|开|交|放|施放|发动)?$/.test(before);
+    const shortAfter = /^(吧|了|呗|挡一下|挡|减他|减命中|减伤害|减一下|重掷|重骰)?[。.!！~～]*$/.test(after);
+    const directiveAfter = /^[，,、：:\s]*(直接)?(放|加|减|用|改|算|扣|压)?[^\n?？吗呢不没别持续]*(伤害|命中|攻击|检定|鉴定|豁免|骰|d20)[上里]?[。.!！~～]*$/i.test(after);
+    return validBefore && (shortAfter || directiveAfter);
   });
   return explicit.length === 1
     ? { kind: 'use', characters: [explicit[0]!.character], windowId: p.seq, choices: explicit }
@@ -392,4 +434,20 @@ export function refreshReactors(c: Campaign, p: PendingAttack): ReactorOption[] 
   const before = new Set(p.reactors.map((r) => `${r.character}·${r.reaction}`));
   p.reactors = [...keep, ...fresh];
   return fresh.filter((r) => !before.has(`${r.character}·${r.reaction}`));
+}
+
+/**
+ * 改命中阶段全部答复后，若最终仍命中且造成伤害，解锁目标的「受伤后反应」（迷雾逃生、炼狱叱喝等）。
+ */
+export function unlockDamagedReactors(c: Campaign, p: PendingAttack): ReactorOption[] {
+  if (!pendingHit(p) || (p.rawDamage !== undefined && Math.max(0, p.rawDamage + p.damageMod) <= 0)) return [];
+  const attacker = findCharacter(c, p.attacker);
+  const target = findCharacter(c, p.target);
+  if (attacker === undefined || target === undefined) return [];
+  const answered = new Set([...p.declined, ...p.used.map((u) => u.by), ...p.claimed.map((o) => o.character)]);
+  const existing = new Set(p.reactors.map((r) => `${r.character}·${r.reaction}`));
+  const fresh = eligibleReactors(c, attacker, target, { hit: true, crit: p.crit, natural: p.natural }, 'damaged')
+    .filter((r) => !answered.has(r.character) && !existing.has(`${r.character}·${r.reaction}`));
+  if (fresh.length > 0) p.reactors = [...p.reactors, ...fresh];
+  return fresh;
 }

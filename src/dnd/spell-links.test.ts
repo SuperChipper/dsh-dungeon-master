@@ -110,16 +110,40 @@ describe('工具和按钮', () => {
     expect(findCharacter(t.campaign(), '恩佐')!.spells!.map((s) => s.name)).toEqual(['魔能爆']);
   });
 
-  it('回合弹窗的「我的法术」：谁点列谁的', async () => {
+  it('回合弹窗的「法术/能力」：谁点列谁的，且支持职业动作与旧卡自动兜底', async () => {
     const t = setup();
-    await t.call('dnd_character', { action: 'update', name: '恩佐', spells: [{ name: '魔能爆', level: 0 }] });
+    await t.call('dnd_resource', { action: 'set', character: 'Kriv', resource: '诗人激励', max: 3, reset: 'short' });
+    await t.call('dnd_character', {
+      action: 'update',
+      name: 'Kriv',
+      reactions: [{ name: '尖刻言语', when: 'foe_attacks', resource: '诗人激励' }],
+    });
+    await t.call('dnd_character', {
+      action: 'update',
+      name: '恩佐',
+      spells: [
+        { name: '魔能爆', level: 0 },
+        { name: '咒剑诅咒', kind: 'feature', action: 'bonus', summary: '30尺1目标，19-20重击+熟练加伤' },
+      ],
+    });
     const row = buildTurnKeyboard('Kriv', 1).content.rows[1]!.buttons.map((b) => b.render_data.label);
-    // 第二行只剩两个，手机上不会被截成「我的…」
-    expect(row).toEqual(['行动', '我的法术']);
+    // 第二行只剩两个，手机上不会被截断
+    expect(row).toEqual(['行动', '法术/能力']);
 
     expect(t.press({ a: 'spells', n: 'Kriv' }, 'P1')).toBe(ACK.ok);
     await Promise.resolve();
-    expect(t.sender.sendMarkdown.mock.calls[0]![1]).toContain('🔮 **恩佐** 的法术');
+    const enzoMsg = t.sender.sendMarkdown.mock.calls[0]![1] as string;
+    expect(enzoMsg).toContain('🔮 **恩佐** 的法术与能力');
+    expect(enzoMsg).toContain('**职业与物品能力**');
+    expect(enzoMsg).toContain('咒剑诅咒 [附赠] — 30尺1目标，19-20重击+熟练加伤');
+
+    // Kriv 没显式填 spells，但旧卡有 resources 和 reactions，点按钮自动兜底列出
+    expect(t.press({ a: 'spells', n: 'Kriv' }, 'P2')).toBe(ACK.ok);
+    await Promise.resolve();
+    const krivMsg = t.sender.sendMarkdown.mock.calls[1]![1] as string;
+    expect(krivMsg).toContain('🔮 **Kriv** 的法术与能力');
+    expect(krivMsg).toContain('尖刻言语 [反应]（诗人激励 3/3）');
+    expect(krivMsg).toContain('诗人激励（3/3，短休回）');
   });
 });
 

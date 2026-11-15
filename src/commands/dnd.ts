@@ -71,7 +71,7 @@ const HELP = [
   '【查规则】',
   '· /dnd search 火球术：给出 wiki 词条链接，法术、技能、职业特性、专长、怪物都能查。',
   '· /dnd spells 牧师：职业法术列表。',
-  '· 回合按钮里的「我的法术」列出你自己卡上的法术，带 wiki 链接；卡上还没有就找 DM 补。',
+  '· 回合按钮里的「法术/能力」列出你自己卡上的法术、职业动作与充能能力，带 wiki 链接；卡上还没有就找 DM 补。',
   `· wiki 首页：${RULES_WIKI}`,
   '',
   '命令：/dnd start｜new｜status｜combat｜checkin｜end｜dungeons｜search｜spells｜help',

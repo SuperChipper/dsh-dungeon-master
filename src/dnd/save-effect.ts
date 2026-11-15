@@ -6,6 +6,7 @@
  */
 import { type Advantage, type DiceResult, type Roller, rollD20, rollExpression } from './dice.ts';
 import { type Campaign, type HpChange, applyDamage, changeCondition, checkModifier, requireCharacter } from './campaign.ts';
+import { computeDefenseStateMod, computeSaveStateMods, formatStateModSummary } from './conditions.ts';
 import type { Ability } from './rules.ts';
 
 export type Defense = 'resistant' | 'immune' | 'vulnerable';
@@ -77,6 +78,8 @@ export interface SaveEffectInput {
   bonus?: number;
   /** 每个目标各掷一次加在豁免上（祝福术） */
   bonusDice?: string;
+  /** 跳过结构化状态对豁免优劣势/自动失败/抗性的自动修正 */
+  ignoreStateMods?: boolean;
   roller: Roller;
 }
 
@@ -85,6 +88,8 @@ export interface RolledSave {
   name: string;
   /** 已死亡等原因跳过时的说明 */
   skipped?: string;
+  /** 因麻痹/石化/震慑/昏迷自动失败时的说明 */
+  autoFailed?: string;
   natural?: number;
   /** 含 bonus 和祝福骰：重掷时只换 d20，这些照旧 */
   modifier?: number;
@@ -132,16 +137,51 @@ export function rollSaveEffect(c: Campaign, input: SaveEffectInput): RolledSaveE
   const damageRoll = input.damage === undefined ? undefined : rollExpression(input.damage, input.roller);
   const saves = resolved.map(({ t, ch }): RolledSave => {
     if (ch.conditions.includes('死亡')) return { name: ch.name, skipped: '已死亡' };
+    const defenseMod = input.ignoreStateMods === true
+      ? { defense: t.defense }
+      : computeDefenseStateMod(ch, input.damageType, t.defense);
     const bonusDice = t.bonusDice ?? input.bonusDice;
+    const saveMods = input.ignoreStateMods === true
+      ? undefined
+      : computeSaveStateMods(ch, input.ability, {
+        ...(t.advantage !== undefined || input.advantage !== undefined ? { explicitAdvantage: t.advantage ?? input.advantage } : {}),
+        ...(bonusDice !== undefined ? { explicitBonusDice: bonusDice } : {}),
+      });
+    if (saveMods?.autoFail === true) {
+      const reason = saveMods.autoFailReason ?? '状态限制';
+      return {
+        name: ch.name,
+        natural: 1,
+        modifier: 0,
+        advantage: 'none',
+        total: -99,
+        detail: `自动失败（${reason}）`,
+        autoFailed: reason,
+        ...(defenseMod.defense !== undefined ? { defense: defenseMod.defense } : {}),
+      };
+    }
     const extra = bonusDice === undefined || bonusDice.length === 0 ? undefined : rollExpression(bonusDice, input.roller);
-    const modifier = checkModifier(ch, 'save', input.ability) + (t.bonus ?? input.bonus ?? 0) + (extra?.total ?? 0);
-    const advantage = t.advantage ?? input.advantage ?? 'none';
+    let autoDiceTotal = 0;
+    const autoDiceDetails: string[] = [];
+    for (const expr of saveMods?.autoDice ?? []) {
+      const m = /^([+-])(.+)$/.exec(expr)!;
+      const r = rollExpression(m[2]!, input.roller);
+      autoDiceTotal += m[1] === '-' ? -r.total : r.total;
+      autoDiceDetails.push(`${m[1]}${r.detail}`);
+    }
+    const modifier = checkModifier(ch, 'save', input.ability) + (t.bonus ?? input.bonus ?? 0) + (extra?.total ?? 0) + autoDiceTotal;
+    const advantage = saveMods !== undefined ? saveMods.advantage : (t.advantage ?? input.advantage ?? 'none');
     const roll = rollD20(modifier, advantage, input.roller);
+    const modExtras: string[] = [...autoDiceDetails];
+    if (defenseMod.reason !== undefined) modExtras.push(defenseMod.reason);
+    const stateSummary = saveMods !== undefined
+      ? formatStateModSummary(saveMods.advReasons, saveMods.disadvReasons, advantage, modExtras)
+      : undefined;
     const out: RolledSave = {
       name: ch.name, natural: roll.natural, modifier, advantage, total: roll.total,
-      detail: `${roll.detail}${extra !== undefined ? `（含 ${extra.detail}）` : ''}`,
+      detail: `${roll.detail}${extra !== undefined ? `（含 ${extra.detail}）` : ''}${stateSummary !== undefined ? ` ${stateSummary}` : ''}`,
     };
-    if (t.defense !== undefined) out.defense = t.defense;
+    if (defenseMod.defense !== undefined) out.defense = defenseMod.defense;
     return out;
   });
   return damageRoll === undefined ? { saves } : { damageRoll, saves };
@@ -163,7 +203,7 @@ export function applySaveEffect(c: Campaign, saves: readonly RolledSave[], input
     if (s.skipped !== undefined || s.total === undefined) return { name: s.name, skipped: s.skipped ?? '没有掷骰' };
     const base: SaveOutcome = { name: s.name, ...(s.detail !== undefined ? { detail: s.detail } : {}), ...(s.natural !== undefined ? { natural: s.natural } : {}) };
     if (input.dc === undefined) return base;
-    const saved = s.total >= input.dc;
+    const saved = s.autoFailed !== undefined ? false : s.total >= input.dc;
     const out: SaveOutcome = { ...base, saved };
     if (s.defense !== undefined) out.defense = s.defense;
     if (input.damage !== undefined) {
