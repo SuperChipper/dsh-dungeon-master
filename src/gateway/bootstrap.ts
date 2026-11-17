@@ -635,6 +635,7 @@ export async function bootstrapGateway(
           return { activeFailover, backup, mainRoute };
         },
       );
+      manager.combatAgents.installCompactionGuard(ctx);
       dndService.onStateChange = (key) => manager.syncDndTools(key);
       // 不是 QQ 会话的 agent 也不带跑团工具：每个 agent 出现时先全藏，QQ 会话建好记录后再按团的状态放开。
       // 这两个事件按 agent 作用域派发，根作用域监听要带 global（同 agent/assistant-stream）

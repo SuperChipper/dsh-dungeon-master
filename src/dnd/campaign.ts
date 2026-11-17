@@ -2245,9 +2245,16 @@ export function changeInventory(c: Campaign, name: string, add: string[] = [], r
 }
 
 export function resourceTag(ch: Character, c?: Campaign): string {
-  const parts = Object.entries(ch.resources ?? {}).map(([k, r]) => `${k}${r.current}/${r.max}`);
+  const entries = Object.entries(ch.resources ?? {});
+  const hitDiceKeys = entries.map(([k]) => k).filter((k) => k.startsWith('生命骰'));
+  const preferredHitDieKey = hitDiceKeys.length > 1
+    ? (hitDiceKeys.find((k) => k.length > '生命骰'.length) ?? hitDiceKeys.at(-1))
+    : undefined;
+  const parts = entries
+    .filter(([k]) => preferredHitDieKey === undefined || !k.startsWith('生命骰') || k === preferredHitDieKey)
+    .map(([k, r]) => `${k}${r.current}/${r.max}`);
   if (c?.initiative !== undefined && inInitiative(c, ch.name)) parts.push(`反应${reactionBlocked(c, ch.name) === undefined && canReact(ch) ? 1 : 0}/1`);
-  const hasHitDieResource = Object.keys(ch.resources ?? {}).some((k) => k.startsWith('生命骰'));
+  const hasHitDieResource = hitDiceKeys.length > 0;
   if (ch.hitDie !== undefined && !hasHitDieResource) parts.push(`生命骰${ch.level - (ch.hitDiceUsed ?? 0)}/${ch.level}`);
   return parts.length > 0 ? ` {${parts.join(' ')}}` : '';
 }

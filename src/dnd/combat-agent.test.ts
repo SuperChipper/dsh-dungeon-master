@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Context, Service } from '@deepseek-ai/cordis';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { describe, expect, it, vi } from 'vitest';
 import { DND_COMBAT_AGENT_DEFAULTS } from '../config.ts';
@@ -469,7 +470,7 @@ it('主通道 turn/end 报 429 QUOTA 时自动切备用通道重放提示，下�
   await h.router.dispose();
 });
 
-it('宿主支持 suppressRuntimeContext 时关闭每步全量快照，改为回合变化时前置精简战斗快照并去重生命骰', async () => {
+it('无论宿主是否提供 suppressRuntimeContext，仅在回合变化时前置精简战斗快照并去重生命骰', async () => {
   const h = harness();
   const suppressRuntimeContext = vi.fn();
   const baseImpl = h.agents.create.getMockImplementation()!;
@@ -485,11 +486,15 @@ it('宿主支持 suppressRuntimeContext 时关闭每步全量快照，改为回�
     return baseImpl({ ...options, setup: wrappedSetup });
   });
 
-  // 增加同房未参战 PC、异地 PC、重复生命骰资源，并配置非演练房间 DM 笔记
+  // 增加同房未参战 PC、异地 PC、多种重复生命骰资源，并配置非演练房间 DM 笔记
   h.service.store.update(h.key, (c) => {
     const fighter = c.characters.find((x) => x.name === '战士')!;
     fighter.hitDie = 'd10';
-    fighter.resources = { 动作如潮: { current: 1, max: 1, reset: 'short' }, '生命骰 d10': { current: 4, max: 5, reset: 'long' } };
+    fighter.resources = {
+      动作如潮: { current: 1, max: 1, reset: 'short' },
+      生命骰: { current: 5, max: 5, reset: 'long' },
+      '生命骰 d10': { current: 4, max: 5, reset: 'long' },
+    };
     upsertCharacter(c, {
       name: '法师', playerId: 'P2', maxHp: 22, room: c.currentRoom,
       resources: { '1环法术位': { current: 3, max: 4, reset: 'long' } },
@@ -515,6 +520,7 @@ it('宿主支持 suppressRuntimeContext 时关闭每步全量快照，改为回�
   expect(startPrompt).toContain('参战我方：战士 30/30');
   expect(startPrompt).toContain('同房未入战：法师');
   expect(startPrompt).toContain('生命骰 d104/5');
+  expect(startPrompt).not.toContain('生命骰5/5');
   expect(startPrompt).not.toMatch(/生命骰 d104\/5[^\n]*生命骰\d+\/\d+/);
   expect(startPrompt).not.toContain('留守牧师');
   expect(startPrompt).not.toContain('引导神力');
@@ -548,7 +554,7 @@ it('宿主支持 suppressRuntimeContext 时关闭每步全量快照，改为回�
   await h.router.dispose();
 });
 
-it('演练模式精简快照与 dndStateText 降级路径屏蔽无关房内怪物及借用房间 DM 笔记', async () => {
+it('演练模式精简快照与 dndStateText 对子代理静默、主代理保留完整快照', async () => {
   const h = harness();
   h.service.store.update(h.key, (c) => {
     endInitiative(c);
@@ -561,15 +567,19 @@ it('演练模式精简快照与 dndStateText 降级路径屏蔽无关房内怪�
   const child = await h.router.select(h.main);
   expect(h.prompts[0]!.text).not.toContain('真实地城房间暗门笔记');
 
-  // 旧宿主无 suppressRuntimeContext 时，dndStateText 通过 isCombatChild 仍走精简 combatStateSnapshot
-  const childSnap = dndStateText(child.agent, (a) => h.router.findAgent(a), h.service, h.logger, (a) => h.router.isChild(a));
-  const mainSnap = dndStateText(h.main.agent, () => h.main, h.service, h.logger, (a) => h.router.isChild(a));
-  expect(childSnap).toContain('【演练模式·战后自动还原状态与场地图】');
-  expect(childSnap).not.toContain('无关路人怪');
-  expect(childSnap).not.toContain('真实地城房间暗门笔记');
-  expect(childSnap).not.toContain('可见出口：');
-  expect(mainSnap).toContain('可见出口：');
-  expect(mainSnap).toContain('真实地城房间暗门笔记');
+  // 无 suppressRuntimeContext 的宿主中，入站照样注入精简战况且排除无关怪与 DM 笔记
+  const decorated = h.router.decorateInboundText(child, '[玩家 #U1] 开始演练');
+  expect(decorated).toContain('【演练模式·战后自动还原状态与场地图】');
+  expect(decorated).not.toContain('无关路人怪');
+  expect(decorated).not.toContain('真实地城房间暗门笔记');
+  expect(decorated).not.toContain('可见出口：');
+
+  // required runtime context（qqbot:dnd-state）对战斗子代理固定返回空串，杜绝每步工具写档重发 Current runtime context
+  const childRuntimeCtx = dndStateText(child.agent, (a) => h.router.findAgent(a), h.service, h.logger, (a) => h.router.isCombatAgent(a));
+  const mainRuntimeCtx = dndStateText(h.main.agent, () => h.main, h.service, h.logger, (a) => h.router.isCombatAgent(a));
+  expect(childRuntimeCtx).toBe('');
+  expect(mainRuntimeCtx).toContain('可见出口：');
+  expect(mainRuntimeCtx).toContain('真实地城房间暗门笔记');
   await h.router.dispose();
 });
 
@@ -707,4 +717,63 @@ it('三级回退链（独立源 -> modelFailover 备用源 -> 主会话路由 ->
   expect(handoff).toContain('backup 502');
   expect(handoff).toContain('main 503');
   await h.router.dispose();
+});
+
+it('战斗子代理全程禁用宿主自动压缩/溢出摘要与插件侧自动压缩，dispose 后恢复原宿主方法', async () => {
+  const h = harness();
+  const innerCompact = vi.fn(async () => ({ shadowedSeqs: [1], shadowedRange: { start: 1, end: 1 }, shadowedTokenCount: 100 }));
+  let stepTrigger!: (agent: DshAgent, trigger: string) => Promise<unknown>;
+  class FakeCompaction extends Service {
+    constructor(c: Context) {
+      super(c, 'compaction');
+      stepTrigger = (agent, trigger) => this.compactIfNeeded(agent, trigger);
+    }
+    async compactIfNeeded(agent: DshAgent, trigger: string): Promise<unknown> {
+      return innerCompact(agent, trigger);
+    }
+  }
+  const cordisCtx = new Context();
+  cordisCtx.plugin(FakeCompaction as never);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  h.router.installCompactionGuard(cordisCtx);
+
+  const child = await h.router.select(h.main);
+  expect(h.router.isCombatAgent(child.agent)).toBe(true);
+  expect(h.router.isCombatAgent(h.main.agent)).toBe(false);
+
+  // 通过 Cordis service internal `this.compactIfNeeded`（即 BasicCompactionEngine agent/pre-step 的实际调用路径）测试拦截
+  expect(await stepTrigger(child.agent, 'pressure')).toBeNull();
+  expect(await stepTrigger(child.agent, 'context-overflow')).toBeNull();
+  expect(innerCompact).not.toHaveBeenCalled();
+
+  // 主会话不受影响
+  await stepTrigger(h.main.agent, 'pressure');
+  expect(innerCompact).toHaveBeenCalledOnce();
+  expect(innerCompact).toHaveBeenCalledWith(h.main.agent, 'pressure');
+
+  // 插件侧 maybeAutoCompact 对子代理（含结束刚移出 active 后的尾轮竞争窗口）同样静默
+  const compact = vi.fn();
+  const fakeManager = {
+    config: { autoCompactTokens: 1000, autoCompactPrivateRatio: 0.5, autoCompactDeferOnTools: false },
+    sessions: new Map([[h.key, h.main]]),
+    combatAgents: h.router,
+    compact,
+  };
+  const childRec = { ...child, contextTokens: 500_000 } as SessionRecord;
+  SessionManager.prototype.maybeAutoCompact.call(fakeManager as never, childRec);
+  expect(compact).not.toHaveBeenCalled();
+
+  h.service.store.update(h.key, (c) => endInitiative(c));
+  h.router.observe(child, { type: 'turn/end', seq: 1, data: { reason: { kind: 'completed' } } });
+  await vi.waitFor(() => expect(h.main.agent.followup).toHaveBeenCalledOnce());
+  expect(h.router.isCombatAgent(child.agent)).toBe(true);
+  expect(await stepTrigger(child.agent, 'pressure')).toBeNull();
+  SessionManager.prototype.maybeAutoCompact.call(fakeManager as never, childRec);
+  expect(compact).not.toHaveBeenCalled();
+
+  // dispose 后完整撤销对宿主 compaction 实例的方法包装
+  await h.router.dispose();
+  innerCompact.mockClear();
+  await stepTrigger(child.agent, 'pressure');
+  expect(innerCompact).toHaveBeenCalledOnce();
 });

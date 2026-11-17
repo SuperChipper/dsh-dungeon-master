@@ -20,7 +20,7 @@
 
 - **战斗子代理收场尾轮漏播报修复**：修复战斗子代理调用 `dnd_initiative(action="end")` 后直接切回主会话导致最后一轮攻击/击杀过程在群内被吞的问题；现子代理会先完整播报尾轮战况，再将战后交接移交主 DM。
 - **主备模型故障转移重启卡死修复**：修复开启 `modelFailover` 时插件在备用模型状态重启后 `ModelWatch` 初始状态失步无法切回主通道的问题，并在关闭 `modelFailover` 后自动清理历史残留的 `failover` 持久化记录。
-- **战斗子代理上下文膨胀与群历史游标失配修复**：在战斗子代理作用域启用 `suppressRuntimeContext`，停止每步工具写档都往上下文历史追加全量探索快照（改为仅在每轮新消息进入、且精简参战战况变化时前置一次；降级兼容模式亦切至精简 `combatStateSnapshot`），并将 `resourceTag` 中重复显示的生命骰条目去重；固定 `SessionManager.sessionIdFor` 始终返回主会话 ID，避免开战、备用通道切换与战后交回时触发全量群聊历史重灌；同时支持三级故障回退（`combatAgent -> modelFailover 备用源 -> 子代理内复用主 DM 生效模型路由 -> 主 DM`）并隔离跨模型 `reasoningEffort` 参数。
+- **战斗子代理上下文膨胀与群历史游标失配修复**：在战斗子代理作用域启用 `suppressRuntimeContext` 并强制对子代理静默 `required: true` 的 `qqbot:dnd-state` / `qqbot:sticker-additions` 运行时上下文（彻底消除每步工具改档重发的 `Current runtime context` 全量注入），改为每轮新消息仅在精简参战战况变化时前置一次增量快照，同时将 `resourceTag` 中重复显示的生命骰条目去重；对即将战后回收的战斗子代理全程禁用宿主级自动压力/溢出压缩及插件侧 `maybeAutoCompact`，避免战中误压缩与缓存失效；固定 `SessionManager.sessionIdFor` 始终返回主会话 ID，避免开战、备用通道切换与战后交回时触发全量群聊历史重灌；支持三级故障回退（`combatAgent -> modelFailover 备用源 -> 子代理内复用主 DM 生效模型路由 -> 主 DM`）并隔离跨模型 `reasoningEffort` 参数。
 - **战斗结算护栏补强**：`dnd_apply` 拦截同次调用同时传 `damage` 与 `heal` 的混淆参数；新增同回合附赠动作法术与正牌法术连发提示；优化 `reactionsOf` 被动描述中否定句（如「无法借机」）的误提取过滤。
 
 ## [0.6.0] - 2026-11-16

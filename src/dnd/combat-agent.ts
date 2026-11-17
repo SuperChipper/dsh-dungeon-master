@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Context } from '@deepseek-ai/cordis';
+import { symbols, type Context } from '@deepseek-ai/cordis';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { DndCombatAgentConfig } from '../config.ts';
 import type { DshAgent, DshAgentHandle, DshAgentRegistry, SessionEventLike, SessionRecord } from '../session/types.ts';
@@ -83,7 +83,6 @@ interface ActiveCombat {
   run: CombatRun;
   triedRoutes: Set<string>;
   lastDialogue?: { text: string; fromChild: boolean };
-  runtimeContextSuppressed?: boolean;
   lastInjectedSnapshot?: string;
   lastPrompt?: string;
   pendingTurnEnd?: Promise<void>;
@@ -329,12 +328,26 @@ function rowUsage(label: string, u: Usage): string {
   return `${label}：${u.requests} 次请求｜新输入 ${u.input}｜缓存读取 ${u.cacheRead}｜缓存写入 ${u.cacheWrite}｜输出 ${u.output}`;
 }
 
+interface CompactionTargetLike {
+  compactIfNeeded?(agent: DshAgent, trigger: string, signal?: AbortSignal): Promise<unknown>;
+}
+
+interface CompactionCtxLike {
+  get?(name: string): unknown;
+  inject?(
+    deps: string[],
+    callback: (scope: Record<string, unknown> & { effect?(fn: () => (() => void) | undefined, name?: string): unknown }) => void,
+  ): { dispose?(): unknown } | void;
+}
+
 /**
  * 专用子 Agent 由 QQ 插件持有 handle：群消息直接路由，不经主模型逐条转述。
  * 活跃日志记录精简前缀和子会话 ID，插件重组后可恢复同一场战斗。
  */
 export class DndCombatAgents {
   private readonly active = new Map<string, ActiveCombat>();
+  private readonly knownChildren = new WeakSet<DshAgent>();
+  private cleanupCompactionGuard?: () => void;
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly settling = new Map<string, CombatRun>();
   private readonly generations = new Map<string, number>();
@@ -408,7 +421,7 @@ export class DndCombatAgents {
     }
   }
 
-  private makeSetup(sessionKey: string, getPrompt: () => string, onSuppressed?: (suppressed: boolean) => void): (scope: Context) => void {
+  private makeSetup(sessionKey: string, getPrompt: () => string): (scope: Context) => void {
     return (scope: Context): void => {
       const tools = scope.get('tools') as { restrict?: (filter: { allow: readonly string[] }) => unknown; guard?: (guard: (exec: { name: string; arguments?: unknown }) => string | undefined) => unknown } | undefined;
       const prompt = scope.get('systemPrompt') as {
@@ -429,9 +442,7 @@ export class DndCombatAgents {
         }
         return undefined;
       });
-      const suppressed = typeof prompt.suppressRuntimeContext === 'function';
-      if (suppressed) prompt.suppressRuntimeContext!();
-      onSuppressed?.(suppressed);
+      prompt.suppressRuntimeContext?.();
       // runtime-context 每次团况变化都会重发整份快照，固定交接放在稳定前缀里，避免每次重复几千 token。
       // 交接含玩家原话，不作模板插值；{{...}} 保持字面文本。
       prompt.section({
@@ -442,12 +453,12 @@ export class DndCombatAgents {
   }
 
   /**
-   * 当宿主支持 suppressRuntimeContext 时，关闭每步工具改档的 4KB 全量快照刷屏，
+   * 关闭战斗子代理每步工具改档的 runtime-context 刷屏，
    * 改为仅在每轮新消息进入子代理、且精简战况较上一轮发生变化时前置一次精简战斗快照。
    */
   public decorateTurnText(record: SessionRecord, text: string): string {
     const active = this.active.get(record.sessionKey);
-    if (active === undefined || active.child.agent !== record.agent || !active.runtimeContextSuppressed) return text;
+    if (active === undefined || active.child.agent !== record.agent) return text;
     let snap = '';
     try {
       snap = this.service.combatStateSnapshot(record.sessionKey);
@@ -561,6 +572,67 @@ export class DndCombatAgents {
     }).finally(() => this.starting.delete(main.sessionKey));
   }
   public isChild(agent: DshAgent): boolean { return this.findAgent(agent) !== undefined; }
+  public isCombatAgent(agent: DshAgent): boolean { return this.knownChildren.has(agent) || this.isChild(agent); }
+
+  /** 战斗子代理战后即回收，屏蔽宿主级自动上下文压缩与溢出摘要重整，避免战中失忆或打穿提示词缓存。 */
+  public installCompactionGuard(ctx: Context): () => void {
+    this.cleanupCompactionGuard?.();
+    const restorer = new Set<() => void>();
+    const attach = (rawService: unknown): (() => void) | undefined => {
+      if (rawService === undefined || rawService === null || (typeof rawService !== 'object' && typeof rawService !== 'function')) {
+        return undefined;
+      }
+      // 宿主 BasicCompactionEngine 的监听器绑定在原始实例 `this` 上，必须解包 Cordis 代理再拦截 `compactIfNeeded`。
+      const target = ((rawService as Record<symbol, unknown>)[symbols.original] ?? rawService) as CompactionTargetLike;
+      const ownDesc = Object.getOwnPropertyDescriptor(target, 'compactIfNeeded');
+      const original = target.compactIfNeeded;
+      if (typeof original !== 'function') return undefined;
+      let active = true;
+      const wrapped: NonNullable<CompactionTargetLike['compactIfNeeded']> = async (agent, trigger, signal) => {
+        if (!this.disposed && this.isCombatAgent(agent)) {
+          this.logger.debug?.(`im-qqbot: 跳过战斗子代理自动压缩 trigger=${trigger} agent=${agent.id}`);
+          return null;
+        }
+        return await original.call(target, agent, trigger, signal);
+      };
+      target.compactIfNeeded = wrapped;
+      const undo = () => {
+        if (!active) return;
+        active = false;
+        restorer.delete(undo);
+        if (target.compactIfNeeded !== wrapped) return;
+        if (ownDesc !== undefined) Object.defineProperty(target, 'compactIfNeeded', ownDesc);
+        else delete (target as { compactIfNeeded?: unknown }).compactIfNeeded;
+      };
+      restorer.add(undo);
+      return undo;
+    };
+
+    const cCtx = ctx as unknown as CompactionCtxLike;
+    let forkDispose: (() => void) | undefined;
+    if (typeof cCtx.inject === 'function') {
+      const fork = cCtx.inject(['compaction'], (scope) => {
+        scope.effect?.(() => attach(scope.compaction), 'im-qqbot.combat-compaction-guard');
+      });
+      if (fork && typeof fork.dispose === 'function') {
+        forkDispose = () => { void fork.dispose?.(); };
+      }
+    } else if (typeof cCtx.get === 'function') {
+      try {
+        attach(cCtx.get('compaction'));
+      } catch { /* compaction 服务未加载时跳过 */ }
+    }
+
+    const cleanup = () => {
+      for (const undo of [...restorer]) undo();
+      forkDispose?.();
+      forkDispose = undefined;
+      if (this.cleanupCompactionGuard === cleanup) this.cleanupCompactionGuard = undefined;
+    };
+    this.cleanupCompactionGuard = cleanup;
+    return cleanup;
+  }
+
   public findAgent(agent: DshAgent): SessionRecord | undefined {
     return [...this.active.values()].find((a) => a.child.agent === agent)?.child;
   }
@@ -617,8 +689,7 @@ export class DndCombatAgents {
           before: partyState(found.campaign), chronicleId: found.campaign.chronicle?.at(-1)?.id ?? 0, usage: {}, lastSeq: {},
         };
       }
-      let runtimeContextSuppressed = false;
-      const setup = this.makeSetup(main.sessionKey, () => run!.prompt, (s) => { runtimeContextSuppressed = s; });
+      const setup = this.makeSetup(main.sessionKey, () => run!.prompt);
       const spawn = async (route: CombatRoute, effort: string | undefined, allowResume: boolean): Promise<DshAgentHandle> => {
         const options = {
           agentOptions: {
@@ -628,9 +699,11 @@ export class DndCombatAgents {
           },
           setup,
         };
-        return allowResume
+        const created = allowResume
           ? await this.agents.resume({ resumeSessionId: run!.childSessionId, ...options })
           : await this.agents.create({ sessionId: run!.childSessionId, meta: { parentSession: main.sessionId, cwd: main.agent.session.header?.cwd ?? process.cwd() }, ...options });
+        this.knownChildren.add(created.agent);
+        return created;
       };
       let handle: DshAgentHandle | undefined;
       try {
@@ -669,7 +742,7 @@ export class DndCombatAgents {
         }
         if (this.disposed || generation !== (this.generations.get(main.sessionKey) ?? 0)) { await handle.dispose(); return main; }
         const child: SessionRecord = { ...main, sessionId: run.childSessionId, agent: handle.agent, handle, agentPreset: undefined, contextTokens: undefined };
-        this.active.set(main.sessionKey, { main, child, run, triedRoutes: triedSet, runtimeContextSuppressed });
+        this.active.set(main.sessionKey, { main, child, run, triedRoutes: triedSet });
         this.syncTools(main);
         this.syncTools(child);
         this.save(run);
@@ -795,8 +868,7 @@ export class DndCombatAgents {
       this.service.roomCombatNotes(active.run.sessionKey),
     );
     const nextChildId = randomUUID();
-    let runtimeContextSuppressed = false;
-    const setup = this.makeSetup(active.run.sessionKey, () => nextPrompt, (s) => { runtimeContextSuppressed = s; });
+    const setup = this.makeSetup(active.run.sessionKey, () => nextPrompt);
     const handle = await this.agents.create({
       sessionId: nextChildId,
       meta: { parentSession: active.main.sessionId, cwd: active.main.agent.session.header?.cwd ?? process.cwd() },
@@ -807,6 +879,7 @@ export class DndCombatAgents {
       },
       setup,
     });
+    this.knownChildren.add(handle.agent);
     active.lastDialogue = dialogue;
     active.run.prompt = nextPrompt;
     active.run.fallbackFrom = fallbackFromChain;
@@ -827,7 +900,6 @@ export class DndCombatAgents {
       contextTokens: undefined,
     };
     active.child = newChild;
-    active.runtimeContextSuppressed = runtimeContextSuppressed;
     active.lastInjectedSnapshot = undefined;
     active.lastPrompt = replayPrompt;
     this.syncTools(newChild);
@@ -921,6 +993,8 @@ export class DndCombatAgents {
 
   public async dispose(): Promise<void> {
     this.disposed = true;
+    this.cleanupCompactionGuard?.();
+    this.cleanupCompactionGuard = undefined;
     await Promise.allSettled([...this.locks.values()]);
     const active = [...this.active.values()];
     this.active.clear();

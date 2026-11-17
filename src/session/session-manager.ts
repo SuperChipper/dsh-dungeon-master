@@ -242,7 +242,7 @@ export function promptEpoch(record: Pick<SessionRecord, 'agent'>): string {
   return `${session.id}:${session.surface?.contentGeneration ?? 0}`;
 }
 
-/** 这个 agent 所在会话的团况快照文字；不是 QQ 会话、没开团或读取失败都返回空串 */
+/** 这个 agent 所在会话的团况快照文字；不是 QQ 会话、战斗子代理（改由回合前增量注入）、没开团或读取失败都返回空串 */
 export function dndStateText(
   agent: DshAgent | undefined,
   findRecord: (agent: DshAgent) => SessionRecord | undefined,
@@ -251,12 +251,10 @@ export function dndStateText(
   isCombatChild?: (agent: DshAgent) => boolean,
 ): string {
   if (agent === undefined || dnd === undefined) return '';
+  if (isCombatChild?.(agent)) return '';
   const record = findRecord(agent);
   if (record === undefined) return '';
   try {
-    if (isCombatChild?.(agent) && typeof dnd.combatStateSnapshot === 'function') {
-      return dnd.combatStateSnapshot(record.sessionKey);
-    }
     return dnd.stateSnapshot(record.sessionKey);
   } catch (err) {
     logger.warn(`im-qqbot: 注入团况失败: ${err instanceof Error ? err.message : String(err)}`);
@@ -594,7 +592,7 @@ export class SessionManager {
           (agent) => this.findByAgent(agent),
           this.dndService,
           this.logger,
-          (agent) => Boolean(this.combatAgents?.isChild(agent)),
+          (agent) => Boolean(this.combatAgents?.isCombatAgent(agent)),
         ),
       });
       scope.systemPrompt.context({
@@ -603,6 +601,7 @@ export class SessionManager {
         required: true,
         interpolate: false,
         text: (context) => {
+          if (context.agent !== undefined && this.combatAgents?.isCombatAgent(context.agent)) return '';
           const record = context.agent === undefined ? undefined : this.findByAgent(context.agent);
           const catalog = record === undefined ? undefined : this.promptLatch.peek(`${record.sessionKey}|${STICKER_CATALOG_SECTION}`);
           return catalog === undefined ? '' : this.stickerStore?.catalogAdditions(catalog) ?? '';
@@ -1721,7 +1720,9 @@ export class SessionManager {
    */
   maybeAutoCompact(record: SessionRecord): void {
     if (this.personaTransitions?.has(record.sessionKey)) return;
+    if (this.sessions !== undefined && this.sessions.get(record.sessionKey) !== record) return;
     if (this.combatAgents?.current(record.sessionKey) !== undefined) return;
+    if (this.combatAgents?.isCombatAgent(record.agent)) return;
     if ((this.config.autoCompactTokens ?? 0) <= 0 || record.compacting) return;
     if (record.contextTokens === undefined || record.agent.status !== 'idle') return;
 
