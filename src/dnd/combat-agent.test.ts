@@ -1,12 +1,13 @@
 import { mkdtempSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { describe, expect, it, vi } from 'vitest';
 import { DND_COMBAT_AGENT_DEFAULTS } from '../config.ts';
 import { SessionManager, dndStateText } from '../session/session-manager.ts';
 import type { DshAgent, SessionRecord } from '../session/types.ts';
 import { AdventureLibrary } from './adventure.ts';
-import { CampaignStore, endInitiative, startInitiative, upsertCharacter } from './campaign.ts';
+import { CampaignStore, applyDamage, endInitiative, startInitiative, upsertCharacter } from './campaign.ts';
 import { COMBAT_TOOLS, DndCombatAgents, recentCombatDialogue, type CombatFallbackState } from './combat-agent.ts';
 import { DndService } from './dnd-service.ts';
 import { registerDndTools } from './dnd-tools.ts';
@@ -203,6 +204,8 @@ describe('战斗代理路由和同一份团档', () => {
     expect(h.guards[0]!({ name: 'pwsh' })).toContain('只能');
     expect(h.guards[0]!({ name: 'subagent' })).toContain('只能');
     expect(h.guards[0]!({ name: 'dnd_initiative', arguments: { action: 'start' } })).toContain('不可重开');
+    expect(h.guards[0]!({ name: 'dnd_rule', arguments: { action: 'define' } })).toContain('仅可查询');
+    expect(h.guards[0]!({ name: 'dnd_rule', arguments: { action: 'list' } })).toBeUndefined();
     await h.router.dispose();
   });
 
@@ -222,14 +225,27 @@ describe('战斗代理路由和同一份团档', () => {
     await expect(call('dnd_apply', { target: '战士', damage: 3 }, h.main.agent)).rejects.toThrow('不能同时');
     await call('dnd_apply', { target: '战士', damage: 3 });
     expect(h.service.store.load(h.key)!.characters.find((ch) => ch.name === '战士')!.hp).toBe(27);
-    await call('dnd_initiative', { action: 'end' });
-    expect(concludeTurn).toHaveBeenCalledOnce();
+    const endRes = await call('dnd_initiative', { action: 'end' });
+    expect(concludeTurn).not.toHaveBeenCalled();
+    expect(endRes.text).toContain('【收尾播报】');
     expect(h.guards[0]!({ name: 'dnd_apply' })).toContain('战斗已结束');
-    h.router.observe(child, { type: 'turn/end', data: { reason: { kind: 'completed' } } });
+    h.router.observe(child, {
+      type: 'assistant/message',
+      seq: 10,
+      data: {
+        message: {
+          source: { provider: 'opencode-go', model: 'deepseek-v4.1-flash' },
+          content: [{ type: 'text', text: '战士挥出最后一剑斩倒地精，战斗结束！' }],
+        },
+      },
+    });
+    h.router.observe(child, { type: 'turn/end', seq: 11, data: { reason: { kind: 'completed' } } });
     await vi.waitFor(() => expect(h.main.agent.followup).toHaveBeenCalledOnce());
     const handoff = JSON.stringify(vi.mocked(h.main.agent.followup).mock.calls[0]);
     expect(handoff).toContain('禁止重复扣血');
     expect(handoff).toContain('27');
+    expect(handoff).toContain('战士挥出最后一剑斩倒地精');
+    expect(handoff).not.toContain('未向群内播报的战斗账本');
     expect(h.router.current(h.key)).toBeUndefined();
     expect(h.children[0]!.dispose).toHaveBeenCalledOnce();
   });
@@ -450,5 +466,245 @@ it('主通道 turn/end 报 429 QUOTA 时自动切备用通道重放提示，下�
   expect(child3).not.toBe(h.main);
   const thirdCreateOpts = h.agents.create.mock.calls[2]![0] as { agentOptions?: { provider?: string; model?: string } };
   expect(thirdCreateOpts.agentOptions).toMatchObject({ provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' });
+  await h.router.dispose();
+});
+
+it('宿主支持 suppressRuntimeContext 时关闭每步全量快照，改为回合变化时前置精简战斗快照并去重生命骰', async () => {
+  const h = harness();
+  const suppressRuntimeContext = vi.fn();
+  const baseImpl = h.agents.create.getMockImplementation()!;
+  h.agents.create.mockImplementation(async (options: { sessionId?: string; resumeSessionId?: string; setup?: (scope: unknown) => void }) => {
+    const wrappedSetup = async (scope: { get(name: string): unknown }) => {
+      const sp = {
+        ...(scope.get('systemPrompt') as Record<string, unknown>),
+        suppressRuntimeContext,
+      };
+      const wrappedScope = { get: (name: string) => (name === 'systemPrompt' ? sp : scope.get(name)) };
+      await options.setup?.(wrappedScope);
+    };
+    return baseImpl({ ...options, setup: wrappedSetup });
+  });
+
+  // 增加同房未参战 PC、异地 PC、重复生命骰资源，并配置非演练房间 DM 笔记
+  h.service.store.update(h.key, (c) => {
+    const fighter = c.characters.find((x) => x.name === '战士')!;
+    fighter.hitDie = 'd10';
+    fighter.resources = { 动作如潮: { current: 1, max: 1, reset: 'short' }, '生命骰 d10': { current: 4, max: 5, reset: 'long' } };
+    upsertCharacter(c, {
+      name: '法师', playerId: 'P2', maxHp: 22, room: c.currentRoom,
+      resources: { '1环法术位': { current: 3, max: 4, reset: 'long' } },
+    });
+    upsertCharacter(c, {
+      name: '留守牧师', playerId: 'P3', maxHp: 28, room: 'other-room',
+      resources: { 引导神力: { current: 2, max: 2, reset: 'short' } },
+    });
+    c.begun = true;
+  });
+  const advRoom = h.service.require(h.key).adventure.sites[0]!.rooms.find((r) => r.id === h.service.require(h.key).campaign.currentRoom)!;
+  advRoom.dmNotes = '祭坛下方藏有酸液暗格（感知 DC 15 发现）。';
+
+  const child = (await h.router.startAfterReply(h.main, '场地 10x10'))!;
+  expect(suppressRuntimeContext).toHaveBeenCalledOnce();
+  // 静态房间 DM 笔记只放进固定交接前缀一次
+  expect(h.prompts[0]!.text).toContain('祭坛下方藏有酸液暗格');
+
+  // 开战接管首条消息前置了精简战斗快照
+  const startPrompt = (vi.mocked(child.agent.followup).mock.calls[0]![0] as { content: Array<{ text?: string }> }).content[0]!.text!;
+  expect(startPrompt).toContain('【团况 · DM 视角（本轮最新快照，旧快照作废）】');
+  expect(startPrompt).toContain('当前战场：');
+  expect(startPrompt).toContain('参战我方：战士 30/30');
+  expect(startPrompt).toContain('同房未入战：法师');
+  expect(startPrompt).toContain('生命骰 d104/5');
+  expect(startPrompt).not.toMatch(/生命骰 d104\/5[^\n]*生命骰\d+\/\d+/);
+  expect(startPrompt).not.toContain('留守牧师');
+  expect(startPrompt).not.toContain('引导神力');
+  expect(startPrompt).not.toContain('1环法术位');
+  expect(startPrompt).not.toContain('可见出口：');
+  expect(startPrompt).not.toContain('祭坛下方藏有酸液暗格');
+
+  // 局面未变化（玩家只问规则）时不重复前置快照
+  const qnaTurn = h.router.decorateInboundText(child, '[玩家 #U1] (@you) 我能退几格？');
+  expect(qnaTurn).toBe('[玩家 #U1] (@you) 我能退几格？');
+
+  // 血量变化后下一轮入站或按钮 followup 重新注入更新后的精简快照
+  h.service.store.update(h.key, (c) => applyDamage(c, '战士', 6));
+  const nextTurn = h.router.decorateInboundText(child, '[玩家 #U1] (@you) 我砍它一剑');
+  expect(nextTurn).toContain('【团况 · DM 视角（本轮最新快照，旧快照作废）】');
+  expect(nextTurn).toContain('战士 24/30');
+  expect(nextTurn).toContain('[玩家 #U1] (@you) 我砍它一剑');
+
+  // 无新变化时 sendDndFollowup 不重复注入；再扣血则注入一次
+  const manager = Object.assign(Object.create(SessionManager.prototype), {
+    sessions: new Map([[h.key, h.main]]), combatAgents: h.router,
+  }) as SessionManager;
+  await manager.sendDndFollowup(h.main, createUserMessage({ content: [{ type: 'text', text: '[系统 · 按钮] 战士结束了回合' }], source: { kind: 'user' } }));
+  expect((vi.mocked(child.agent.followup).mock.calls.at(-1)![0] as { content: Array<{ text?: string }> }).content[0]!.text).toBe('[系统 · 按钮] 战士结束了回合');
+
+  h.service.store.update(h.key, (c) => applyDamage(c, '战士', 4));
+  await manager.sendDndFollowup(h.main, createUserMessage({ content: [{ type: 'text', text: '[系统 · 按钮] 战士再点状态' }], source: { kind: 'user' } }));
+  const btnMsg = (vi.mocked(child.agent.followup).mock.calls.at(-1)![0] as { content: Array<{ text?: string }> }).content[0]!.text!;
+  expect(btnMsg).toContain('战士 20/30');
+  expect(btnMsg).toContain('[系统 · 按钮] 战士再点状态');
+  await h.router.dispose();
+});
+
+it('演练模式精简快照与 dndStateText 降级路径屏蔽无关房内怪物及借用房间 DM 笔记', async () => {
+  const h = harness();
+  h.service.store.update(h.key, (c) => {
+    endInitiative(c);
+    upsertCharacter(c, { name: '无关路人怪', kind: 'monster', room: c.currentRoom, maxHp: 40 });
+    startInitiative(c, () => 10, ['战士', '地精'], undefined, {}, [], { rehearsal: true });
+  });
+  const advRoom = h.service.require(h.key).adventure.sites[0]!.rooms.find((r) => r.id === h.service.require(h.key).campaign.currentRoom)!;
+  advRoom.dmNotes = '真实地城房间暗门笔记。';
+
+  const child = await h.router.select(h.main);
+  expect(h.prompts[0]!.text).not.toContain('真实地城房间暗门笔记');
+
+  // 旧宿主无 suppressRuntimeContext 时，dndStateText 通过 isCombatChild 仍走精简 combatStateSnapshot
+  const childSnap = dndStateText(child.agent, (a) => h.router.findAgent(a), h.service, h.logger, (a) => h.router.isChild(a));
+  const mainSnap = dndStateText(h.main.agent, () => h.main, h.service, h.logger, (a) => h.router.isChild(a));
+  expect(childSnap).toContain('【演练模式·战后自动还原状态与场地图】');
+  expect(childSnap).not.toContain('无关路人怪');
+  expect(childSnap).not.toContain('真实地城房间暗门笔记');
+  expect(childSnap).not.toContain('可见出口：');
+  expect(mainSnap).toContain('可见出口：');
+  expect(mainSnap).toContain('真实地城房间暗门笔记');
+  await h.router.dispose();
+});
+
+it('SessionManager.sessionIdFor 在战斗接管和备用通道切换期间始终保持为主会话 ID，不打断群历史游标', async () => {
+  const h = harness();
+  h.setFallback({ backup: { provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' } });
+  const resolver = { getSessionId: () => undefined };
+  const manager = Object.assign(Object.create(SessionManager.prototype), {
+    config: { appId: 'app' },
+    sessions: new Map([[h.key, h.main]]),
+    modelResolver: resolver,
+    combatAgents: h.router,
+  }) as SessionManager;
+
+  expect(manager.sessionIdFor('group', 'G1')).toBe('main');
+  const child1 = await manager.routeDndRecord(h.main);
+  expect(child1.sessionId).not.toBe('main');
+  expect(manager.getSessionRecord('group', 'G1')).toBe(child1);
+  expect(manager.sessionIdFor('group', 'G1')).toBe('main');
+
+  h.router.observe(child1, {
+    type: 'turn/end',
+    seq: 1,
+    data: { reason: { kind: 'error', error: { code: 'QUOTA', message: 'limit' } } },
+  });
+  await vi.waitFor(() => expect(h.agents.create).toHaveBeenCalledTimes(2));
+  const child2 = h.router.current(h.key)!;
+  expect(child2.sessionId).not.toBe(child1.sessionId);
+  expect(manager.sessionIdFor('group', 'G1')).toBe('main');
+
+  h.service.store.update(h.key, (c) => endInitiative(c));
+  await manager.routeDndRecord(h.main);
+  expect(manager.sessionIdFor('group', 'G1')).toBe('main');
+  await h.router.dispose();
+});
+
+it('未开启 modelFailover 时，子代理提供商失败自动回退复用主会话模型路由（不继承异构 reasoningEffort、不交回主 DM），冷却期内新战直连主路由，主路由也失败才交回主 DM', async () => {
+  const h = harness();
+  (h.main.agent.session as { requestHeader?: () => unknown }).requestHeader = () => ({
+    config: { provider: 'opencode-argon-native', model: 'gemini-4-argon' },
+  });
+  const fakeManager = Object.create(SessionManager.prototype) as SessionManager;
+  const mainRoute = fakeManager.getEffectiveSessionRoute(h.main);
+  expect(mainRoute).toEqual({ provider: 'opencode-argon-native', model: 'gemini-4-argon', reasoningEffort: null });
+
+  h.setFallback({ mainRoute });
+  const child1 = await h.router.select(h.main);
+  const firstOpts = h.agents.create.mock.calls[0]![0] as { agentOptions?: { provider?: string; model?: string; reasoningEffort?: string } };
+  expect(firstOpts.agentOptions).toMatchObject({ provider: 'opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high' });
+
+  h.router.observe(child1, {
+    type: 'turn/end',
+    seq: 1,
+    data: { reason: { kind: 'error', error: { code: 'QUOTA', message: 'primary quota exceeded' } } },
+  });
+  await vi.waitFor(() => expect(h.agents.create).toHaveBeenCalledTimes(2));
+
+  const secondOpts = h.agents.create.mock.calls[1]![0] as { agentOptions?: { provider?: string; model?: string; reasoningEffort?: string } };
+  expect(secondOpts.agentOptions).toEqual({ provider: 'opencode-argon-native', model: 'gemini-4-argon' });
+  expect(secondOpts.agentOptions).not.toHaveProperty('reasoningEffort');
+  expect(h.main.agent.followup).not.toHaveBeenCalled();
+  expect(h.router.toolView(h.main)).toBe('waiting');
+  expect(h.router.report(h.key)).toContain('opencode-argon-native/gemini-4-argon');
+  expect(h.router.report(h.key)).toContain('已回退自：opencode-go/deepseek-v4.1-flash');
+
+  // 冷却期内下一场新战斗直接复用主路由子代理，不再撞已失败的 opencode-go
+  h.service.store.update(h.key, (c) => endInitiative(c));
+  await h.router.select(h.main);
+  vi.mocked(h.main.agent.followup).mockClear();
+  h.service.store.update(h.key, (c) => startInitiative(c, () => 12));
+  const child3 = await h.router.select(h.main);
+  expect(child3).not.toBe(h.main);
+  const thirdOpts = h.agents.create.mock.calls[2]![0] as { agentOptions?: { provider?: string; model?: string; reasoningEffort?: string } };
+  expect(thirdOpts.agentOptions).toEqual({ provider: 'opencode-argon-native', model: 'gemini-4-argon' });
+
+  // 若主路由在子代理内也报错，才交回主 DM
+  h.router.observe(child3, {
+    type: 'turn/end',
+    seq: 2,
+    data: { reason: { kind: 'error', error: { code: 'TRANSPORT', message: 'main route 502' } } },
+  });
+  await vi.waitFor(() => expect(h.main.agent.followup).toHaveBeenCalledOnce());
+  expect(h.agents.create).toHaveBeenCalledTimes(3);
+  expect(h.router.toolView(h.main)).toBe('full');
+  expect(JSON.stringify(vi.mocked(h.main.agent.followup).mock.calls)).toContain('main route 502');
+  await h.router.dispose();
+});
+
+it('三级回退链（独立源 -> modelFailover 备用源 -> 主会话路由 -> 主 DM）跨两跳保留已发生战斗对话且不重复重试同路由', async () => {
+  const h = harness();
+  h.setFallback({
+    backup: { provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' },
+    mainRoute: { provider: 'deepseek-official', model: 'deepseek-chat', reasoningEffort: null },
+  });
+  const child1 = await h.router.select(h.main);
+  (child1.agent.session.events as unknown[]).push(
+    { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '[系统 · 战斗接管] 第1轮开始' }] } },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '第1轮：地精挥刀未中。' }] } } },
+  );
+
+  // 第 1 跳：独立源 -> modelFailover 备用源（同模型族保留 high）
+  h.router.observe(child1, {
+    type: 'turn/end',
+    seq: 1,
+    data: { reason: { kind: 'error', error: { code: 'QUOTA', message: 'quota 1' } } },
+  });
+  await vi.waitFor(() => expect(h.agents.create).toHaveBeenCalledTimes(2));
+  const secondOpts = h.agents.create.mock.calls[1]![0] as { agentOptions?: { provider?: string; model?: string; reasoningEffort?: string } };
+  expect(secondOpts.agentOptions).toMatchObject({ provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash', reasoningEffort: 'high' });
+
+  // 第 2 跳：备用源首轮即挂（未产生 assistant/message）-> 主会话路由，仍保留第1轮对话且去掉不兼容 reasoningEffort
+  const child2 = h.router.current(h.key)!;
+  h.router.observe(child2, {
+    type: 'turn/end',
+    seq: 2,
+    data: { reason: { kind: 'error', error: { code: 'TRANSPORT', message: 'backup 502' } } },
+  });
+  await vi.waitFor(() => expect(h.agents.create).toHaveBeenCalledTimes(3));
+  const thirdOpts = h.agents.create.mock.calls[2]![0] as { agentOptions?: { provider?: string; model?: string; reasoningEffort?: string } };
+  expect(thirdOpts.agentOptions).toEqual({ provider: 'deepseek-official', model: 'deepseek-chat' });
+  expect(h.prompts.at(-1)!.text).toContain('第1轮：地精挥刀未中。');
+  expect(h.main.agent.followup).not.toHaveBeenCalled();
+
+  // 第 3 跳：主会话路由也失败 -> 交回主 DM，汇总三级失败原因且不再重试
+  const child3 = h.router.current(h.key)!;
+  h.router.observe(child3, {
+    type: 'turn/end',
+    seq: 3,
+    data: { reason: { kind: 'error', error: { code: 'TRANSPORT', message: 'main 503' } } },
+  });
+  await vi.waitFor(() => expect(h.main.agent.followup).toHaveBeenCalledOnce());
+  expect(h.agents.create).toHaveBeenCalledTimes(3);
+  const handoff = JSON.stringify(vi.mocked(h.main.agent.followup).mock.calls);
+  expect(handoff).toContain('quota 1');
+  expect(handoff).toContain('backup 502');
+  expect(handoff).toContain('main 503');
   await h.router.dispose();
 });

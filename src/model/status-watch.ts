@@ -211,6 +211,10 @@ export interface ModelWatchOptions {
   recoverThreshold?: number;
   /** 请求探测的时延阈值（毫秒），默认 8000 */
   ttftThresholdMs?: number;
+  /** 重启前磁盘里已处于备用故障转移态：为 true 时以备用态起步，主用恢复后能正常触发 switchBack 清掉持久化 failover */
+  initialUsingBackup?: boolean;
+  /** start() 时是否立即执行首轮异步探测（默认 false） */
+  immediate?: boolean;
   /** 执行切换 */
   switchTo: (target: { provider: string; model: string }, health: Health) => Promise<void>;
   switchBack: (target: { provider: string; model: string }, health: Health) => Promise<void>;
@@ -236,14 +240,16 @@ function isSick(state: HealthState): boolean {
  */
 export class ModelWatch {
   private timer: NodeJS.Timeout | undefined;
-  private usingBackup = false;
+  private usingBackup: boolean;
   private primaryHealth: Health = { state: 'unknown', reason: 'init', detail: '尚未探测' };
   private backupHealth: Health = { state: 'unknown', reason: 'init', detail: '尚未探测' };
   private badPrimary = 0;
   private goodPrimary = 0;
   private badBackup = 0;
 
-  public constructor(private readonly options: ModelWatchOptions) {}
+  public constructor(private readonly options: ModelWatchOptions) {
+    this.usingBackup = options.initialUsingBackup === true;
+  }
 
   public get state(): {
     usingBackup: boolean;
@@ -261,8 +267,11 @@ export class ModelWatch {
     const p = this.options.primary;
     const b = this.options.backup;
     this.options.log(
-      `model-watch: 已启动，每 ${Math.round(interval / 60_000)} 分钟对 ${p.provider}/${p.model} 与 ${b.provider}/${b.model} 各探一次`,
+      `model-watch: 已启动（初始=${this.usingBackup ? '备用态' : '主用态'}），每 ${Math.round(interval / 60_000)} 分钟对 ${p.provider}/${p.model} 与 ${b.provider}/${b.model} 各探一次`,
     );
+    if (this.options.immediate === true) {
+      void this.tick();
+    }
   }
 
   public stop(): void {

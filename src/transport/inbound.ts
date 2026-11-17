@@ -131,8 +131,9 @@ export async function handleInbound(
   // 游标绑定 sessionId，换了新会话（/new）时会话里没有旧历史，退回完整的最近 N 条。
   const isGroupTrigger = scope === 'group'
     && ((mwState.mention?.wasMentioned ?? false) || (mwState.mention?.implicit ?? false));
+  const historySessionId = isGroupTrigger ? manager.sessionIdFor(scope, peerId) : undefined;
   const cursor = isGroupTrigger ? readHistoryCursor(config.appId, peerId) : undefined;
-  const cursorMessageId = cursor !== undefined && cursor.sessionId === manager.sessionIdFor(scope, peerId)
+  const cursorMessageId = cursor !== undefined && cursor.sessionId === historySessionId
     ? cursor.messageId
     : undefined;
   const history: HistoryEntry[] | undefined = isGroupTrigger
@@ -199,7 +200,7 @@ export async function handleInbound(
   }
 
   // ── 构建 UserMessage → followup ──
-  let text = agentBody;
+  let text = steered ? agentBody : (manager.combatAgents?.decorateInboundText(record, agentBody) ?? agentBody);
   let nativeImages = false;
   if (config.vision.native) {
     // 旧会话可能仍是 text-only 路由；按会话实际 requestHeader 判断，不能只看全局 config。
@@ -299,7 +300,7 @@ export async function handleInbound(
           clearGroupHistory(config.appId, msg.groupOpenid ?? msg.senderId);
         }
         if (isGroupTrigger) {
-          writeHistoryCursor(config.appId, peerId, { sessionId: record.sessionId, messageId: msg.messageId });
+          writeHistoryCursor(config.appId, peerId, { sessionId: historySessionId ?? record.sessionId, messageId: msg.messageId });
         }
       },
       { slot: turnSlot, tracker: manager.turnSteer },

@@ -534,6 +534,8 @@ export async function bootstrapGateway(
         failThreshold: Math.max(1, failover.failThreshold),
         recoverThreshold: Math.max(1, failover.recoverThreshold),
         ttftThresholdMs: Math.max(1000, failover.ttftThresholdMs),
+        initialUsingBackup: manager.getFailoverRoute() !== undefined,
+        immediate: true,
         switchTo: async (target, health) => {
           const count = await manager.switchAllSessions(target);
           await notify(`⚠️ ${health.detail}\n已把 ${count} 个会话切到 ${target.provider}/${target.model}`);
@@ -552,6 +554,11 @@ export async function bootstrapGateway(
     } else {
       logger.warn("model-watch: 主用或备用的 provider/model 没配全，跳过");
     }
+  }
+  if (modelWatch === undefined && manager.getFailoverRoute() !== undefined) {
+    void manager.clearFailoverRoute()
+      .then((count) => logger.info(`im-qqbot: model-watch 未运行，已自动清理磁盘残留故障转移路由（切回默认会话=${count}）`))
+      .catch((err: unknown) => logger.warn(`im-qqbot: 清理残留故障转移路由失败: ${String(err)}`));
   }
   // ── 表情收藏工具注册（qqbot_save_sticker） ──
   if (stickerStore !== undefined) {
@@ -608,15 +615,16 @@ export async function bootstrapGateway(
       manager.combatAgents = new DndCombatAgents(
         agents, dndService, () => config.dnd?.combatAgent,
         (record) => toolScope.sync(record), logger, undefined,
-        () => {
-          const activeFailover = manager.getFailoverRoute();
+        (main) => {
+          const mainRoute = manager.getEffectiveSessionRoute(main);
           const fo = config.modelFailover;
-          if (!fo?.enabled) return activeFailover ? { activeFailover } : undefined;
+          if (!fo?.enabled) return mainRoute ? { mainRoute } : undefined;
           const cur = config.dnd?.combatAgent;
           const pProv = fo.primaryProvider.trim() || (config.provider ?? '').trim();
           const pMod = fo.primaryModel.trim() || (config.model ?? '').trim();
           const bProv = fo.backupProvider.trim();
           const bMod = fo.backupModel.trim();
+          const activeFailover = cur?.provider.trim() === pProv ? manager.getFailoverRoute() : undefined;
           const isBackupConfiguredAsPrimary = cur?.provider.trim() === bProv && cur?.model.trim() === bMod;
           const cand = isBackupConfiguredAsPrimary
             ? (pProv && pMod ? { provider: pProv, model: pMod } : undefined)
@@ -624,7 +632,7 @@ export async function bootstrapGateway(
           const backup = cand && (cand.provider !== cur?.provider.trim() || cand.model !== cur?.model.trim())
             ? cand
             : undefined;
-          return { activeFailover, backup };
+          return { activeFailover, backup, mainRoute };
         },
       );
       dndService.onStateChange = (key) => manager.syncDndTools(key);

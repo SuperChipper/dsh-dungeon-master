@@ -37,7 +37,7 @@ export interface DshAgent {
     /** 压缩、替换历史时 contentGeneration 会变，普通追加不变 */
     readonly surface?: { readonly contentGeneration?: number; readonly nodes?: readonly number[] };
     /** 最近一次请求头（取实际路由的 provider/model，用于查上下文窗口） */
-    requestHeader?(): { config?: { provider?: string; model?: string } } | undefined;
+    requestHeader?(): { config?: { provider?: string; model?: string; reasoningEffort?: string } } | undefined;
   };
   /** 持久化输入到边界；交接使用 next-step 且不唤醒，系统头由宿主先建立。 */
   send?(message: unknown, target: 'next-turn' | 'next-step', wakeup: boolean): void;

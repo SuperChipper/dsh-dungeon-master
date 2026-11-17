@@ -81,7 +81,7 @@ describe('probeStatus', () => {
 
 describe('ModelWatch 双链路互备', () => {
   /** 用脚本化结果替换 probe（避免真打网络） */
-  function harness(script: { primary: Health[]; backup: Health[] }) {
+  function harness(script: { primary: Health[]; backup: Health[] }, extra: { initialUsingBackup?: boolean; immediate?: boolean } = {}) {
     const calls: string[] = [];
     const pi = { n: 0 };
     const bi = { n: 0 };
@@ -90,6 +90,7 @@ describe('ModelWatch 双链路互备', () => {
       backup: { provider: 'commandcode', model: 'b' },
       failThreshold: 1,
       recoverThreshold: 2,
+      ...extra,
       switchTo: async (target) => { calls.push(`to:${target.provider}/${target.model}`); },
       switchBack: async (target) => { calls.push(`back:${target.provider}/${target.model}`); },
       log: () => {},
@@ -154,5 +155,15 @@ describe('ModelWatch 双链路互备', () => {
     const { watch, calls } = harness({ primary: [unknown], backup: [unknown] });
     await watch.tick();
     expect(calls).toEqual([]);
+  });
+
+  it('重启前磁盘已有 failover（initialUsingBackup=true）：主用恢复满阈值后正常触发 switchBack 清锁', async () => {
+    const { watch, calls } = harness({ primary: [ok, ok], backup: [ok, ok] }, { initialUsingBackup: true });
+    expect(watch.state.usingBackup).toBe(true);
+    await watch.tick();
+    expect(calls).toEqual([]);
+    await watch.tick();
+    expect(calls).toEqual(['back:opencode-go/a']);
+    expect(watch.state.usingBackup).toBe(false);
   });
 });

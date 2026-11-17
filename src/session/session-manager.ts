@@ -246,13 +246,17 @@ export function promptEpoch(record: Pick<SessionRecord, 'agent'>): string {
 export function dndStateText(
   agent: DshAgent | undefined,
   findRecord: (agent: DshAgent) => SessionRecord | undefined,
-  dnd: Pick<DndService, 'stateSnapshot'> | undefined,
+  dnd: (Pick<DndService, 'stateSnapshot'> & Partial<Pick<DndService, 'combatStateSnapshot'>>) | undefined,
   logger: Logger,
+  isCombatChild?: (agent: DshAgent) => boolean,
 ): string {
   if (agent === undefined || dnd === undefined) return '';
   const record = findRecord(agent);
   if (record === undefined) return '';
   try {
+    if (isCombatChild?.(agent) && typeof dnd.combatStateSnapshot === 'function') {
+      return dnd.combatStateSnapshot(record.sessionKey);
+    }
     return dnd.stateSnapshot(record.sessionKey);
   } catch (err) {
     logger.warn(`im-qqbot: 注入团况失败: ${err instanceof Error ? err.message : String(err)}`);
@@ -585,7 +589,13 @@ export class SessionManager {
         order: DND_STATE_CONTEXT_ORDER,
         required: true,
         interpolate: false,
-        text: (context) => dndStateText(context.agent, (agent) => this.findByAgent(agent), this.dndService, this.logger),
+        text: (context) => dndStateText(
+          context.agent,
+          (agent) => this.findByAgent(agent),
+          this.dndService,
+          this.logger,
+          (agent) => Boolean(this.combatAgents?.isChild(agent)),
+        ),
       });
       scope.systemPrompt.context({
         name: 'qqbot:sticker-additions',
@@ -888,7 +898,8 @@ export class SessionManager {
     const main = this.sessions.get(record.sessionKey);
     if (main !== undefined) main.lastActivity = Date.now();
     const target = await this.routeDndRecord(record);
-    target.agent.followup(message);
+    const decorated = this.combatAgents?.decorateFollowupMessage(target, message) ?? message;
+    target.agent.followup(decorated);
     await target.agent.whenIdle();
   }
 
@@ -1209,10 +1220,10 @@ export class SessionManager {
     return this.modelResolver.getSessionId(sessionKey) ?? this.deriveSessionId(sessionKey);
   }
 
-  /** 该 peer 当前（或下一次 getOrCreate 将使用）的 sessionId */
+  /** 该 peer 当前主会话（或下一次 getOrCreate 将使用）的 sessionId；不随临时战斗子代理漂移，保证群历史游标连续 */
   sessionIdFor(scope: ChatScope, peerId: string): string {
-    const record = this.getSessionRecord(scope, peerId);
-    return record?.sessionId ?? this.currentSessionId(this.sessionKey(scope, peerId));
+    const key = this.sessionKey(scope, peerId);
+    return this.sessions.get(key)?.sessionId ?? this.currentSessionId(key);
   }
 
   private async composePreset(presetId?: string): Promise<PresetComposition> {
@@ -1494,6 +1505,23 @@ export class SessionManager {
     }
     await this.remove(scope, peerId, store.sessionFor(peerId, personaId, scope) ?? randomUUID());
     return incomplete ? 'handoff-incomplete' : 'ok';
+  }
+
+  /**
+   * 解析指定会话当前实际生效的 provider/model 路由（含 Web/命令切换、model/selection、最近请求头及配置解析链）。
+   * reasoningEffort 仅在最近请求头与该路由一致且显式非空时透传，否则置为 null，避免战斗子代理回退复用主会话模型时强行塞入不兼容的推理档位导致 400。
+   */
+  public getEffectiveSessionRoute(record: SessionRecord): (ModelRoute & { reasoningEffort?: string | null }) | undefined {
+    const route = this.personaModelRoute(record);
+    if (!route?.provider || !route.model) return undefined;
+    const headerCfg = record.agent.session.requestHeader?.()?.config;
+    const effort = headerCfg?.provider === route.provider
+      && headerCfg?.model === route.model
+      && typeof headerCfg.reasoningEffort === 'string'
+      && headerCfg.reasoningEffort.trim()
+      ? headerCfg.reasoningEffort.trim()
+      : null;
+    return { provider: route.provider, model: route.model, reasoningEffort: effort };
   }
 
   private personaModelRoute(record: SessionRecord): ModelRoute | undefined {
