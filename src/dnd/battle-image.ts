@@ -11,6 +11,13 @@ import type { Adventure } from './adventure.ts';
 import { cellOf, mapOf } from './battlefield.ts';
 import { type Campaign, type Character, isOut } from './campaign.ts';
 import { type BattleMap, areaName } from './terrain.ts';
+import {
+  type BattleZone,
+  type VisualAuraRing,
+  type ZoneTheme,
+  activeVisualAurasInRoom,
+  zonesInRoom,
+} from './zones.ts';
 import { loadSharp } from '../shared/sharp.ts';
 import { esc } from './map-render.ts';
 
@@ -26,6 +33,7 @@ export interface Token {
   label: string;
   x: number;
   y: number;
+  z?: number;
   kind: 'pc' | 'npc' | 'monster';
   down: boolean;
   current: boolean;
@@ -68,6 +76,7 @@ export function roomTokens(c: Campaign, room: string, visible: (ch: Character) =
     label: labels.get(ch.name) ?? '?',
     x: cell.x,
     y: cell.y,
+    ...(cell.z !== undefined && cell.z > 0 ? { z: cell.z } : {}),
     kind: ch.kind === 'monster' ? 'monster' : (ch.kind === 'pc' ? 'pc' : 'npc'),
     // 倒地（0 HP 在做死亡豁免）和死了都画成灰的：玩家一眼要看出谁需要救
     down: isOut(ch) || ch.hp <= 0,
@@ -80,11 +89,30 @@ export function roomTokens(c: Campaign, room: string, visible: (ch: Character) =
 
 const TOKEN_FILL = { pc: '#2f7dd4', npc: '#3a9a5b', monster: '#c8372d' } as const;
 
+const ZONE_PALETTE: Record<ZoneTheme, { fill: string; stroke: string; text: string; opacity: number }> = {
+  darkness: { fill: '#221238', stroke: '#a87bff', text: '#ede0ff', opacity: 0.54 },
+  poison: { fill: '#1f6e2c', stroke: '#69f0ae', text: '#e8ffe9', opacity: 0.36 },
+  fire: { fill: '#c63f17', stroke: '#ff8a50', text: '#fff2e6', opacity: 0.36 },
+  radiant: { fill: '#c99714', stroke: '#ffe082', text: '#fff9db', opacity: 0.34 },
+  frost: { fill: '#196496', stroke: '#80d8ff', text: '#e6f7ff', opacity: 0.36 },
+  nature: { fill: '#5d6b24', stroke: '#c5e1a5', text: '#f4ffdf', opacity: 0.36 },
+  fog: { fill: '#546e7a', stroke: '#cfd8dc', text: '#f5f8fa', opacity: 0.44 },
+};
+
 /**
  * 叠在底图上的那一层（或者没有底图时的整张图）。坐标都是输出图的像素，左上留出标题和坐标的边。
- * withArt=false 时把地形本身也画出来：地面、墙、门、障碍、难行地形。
+ * withArt=false 时把地形本身也画出来：地面、墙、门、障碍、难行地形；
+ * 同时支持叠加持续区域（黑暗术、毒雾、蛛网术等）、移动光环（灵体卫士）与飞行高度角标。
  */
-export function buildBattleSvg(map: BattleMap, tokens: readonly Token[], title: string, withArt: boolean, marks: readonly { name: string; x: number; y: number }[] = []): string {
+export function buildBattleSvg(
+  map: BattleMap,
+  tokens: readonly Token[],
+  title: string,
+  withArt: boolean,
+  marks: readonly { name: string; x: number; y: number }[] = [],
+  zones: readonly BattleZone[] = [],
+  auras: readonly VisualAuraRing[] = [],
+): string {
   const W = MARGIN + map.width * CELL;
   const H = TITLE_H + MARGIN + map.height * CELL;
   const ox = MARGIN;
@@ -92,6 +120,7 @@ export function buildBattleSvg(map: BattleMap, tokens: readonly Token[], title: 
   const px = (x: number): number => ox + x * CELL;
   const py = (y: number): number => oy + y * CELL;
   const p: string[] = [`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`];
+  p.push(`<defs><clipPath id="gridClip"><rect x="${ox}" y="${oy}" width="${map.width * CELL}" height="${map.height * CELL}"/></clipPath></defs>`);
   p.push(`<rect x="0" y="0" width="${W}" height="${oy}" fill="#1b1d22"/><rect x="0" y="0" width="${ox}" height="${H}" fill="#1b1d22"/>`);
   p.push(`<text x="10" y="27" font-family="${FONT}" font-size="20" font-weight="bold" fill="#e8dcc0">${esc(title)}</text>`);
 
@@ -115,6 +144,51 @@ export function buildBattleSvg(map: BattleMap, tokens: readonly Token[], title: 
   for (const [x, y, w, h] of map.art?.shade ?? []) {
     if (withArt) p.push(`<rect x="${px(x)}" y="${py(y)}" width="${w * CELL}" height="${h * CELL}" fill="#121316" fill-opacity="0.92"/>`);
   }
+
+  // 绘制持续区域效果（黑暗术、毒雾、蛛网术等）与移动光环（灵体卫士）
+  if (zones.length > 0 || auras.length > 0) {
+    p.push('<g clip-path="url(#gridClip)">');
+    for (const aura of auras) {
+      const col = ZONE_PALETTE[aura.theme ?? 'radiant'];
+      const rCells = Math.max(1, Math.round(aura.radius / 5));
+      const rx = px(aura.x - rCells) + 2;
+      const ry = py(aura.y - rCells) + 2;
+      const rw = (rCells * 2 + 1) * CELL - 4;
+      const rh = (rCells * 2 + 1) * CELL - 4;
+      p.push(`<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" rx="14" fill="${col.fill}" fill-opacity="0.16" stroke="${col.stroke}" stroke-width="2" stroke-dasharray="5 5"/>`);
+      const tagX = Math.min(Math.max(ox + 36, rx + rw / 2), W - 36);
+      const tagY = Math.max(oy + 15, ry + 15);
+      p.push(`<text x="${tagX}" y="${tagY}" font-family="${FONT}" font-size="12" font-weight="bold" fill="${col.text}" stroke="#000" stroke-width="0.5" text-anchor="middle">${esc(aura.name)}</text>`);
+    }
+    for (const z of zones) {
+      const col = ZONE_PALETTE[z.theme ?? 'fog'];
+      let rx: number;
+      let ry: number;
+      let rw: number;
+      let rh: number;
+      if (z.shape === 'sphere') {
+        const rCells = Math.max(1, Math.round((z.radius ?? 15) / 5));
+        rx = px(z.x - rCells) + 1;
+        ry = py(z.y - rCells) + 1;
+        rw = (rCells * 2 + 1) * CELL - 2;
+        rh = (rCells * 2 + 1) * CELL - 2;
+        p.push(`<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" rx="12" fill="${col.fill}" fill-opacity="${col.opacity}" stroke="${col.stroke}" stroke-width="2.5" stroke-dasharray="8 4"/>`);
+        p.push(`<circle cx="${px(z.x) + CELL / 2}" cy="${py(z.y) + CELL / 2}" r="${(rCells + 0.42) * CELL}" fill="none" stroke="${col.stroke}" stroke-opacity="0.55" stroke-width="1.5"/>`);
+      } else {
+        rx = px(z.x) + 1;
+        ry = py(z.y) + 1;
+        rw = (z.w ?? 1) * CELL - 2;
+        rh = (z.h ?? 1) * CELL - 2;
+        p.push(`<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" rx="8" fill="${col.fill}" fill-opacity="${col.opacity}" stroke="${col.stroke}" stroke-width="2.5" stroke-dasharray="8 4"/>`);
+      }
+      const label = `${z.name}${z.roundsLeft !== undefined && z.roundsLeft <= 20 ? `(${z.roundsLeft})` : ''}`;
+      const lx = Math.min(Math.max(ox + 34, rx + rw / 2), W - 34);
+      const ly = Math.min(Math.max(oy + 16, ry + 16), H - 8);
+      p.push(`<text x="${lx}" y="${ly}" font-family="${FONT}" font-size="13" font-weight="bold" fill="${col.text}" stroke="#000" stroke-width="0.6" text-anchor="middle">${esc(label)}</text>`);
+    }
+    p.push('</g>');
+  }
+
   // 网格和坐标：玩家报「我走到 (6,8)」时要对得上 dnd_position 的坐标
   p.push(`<g stroke="#000" stroke-opacity="${withArt ? 0.22 : 0.18}" stroke-width="1">`);
   for (let i = 0; i <= map.width; i++) p.push(`<line x1="${px(i)}" y1="${oy}" x2="${px(i)}" y2="${H}"/>`);
@@ -129,15 +203,33 @@ export function buildBattleSvg(map: BattleMap, tokens: readonly Token[], title: 
     p.push(`<path d="M ${cx} ${cy - 12} L ${cx + 12} ${cy} L ${cx} ${cy + 12} L ${cx - 12} ${cy} Z" fill="#e8b830" stroke="#fff" stroke-width="2"/>`);
     p.push(`<text x="${cx}" y="${cy + 26}" font-family="${FONT}" font-size="12" fill="#fff" stroke="#000" stroke-width="0.5" text-anchor="middle">${esc(m.name.slice(0, 4))}</text>`);
   }
+
+  // 同一平面格有多枚棋子（如高空飞行悬在地面角色头顶）时微错位排布，避免完全遮挡
+  const cellGroups = new Map<string, Token[]>();
   for (const t of tokens) {
-    const cx = px(t.x) + CELL / 2;
-    const cy = py(t.y) + CELL / 2;
-    const r = CELL * 0.42;
+    const k = `${t.x},${t.y}`;
+    cellGroups.set(k, [...(cellGroups.get(k) ?? []), t]);
+  }
+  for (const t of tokens) {
+    const siblings = cellGroups.get(`${t.x},${t.y}`) ?? [t];
+    const idx = siblings.indexOf(t);
+    const shift = siblings.length > 1 ? (idx === 0 ? -7 : 7) : 0;
+    const cx = px(t.x) + CELL / 2 + shift;
+    const cy = py(t.y) + CELL / 2 - shift * 0.6;
+    const r = siblings.length > 1 ? CELL * 0.36 : CELL * 0.42;
     if (t.current) p.push(`<circle cx="${cx}" cy="${cy}" r="${r + 5}" fill="none" stroke="#f5d142" stroke-width="4"/>`);
     p.push(`<circle cx="${cx}" cy="${cy}" r="${r}" fill="${t.down ? '#6b6b6b' : TOKEN_FILL[t.kind]}" stroke="#fff" stroke-width="2.5"/>`);
     const size = t.label.length <= 1 ? 22 : (t.label.length === 2 ? 16 : 12);
     p.push(`<text x="${cx}" y="${cy + size * 0.36}" font-family="${FONT}" font-size="${size}" font-weight="bold" fill="#fff" text-anchor="middle">${esc(t.label)}</text>`);
     if (t.down) p.push(`<path d="M ${cx - r * 0.6} ${cy - r * 0.6} L ${cx + r * 0.6} ${cy + r * 0.6} M ${cx + r * 0.6} ${cy - r * 0.6} L ${cx - r * 0.6} ${cy + r * 0.6}" stroke="#fff" stroke-width="3"/>`);
+    if ((t.z ?? 0) > 0) {
+      const zText = `↑${t.z}'`;
+      const bw = Math.max(26, zText.length * 7 + 6);
+      const bx = Math.min(W - bw - 2, cx + r * 0.35);
+      const by = Math.max(oy + 2, cy - r - 8);
+      p.push(`<rect x="${bx}" y="${by}" width="${bw}" height="15" rx="7" fill="#1b1d22" stroke="#ffd54f" stroke-width="1.4"/>`);
+      p.push(`<text x="${bx + bw / 2}" y="${by + 11.5}" font-family="${FONT}" font-size="10.5" font-weight="bold" fill="#ffd54f" text-anchor="middle">${esc(zText)}</text>`);
+    }
   }
   p.push('</svg>');
   return p.join('');
@@ -196,7 +288,9 @@ export async function renderBattleImage(
   const path = map.art === undefined ? undefined : artPath(adv, map.art.image);
   const base = path === undefined ? undefined : await cropArt(sharp, path, map).catch(() => undefined);
   const marks = Object.entries(c.initiative?.marks ?? {}).filter(([, m]) => m.room === room).map(([name, m]) => ({ name, x: m.x, y: m.y }));
-  const svg = Buffer.from(buildBattleSvg(map, roomTokens(c, room, visible), title, base !== undefined, marks));
+  const zones = zonesInRoom(c, room);
+  const auras = activeVisualAurasInRoom(c, room, visible);
+  const svg = Buffer.from(buildBattleSvg(map, roomTokens(c, room, visible), title, base !== undefined, marks, zones, auras));
   const W = MARGIN + map.width * CELL;
   const H = TITLE_H + MARGIN + map.height * CELL;
   const layers = base === undefined ? [{ input: svg }] : [{ input: base, left: MARGIN, top: TITLE_H + MARGIN }, { input: svg }];

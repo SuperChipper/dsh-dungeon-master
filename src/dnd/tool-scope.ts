@@ -23,7 +23,7 @@ import { type DndToolDefinition, type DndToolView, NARRATIVE_TOOL_OVERRIDES, nar
 export type DndToolLevel = 'none' | 'paused' | 'active';
 
 /** 停团期间仍然用得上的工具：都是 active ?? saved 两种团档都认的 */
-export const PAUSED_DND_TOOLS: readonly string[] = ['dnd_chronicle', 'dnd_prepare', 'dnd_end', 'dnd_lookup', 'dnd_character', 'dnd_resource'];
+export const PAUSED_DND_TOOLS: readonly string[] = ['dnd_chronicle', 'dnd_prepare', 'dnd_end', 'dnd_lookup', 'dnd_character', 'dnd_resource', 'dnd_rule'];
 
 /** 这个状态下该藏起来的工具 */
 export function hiddenDndTools(level: DndToolLevel, all: readonly string[]): string[] {

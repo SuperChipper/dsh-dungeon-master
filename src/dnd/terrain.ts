@@ -28,6 +28,8 @@ export interface TerrainArea {
 export interface BattleMap {
   width: number;
   height: number;
+  /** 洞顶/室内垂直限高（尺）；未设则视为露天不限高 */
+  ceiling?: number;
   /** 后写的盖住先写的：先画整面墙，再在墙上开门 */
   areas: TerrainArea[];
   /** 模组书里这间屋的底图：发给玩家的战斗图用它，规则仍只看 areas */
@@ -87,8 +89,9 @@ export function parseBattleMap(input: unknown): BattleMap {
     const to = typeof a.to === 'string' && a.to.trim().length > 0 ? a.to.trim() : undefined;
     return { kind, x, y, ...(w !== 1 ? { w } : {}), ...(h !== 1 ? { h } : {}), ...(name !== undefined ? { name } : {}), ...(to !== undefined ? { to } : {}) };
   });
+  const ceiling = o.ceiling === undefined ? undefined : intIn(o.ceiling, 5, 500, 'ceiling');
   const art = o.art === undefined ? undefined : parseArt(o.art, width, height);
-  return { width, height, areas, ...(art !== undefined ? { art } : {}) };
+  return { width, height, ...(ceiling !== undefined ? { ceiling } : {}), areas, ...(art !== undefined ? { art } : {}) };
 }
 
 function parseArt(input: unknown, width: number, height: number): BattleArt {
@@ -133,12 +136,12 @@ export function areaAt(map: BattleMap, at: Cell): TerrainArea | undefined {
 /** 底图涂黑那部分的墙：只有一个，areaCells 拿它能取回所有涂黑的格子 */
 const OUTSIDE_ROOM: TerrainArea = { kind: 'wall', x: 0, y: 0, name: '屋外' };
 
-/** 走不进去：图外、墙、障碍物 */
-export function blocksMove(map: BattleMap | undefined, at: Cell): boolean {
+/** 走不进去：图外、墙、障碍物（highAltitude=true 时忽略地面矮障碍 object，仍受墙与边界阻挡） */
+export function blocksMove(map: BattleMap | undefined, at: Cell, highAltitude = false): boolean {
   if (map === undefined) return false;
   if (!inBounds(map, at)) return true;
   const kind = areaAt(map, at)?.kind;
-  return kind === 'wall' || kind === 'object';
+  return kind === 'wall' || (!highAltitude && kind === 'object');
 }
 
 export function areaCells(map: BattleMap, area: TerrainArea): Cell[] {
@@ -181,6 +184,10 @@ export interface WalkOptions {
   costFactor?: number;
   /** 最多走多少尺（含）；不给就不限 */
   maxFeet?: number;
+  /** 高空飞行（z >= 15）：飞越地面矮障碍（object）与地面难行地形 */
+  highAltitude?: boolean;
+  /** 额外地形/法术区域耗速倍率（如蛛网/荆棘/灵体卫士减速区返回 2） */
+  cellCostMultiplier?: (at: Cell) => number;
 }
 
 const key = (at: Cell): string => `${at.x},${at.y}`;
@@ -197,11 +204,12 @@ const OPEN_MAX = 99;
  */
 export function walk(map: BattleMap | undefined, from: Cell, options: WalkOptions): Map<string, Reach> {
   const factor = options.costFactor ?? 1;
+  const highAlt = options.highAltitude === true;
   const best = new Map<string, Reach>([[key(from), { feet: 0, provokes: 0 }]]);
   const open: Array<Cell & Reach> = [{ ...from, feet: 0, provokes: 0 }];
   const passable = (at: Cell): boolean => {
     if (map === undefined) return at.x >= 0 && at.y >= 0 && at.x <= OPEN_MAX && at.y <= OPEN_MAX;
-    return !blocksMove(map, at);
+    return !blocksMove(map, at, highAlt);
   };
   while (open.length > 0) {
     open.sort((a, b) => a.feet - b.feet || a.provokes - b.provokes);
@@ -213,8 +221,10 @@ export function walk(map: BattleMap | undefined, from: Cell, options: WalkOption
       const next = { x: cur.x + step.x, y: cur.y + step.y };
       if (!passable(next) || options.blocked(next)) continue;
       if (step.x !== 0 && step.y !== 0 && map !== undefined
-        && blocksMove(map, { x: cur.x + step.x, y: cur.y }) && blocksMove(map, { x: cur.x, y: cur.y + step.y })) continue;
-      const enter = map !== undefined && areaAt(map, next)?.kind === 'difficult' ? 2 * CELL_FEET : CELL_FEET;
+        && blocksMove(map, { x: cur.x + step.x, y: cur.y }, highAlt) && blocksMove(map, { x: cur.x, y: cur.y + step.y }, highAlt)) continue;
+      const terrainDifficult = !highAlt && map !== undefined && areaAt(map, next)?.kind === 'difficult';
+      const extraMult = options.cellCostMultiplier?.(next) ?? 1;
+      const enter = CELL_FEET * Math.max(terrainDifficult ? 2 : 1, extraMult);
       const feet = cur.feet + enter * factor;
       if (options.maxFeet !== undefined && feet > options.maxFeet) continue;
       const provokes = cur.provokes + (options.provokes?.(cur, next) ?? 0);
@@ -297,5 +307,6 @@ export function terrainLine(map: BattleMap): string {
       const tag = a.kind === 'difficult' ? '难行' : a.kind === 'object' ? '挡路' : a.kind === 'outside' ? '门外' : '门';
       return `${areaName(a)}${span}${areaName(a).includes(tag) ? '' : `[${tag}]`}`;
     });
-  return `场地 ${map.width}×${map.height}${parts.length > 0 ? `：${parts.join('、')}` : ''}`;
+  const ceilTag = map.ceiling !== undefined ? `（限高${map.ceiling}尺）` : '';
+  return `场地 ${map.width}×${map.height}${ceilTag}${parts.length > 0 ? `：${parts.join('、')}` : ''}`;
 }

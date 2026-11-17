@@ -1,7 +1,7 @@
 /** 角色卡与资源：dnd_character、dnd_resource、dnd_rest。 */
 import type { Adventure } from '../adventure.ts';
 import {
-type Campaign,type CharacterInput,type CharacterKind,assertNoPending,changeInventory,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isOut,fightRooms,leaveInitiative,reactionBlocked,removeCharacter,requireCharacter,requireResource,rest,
+type Campaign,type CharacterInput,type CharacterKind,assertNoPending,changeInventory,checkAllAirborneCrashes,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isOut,fightRooms,leaveInitiative,reactionBlocked,removeCharacter,requireCharacter,requireResource,rest,
 restoreReaction,
 restoreResource,
 roomOf,
@@ -14,8 +14,11 @@ npcAlive
 } from '../story.ts';
 import { ABILITIES,type Ability,abilityModifier,proficiencyBonus } from '../rules.ts';
 import {
-DEFAULT_CONCENTRATION_STATES,breakConcentration,ensureTurnState,normalizeCondition,upsertActiveState
+DEFAULT_CONCENTRATION_STATES,breakConcentration,ensureTurnState,normalizeCondition,recordTurnSpellCast,upsertActiveState
 } from '../conditions.ts';
+import { resolveEffectDef } from '../custom-effects.ts';
+import { buildFormulaContext,evalIntFormula } from '../formula.ts';
+import { inferSpellSaveDc } from '../zones.ts';
 import { resolveSrdQuery,zhTable } from '../srd-lookup.ts';
 import { type CardSpell,mergeSpells,resolveSpells } from '../spell-links.ts';
 import { hookHint } from '../hooks.ts';
@@ -91,6 +94,8 @@ export function registerCharacterTools(kit: ToolKit): void {
       },
       forced_move: { type: 'boolean', description: 'With room: actual teleport/forced movement or correction only, bypassing the voluntary exit-route check. Never for voluntary fleeing. Explain the cause in the reply.' },
       speed: { type: 'integer', description: 'Walking speed in feet (default 30). dnd_position warns when a turn\'s movement exceeds it.' },
+      fly_speed: { type: 'integer', description: 'Flying speed in feet (e.g. 60 for Young Green Dragon); enables 2.5D vertical movement (z > 0) in dnd_position.' },
+      hover: { type: 'boolean', description: 'True if the creature can hover (immune to falling/crash damage when prone or speed=0 while airborne).' },
       reactions: {
         type: 'array',
         description: 'Reactions that can change an attack; attacks pause for the player when one applies (replaces the list). '
@@ -187,6 +192,19 @@ export function registerCharacterTools(kit: ToolKit): void {
             proficient: { type: 'boolean', description: 'false when the wielder lacks proficiency (no proficiency bonus to hit).' },
             ranged: { type: 'boolean', description: 'Ranged weapon (Archery applies). Default: name contains 弓/弩.' },
             two_handed: { type: 'boolean', description: 'Wielded two-handed (Great Weapon Fighting applies). Default: notes contain 双手.' },
+            riders: {
+              type: 'array',
+              description: 'Multi-part extra damage on hit (e.g. [{damage:"2d6", damage_type:"火焰"}]), rolled separately with its own resistance/immunity and doubled on crit.',
+              items: {
+                type: 'object',
+                properties: {
+                  damage: { type: 'string' },
+                  damage_type: { type: 'string' },
+                },
+                required: ['damage', 'damage_type'],
+                additionalProperties: false,
+              },
+            },
           },
           required: ['name', 'damage'],
           additionalProperties: false,
@@ -270,7 +288,9 @@ export function registerCharacterTools(kit: ToolKit): void {
           player: str(args.player), playerId: memberId(exec, args.player_id, 'player_id'), className: str(args.class_name), level: int(args.level), maxHp: int(args.max_hp),
           ac: int(args.ac), initBonus: int(args.init_bonus), attackBonus: int(args.attack_bonus), damage: str(args.damage), notes: str(args.notes),
           skills: parseSkills(strList(args.skills)), expertise: parseSkills(strList(args.expertise)), saves: parseAbilities(strList(args.saves)),
-          weapons: parseWeapons(args.weapons), room: str(args.room), hitDie: str(args.hit_die), traits: strList(args.traits), speed: int(args.speed), reactions: parseReactions(args.reactions),
+          weapons: parseWeapons(args.weapons), room: str(args.room), hitDie: str(args.hit_die), traits: strList(args.traits),
+          speed: int(args.speed), flySpeed: int(args.fly_speed), hover: typeof args.hover === 'boolean' ? args.hover : undefined,
+          reactions: parseReactions(args.reactions),
         };
         for (const [k, v] of Object.entries(optional)) {
           if (v !== undefined) (input as unknown as Record<string, unknown>)[k] = v;
@@ -352,6 +372,8 @@ export function registerCharacterTools(kit: ToolKit): void {
         description: 'For use: atomically attach a structured active state/buff (e.g. "祝福术", "灾祸术", "护盾信仰", "加速术", "狂暴", "神圣武器", "闪避", "妖火"). Automatically applies attack/save/AC/speed modifiers, concentration management and round countdowns.',
       },
       concentration: { type: 'boolean', description: 'For apply_state: whether this effect requires concentration (auto-breaks previous concentration). Auto-detected for standard spells like 祝福术/护盾信仰/加速术.' },
+      drop_concentration: { type: 'boolean', description: 'Drop active concentration for this character (pass resource="专注" drop_concentration=true to drop without spending a resource).' },
+      slot_level: { type: 'integer', description: 'Optional spell slot level (1-9; auto-inferred when resource is like "3环法术位", used for upcast 灵体卫士 etc.).' },
       rounds: { type: 'integer', description: 'For apply_state: duration in combat rounds (default 10 for 1-minute buffs); auto-ticks on the caster\'s turn.' },
       hit_bonus: { type: 'integer', description: 'For apply_state: flat attack bonus while active (神圣武器 auto-computes max(1, CHA mod) if omitted).' },
       ac_bonus: { type: 'integer', description: 'For apply_state: flat AC bonus while active (护盾信仰/加速术 auto-apply +2 if omitted).' },
@@ -388,6 +410,11 @@ export function registerCharacterTools(kit: ToolKit): void {
       }
       if (action === 'use') {
         const ch = requireCharacter(c, name);
+        const globalEffects = service.globalEffects();
+        if (args.drop_concentration === true && /^(专注|concentration)$/i.test(key.trim())) {
+          const broken = [...breakConcentration(c, ch.name, '主动解除专注'), ...checkAllAirborneCrashes(c, service.roller, globalEffects)];
+          return `${broken.length > 0 ? broken.join('；') : `${ch.name} 当前没有维持中的专注效果`}${combatLedgerSuffix(c)}`;
+        }
         const [matchedKey] = requireResource(ch, key);
         let curseTarget: ReturnType<typeof requireCharacter> | undefined;
         if (/^(咒剑诅咒|Hexblade'?s Curse)$/i.test(matchedKey.trim())) {
@@ -407,21 +434,27 @@ export function registerCharacterTools(kit: ToolKit): void {
         const result = useResource(c, ch.name, key, int(args.amount) ?? 1);
         const baseLine = `${ch.name}「${result.key}」${result.before}→${result.resource.current}/${result.resource.max}`;
         const keyTrim = result.key.trim();
+        const slotMatch = /([1-9])\s*环/.exec(keyTrim);
+        const slotLevel = int(args.slot_level) ?? (slotMatch !== null ? Number(slotMatch[1]) : undefined);
         const rawApplyState = str(args.apply_state);
         const normApplyState = rawApplyState !== undefined ? normalizeCondition(rawApplyState) : undefined;
         const isSacredWeapon = /^(神圣武器|Sacred Weapon)$/i.test(keyTrim) || normApplyState === '神圣武器';
         const isActionSurge = /^(动作如潮|Action Surge)$/i.test(keyTrim);
         const isFightingSpirit = /^(战斗英姿|Fighting Spirit)$/i.test(keyTrim);
         const isRageResource = /^(狂暴|Rage)$/i.test(keyTrim);
+        const isBonusSpellState = normApplyState === '护盾信仰' || normApplyState === '猎人印记' || normApplyState === '脆弱诅咒' || normApplyState === '神恩';
 
         // 当前行动者回合内自动追踪主动作/附赠动作槽位并提示重复消耗
         const warnings: string[] = [];
+        if (args.drop_concentration === true) {
+          warnings.push(...breakConcentration(c, ch.name, '主动解除专注'), ...checkAllAirborneCrashes(c, service.roller, globalEffects));
+        }
         const onOwnTurn = c.initiative !== undefined && c.initiative.order[c.initiative.turn]?.name === ch.name;
         const ts = onOwnTurn ? ensureTurnState(c) : undefined;
         const explicitCost = str(args.action_cost) as 'action' | 'bonus' | 'reaction' | 'free' | undefined;
         const inferredCost: 'action' | 'bonus' | 'reaction' | 'free' | undefined = explicitCost
           ?? (isActionSurge ? 'free' : undefined)
-          ?? (isFightingSpirit || curseTarget !== undefined || isRageResource || normApplyState === '狂暴' || normApplyState === '护盾信仰' || /^(回气|Second Wind)$/i.test(keyTrim) ? 'bonus' : undefined)
+          ?? (isFightingSpirit || curseTarget !== undefined || isRageResource || normApplyState === '狂暴' || isBonusSpellState || /^(回气|Second Wind)$/i.test(keyTrim) ? 'bonus' : undefined)
           ?? (isSacredWeapon ? 'action' : undefined);
 
         if (isActionSurge) {
@@ -441,6 +474,11 @@ export function registerCharacterTools(kit: ToolKit): void {
             warnings.push(`【动作经济提醒】${ch.name} 本回合此前已使用过附赠动作（${ts.bonusUsed}），每回合通常只有 1 个附赠动作`);
           }
           ts.bonusUsed = normApplyState ?? keyTrim;
+        }
+        if (ts !== undefined && (slotLevel !== undefined || isBonusSpellState)) {
+          const spellCost = inferredCost ?? (slotLevel !== undefined ? 'action' : undefined);
+          const spellWarn = recordTurnSpellCast(ts, ch.name, normApplyState ?? keyTrim, slotLevel ?? 1, spellCost);
+          if (spellWarn !== undefined) warnings.push(spellWarn);
         }
         const warnSuffix = warnings.length > 0 ? `\n${warnings.join('\n')}` : '';
 
@@ -465,18 +503,31 @@ export function registerCharacterTools(kit: ToolKit): void {
           return `${baseLine}；已激活「神圣武器」（持续 ${rounds} 轮，攻击检定自动 +${hitBonus}）${warnSuffix}${combatLedgerSuffix(c)}`;
         }
 
+        const poolDef = resolveEffectDef(normApplyState ?? keyTrim, c.customEffects, globalEffects);
+        if (poolDef?.healMod?.poolFormula !== undefined && (normApplyState === undefined || normApplyState === poolDef.name)) {
+          const pool = evalIntFormula(poolDef.healMod.poolFormula, buildFormulaContext(ch, slotLevel !== undefined ? { slotLevel } : {}));
+          const capHint = poolDef.healMod.capAtHalfMaxHp
+            ? `；接下来请用 dnd_apply caster="${ch.name}" preserve_life=true targets=[...] 分配治疗，每名目标最多恢复至有效生命上限的一半`
+            : '';
+          return `${baseLine}；「${poolDef.name}」治疗池共 ${pool} 点 HP${capHint}${warnSuffix}${combatLedgerSuffix(c)}`;
+        }
+
         const effectiveApplyState = normApplyState ?? (isRageResource ? '狂暴' : undefined);
         if (effectiveApplyState !== undefined && effectiveApplyState.length > 0) {
+          const effectDef = resolveEffectDef(effectiveApplyState, c.customEffects, globalEffects);
           const isConc = typeof args.concentration === 'boolean'
             ? args.concentration
-            : DEFAULT_CONCENTRATION_STATES.has(effectiveApplyState);
+            : (effectDef?.concentration ?? DEFAULT_CONCENTRATION_STATES.has(effectiveApplyState));
           const targetNames = strList(args.targets) ?? (str(args.target) !== undefined ? [str(args.target)!] : [ch.name]);
           const targetChars = targetNames.map((n) => requireCharacter(c, n));
-          const broken = isConc ? breakConcentration(c, ch.name, `改换专注为「${effectiveApplyState}」`) : [];
-          const rounds = int(args.rounds) ?? (isConc || effectiveApplyState === '狂暴' ? 10 : (effectiveApplyState === '闪避' ? 1 : undefined));
+          const broken = isConc
+            ? [...breakConcentration(c, ch.name, `改换专注为「${effectiveApplyState}」`), ...checkAllAirborneCrashes(c, service.roller, globalEffects)]
+            : [];
+          const rounds = int(args.rounds) ?? effectDef?.defaultRounds ?? (isConc || effectiveApplyState === '狂暴' ? 10 : (effectiveApplyState === '闪避' ? 1 : undefined));
           const expires = effectiveApplyState === '闪避' ? 'start_of_source_turn' as const : undefined;
           const hitBonus = int(args.hit_bonus);
           const acBonus = int(args.ac_bonus);
+          const saveDc = effectDef?.aura?.hazard !== undefined ? inferSpellSaveDc(ch) : undefined;
           for (const tCh of targetChars) {
             const up = upsertActiveState(c, tCh, {
               name: effectiveApplyState,
@@ -486,12 +537,16 @@ export function registerCharacterTools(kit: ToolKit): void {
               ...(expires !== undefined ? { expires } : {}),
               ...(hitBonus !== undefined ? { hitBonus } : {}),
               ...(acBonus !== undefined ? { acBonus } : {}),
+              ...(slotLevel !== undefined ? { slotLevel } : {}),
+              ...(saveDc !== undefined ? { saveDc } : {}),
             }, { replaceConcentration: false });
             broken.push(...up.broken);
           }
+          broken.push(...checkAllAirborneCrashes(c, service.roller, globalEffects));
           const metaDesc = [
             isConc ? '需专注' : '',
             rounds !== undefined ? `持续${rounds}轮` : '',
+            slotLevel !== undefined && effectDef?.aura?.hazard !== undefined ? `${slotLevel}环施放·DC${saveDc}` : '',
             hitBonus !== undefined ? `命中${hitBonus >= 0 ? '+' : ''}${hitBonus}` : '',
             acBonus !== undefined ? `AC${acBonus >= 0 ? '+' : ''}${acBonus}` : (effectiveApplyState === '护盾信仰' || effectiveApplyState === '加速术' ? 'AC+2' : ''),
           ].filter(Boolean).join('，');

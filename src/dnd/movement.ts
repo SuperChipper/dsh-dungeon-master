@@ -1,19 +1,20 @@
 /** 移动与借机的停止点：路径计算不代替玩家决定，也不把剩余路程提前落盘。 */
 import { type Campaign, type PendingMovement, nextRollId, pushLog, requireCharacter, requireInitiative } from './campaign.ts';
-import { type MoveRequest, moveOnGrid, moveResultText } from './battlefield.ts';
-import { movementSpeedInfo } from './conditions.ts';
+import { type MoveGridOptions, type MoveRequest, moveOnGrid, moveResultText } from './battlefield.ts';
+import { hasCondition, movementSpeedInfo } from './conditions.ts';
 import { assertWindowClosed, declineReaction } from './pending-attack.ts';
 
 function stopped(c: Campaign, name: string, ignoreStateMods = false): boolean {
   const ch = requireCharacter(c, name);
   if (ch.hp <= 0 || ch.conditions.includes('死亡')) return true;
-  if (ignoreStateMods) return (ch.speed ?? 30) <= 0;
-  return movementSpeedInfo(ch).zeroSpeed;
+  const base = Math.max(ch.speed ?? 30, ch.flySpeed ?? 0, hasCondition(ch, '飞行术') ? 60 : 0);
+  if (ignoreStateMods) return base <= 0;
+  return movementSpeedInfo(ch, base).zeroSpeed;
 }
 
-export function beginMovement(c: Campaign, name: string, request: MoveRequest): string {
+export function beginMovement(c: Campaign, name: string, request: MoveRequest, options: MoveGridOptions = {}): string {
   if (stopped(c, name, request.ignoreStateMods === true)) throw new Error(`${name} 现在不能移动（速度为 0、失去意识或被限制移动），先结算对应状态`);
-  const result = moveOnGrid(c, name, { ...request, interrupt: true });
+  const result = moveOnGrid(c, name, { ...request, interrupt: true }, options);
   if (result.opportunity !== undefined) {
     const p: PendingMovement = {
       kind: 'move', seq: nextRollId(c), at: Date.now(), attacker: result.name, target: result.name,
@@ -24,7 +25,11 @@ export function beginMovement(c: Campaign, name: string, request: MoveRequest): 
   return moveResultText(result);
 }
 
-export function resolveMovement(c: Campaign, args: { target?: unknown; decline?: unknown; settle?: unknown; cancel?: unknown }): string {
+export function resolveMovement(
+  c: Campaign,
+  args: { target?: unknown; decline?: unknown; settle?: unknown; cancel?: unknown },
+  options: MoveGridOptions = {},
+): string {
   const state = requireInitiative(c);
   if (state.pending !== undefined) throw new Error('借机攻击还没落账，先用 dnd_apply 处理攻击的反应和 settle，再继续移动');
   const p = state.movement;
@@ -40,5 +45,5 @@ export function resolveMovement(c: Campaign, args: { target?: unknown; decline?:
   assertWindowClosed(p);
   delete state.movement;
   if (stopped(c, p.target, p.resume.ignoreStateMods === true)) return `${p.target} 在借机后无法继续移动，停在当前格。`;
-  return beginMovement(c, p.target, p.resume);
+  return beginMovement(c, p.target, p.resume, options);
 }

@@ -4,10 +4,12 @@
  * 开团后，这个会话每回合多两段 system prompt：DM 守则 + 精简团况。
  * 不需要切换 preset 或开新会话，/dnd end 之后自动恢复成普通聊天。
  */
+import { join } from 'node:path';
 import type { Roller } from './dice.ts';
 import { cryptoRoller } from './dice.ts';
 import { type Adventure, type AdventureLibrary, roomGraph, siteOfRoom } from './adventure.ts';
-import { type Campaign, CampaignStore, addSummary, campaignState, createCampaign, ensureSessionSummary, reconcileKnownSites, summarize } from './campaign.ts';
+import { type Campaign, CampaignStore, addSummary, campaignState, createCampaign, ensureSessionSummary, reconcileKnownSites, summarize, summarizeCombat } from './campaign.ts';
+import { CustomEffectStore, type CustomEffectDef } from './custom-effects.ts';
 import { PREPARATION_MAX_CHARS, preparationLines, recoveryLines } from './session-recovery.ts';
 import { type CheckIn, rosterOf, rosterPrompt } from './check-in.ts';
 import { chronicleLines } from './chronicle.ts';
@@ -119,9 +121,9 @@ export class DndService {
       DM_RULES,
       '【专用战斗代理】',
       '你接替主 DM 主持当前这场战斗。只处理战斗、战斗规则提问和当场反应；所有数值仍实时通过 dnd_* 写入团档。',
-      '主 DM 已经讲过开战场景，不重复开场。先核对最新团况；最近对话只补充行动意图与效果，不覆盖团档。能力不明用 dnd_character show 查卡或 dnd_srd 查规则，不自行猜测。',
-      '【角色能力与被动】包含职业、属性、熟练与专精、武器、法术、反应、资源和备注；固定加值只认结构化字段，备注里的被动与临时增益仍须核对，不能漏算，也不能把已计算的加值重复添加。traits 含「精灵精准」、dnd_resource use 触发的「战斗英姿」（自动加临时 HP 与本回合优势）与「咒剑诅咒」（传 target 自动 19-20 重击、加熟练伤害、击杀回血）由工具自动结算，勿再用 dnd_roll 手掷 3d20kh1 或在 damage 里重复填常数。',
-      '每次只处理当前宣告；轮到 PC 或有反应待答就停。敌人倒光或战斗以其他方式确定结束，用 dnd_initiative end（若演练/切磋未开 rehearsal=true 但临时画了竞技场地形，结束前先 dnd_position clear_terrain 清理）；多轮连续自动结算直接 end 时，系统会把未播报回合的战斗账本交回主 DM 补叙。',
+      '主 DM 已经讲过开战场景，不重复开场。先核对每轮消息开头的最新【团况 · DM 视角】（单回合内连续调用工具时不再每步重发整份快照，回合内变化直接以每次工具返回的结果与【当前回合账本】为准）；最近对话只补充行动意图与效果，不覆盖团档。能力不明用 dnd_character show 查卡或 dnd_srd 查规则，不自行猜测。',
+      '【角色能力与被动】包含职业、属性、熟练与专精、武器、法术、反应、资源和备注；固定加值只认结构化字段，备注里的被动与临时增益仍须核对，不能漏算，也不能把已计算的加值重复添加。traits 含「精灵精准」「守护灵光」「生命门徒」「神佑医者」、武器多段 riders、以及状态/资源触发的「战斗英姿」「咒剑诅咒」「脆弱诅咒」「猎人印记」「神恩」「变巨术」「狂暴」「灵体卫士」「防护毒素」与 dnd_rule 已登记扩展规则均由工具自动结算，勿再用 dnd_roll 手掷或重复填进 damage。持续区域法术/毒雾/黑暗术用 dnd_position action=zone 放置，飞行单位用 z 高度移动。',
+      '每次只处理当前宣告；轮到 PC 或有反应待答就停。敌人倒光或战斗以其他方式确定结束，用 dnd_initiative end（若演练/切磋未开 rehearsal=true 但临时画了竞技场地形，结束前先 dnd_position clear_terrain 清理），并在本条回复中完整播报最后一轮的掷骰过程与胜负收场，播报完即停，等待主 DM 接手战后剧情。',
       '专注、猎人印记、临时增益、未完成动作、本桌裁定不能只留在叙述里：备注用 dnd_character update notes、状态用 dnd_apply add_conditions/remove_conditions，本桌裁定用 dnd_chronicle 记清目标、持续时间和已使用情况。',
       '战斗结束后不继续探索、不重开下一场、不替玩家选择行动；主 DM 会收到系统生成的最新团况与队伍消耗。',
       '收到暂停要求可用 dnd_end；遇到需要剧情裁定的事先问玩家，不补编模组秘密。',
@@ -131,6 +133,7 @@ export class DndService {
   public readonly store: CampaignStore;
   public readonly library: AdventureLibrary;
   public readonly roller: Roller;
+  public readonly customEffects: CustomEffectStore;
   /** 地图 PNG 输出目录 */
   public readonly mapDir: string;
   /** 发图片到群里：启动时由 bootstrap 接上，/dnd map 和 dnd_map 发同一张图；没接上时 /dnd map 退回文字地图 */
@@ -147,6 +150,11 @@ export class DndService {
     this.library = options.library;
     this.mapDir = options.mapDir;
     this.roller = options.roller ?? cryptoRoller;
+    this.customEffects = new CustomEffectStore(join(options.store.root, '..', 'custom-effects.json'));
+  }
+
+  public globalEffects(): Record<string, CustomEffectDef> {
+    return this.customEffects.loadAll();
   }
 
   /** 进行中的团；没有或已结束时返回 undefined */
@@ -313,5 +321,27 @@ export class DndService {
     const checkIn = this.checkIns.get(key);
     if (checkIn !== undefined) lines.push(rosterPrompt(rosterOf(checkIn, campaign)));
     return lines.join('\n');
+  }
+
+  public static readonly TURN_SNAPSHOT_HEADER = '【团况 · DM 视角（本轮最新快照，旧快照作废）】';
+
+  /** 专用战斗子代理使用的精简快照（不含全图出口、场外角色资源与主线剧情进展） */
+  public combatStateSnapshot(key: string): string {
+    const found = this.active(key);
+    if (found === undefined) return '';
+    const { campaign, adventure } = found;
+    if (campaign.initiative === undefined) return this.stateSnapshot(key);
+    return [DndService.TURN_SNAPSHOT_HEADER, summarizeCombat(campaign, adventure, this.globalEffects())].join('\n');
+  }
+
+  /** 非演练战斗的当前房间静态环境/DM 笔记，放在开战交接固定前缀中一次，避免随每次扣血重复追加 */
+  public roomCombatNotes(key: string): string {
+    const found = this.active(key);
+    if (found === undefined) return '';
+    const { campaign, adventure } = found;
+    if (inOpening(campaign) || campaign.initiative?.rehearsal === true) return '';
+    const room = findRoom(roomGraph(adventure), campaign.currentRoom);
+    const notes = room === undefined ? '' : roomView(campaign, adventure, room).dmNotes;
+    return notes ? `本房间环境与 DM 笔记（只给你裁定地形/机关用，不要直接念）：${notes}` : '';
   }
 }

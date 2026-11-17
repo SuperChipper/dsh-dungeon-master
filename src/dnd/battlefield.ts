@@ -18,6 +18,7 @@ import {
   isOut,
   isRangedWeapon,
   inInitiative,
+  pushLog,
   reactionBlocked,
   reactionsOf,
   requireCharacter,
@@ -25,11 +26,27 @@ import {
   roomOf,
 } from './campaign.ts';
 import {
+  breakConcentration,
+  concentratingOn,
+  concentratingZoneNames,
   ensureTurnState,
   hasCondition,
   isIncapacitated,
   movementSpeedInfo,
 } from './conditions.ts';
+import type { CustomEffectDef } from './custom-effects.ts';
+import { cryptoRoller, type Roller } from './dice.ts';
+import {
+  type BattleZone,
+  createBattleZoneInput,
+  extraCellCostMultiplier,
+  formatZonePlayerLegend,
+  formatZoneSummary,
+  isCellHeavilyObscured,
+  settleMovementHazards,
+  zonesAtCell,
+  zonesInRoom,
+} from './zones.ts';
 import {
   type BattleMap,
   type Cell,
@@ -52,9 +69,21 @@ export const CELL_FEET = 5;
 export const DEFAULT_SPEED = 30;
 const MELEE_REACH_FEET = 5;
 const MAX_COORD = 99;
+const MAX_ALTITUDE_FEET = 300;
 
-export function distanceFeet(a: Pick<BattleCell, 'x' | 'y'>, b: Pick<BattleCell, 'x' | 'y'>): number {
-  return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y)) * CELL_FEET;
+export function distanceFeet(
+  a: { x: number; y: number; z?: number },
+  b: { x: number; y: number; z?: number },
+): number {
+  return Math.max(
+    Math.abs(a.x - b.x) * CELL_FEET,
+    Math.abs(a.y - b.y) * CELL_FEET,
+    Math.abs((a.z ?? 0) - (b.z ?? 0)),
+  );
+}
+
+function fmtCoord(cell: { x: number; y: number; z?: number }): string {
+  return (cell.z ?? 0) > 0 ? `(${cell.x},${cell.y},↑${cell.z}尺)` : `(${cell.x},${cell.y})`;
 }
 
 /** 角色当前的格子；换过房间后旧坐标作废（room 对不上就当没摆位，比沿用错坐标安全） */
@@ -90,8 +119,9 @@ function placedIn(c: Campaign, room: string): Array<{ ch: Character; cell: Battl
   });
 }
 
-function occupant(c: Campaign, room: string, at: { x: number; y: number }, except: string): Character | undefined {
-  return placedIn(c, room).find(({ ch, cell }) => ch.name !== except && cell.x === at.x && cell.y === at.y)?.ch;
+function occupant(c: Campaign, room: string, at: { x: number; y: number; z?: number }, except: string): Character | undefined {
+  const az = at.z ?? 0;
+  return placedIn(c, room).find(({ ch, cell }) => ch.name !== except && cell.x === at.x && cell.y === at.y && (cell.z ?? 0) === az)?.ch;
 }
 
 function requireCoord(value: unknown, label: string): number {
@@ -101,10 +131,23 @@ function requireCoord(value: unknown, label: string): number {
   return value;
 }
 
+function requireAltitude(value: unknown, label: string, ceiling?: number): number {
+  if (value === undefined) return 0;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > MAX_ALTITUDE_FEET || value % CELL_FEET !== 0) {
+    throw new Error(`${label} 要是 0-${MAX_ALTITUDE_FEET} 且为 5 的整数倍（离地尺数，如 0 / 15 / 30），收到 ${String(value)}`);
+  }
+  if (ceiling !== undefined && value > ceiling) {
+    throw new Error(`房间层高上限为 ${ceiling} 尺，不能升空到 ${value} 尺`);
+  }
+  return value;
+}
+
 export interface Placement {
   name: string;
   x?: number;
   y?: number;
+  /** 离地高度（尺，5 的非负整数倍；缺省为 0 地面） */
+  z?: number;
   /** 不给坐标时：摆在这个人/地标/地形（门）旁边最近的空格，按 placements 的顺序一个个占 */
   near?: string;
   /** 不是角色卡上的东西：门、柱子、没建卡的俘虏 */
@@ -194,19 +237,23 @@ export function setPositions(c: Campaign, placements: readonly Placement[]): str
     const room = roomOf(c, ch);
     if (room === undefined) throw new Error(`${ch.name} 没有所在房间，先 dnd_character update room`);
     const map = mapOf(c, room);
+    const z = requireAltitude(p.z, `${p.name} 的 z`, map?.ceiling);
     let at: Cell;
     if (p.x === undefined && p.y === undefined && p.near !== undefined) {
       const spot = spotCells(c, room, p.near);
       if (spot === undefined) throw unknownSpot(c, room, p.near);
-      const taken = (cell: Cell): boolean => occupant(c, room, cell, ch.name) !== undefined || (spot.blocking && spot.cells.some((s) => s.x === cell.x && s.y === cell.y));
+      const taken = (cell: Cell): boolean => occupant(c, room, { ...cell, z }, ch.name) !== undefined || (spot.blocking && z < 15 && spot.cells.some((s) => s.x === cell.x && s.y === cell.y));
       const free = nearestFree(map, spot.cells, taken);
       if (free === undefined) throw new Error(`${spot.label} 附近没有空格了`);
       at = free;
     } else {
       at = { x: requireCoord(p.x, `${p.name} 的 x`), y: requireCoord(p.y, `${p.name} 的 y`) };
-      if (blocksMove(map, at)) throw new Error(`(${at.x},${at.y}) 是${map === undefined ? '' : terrainHere(map, at)}，${ch.name} 站不上去；换一格，或用 near`);
+      if (blocksMove(map, at, z >= 15)) throw new Error(`(${at.x},${at.y}) 是${map === undefined ? '' : terrainHere(map, at)}，${ch.name} 站不上去；换一格，或用 near`);
     }
-    (state.positions ??= {})[ch.name] = { x: at.x, y: at.y, room };
+    (state.positions ??= {})[ch.name] = { x: at.x, y: at.y, ...(z > 0 ? { z } : {}), room };
+    if (z > 0 && (ch.flySpeed ?? 0) <= 0 && ch.hover !== true && !hasCondition(ch, '飞行术')) {
+      notes.push(`【DM】${ch.name} 置于高空 ↑${z}尺，但角色卡未记录 fly_speed 且未挂「飞行术」；若天生会飞请用 dnd_character update fly_speed=60 补齐。`);
+    }
   }
   // 全部放好再查重叠：同一次调用里两个人互换位置不算冲突
   for (const p of placements) {
@@ -214,8 +261,8 @@ export function setPositions(c: Campaign, placements: readonly Placement[]): str
     const ch = requireCharacter(c, p.name);
     const cell = state.positions![ch.name]!;
     const other = occupant(c, cell.room, cell, ch.name);
-    if (other !== undefined && !notes.some((n) => n.includes(ch.name))) {
-      notes.push(`【DM】${ch.name} 和 ${other.name} 在同一格 (${cell.x},${cell.y})，不是故意的话改一下。`);
+    if (other !== undefined && !notes.some((n) => n.includes(ch.name) && n.includes('同一格'))) {
+      notes.push(`【DM】${ch.name} 和 ${other.name} 在同一格 ${fmtCoord(cell)}，不是故意的话改一下。`);
     }
   }
   return notes;
@@ -244,9 +291,68 @@ export function removePosition(c: Campaign, name: string): string {
   return `${ch.name} 已从站位上拿掉`;
 }
 
+/** 放置或更新战场持续区域效果（黑暗术、毒雾、蛛网术、荆棘丛生、月华之光等） */
+export function upsertBattleZone(
+  c: Campaign,
+  raw: Omit<Parameters<typeof createBattleZoneInput>[0], 'room'> & { room?: string },
+): { zone: BattleZone; broken: string[]; affected: string[] } {
+  const state = requireInitiative(c);
+  const caster = raw.source !== undefined ? requireCharacter(c, raw.source) : undefined;
+  const room = raw.room ?? (caster !== undefined ? roomOf(c, caster) : undefined) ?? markRoom(c, state);
+  const x = requireCoord(raw.x, '区域 x');
+  const y = requireCoord(raw.y, '区域 y');
+  const seqHint = (state.zones?.length ?? 0) + 1;
+  const zone = createBattleZoneInput({ ...raw, room, x, y, ...(caster !== undefined ? { source: caster.name } : {}) }, seqHint);
+
+  const broken: string[] = [];
+  if (zone.concentration === true && zone.source !== undefined) {
+    const prevStates = concentratingOn(c, zone.source).filter((s) => s.state.name !== zone.name);
+    const prevZones = concentratingZoneNames(c, zone.source).filter((zName) => zName !== zone.name);
+    if (prevStates.length > 0 || prevZones.length > 0) {
+      broken.push(...breakConcentration(c, zone.source, `改换专注为「${zone.name}」`));
+      for (const line of broken) pushLog(c, line);
+    }
+  }
+
+  const existing = (state.zones ?? []).filter((z) => {
+    if (z.id === zone.id) return false;
+    // 同一施法者重放/挪动同名专注区域（如移动月华之光）时原地更新，不留残影
+    if (zone.concentration === true && zone.source !== undefined && z.source === zone.source && z.name === zone.name) return false;
+    return true;
+  });
+  existing.push(zone);
+  state.zones = existing;
+  pushLog(c, `放置战场区域：${formatZoneSummary(zone)}`);
+
+  const affected = placedIn(c, room)
+    .filter(({ cell }) => zonesAtCell(c, room, cell).some((z) => z.id === zone.id))
+    .map(({ ch }) => ch.name);
+  return { zone, broken, affected };
+}
+
+/** 手动移除战场持续区域（按区域 id 或名称） */
+export function removeBattleZone(c: Campaign, idOrName: string, room?: string): BattleZone[] {
+  const state = requireInitiative(c);
+  const q = idOrName.trim();
+  if (!q) throw new Error('remove_zone 要给 name（区域名称或 id）');
+  const list = state.zones ?? [];
+  const removed = list.filter((z) => (room === undefined || z.room === room) && (z.id === q || z.name === q || z.name.includes(q)));
+  if (removed.length === 0) {
+    const existing = list.map((z) => `${z.name}(${z.id})`).join('、') || '无';
+    throw new Error(`找不到持续区域「${q}」。当前场上区域：${existing}`);
+  }
+  const rest = list.filter((z) => !removed.includes(z));
+  if (rest.length === 0) delete state.zones;
+  else state.zones = rest;
+  for (const r of removed) pushLog(c, `移除战场区域「${r.name}」`);
+  return removed;
+}
+
 export interface MoveRequest {
   x?: number;
   y?: number;
+  /** 目标离地高度（尺，5 的非负整数倍；省略时保持当前高度） */
+  z?: number;
   /** 走到这个人身边最近的空格（同 to=某人，留着兼容） */
   adjacentTo?: string;
   /** 走向一个人（贴上去）、地标或地形（门、门外、熔炉旁）；比让模型算坐标靠谱 */
@@ -316,17 +422,35 @@ function straightPath(from: Cell, to: Cell): Cell[] {
 
 const minFeet = (cells: readonly Cell[], at: Cell): number => Math.min(...cells.map((c) => distanceFeet(c, at)));
 
+function hasBlindOrSpecialSight(ch: Character): boolean {
+  const text = `${ch.notes ?? ''} ${(ch.traits ?? []).join(' ')}`;
+  return /盲视|blindsight|真实视觉|truesight|魔鬼视界|devil'?s\s*sight|震颤感知|tremorsense/i.test(text);
+}
+
+export interface MoveGridOptions {
+  roller?: Roller;
+  globalEffects?: Record<string, CustomEffectDef>;
+}
+
 /**
- * 回合内移动：算走了多少尺，报出会触发谁的借机。
+ * 回合内移动：算走了多少尺，报出会触发谁的借机，联动结算持续地形（难行/遮蔽/进圈伤害）与 2.5D 飞行高度。
  * 有场地图时按最短路绕墙、难行地形算双倍；目的地可以是坐标，也可以是「走到谁身边 / 门口 / 离谁远点」，
  * 由工具挑格子：今晚的错位都出在模型自己把「靠着熊二往门口挪」换算成坐标时丢了条件。
  */
-export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): MoveResult {
+export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, options: MoveGridOptions = {}): MoveResult {
   const state = requireInitiative(c);
   const ch = requireCharacter(c, name);
   const from = cellOf(c, ch);
   if (from === undefined) throw new Error(`${ch.name} 还没摆位，先 dnd_position set`);
   const map = mapOf(c, from.room);
+  const fromZ = from.z ?? 0;
+  const targetZ = request.z !== undefined ? requireAltitude(request.z, 'z', map?.ceiling) : fromZ;
+  const isAirborneMove = fromZ > 0 || targetZ > 0;
+  const canFly = (ch.flySpeed ?? 0) > 0 || ch.hover === true || hasCondition(ch, '飞行术');
+  if (targetZ > 0 && !canFly && request.ignoreStateMods !== true) {
+    throw new Error(`${ch.name} 没有飞行速度（fly_speed）也未处于「飞行术」状态，无法升空到 z=${targetZ} 尺`);
+  }
+
   const reaction = request.reaction === true;
   if (request.disengage === true) {
     state.disengaged = [...new Set([...(state.disengaged ?? []), ch.name])];
@@ -345,10 +469,12 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
     if (ts?.actor === ch.name) ts.actionUsed ??= '冲刺';
   }
   const isDashed = state.dashed?.includes(ch.name) === true;
+  const rawBaseSpeed = isAirborneMove
+    ? (ch.flySpeed ?? (hasCondition(ch, '飞行术') ? 60 : (ch.speed ?? DEFAULT_SPEED)))
+    : (ch.speed ?? DEFAULT_SPEED);
   const moveInfo = request.ignoreStateMods === true
-    ? { baseSpeed: ch.speed ?? DEFAULT_SPEED, zeroSpeed: false, zeroReasons: [] as string[], notes: [] as string[], fearSources: [] as string[], hasUnboundFear: false }
-    : movementSpeedInfo(ch, DEFAULT_SPEED);
-  const rawBaseSpeed = ch.speed ?? DEFAULT_SPEED;
+    ? { baseSpeed: rawBaseSpeed, zeroSpeed: false, zeroReasons: [] as string[], notes: [] as string[], fearSources: [] as string[], hasUnboundFear: false }
+    : movementSpeedInfo(ch, rawBaseSpeed);
   const baseSpeed = moveInfo.zeroSpeed ? rawBaseSpeed : moveInfo.baseSpeed;
   const speed = baseSpeed * (isDashed ? 2 : 1);
   const usedBefore = reaction ? 0 : state.moved?.[ch.name] ?? 0;
@@ -377,37 +503,63 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
   const reactors = moverInvisible ? [] : foes.filter(({ ch: o }) => inInitiative(c, o.name) && canReact(o) && !hasCondition(o, '失明') && reactionBlocked(c, o.name) === undefined
     && !request.ignoredReactors?.includes(o.name));
   const reachOf = (other: Character): number => Math.max(MELEE_REACH_FEET, ...(other.weapons ?? []).map((w) => weaponReach(w, true) ?? 0));
-  // 5e：能穿过友方的格子，不能穿过敌人的
-  const blocked = (at: Cell): boolean => foes.some(({ cell }) => cell.x === at.x && cell.y === at.y);
-  const taken = (at: Cell): boolean => others.some(({ cell }) => cell.x === at.x && cell.y === at.y);
+
+  const highAltitude = fromZ >= 15 && targetZ >= 15;
+  // 5e：能穿过友方的格子，不能穿过同一高度层的敌人的格子；高空飞越地面敌人不阻挡
+  const blocked = (at: Cell): boolean => foes.some(({ cell }) => cell.x === at.x && cell.y === at.y && Math.abs((cell.z ?? 0) - targetZ) < CELL_FEET);
+  const taken = (at: Cell): boolean => others.some(({ cell }) => cell.x === at.x && cell.y === at.y && (cell.z ?? 0) === targetZ);
+  const cellCostMult = (at: Cell): number => extraCellCostMultiplier(c, ch, { ...at, z: targetZ }, from.room, options.globalEffects);
+  const canReactorSeeAt = (other: Character, reactorCell: BattleCell, moverCell: BattleCell): { ok: boolean; reason?: string } => {
+    if (hasBlindOrSpecialSight(other)) return { ok: true };
+    const obs = isCellHeavilyObscured(c, moverCell) ?? isCellHeavilyObscured(c, reactorCell);
+    if (obs !== undefined) return { ok: false, reason: `「${obs.name}」遮蔽视线，${other.name} 无法借机攻击` };
+    return { ok: true };
+  };
   const provokesOn = (a: Cell, b: Cell): number => disengaged ? 0
-    : reactors.filter(({ ch: other, cell }) => distanceFeet(a, cell) <= reachOf(other) && distanceFeet(b, cell) > reachOf(other)).length;
+    : reactors.filter(({ ch: other, cell }) => {
+      const a3: BattleCell = { ...a, ...(targetZ > 0 ? { z: targetZ } : {}), room: from.room };
+      const b3: BattleCell = { ...b, ...(targetZ > 0 ? { z: targetZ } : {}), room: from.room };
+      return canReactorSeeAt(other, cell, a3).ok && distanceFeet(a3, cell) <= reachOf(other) && distanceFeet(b3, cell) > reachOf(other);
+    }).length;
   const factor = (dragged === undefined ? 1 : 2) * (crawling ? 2 : 1);
 
   let dest: Cell;
   let path: Cell[];
-  let feet: number;
+  let horizFeet: number;
   let short: string | undefined;
   const explicit = request.x !== undefined || request.y !== undefined;
   const target = request.to ?? request.adjacentTo;
-  if (explicit) {
+  const pureVertical = !explicit && target === undefined && request.awayFrom === undefined && request.z !== undefined;
+
+  if (pureVertical) {
+    dest = { x: from.x, y: from.y };
+    if (blocksMove(map, dest, targetZ >= 15)) throw new Error(`(${dest.x},${dest.y}) 无法停靠`);
+    const occupied = occupant(c, from.room, { ...dest, z: targetZ }, ch.name);
+    if (occupied !== undefined && occupied.name !== dragged?.name) {
+      throw new Error(`${fmtCoord({ ...dest, z: targetZ })} 已经站着 ${occupied.name}，换一格或换高度`);
+    }
+    path = [{ x: from.x, y: from.y }];
+    horizFeet = 0;
+  } else if (explicit) {
     if (target !== undefined || request.awayFrom !== undefined) throw new Error('x/y 和 to/away_from 二选一');
-    dest = { x: requireCoord(request.x, 'x'), y: requireCoord(request.y, 'y') };
-    if (blocksMove(map, dest)) throw new Error(`(${dest.x},${dest.y}) 是${terrainHere(map!, dest)}，站不上去；要去旁边用 to`);
-    const occupied = occupant(c, from.room, dest, ch.name);
-    if (occupied !== undefined && occupied.name !== dragged?.name) throw new Error(`(${dest.x},${dest.y}) 已经站着 ${occupied.name}，换一格，或用 to`);
-    if (map === undefined && foes.length === 0) {
+    dest = { x: requireCoord(request.x ?? from.x, 'x'), y: requireCoord(request.y ?? from.y, 'y') };
+    if (blocksMove(map, dest, targetZ >= 15)) throw new Error(`(${dest.x},${dest.y}) 是${terrainHere(map!, dest)}，站不上去；要去旁边用 to`);
+    const occupied = occupant(c, from.room, { ...dest, z: targetZ }, ch.name);
+    if (occupied !== undefined && occupied.name !== dragged?.name) throw new Error(`${fmtCoord({ ...dest, z: targetZ })} 已经站着 ${occupied.name}，换一格，或用 to`);
+    const hasExtraTerrain = map !== undefined || foes.length > 0 || (state.zones?.length ?? 0) > 0
+      || c.characters.some((o) => o.name !== ch.name && (o.activeStates?.length ?? 0) > 0);
+    if (!hasExtraTerrain) {
       path = straightPath(from, dest);
-      feet = distanceFeet(from, dest) * factor;
+      horizFeet = Math.max(Math.abs(from.x - dest.x), Math.abs(from.y - dest.y)) * CELL_FEET * factor;
     } else {
-      const reached = walk(map, from, { blocked, provokes: provokesOn, costFactor: factor, stopAt: dest });
+      const reached = walk(map, from, { blocked, provokes: provokesOn, costFactor: factor, highAltitude, cellCostMultiplier: cellCostMult, stopAt: dest });
       const found = pathTo(reached, dest);
       if (found === undefined) throw new Error(`走不到 (${dest.x},${dest.y})：被墙或敌人堵死了`);
       path = found;
-      feet = reached.get(cellKey(dest))!.feet;
+      horizFeet = reached.get(cellKey(dest))!.feet;
     }
   } else {
-    if (target === undefined && request.awayFrom === undefined) throw new Error('move 要给 x/y，或者 to / adjacent_to / away_from 之一');
+    if (target === undefined && request.awayFrom === undefined) throw new Error('move 要给 x/y/z，或者 to / adjacent_to / away_from 之一');
     if (target !== undefined && request.awayFrom !== undefined) throw new Error('to 和 away_from 二选一');
     const remaining = reaction ? baseSpeed : speed - used;
     const maxFeet = request.feet ?? remaining;
@@ -428,15 +580,15 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
       const away = requireCharacter(c, request.awayFrom!);
       const awayCell = cellOf(c, away);
       if (awayCell === undefined || awayCell.room !== from.room) throw new Error(`${away.name} 不在这个房间的站位上`);
-      score = (at) => -distanceFeet(at, awayCell);
+      score = (at) => -distanceFeet({ ...at, z: targetZ }, awayCell);
       goal = `远离 ${away.name}`;
     }
-    const reached = walk(map, from, { blocked, provokes: provokesOn, costFactor: factor, maxFeet });
+    const reached = walk(map, from, { blocked, provokes: provokesOn, costFactor: factor, highAltitude, cellCostMultiplier: cellCostMult, maxFeet });
     let best: { at: Cell; s: number; feet: number; provokes: number } | undefined;
     for (const [k, r] of reached) {
       const at = parseKey(k);
-      if (taken(at) && !(at.x === from.x && at.y === from.y)) continue;
-      if (keepCell !== undefined && distanceFeet(at, keepCell) > MELEE_REACH_FEET) continue;
+      if (taken(at) && !(at.x === from.x && at.y === from.y && targetZ === fromZ)) continue;
+      if (keepCell !== undefined && distanceFeet({ ...at, z: targetZ }, keepCell) > MELEE_REACH_FEET) continue;
       const s = score(at);
       if (best === undefined || s < best.s || (s === best.s && (r.feet < best.feet || (r.feet === best.feet && r.provokes < best.provokes)))) {
         best = { at, s, feet: r.feet, provokes: r.provokes };
@@ -445,17 +597,37 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
     if (best === undefined) throw new Error(`${keep === undefined ? '' : `贴着 ${keep.name} 的`}格子都走不到或站满了`);
     dest = best.at;
     path = pathTo(reached, dest)!;
-    feet = best.feet;
+    horizFeet = best.feet;
     if (target !== undefined && best.s > 0) {
       const limit = keep !== undefined ? `要贴着 ${keep.name}，最多` : request.feet !== undefined ? `限 ${request.feet} 尺，只够` : '移动力只够';
       short = `${limit}走到这里，离 ${goal} 还有 ${best.s} 尺`;
     }
   }
-  const blocker = occupant(c, from.room, dest, ch.name);
-  if (blocker !== undefined && blocker.name !== dragged?.name) throw new Error(`(${dest.x},${dest.y}) 已经站着 ${blocker.name}，换一格，或用 to`);
-  if (keepCell !== undefined && distanceFeet(dest, keepCell) > MELEE_REACH_FEET) {
-    throw new Error(`走到 (${dest.x},${dest.y}) 就不贴着 ${keep!.name} 了；不给坐标、传 to + keep_adjacent，工具会挑贴着他的格子`);
+  const blocker = occupant(c, from.room, { ...dest, z: targetZ }, ch.name);
+  if (blocker !== undefined && blocker.name !== dragged?.name) throw new Error(`${fmtCoord({ ...dest, z: targetZ })} 已经站着 ${blocker.name}，换一格，或用 to`);
+  if (keepCell !== undefined && distanceFeet({ ...dest, z: targetZ }, keepCell) > MELEE_REACH_FEET) {
+    throw new Error(`走到 ${fmtCoord({ ...dest, z: targetZ })} 就不贴着 ${keep!.name} 了；不给坐标、传 to + keep_adjacent，工具会挑贴着他的格子`);
   }
+
+  // 生成完整 3D 轨迹（支持原地升空/俯冲与斜飞）
+  const horizSteps = path.length - 1;
+  const vertSteps = Math.abs(targetZ - fromZ) / CELL_FEET;
+  const totalSteps = Math.max(horizSteps, vertSteps);
+  let path3d: BattleCell[];
+  if (totalSteps === 0) {
+    path3d = [{ x: from.x, y: from.y, ...(fromZ > 0 ? { z: fromZ } : {}), room: from.room }];
+  } else {
+    path3d = Array.from({ length: totalSteps + 1 }, (_, k) => {
+      const hIdx = horizSteps === 0 ? 0 : Math.min(horizSteps, Math.round((k * horizSteps) / totalSteps));
+      const hc = path[hIdx]!;
+      const zk = Math.round((fromZ + ((targetZ - fromZ) * k) / totalSteps) / CELL_FEET) * CELL_FEET;
+      return { x: hc.x, y: hc.y, ...(zk > 0 ? { z: zk } : {}), room: from.room };
+    });
+  }
+
+  let feet = horizSteps === 0
+    ? path3d.slice(1).reduce((sum, step) => sum + CELL_FEET * factor * extraCellCostMultiplier(c, ch, step, from.room, options.globalEffects), 0)
+    : Math.max(horizFeet, Math.abs(targetZ - fromZ) * factor);
 
   if (!reaction && request.ignoreStateMods !== true && moveInfo.fearSources.length > 0) {
     for (const srcName of moveInfo.fearSources) {
@@ -463,7 +635,7 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
       const srcCell = srcCh === undefined ? undefined : cellOf(c, srcCh);
       if (srcCh !== undefined && srcCell !== undefined && srcCell.room === from.room) {
         const startDist = distanceFeet(from, srcCell);
-        const closer = path.some((step, i) => i > 0 && distanceFeet(step, srcCell) < startDist);
+        const closer = path3d.some((step, i) => i > 0 && distanceFeet(step, srcCell) < startDist);
         if (closer) {
           throw new Error(`${ch.name} 正对 ${srcCh.name} 处于「恐慌」状态，不能主动移向恐惧源（若免疫或强制位移请传 ignore_state_mods=true 或用 set）`);
         }
@@ -471,20 +643,33 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
     }
   }
 
+  const blockedSightNotes = new Set<string>();
   let opportunity: MoveResult['opportunity'];
+  const fullDestZ = targetZ;
+  const fullDest = { ...dest };
   if (request.interrupt === true && !disengaged) {
     const triggers: Array<{ stop: number; character: string; reaction: string }> = [];
     for (const { ch: other, cell } of reactors) {
       const reach = reachOf(other);
-      for (let i = 0; i + 1 < path.length; i++) {
-        if (distanceFeet(path[i]!, cell) <= reach && distanceFeet(path[i + 1]!, cell) > reach && wallBetween(map, path[i]!, cell) === undefined) {
+      for (let i = 0; i + 1 < path3d.length; i++) {
+        if (distanceFeet(path3d[i]!, cell) <= reach && distanceFeet(path3d[i + 1]!, cell) > reach && wallBetween(map, path3d[i]!, cell) === undefined) {
+          const sight = canReactorSeeAt(other, cell, path3d[i]!);
+          if (!sight.ok) {
+            if (sight.reason) blockedSightNotes.add(sight.reason);
+            continue;
+          }
           triggers.push({ stop: i, character: other.name, reaction: '借机攻击' });
           break;
         }
       }
       for (const r of reactionsOf(other).filter((r) => r.enter === true)) {
-        for (let i = 0; i + 1 < path.length; i++) {
-          if (distanceFeet(path[i]!, cell) > (r.range ?? MELEE_REACH_FEET) && distanceFeet(path[i + 1]!, cell) <= (r.range ?? MELEE_REACH_FEET) && wallBetween(map, path[i + 1]!, cell) === undefined) {
+        for (let i = 0; i + 1 < path3d.length; i++) {
+          if (distanceFeet(path3d[i]!, cell) > (r.range ?? MELEE_REACH_FEET) && distanceFeet(path3d[i + 1]!, cell) <= (r.range ?? MELEE_REACH_FEET) && wallBetween(map, path3d[i + 1]!, cell) === undefined) {
+            const sight = canReactorSeeAt(other, cell, path3d[i + 1]!);
+            if (!sight.ok) {
+              if (sight.reason) blockedSightNotes.add(sight.reason);
+              continue;
+            }
             triggers.push({ stop: i + 1, character: other.name, reaction: r.name });
             break;
           }
@@ -494,19 +679,25 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
     if (triggers.length > 0) {
       const first = Math.min(...triggers.map((t) => t.stop));
       const here = triggers.filter((t) => t.stop === first);
-      const options: ReactorOption[] = here.map(({ character, reaction }) => ({ character, reaction,
+      const reactorOptions: ReactorOption[] = here.map(({ character, reaction }) => ({ character, reaction,
         ...(requireCharacter(c, character).kind !== 'pc' || requireCharacter(c, character).playerId === undefined ? { npc: true } : {}) }));
-      opportunity = { reactors: options, resume: {
-        x: dest.x, y: dest.y, interrupt: true, reaction,
+      opportunity = { reactors: reactorOptions, resume: {
+        x: fullDest.x, y: fullDest.y, ...(fullDestZ !== 0 || fromZ !== 0 ? { z: fullDestZ } : {}), interrupt: true, reaction,
         ignoredReactors: [...new Set([...(request.ignoredReactors ?? []), ...here.map((t) => t.character)])],
         ...(request.drag !== undefined ? { drag: request.drag } : {}),
         ...(request.keepAdjacent !== undefined ? { keepAdjacent: request.keepAdjacent } : {}),
         ...(request.crawl === true ? { crawl: true } : {}),
         ...(request.ignoreStateMods === true ? { ignoreStateMods: true } : {}),
       } };
-      path = path.slice(0, first + 1);
-      dest = path.at(-1)!;
-      feet = path.slice(1).reduce((sum, step) => sum + CELL_FEET * factor * (map !== undefined && areaAt(map, step)?.kind === 'difficult' ? 2 : 1), 0);
+      path3d = path3d.slice(0, first + 1);
+      const stopCell = path3d.at(-1)!;
+      dest = { x: stopCell.x, y: stopCell.y };
+      feet = path3d.slice(1).reduce((sum, step) => {
+        const stepHigh = (step.z ?? 0) >= 15;
+        const mapMult = !stepHigh && map !== undefined && areaAt(map, step)?.kind === 'difficult' ? 2 : 1;
+        const zoneMult = extraCellCostMultiplier(c, ch, step, from.room, options.globalEffects);
+        return sum + CELL_FEET * factor * Math.max(mapMult, zoneMult);
+      }, 0);
       short = '已在借机触发处暂停，剩余路程等反应结算后再走';
     }
   }
@@ -516,39 +707,52 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
   const enters: Array<{ name: string; reach: number; reaction: string }> = [];
   if (!disengaged) {
     for (const { ch: other, cell } of reactors) {
-      const leaves = path.some((step, i) => {
-        const next = path[i + 1];
-        return next !== undefined && distanceFeet(step, cell) <= reachOf(other) && distanceFeet(next, cell) > reachOf(other);
+      const leaves = path3d.some((step, i) => {
+        const next = path3d[i + 1];
+        if (next === undefined || distanceFeet(step, cell) > reachOf(other) || distanceFeet(next, cell) <= reachOf(other)) return false;
+        const sight = canReactorSeeAt(other, cell, step);
+        if (!sight.ok) {
+          if (sight.reason) blockedSightNotes.add(sight.reason);
+          return false;
+        }
+        return true;
       });
       if (leaves) provokes.push(other.name);
-      else if (!opportunity?.reactors.some((r) => r.character === other.name) && path.length > 1 && path.every((step) => distanceFeet(step, cell) <= reachOf(other))) stayedIn.push(other.name);
+      else if (!opportunity?.reactors.some((r) => r.character === other.name) && path3d.length > 1 && path3d.every((step) => distanceFeet(step, cell) <= reachOf(other))) stayedIn.push(other.name);
       // 长柄大师：拿着长柄武器时，敌人「进入」触及范围也吃借机——方向反着算，一回合至多一次
       for (const r of reactionsOf(other)) {
         if (r.enter !== true) continue;
         const reach = r.range ?? MELEE_REACH_FEET;
-        const steppedIn = path.some((step, i) => {
-          const next = path[i + 1];
-          return next !== undefined && distanceFeet(step, cell) > reach && distanceFeet(next, cell) <= reach;
+        const steppedIn = path3d.some((step, i) => {
+          const next = path3d[i + 1];
+          if (next === undefined || distanceFeet(step, cell) <= reach || distanceFeet(next, cell) > reach) return false;
+          const sight = canReactorSeeAt(other, cell, next);
+          if (!sight.ok) {
+            if (sight.reason) blockedSightNotes.add(sight.reason);
+            return false;
+          }
+          return true;
         });
         if (steppedIn) enters.push({ name: other.name, reach, reaction: r.name });
       }
     }
   }
 
-  const to: BattleCell = { x: dest.x, y: dest.y, room: from.room };
+  const finalStep = path3d.at(-1)!;
+  const to: BattleCell = { x: finalStep.x, y: finalStep.y, ...(finalStep.z !== undefined && finalStep.z > 0 ? { z: finalStep.z } : {}), room: from.room };
   (state.positions ??= {})[ch.name] = to;
   let draggedTo: { name: string; to: BattleCell } | undefined;
   if (dragged !== undefined) {
     // 拖着的人落在你走过的最后一格（原地没动就不动他）
-    const behind = path.length >= 2 ? path[path.length - 2]! : undefined;
-    if (behind !== undefined) {
-      const cell: BattleCell = { x: behind.x, y: behind.y, room: from.room };
+    const behind = path3d.length >= 2 ? path3d[path3d.length - 2]! : undefined;
+    if (behind !== undefined && (behind.x !== to.x || behind.y !== to.y || (behind.z ?? 0) !== (to.z ?? 0))) {
+      const cell: BattleCell = { x: behind.x, y: behind.y, ...(behind.z !== undefined && behind.z > 0 ? { z: behind.z } : {}), room: from.room };
       state.positions[dragged.name] = cell;
       draggedTo = { name: dragged.name, to: cell };
     }
   }
   const moved = state.moved ?? {};
-  const notes: string[] = [...moveInfo.notes];
+  const notes: string[] = [...moveInfo.notes, ...blockedSightNotes];
   if (autoStandUp) {
     changeCondition(c, ch.name, '倒地', false);
     if (ts !== undefined && ts.actor === ch.name) ts.stoodUp = true;
@@ -559,13 +763,22 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
   if (!reaction) moved[ch.name] = (moved[ch.name] ?? 0) + standCost + feet;
   state.moved = moved;
 
+  const hazardLines = settleMovementHazards(c, ch, path3d, options.roller ?? cryptoRoller, options.globalEffects);
+  notes.push(...hazardLines);
+  // 若沿途区域伤害已将角色击倒/击杀，不再保留借机恢复窗口
+  if (opportunity !== undefined && (ch.hp <= 0 || isOut(ch))) {
+    opportunity = undefined;
+  }
+
+  // 若区域伤害导致高空坠机（z 已清零），同步返回值中的 to
+  const postPos = state.positions[ch.name] ?? to;
   if (moveInfo.hasUnboundFear) notes.push(`${ch.name} 处于恐慌：不能主动移向恐惧源`);
   if (moveInfo.zeroReasons.length > 0) notes.push(`${ch.name} 处于${moveInfo.zeroReasons.join('、')}，速度应为 0`);
-  const area = map === undefined ? undefined : areaAt(map, dest);
+  const area = map === undefined || (postPos.z ?? 0) >= 15 ? undefined : areaAt(map, postPos);
   return {
     name: ch.name,
     from,
-    to,
+    to: postPos,
     feet,
     totalFeet: moved[ch.name] ?? 0,
     speed,
@@ -574,9 +787,9 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
     enters,
     disengaged,
     stayedIn,
-    detour: feet > distanceFeet(from, dest) * factor,
+    detour: feet > distanceFeet(from, postPos) * factor,
     ...(area !== undefined && area.kind !== 'wall' ? { where: areaName(area) } : {}),
-    adjacent: adjacentFoes(c, ch, to),
+    adjacent: adjacentFoes(c, ch, postPos),
     ...(draggedTo !== undefined ? { dragged: draggedTo } : {}),
     ...(short !== undefined ? { short } : {}),
     notes,
@@ -586,9 +799,13 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest): Mov
 
 export function moveResultText(r: MoveResult): string {
   const how = [r.detour ? '绕开挡路的' : '', r.dragged !== undefined ? `拖着 ${r.dragged.name}，每格算双倍` : ''].filter(Boolean).join('，');
-  const lines = [`${r.name} (${r.from.x},${r.from.y})→(${r.to.x},${r.to.y})，走 ${r.feet} 尺${how ? `（${how}）` : ''}，本回合累计 ${r.totalFeet}/${r.speed} 尺${r.dashed ? '（冲刺）' : ''}`];
-  const now = [r.where !== undefined ? `站在${r.where}` : '', r.adjacent.length > 0 ? `贴身：${r.adjacent.join('、')}` : '没贴着敌人'].filter(Boolean);
-  lines.push(`现在：${now.join('；')}${r.dragged !== undefined ? `；${r.dragged.name} 在 (${r.dragged.to.x},${r.dragged.to.y})` : ''}`);
+  const lines = [`${r.name} ${fmtCoord(r.from)}→${fmtCoord(r.to)}，走 ${r.feet} 尺${how ? `（${how}）` : ''}，本回合累计 ${r.totalFeet}/${r.speed} 尺${r.dashed ? '（冲刺）' : ''}`];
+  const now = [
+    (r.to.z ?? 0) > 0 ? `离地 ${r.to.z} 尺` : '',
+    r.where !== undefined ? `站在${r.where}` : '',
+    r.adjacent.length > 0 ? `贴身：${r.adjacent.join('、')}` : '没贴着敌人',
+  ].filter(Boolean);
+  lines.push(`现在：${now.join('；')}${r.dragged !== undefined ? `；${r.dragged.name} 在 ${fmtCoord(r.dragged.to)}` : ''}`);
   if (r.short !== undefined) lines.push(`【DM】${r.short}。`);
   if (r.totalFeet > r.speed) lines.push(`【DM】超过速度 ${r.speed}：${r.dashed ? '冲刺也不够' : '没冲刺的话要传 dash=true'}，不合法就 dnd_undo。`);
   if (r.disengaged) lines.push('撤离：这次移动不触发借机。');
@@ -629,8 +846,9 @@ export function turnPositionNote(c: Campaign, name: string): string {
   const foes = placedIn(c, cell.room).filter(({ ch: other }) => isHostile(ch, other));
   const adjacent = adjacentFoes(c, ch, cell);
   const map = mapOf(c, cell.room);
-  const area = map === undefined ? undefined : areaAt(map, cell);
-  let where = `【站位】${ch.name}(${cell.x},${cell.y})${area !== undefined && area.kind !== 'wall' ? `（${areaName(area)}）` : ''}`;
+  const area = map === undefined || (cell.z ?? 0) >= 15 ? undefined : areaAt(map, cell);
+  const zonesHere = zonesAtCell(c, cell.room, cell);
+  let where = `【站位】${ch.name}${fmtCoord(cell)}${area !== undefined && area.kind !== 'wall' ? `（${areaName(area)}）` : ''}${zonesHere.length > 0 ? `（处于区域：${zonesHere.map((z) => z.name).join('、')}）` : ''}`;
   if (adjacent.length > 0) where += `，贴身：${adjacent.join('、')}`;
   else if (foes.length > 0) {
     const nearest = foes.map((f) => ({ name: f.ch.name, feet: distanceFeet(cell, f.cell) })).sort((a, b) => a.feet - b.feet)[0]!;
@@ -647,11 +865,13 @@ export function hiddenFromPlayers(ch: Character): boolean {
   return ch.kind === 'monster' && ch.conditions.some((cond) => HIDDEN.includes(cond));
 }
 
+const defaultVisible = (): boolean => true;
+
 /**
  * 团况和 show 用的全场站位，按房间分行：压缩之后靠这几行恢复现场。
  * visible 给玩家视角用：不列的人也不算进贴身。
  */
-export function battleLines(c: Campaign, roomName: (id: string) => string, visible: (ch: Character) => boolean = () => true): string[] {
+export function battleLines(c: Campaign, roomName: (id: string) => string, visible: (ch: Character) => boolean = defaultVisible): string[] {
   const state = c.initiative;
   if (state === undefined) return [];
   const rooms = new Map<string, Array<{ ch: Character; cell: BattleCell }>>();
@@ -663,8 +883,10 @@ export function battleLines(c: Campaign, roomName: (id: string) => string, visib
   }
   const marks = Object.entries(state.marks ?? {});
   for (const [, cell] of marks) if (!rooms.has(cell.room)) rooms.set(cell.room, []);
+  for (const z of state.zones ?? []) if (!rooms.has(z.room)) rooms.set(z.room, []);
 
   const lines: string[] = [];
+  const isDmView = visible === defaultVisible;
   for (const [room, members] of rooms) {
     const seen = new Set<string>();
     const pairs: string[] = [];
@@ -678,11 +900,15 @@ export function battleLines(c: Campaign, roomName: (id: string) => string, visib
       }
     }
     const roomMarks = marks.filter(([, cell]) => cell.room === room).map(([n, cell]) => `${n}(${cell.x},${cell.y})`);
-    lines.push(`站位｜${roomName(room)}（格=5尺，x东y南）：${members.map(({ ch, cell }) => `${ch.name}(${cell.x},${cell.y})`).join('、') || '无'}`
+    lines.push(`站位｜${roomName(room)}（格=5尺，x东y南）：${members.map(({ ch, cell }) => `${ch.name}${fmtCoord(cell)}`).join('、') || '无'}`
       + `${pairs.length > 0 ? `；贴身：${pairs.join('、')}` : ''}`
       + `${roomMarks.length > 0 ? `；标记：${roomMarks.join('、')}` : ''}`);
     const map = mapOf(c, room);
     if (map !== undefined) lines.push(`　${terrainLine(map)}`);
+    const roomZones = zonesInRoom(c, room);
+    if (roomZones.length > 0) {
+      lines.push(`　持续区域：${roomZones.map(isDmView ? formatZoneSummary : formatZonePlayerLegend).join('；')}`);
+    }
   }
   const missing = unplaced(c).filter((n) => {
     const ch = findCharacter(c, n);
@@ -814,13 +1040,33 @@ export function battleGridLines(c: Campaign, roomName: (id: string) => string, v
     const at = new Map<string, typeof items>();
     for (const i of items.filter(inView)) at.set(`${i.x},${i.y}`, [...(at.get(`${i.x},${i.y}`) ?? []), i]);
     const ground = (x: number, y: number): string => {
-      if (map === undefined) return '.';
+      const zHere = zonesAtCell(c, room, { x, y, z: 0 });
+      if (map === undefined) {
+        if (zHere.length > 0) {
+          if (!terrainNames.has('*')) terrainNames.set('*', new Set());
+          for (const z of zHere) terrainNames.get('*')!.add(z.name);
+          return '*';
+        }
+        return '.';
+      }
       const area = areaAt(map, { x, y });
-      if (area === undefined) return '.';
+      if (area === undefined) {
+        if (zHere.length > 0) {
+          if (!terrainNames.has('*')) terrainNames.set('*', new Set());
+          for (const z of zHere) terrainNames.get('*')!.add(z.name);
+          return '*';
+        }
+        return '.';
+      }
       if (area.kind === 'object') {
         const g = glyph.get(`mark:${areaName(area)}`) ?? '?';
         shownGlyphs.add(`mark:${areaName(area)}`);
         return g;
+      }
+      if (area.kind !== 'wall' && zHere.length > 0) {
+        if (!terrainNames.has('*')) terrainNames.set('*', new Set());
+        for (const z of zHere) terrainNames.get('*')!.add(z.name);
+        return '*';
       }
       const g = TERRAIN_GLYPH[area.kind];
       if (!terrainNames.has(g)) terrainNames.set(g, new Set());
@@ -842,10 +1088,19 @@ export function battleGridLines(c: Campaign, roomName: (id: string) => string, v
     out.push('```');
     for (const here of at.values()) if (here.length > 1) stacked.push(`@=${here.map((i) => i.name).join('+')}`);
   }
-  const legend = [...glyph].filter(([key]) => shownGlyphs.has(key)).map(([key, g]) => `${g}=${key.replace(/^mark:/, '')}`);
+  const altByKey = new Map(placed.filter((p) => (p.cell.z ?? 0) > 0).map((p) => [p.ch.name, p.cell.z!]));
+  const legend = [...glyph]
+    .filter(([key]) => shownGlyphs.has(key))
+    .map(([key, g]) => {
+      const label = key.replace(/^mark:/, '');
+      const z = altByKey.get(key);
+      return `${g}=${label}${z !== undefined ? `(↑${z}尺)` : ''}`;
+    });
   const terrain = [...terrainNames].map(([g, names]) => `${g}=${[...names].join('/')}`);
   out.push([...legend, ...stacked].join('　'));
   if (terrain.length > 0) out.push(terrain.join('　'));
+  const activeZones = rooms.flatMap((room) => zonesInRoom(c, room));
+  if (activeZones.length > 0) out.push(`🌀 区域：${activeZones.map(formatZonePlayerLegend).join('；')}`);
   if (offView.length > 0) out.push(`图外：${offView.join('、')}`);
   out.push('每格 5 尺，x 向东（右）、y 向南（下）');
   const missing = unplaced(c).filter((n) => {
@@ -869,7 +1124,7 @@ export function distancesFrom(c: Campaign, name: string, visible: (ch: Character
     .filter(([, at]) => at.room === cell.room)
     .map(([n, at]) => `${n} ${distanceFeet(cell, at)} 尺`);
   const who = others.map((o) => `${o.foe ? '敌 ' : ''}${o.name} ${o.feet} 尺`).join('、') || '房间里没有别人';
-  return `${ch.name}(${cell.x},${cell.y}) 到：${who}${marks.length > 0 ? `；标记：${marks.join('、')}` : ''}`;
+  return `${ch.name}${fmtCoord(cell)} 到：${who}${marks.length > 0 ? `；标记：${marks.join('、')}` : ''}`;
 }
 
 export type AreaShape = 'sphere' | 'cube' | 'line';

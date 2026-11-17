@@ -12,6 +12,8 @@ export function combatParticipantCard(campaign: Campaign, ch: Character) {
     participating: true,
     abilities: ch.abilities, skills: ch.skills, expertise: ch.expertise, saves: ch.saves,
     ac: armorClass(campaign, ch), baseAc: ch.ac, hp: ch.hp, maxHp: ch.maxHp, tempHp: ch.tempHp, speed: ch.speed ?? 30,
+    ...(ch.flySpeed !== undefined ? { flySpeed: ch.flySpeed } : {}),
+    ...(ch.hover === true ? { hover: true } : {}),
     reaction: { current: reactionBlocked(campaign, ch.name) === undefined && canReact(ch) ? 1 : 0, max: 1, reset: '本人下回合开始' },
     initiative: { fixed: initBonusOf(ch), source: ch.initBonus === undefined ? '敏捷调整值' : 'init_bonus 固定总加值', rolled: initiative?.init },
     attackBonus: ch.attackBonus, damage: ch.damage, weapons,
@@ -60,9 +62,11 @@ export function combatPartyContext(campaign: Campaign): string {
     }
     return combatParticipantCard(campaign, ch);
   });
+  const customNames = Object.keys(campaign.customEffects ?? {});
   return [
     '【角色能力与被动 · 开战时快照】',
-    '下列基础命中、伤害和固定先攻只按结构化字段计算；备注里的职业被动、专长与临时效果不会被程序自动识别（已结构化支持的：14种PHB状态与力竭自动优劣势/速度/专注管理、巨武器战斗、箭术、精灵精准、不死坚韧；dnd_resource use 支持「战斗英姿」「咒剑诅咒」「神圣武器」「动作如潮」及 apply_state 结构化增益如祝福术/护盾信仰/加速术/狂暴）。',
+    '下列基础命中、伤害和固定先攻只按结构化字段计算；备注里的职业被动、专长与临时效果不会被程序自动识别（已由工具自动结算的效果包括：14种PHB状态与力竭、巨武器战斗、箭术、精灵精准、不死坚韧、守护灵光、灵体卫士、脆弱诅咒、猎人印记、神恩、变巨术、狂暴近战加伤、防护毒素、生命门徒/神佑医者/保全生命、武器多段 riders，以及 dnd_rule 已登记扩展规则；上述自动项切勿再手掷或重复填进 damage）。',
+    ...(customNames.length > 0 ? [`本团已登记扩展规则（可用 dnd_rule show 查看详情）：${customNames.join('、')}`] : []),
     'participating=false 的角色未参战，不进入反应与借机名单；若中途入战须先 dnd_initiative join（返回结果会自动附上新参战我方的完整能力卡）。',
     '核对参战者的 notes、traits、reactions、装备和本桌约定；先攻已掷出的 rolled 与最新先攻表为准，不重掷。',
     '固定总先攻可用 dnd_character update init_bonus 持久保存；灵敏之赐等临时骰只在开战/中途入战时传 bonus，不写成固定值，也不重复添加已包含的加值。',

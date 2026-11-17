@@ -7,6 +7,7 @@
 import { type Advantage, type DiceResult, type Roller, rollD20, rollExpression } from './dice.ts';
 import { type Campaign, type HpChange, applyDamage, changeCondition, checkModifier, requireCharacter } from './campaign.ts';
 import { computeDefenseStateMod, computeSaveStateMods, formatStateModSummary } from './conditions.ts';
+import type { CustomEffectDef } from './custom-effects.ts';
 import type { Ability } from './rules.ts';
 
 export type Defense = 'resistant' | 'immune' | 'vulnerable';
@@ -80,6 +81,11 @@ export interface SaveEffectInput {
   bonusDice?: string;
   /** 跳过结构化状态对豁免优劣势/自动失败/抗性的自动修正 */
   ignoreStateMods?: boolean;
+  /** 专注控制法术施法者名称：豁免失败附加的状态将绑定至该施法者的专注位 */
+  concentrationSource?: string;
+  /** 持续轮数（可选，绑定到失败附加状态） */
+  failRounds?: number;
+  globalEffects?: Record<string, CustomEffectDef>;
   roller: Roller;
 }
 
@@ -135,17 +141,24 @@ export function rollSaveEffect(c: Campaign, input: SaveEffectInput): RolledSaveE
     return [{ t, ch }];
   });
   const damageRoll = input.damage === undefined ? undefined : rollExpression(input.damage, input.roller);
+  const vsTags = [
+    ...(input.damageType ? [input.damageType] : []),
+    ...(input.onFail ?? []),
+  ];
   const saves = resolved.map(({ t, ch }): RolledSave => {
     if (ch.conditions.includes('死亡')) return { name: ch.name, skipped: '已死亡' };
     const defenseMod = input.ignoreStateMods === true
       ? { defense: t.defense }
-      : computeDefenseStateMod(ch, input.damageType, t.defense);
+      : computeDefenseStateMod(ch, input.damageType, t.defense, c, input.globalEffects);
     const bonusDice = t.bonusDice ?? input.bonusDice;
     const saveMods = input.ignoreStateMods === true
       ? undefined
       : computeSaveStateMods(ch, input.ability, {
         ...(t.advantage !== undefined || input.advantage !== undefined ? { explicitAdvantage: t.advantage ?? input.advantage } : {}),
         ...(bonusDice !== undefined ? { explicitBonusDice: bonusDice } : {}),
+        vsTags,
+        campaign: c,
+        ...(input.globalEffects !== undefined ? { globalEffects: input.globalEffects } : {}),
       });
     if (saveMods?.autoFail === true) {
       const reason = saveMods.autoFailReason ?? '状态限制';
@@ -169,10 +182,11 @@ export function rollSaveEffect(c: Campaign, input: SaveEffectInput): RolledSaveE
       autoDiceTotal += m[1] === '-' ? -r.total : r.total;
       autoDiceDetails.push(`${m[1]}${r.detail}`);
     }
-    const modifier = checkModifier(ch, 'save', input.ability) + (t.bonus ?? input.bonus ?? 0) + (extra?.total ?? 0) + autoDiceTotal;
+    const flatBonus = saveMods?.flatBonus ?? 0;
+    const modifier = checkModifier(ch, 'save', input.ability) + (t.bonus ?? input.bonus ?? 0) + (extra?.total ?? 0) + autoDiceTotal + flatBonus;
     const advantage = saveMods !== undefined ? saveMods.advantage : (t.advantage ?? input.advantage ?? 'none');
     const roll = rollD20(modifier, advantage, input.roller);
-    const modExtras: string[] = [...autoDiceDetails];
+    const modExtras: string[] = [...(saveMods?.flatBonusReasons ?? []), ...autoDiceDetails];
     if (defenseMod.reason !== undefined) modExtras.push(defenseMod.reason);
     const stateSummary = saveMods !== undefined
       ? formatStateModSummary(saveMods.advReasons, saveMods.disadvReasons, advantage, modExtras)
@@ -194,6 +208,8 @@ export interface ApplySaveInput {
   damageType?: string;
   onSave?: 'half' | 'none';
   onFail?: string[];
+  concentrationSource?: string;
+  failRounds?: number;
   roller: Roller;
 }
 
@@ -212,8 +228,25 @@ export function applySaveEffect(c: Campaign, saves: readonly RolledSave[], input
     }
     const conditions = saved ? [] : (input.onFail ?? []);
     if (conditions.length > 0 && !requireCharacter(c, s.name).conditions.includes('死亡')) {
-      for (const cond of conditions) changeCondition(c, s.name, cond, true);
+      const targetCh = requireCharacter(c, s.name);
+      for (const cond of conditions) {
+        if (input.concentrationSource !== undefined) {
+          changeCondition(c, s.name, cond, true, {
+            source: input.concentrationSource,
+            concentration: true,
+            replaceConcentration: false,
+            ...(input.failRounds !== undefined ? { roundsLeft: input.failRounds } : {}),
+            roller: input.roller,
+          });
+        } else {
+          changeCondition(c, s.name, cond, true, {
+            ...(input.failRounds !== undefined ? { roundsLeft: input.failRounds } : {}),
+            roller: input.roller,
+          });
+        }
+      }
       out.conditions = [...conditions];
+      void targetCh;
     }
     return out;
   });
@@ -228,6 +261,8 @@ export function resolveSaveEffect(c: Campaign, input: SaveEffectInput): SaveEffe
     ...(input.damageType !== undefined ? { damageType: input.damageType } : {}),
     ...(input.onSave !== undefined ? { onSave: input.onSave } : {}),
     ...(input.onFail !== undefined ? { onFail: input.onFail } : {}),
+    ...(input.concentrationSource !== undefined ? { concentrationSource: input.concentrationSource } : {}),
+    ...(input.failRounds !== undefined ? { failRounds: input.failRounds } : {}),
     roller: input.roller,
   });
   return rolled.damageRoll === undefined ? { outcomes } : { damageRoll: rolled.damageRoll, outcomes };

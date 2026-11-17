@@ -14,6 +14,7 @@ import { registerExploreTools } from './tools/explore.ts';
 import { registerStoryTools } from './tools/story.ts';
 import { registerSaveTools } from './tools/saves.ts';
 import { registerSrdTools } from './tools/srd.ts';
+import { registerRuleTools } from './tools/rules.ts';
 import { createToolKit, type DndToolDeps } from './tools/shared.ts';
 
 export {
@@ -49,6 +50,7 @@ export function registerDndTools(ctx: Context, deps: DndToolDeps): string[] {
   registerStoryTools(kit);
   registerSaveTools(kit);
   registerSrdTools(kit);
+  registerRuleTools(kit);
   deps.logger.info(`im-qqbot: 跑团工具已注册 campaigns=${deps.service.store.root}`);
   return kit.names;
 }

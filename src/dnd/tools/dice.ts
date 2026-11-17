@@ -2,16 +2,18 @@
 import { rollD20,rollExpression } from '../dice.ts';
 import {
 type PendingAttack,
+type PendingRider,
 type PendingCheck,applyDamage,
 armorClass,assertCanAct,assertDeclaredByOwner,assertNoPending,attackModifier,
-changeCondition,checkModifier,deathSave,findCharacter,
+changeCondition,checkAllAirborneCrashes,checkModifier,deathSave,findCharacter,
 findWeapon,grantTempHp,heal,hexbladeCurseOn,inInitiative,isRangedWeapon,pushCombatLedger,requireCharacter,
 requireInitiative,requireResource,usesElvenAccuracy,useResource,weaponAttackModifier,spendReaction
 } from '../campaign.ts';
 import {
-breakConcentration,computeAttackStateMods,computeCheckStateMods,computeDefenseStateMod,
-computeSaveStateMods,ensureTurnState,formatStateModSummary,hasCondition,movementSpeedInfo,normalizeCondition
+activeEffectDefsFor,breakConcentration,collectHitRiders,computeAttackStateMods,computeCheckStateMods,computeDefenseStateMod,
+computeSaveStateMods,effectiveMaxHp,ensureTurnState,formatStateModSummary,hasCondition,movementSpeedInfo,normalizeCondition,recordTurnSpellCast
 } from '../conditions.ts';
+import { buildFormulaContext,evalIntFormula } from '../formula.ts';
 import { ABILITY_NAMES,type Ability,type Skill,SKILLS,parseAbility,parseSkill,proficiencyBonus,skillLabel } from '../rules.ts';
 import {
 attackRangeNote,canReact,cellOf,distanceFeet,weaponReach
@@ -30,6 +32,7 @@ import {
 SECRET_NOTE,
 HIDDEN_ROLL_NOTE,attackExpression,
 rollAttackDamage,
+rollCollectedRiders,
 onHitArg,settleAttackDamage,str,
 int,
 strList,advantageOf,hpLine,combatLedgerSuffix,type ToolKit
@@ -187,7 +190,8 @@ export function registerDiceTools(kit: ToolKit): void {
           + 'opportunity attacks, reactions, a perception or knowledge check off-turn. PC opportunity attacks spend a reaction and require the one-use server authorization from the owner\'s explicit choice. Passive saves/checks do not spend a reaction by default.',
       },
       use_reaction: { type: 'boolean', description: 'Explicitly spend a reaction for a save/check feature. reaction=true attack already spends it automatically. Passive/off-turn checks alone do not cost one.' },
-      concentration: { type: 'boolean', description: 'For type=save (Constitution concentration check): if the save fails against dc, automatically breaks this character\'s active concentration and removes their concentrated buffs/debuffs from targets.' },
+      concentration: { type: 'boolean', description: 'For type=save: (1) Constitution concentration check: if failed against dc, breaks active concentration and clears concentrated buffs/zones; (2) Concentration control spell with on_fail_conditions (e.g. Hold Person, Fear): binds failing targets\' applied conditions to the caster\'s concentration.' },
+      rounds: { type: 'integer', description: 'For type=save with on_fail_conditions: duration in rounds for the applied conditions (e.g. 10 for 1-minute control spells).' },
       ignore_state_mods: { type: 'boolean', description: 'Escape hatch: bypass automatic 5e condition modifiers (advantage/disadvantage, incapacitation block, charm block, auto-crit, resistance) when a specific feature/immunity overrides standard rules.' },
       authorization: { type: 'string', description: 'For a PC opportunity attack: copy the one-use authorization from the server player/button notice for this movement window. declared_by is not consent. Sentinel counterattacks already authorized through dnd_apply need no second token.' },
       dm_override: {
@@ -339,23 +343,35 @@ export function registerDiceTools(kit: ToolKit): void {
           : undefined;
         const damageType = str(args.damage_type);
         const explicitDefense = parseDefense(args.defense);
+        const globalEffects = service.globalEffects();
+        const isRanged = weapon !== undefined ? isRangedWeapon(weapon) : false;
+        const hasWeapon = weapon !== undefined || (ch.kind !== 'pc' && override === undefined);
         // 先跑结构化状态计算（若被魅惑不能攻击目标则在扣资源与掷骰前直接拦截）
         const stateMods = args.ignore_state_mods === true
           ? undefined
           : computeAttackStateMods(c, ch, target, {
             ...(distanceFt !== undefined ? { distanceFt } : {}),
-            isRanged: weapon !== undefined ? isRangedWeapon(weapon) : false,
+            isRanged,
+            hasWeapon,
             explicitAdvantage: adv,
             ...(bonusDice !== undefined ? { explicitBonusDice: bonusDice } : {}),
             fightingSpirit: spiritAdv,
+            globalEffects,
           });
         const defenseMod = args.ignore_state_mods === true
           ? { defense: explicitDefense }
-          : computeDefenseStateMod(target, damageType, explicitDefense);
+          : computeDefenseStateMod(target, damageType, explicitDefense, c, globalEffects);
         const defense = defenseMod.defense;
 
         const spent = spendKey === undefined ? undefined : useResource(c, ch.name, spendKey);
-        const spentNote = spent === undefined ? '' : `\n用掉「${spent.key}」，剩 ${spent.resource.current}/${spent.resource.max}`;
+        const slotMatch = spent === undefined ? null : /([1-9])\s*环/.exec(spent.key);
+        const spellWarn = slotMatch !== null && args.reaction !== true && c.initiative?.order[c.initiative.turn]?.name === ch.name
+          ? recordTurnSpellCast(ensureTurnState(c), ch.name, label ?? spent!.key, Number(slotMatch[1]), 'action')
+          : undefined;
+        const spentNote = [
+          spent === undefined ? '' : `用掉「${spent.key}」，剩 ${spent.resource.current}/${spent.resource.max}`,
+          spellWarn ?? '',
+        ].filter(Boolean).map((s) => `\n${s}`).join('');
         const extraRoll = bonusDice === undefined ? undefined : rollExpression(bonusDice, service.roller);
         let autoDiceTotal = 0;
         const autoDiceDetails: string[] = [];
@@ -383,9 +399,13 @@ export function registerDiceTools(kit: ToolKit): void {
         const cursed = hexbladeCurseOn(c, ch.name, target.name) !== undefined
           || (target.conditions.some((cond) => cond.includes('咒剑诅咒')) && ch.resources?.['咒剑诅咒'] !== undefined);
         const rawCritOn = int(args.crit_on);
-        const critThreshold = Math.min(rawCritOn !== undefined ? Math.max(18, Math.min(20, rawCritOn)) : 20, cursed ? 19 : 20);
+        const critThreshold = Math.min(
+          rawCritOn !== undefined ? Math.max(18, Math.min(20, rawCritOn)) : 20,
+          cursed ? 19 : 20,
+          stateMods?.critThreshold ?? 20,
+        );
         const naturalCrit = roll.natural >= critThreshold;
-        const targetAc = armorClass(c, target);
+        const targetAc = armorClass(c, target, globalEffects);
         const hit = naturalCrit || (roll.natural !== 1 && roll.total >= targetAc);
         const autoCritOnHit = stateMods?.autoCritOnHit === true;
         const effectiveCrit = naturalCrit || (hit && autoCritOnHit);
@@ -406,7 +426,20 @@ export function registerDiceTools(kit: ToolKit): void {
         const lines = [`${ch.name}${label !== undefined ? `（${label}）` : ''} 攻击 ${target.name}：${roll.detail}${spiritNote}${extraNote}${stateSuffix}${target.kind === 'monster' ? '' : ` vs AC ${targetAc}`} → ${verdictText} #R${id}${spentNote}`];
         for (const n of stateMods?.notes ?? []) lines.push(`【状态提示】${n}`);
 
-        let extra = str(args.damage);
+        const rawExtra = str(args.damage);
+        const collected = collectHitRiders(c, ch, target, {
+          ...(weapon !== undefined ? { weapon } : {}),
+          ...(attackAbility !== undefined ? { ability: attackAbility } : {}),
+          isRanged,
+          effectiveAdvantage: effectiveAdv,
+          ...(rawExtra !== undefined ? { explicitExtraDamage: rawExtra } : {}),
+          ...(damageType !== undefined ? { mainDamageType: damageType } : {}),
+          ignoreStateMods: args.ignore_state_mods === true,
+          globalEffects,
+        });
+        for (const sn of collected.skippedNotes) lines.push(`【防重算】${sn}`);
+
+        let extra = rawExtra;
         let curseNote = '';
         const curseBonus = cursed ? proficiencyBonus(ch.level) : 0;
         const hasBaseDamage = weapon !== undefined || extra !== undefined || ch.damage !== undefined;
@@ -427,7 +460,24 @@ export function registerDiceTools(kit: ToolKit): void {
         const hold = c.initiative !== undefined && (wantHold || (expression !== undefined && roll.natural !== 1 && auto.length > 0));
         if (hold) {
           const dmg = hit && expression !== undefined ? rollAttackDamage(ch, weapon, expression, effectiveCrit, service.roller) : undefined;
-          if (dmg !== undefined) lines.push(`伤害（还没扣）${dmg.detail}${curseNote}`);
+          const pendingRiders: PendingRider[] = hit
+            ? rollCollectedRiders(c, target, collected.riders, effectiveCrit, service.roller, args.ignore_state_mods === true, globalEffects)
+            : collected.riders.map((r) => {
+              const rDef = args.ignore_state_mods === true ? undefined : computeDefenseStateMod(target, r.damageType, undefined, c, globalEffects).defense;
+              return {
+                label: r.label,
+                expression: r.expression,
+                damageType: r.damageType,
+                ...(rDef !== undefined ? { defense: rDef } : {}),
+                ...(r.oncePerTurnRule !== undefined ? { oncePerTurnRule: r.oncePerTurnRule } : {}),
+              };
+            });
+          if (dmg !== undefined) {
+            const riderPreview = pendingRiders.length > 0
+              ? `；附伤 ${pendingRiders.map((r) => `${r.label} ${r.detail ?? r.expression} ${r.damageType}`).join(' + ')}`
+              : '';
+            lines.push(`伤害（还没扣）${dmg.detail}${curseNote}${riderPreview}`);
+          }
           pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote}${stateSuffix} → ${verdictText}（待反应）`, id);
           const p: PendingAttack = {
             kind: 'attack', seq: id, at: Date.now(), attacker: ch.name, target: target.name, natural: roll.natural, rollDetail: roll.detail,
@@ -443,6 +493,7 @@ export function registerDiceTools(kit: ToolKit): void {
             ...(damageType !== undefined ? { damageType } : {}),
             ...(defense !== undefined ? { defense } : {}),
             ...(onHit !== undefined ? { onHit } : {}),
+            ...(pendingRiders.length > 0 ? { riders: pendingRiders } : {}),
           };
           requireInitiative(c).pending = p;
           lines.push(holdNotice(p));
@@ -453,10 +504,14 @@ export function registerDiceTools(kit: ToolKit): void {
             lines.push('没有伤害表达式：传 weapon（角色卡上的武器），或用 dnd_roll 掷伤害（重击时骰子翻倍）再 dnd_apply 扣血。');
           } else {
             const dmg = rollAttackDamage(ch, weapon, expression, effectiveCrit, service.roller);
+            const rolledRiders = rollCollectedRiders(c, target, collected.riders, effectiveCrit, service.roller, args.ignore_state_mods === true, globalEffects);
             const amount = saveDamage(dmg.total, false, 'half', defense);
-            pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote}${stateSuffix} → ${verdictText}，伤害 ${dmg.detail}${curseNote}`, id);
+            const riderLedger = rolledRiders.length > 0
+              ? ` + 附伤(${rolledRiders.map((r) => `${r.label} ${r.detail} ${r.damageType}`).join(' + ')})`
+              : '';
+            pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote}${stateSuffix} → ${verdictText}，伤害 ${dmg.detail}${curseNote}${riderLedger}`, id);
             lines.push(`伤害 ${dmg.detail}${curseNote}${defense !== undefined ? `，${DEFENSE_NAMES[defense]} → ${amount}` : ''}`);
-            lines.push(...settleAttackDamage(c, ch.name, target.name, dmg.total, effectiveCrit, damageType, defense, onHit, service.roller));
+            lines.push(...settleAttackDamage(c, ch.name, target.name, dmg.total, effectiveCrit, damageType, defense, onHit, service.roller, rolledRiders));
           }
         } else {
           pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote}${stateSuffix} → ${verdictText}`, id);
@@ -486,13 +541,23 @@ export function registerDiceTools(kit: ToolKit): void {
       const spentNote = spent === undefined ? '' : `\n用掉「${spent.key}」，剩 ${spent.resource.current}/${spent.resource.max}`;
 
       if (kind === 'save' && args.ignore_state_mods !== true) {
+        const globalEffects = service.globalEffects();
+        const vsTags = [
+          ...(args.concentration === true ? ['concentration'] : []),
+          ...(str(args.damage_type) !== undefined ? [str(args.damage_type)!] : []),
+        ];
         const saveMods = computeSaveStateMods(ch, ability, {
           explicitAdvantage: adv,
           ...(bonusDice !== undefined ? { explicitBonusDice: bonusDice } : {}),
+          vsTags,
+          campaign: c,
+          globalEffects,
         });
         if (saveMods.autoFail) {
           const id = rollId(c, exec);
-          const concBroken = args.concentration === true ? breakConcentration(c, ch.name, '专注豁免失败') : [];
+          const concBroken = args.concentration === true
+            ? [...breakConcentration(c, ch.name, '专注豁免失败'), ...checkAllAirborneCrashes(c, service.roller, globalEffects)]
+            : [];
           const concLine = concBroken.length > 0 ? `\n${concBroken.join('；')}` : '';
           return `${ch.name} ${label}：自动失败（${saveMods.autoFailReason ?? '状态限制'}）${dc !== undefined ? ' → 失败' : ''} #R${id}${spentNote}${concLine}\n${secret ? HIDDEN_ROLL_NOTE : SECRET_NOTE}${combatLedgerSuffix(c)}`;
         }
@@ -505,18 +570,23 @@ export function registerDiceTools(kit: ToolKit): void {
           autoDiceTotal += m[1] === '-' ? -r.total : r.total;
           autoDiceDetails.push(`${m[1]}${r.detail}`);
         }
-        const bonus = (int(args.bonus) ?? 0) + (extraRoll?.total ?? 0) + autoDiceTotal;
+        const bonus = (int(args.bonus) ?? 0) + (extraRoll?.total ?? 0) + autoDiceTotal + saveMods.flatBonus;
         const extraNote = extraRoll === undefined ? '' : `（含额外骰 ${extraRoll.detail}）`;
         const id = rollId(c, exec);
         const roll = rollD20(checkModifier(ch, kind, ability, skill) + bonus, saveMods.advantage, service.roller);
-        const stateSummary = formatStateModSummary(saveMods.advReasons, saveMods.disadvReasons, saveMods.advantage, autoDiceDetails);
+        const stateSummary = formatStateModSummary(
+          saveMods.advReasons,
+          saveMods.disadvReasons,
+          saveMods.advantage,
+          [...saveMods.flatBonusReasons, ...autoDiceDetails],
+        );
         const stateSuffix = stateSummary !== undefined ? ` ${stateSummary}` : '';
         const passed = dc === undefined ? undefined : roll.total >= dc;
         const verdict = passed === undefined
           ? ''
           : ` → ${passed ? '成功' : '失败'}${roll.natural === 20 ? '（天然 20）' : (roll.natural === 1 ? '（天然 1）' : '')}`;
         const concBroken = passed === false && args.concentration === true && !wantHold
-          ? breakConcentration(c, ch.name, '专注豁免失败')
+          ? [...breakConcentration(c, ch.name, '专注豁免失败'), ...checkAllAirborneCrashes(c, service.roller, globalEffects)]
           : [];
         const concLine = concBroken.length > 0 ? `\n${concBroken.join('；')}` : '';
         const head = `${ch.name} ${label}：${roll.detail}${extraNote}${stateSuffix}${verdict} #R${id}${spentNote}${concLine}`;
@@ -592,6 +662,7 @@ export function registerDiceTools(kit: ToolKit): void {
             name: { type: 'string' }, damage: { type: 'integer' }, heal: { type: 'integer' }, temp_hp: { type: 'integer' },
             damage_type: { type: 'string' }, defense: { type: 'string', enum: ['resistant', 'immune', 'vulnerable'] },
             add_conditions: { type: 'array', items: { type: 'string' } }, remove_conditions: { type: 'array', items: { type: 'string' } },
+            drop_concentration: { type: 'boolean' }, rounds: { type: 'integer' },
           }, required: ['name'], additionalProperties: false,
         },
       },
@@ -603,6 +674,12 @@ export function registerDiceTools(kit: ToolKit): void {
       crit: { type: 'boolean', description: 'The damage came from a critical hit.' },
       heal: { type: 'integer' },
       temp_hp: { type: 'integer' },
+      caster: { type: 'string', description: 'Optional healer/caster character name (enables automatic 生命门徒/神佑医者 bonuses on leveled heals and concentration source binding).' },
+      slot_level: { type: 'integer', description: 'Optional spell slot level (1-9) when applying a leveled healing spell (triggers 生命门徒 +2+slot and 神佑医者 self-heal).' },
+      preserve_life: { type: 'boolean', description: 'True when applying 保全生命 (Preserve Life): caps each target\'s restored HP at half its effective max HP.' },
+      drop_concentration: { type: 'boolean', description: 'Drop active concentration of the target creature(s), clearing their concentrated buffs/debuffs and battlefield zones.' },
+      concentration: { type: 'boolean', description: 'Bind add_conditions to `caster`\'s concentration.' },
+      rounds: { type: 'integer', description: 'Duration in rounds for add_conditions.' },
       add_conditions: { type: 'array', items: { type: 'string' }, description: 'e.g. ["中毒", "倒地"]' },
       remove_conditions: { type: 'array', items: { type: 'string' } },
       reaction: {
@@ -656,7 +733,7 @@ export function registerDiceTools(kit: ToolKit): void {
         if (c.initiative?.pending === undefined && c.initiative?.movement !== undefined) {
           if (args.ask_reactions !== undefined) throw new Error('移动借机名单由路径和触及范围计算；ask_reactions 只用于待结算骰子');
           if (args.reaction !== undefined) throw new Error('移动借机用 dnd_check type=attack reaction=true 结算，不用 dnd_apply reaction 改数值');
-          const text = resolveMovement(c, args);
+          const text = resolveMovement(c, args, { roller: service.roller, globalEffects: service.globalEffects() });
           if (c.initiative?.movement !== undefined) deps.onPendingAttack?.(recordOf(exec));
           else deps.onTurnChange?.(recordOf(exec));
           return text;
@@ -686,6 +763,17 @@ export function registerDiceTools(kit: ToolKit): void {
       });
       if (args.damage !== undefined && args.damage_roll !== undefined) throw new Error('damage 和 damage_roll 二选一');
       if (args.heal !== undefined && args.heal_roll !== undefined) throw new Error('heal 和 heal_roll 二选一');
+      for (const { ch, values } of resolved) {
+        const hasDmg = int(values.damage) !== undefined || str(args.damage_roll) !== undefined;
+        const hasHeal = int(values.heal) !== undefined || str(args.heal_roll) !== undefined;
+        if (hasDmg && hasHeal) {
+          throw new Error(`不能对同一目标「${ch.name}」同时传 damage 和 heal；请分清本次是受伤还是治疗（若需修正角色卡生命上限请用 dnd_character update）`);
+        }
+      }
+      const globalEffects = service.globalEffects();
+      const casterName = str(args.caster);
+      const casterCh = casterName !== undefined ? requireCharacter(c, casterName) : undefined;
+      const slotLevel = int(args.slot_level);
       const damageRoll = str(args.damage_roll) === undefined ? undefined : rollExpression(String(args.damage_roll), service.roller);
       const healRoll = str(args.heal_roll) === undefined ? undefined : rollExpression(String(args.heal_roll), service.roller);
       const lines: string[] = [];
@@ -694,27 +782,84 @@ export function registerDiceTools(kit: ToolKit): void {
         if (damageRoll !== undefined) lines.push(`公共伤害 ${damageRoll.detail} #R${id}`);
         if (healRoll !== undefined) lines.push(`公共治疗 ${healRoll.detail} #R${id}`);
       }
+      let blessedHealerApplied = false;
+      if (args.concentration === true && casterCh !== undefined && resolved.some(({ values }) => (strList(values.add_conditions)?.length ?? 0) > 0)) {
+        const brokenPrev = breakConcentration(c, casterCh.name, '施放新的专注效果');
+        lines.push(...brokenPrev);
+      }
       for (const { ch, values } of resolved) {
         const details: string[] = [];
         const damage = int(values.damage) ?? damageRoll?.total;
-        const healing = int(values.heal) ?? healRoll?.total;
+        let healing = int(values.heal) ?? healRoll?.total;
         const temp = int(values.temp_hp);
         if (damage !== undefined && damage > 0) {
           const explicitDef = parseDefense(values.defense);
           const defMod = args.ignore_state_mods === true
             ? { defense: explicitDef }
-            : computeDefenseStateMod(ch, str(values.damage_type), explicitDef);
+            : computeDefenseStateMod(ch, str(values.damage_type), explicitDef, c, globalEffects);
           const amount = saveDamage(damage, false, 'half', defMod.defense);
           const reasonNote = defMod.reason !== undefined ? `（${defMod.reason} → ${amount}）` : '';
           details.push(`${hpLine(applyDamage(c, ch.name, amount, { crit: args.crit === true, damageType: str(values.damage_type), roller: service.roller }))}${reasonNote}`);
         }
-        if (healing !== undefined && healing > 0) details.push(hpLine(heal(c, ch.name, healing)));
+        if (healing !== undefined && healing > 0) {
+          const healNotes: string[] = [];
+          let capHalf = args.preserve_life === true;
+          if (casterCh !== undefined && args.ignore_state_mods !== true) {
+            const ctx = buildFormulaContext(casterCh, slotLevel !== undefined ? { slotLevel } : {});
+            for (const { def } of activeEffectDefsFor(casterCh, c.customEffects, globalEffects)) {
+              const hm = def.healMod;
+              if (hm === undefined) continue;
+              if (hm.capAtHalfMaxHp) capHalf = true;
+              if (slotLevel !== undefined && slotLevel >= 1 && hm.bonusFormula !== undefined) {
+                const extra = evalIntFormula(hm.bonusFormula, ctx);
+                if (extra > 0) {
+                  healing += extra;
+                  healNotes.push(`${def.name}+${extra}`);
+                }
+              }
+              if (!blessedHealerApplied && ch.name !== casterCh.name && slotLevel !== undefined && slotLevel >= 1 && hm.selfHealOnOtherFormula !== undefined && !casterCh.conditions.includes('死亡')) {
+                const selfGain = evalIntFormula(hm.selfHealOnOtherFormula, ctx);
+                if (selfGain > 0) {
+                  blessedHealerApplied = true;
+                  const selfRes = heal(c, casterCh.name, selfGain);
+                  lines.push(`【${def.name}】${hpLine(selfRes)}`);
+                }
+              }
+            }
+          }
+          if (capHalf) {
+            const halfCap = Math.floor(effectiveMaxHp(ch) / 2);
+            const allowed = Math.max(0, halfCap - ch.hp);
+            if (healing > allowed) {
+              healing = allowed;
+              healNotes.push(`半血上限 ${halfCap}`);
+            }
+          }
+          if (healing > 0) {
+            details.push(`${hpLine(heal(c, ch.name, healing))}${healNotes.length > 0 ? `（${healNotes.join('，')}）` : ''}`);
+          } else if (healNotes.length > 0) {
+            details.push(`${ch.name} 已达治疗上限（${healNotes.join('，')}），恢复 0 HP`);
+          }
+        }
         if (temp !== undefined && temp > 0) details.push(hpLine(grantTempHp(c, ch.name, temp)));
-        for (const cond of strList(values.add_conditions) ?? []) changeCondition(c, ch.name, cond, true);
+        if (values.drop_concentration === true) {
+          const broken = [...breakConcentration(c, ch.name, '主动解除专注'), ...checkAllAirborneCrashes(c, service.roller, globalEffects)];
+          details.push(broken.length > 0 ? broken.join('；') : `${ch.name} 当前没有维持中的专注效果`);
+        }
+        const addRounds = int(values.rounds);
+        for (const cond of strList(values.add_conditions) ?? []) {
+          changeCondition(c, ch.name, cond, true, {
+            ...(casterCh !== undefined ? { source: casterCh.name } : {}),
+            ...(args.concentration === true && casterCh !== undefined ? { concentration: true, replaceConcentration: false } : {}),
+            ...(addRounds !== undefined ? { roundsLeft: addRounds } : {}),
+            roller: service.roller,
+            globalEffects,
+          });
+        }
         const removals = strList(values.remove_conditions) ?? [];
         // 先移除非“倒地”状态（例如同一步挣脱擒抱并起身），再结算起身半速校验
         for (const cond of removals) {
-          if (normalizeCondition(cond) !== '倒地') changeCondition(c, ch.name, cond, false);
+          if (normalizeCondition(cond) !== '倒地') changeCondition(c, ch.name, cond, false, { roller: service.roller, globalEffects });
         }
         for (const cond of removals) {
           if (normalizeCondition(cond) !== '倒地') continue;
@@ -739,7 +884,7 @@ export function registerDiceTools(kit: ToolKit): void {
               details.push(`起身消耗 ${standCost} 尺移动力（本回合移动 ${prevMoved + standCost}/${avail} 尺）`);
             }
           }
-          changeCondition(c, ch.name, cond, false);
+          changeCondition(c, ch.name, cond, false, { roller: service.roller, globalEffects });
         }
         if (details.length === 0) details.push(ch.kind === 'monster' ? `${ch.name} 状态已更新` : `${ch.name} HP ${ch.hp}/${ch.maxHp}`);
         details.push(`状态：${ch.conditions.join('、') || '无'}`);

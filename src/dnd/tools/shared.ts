@@ -17,11 +17,12 @@ type Character,
 type CharacterInput,
 type ReactionDef,type HpChange,
 type PendingAttack,
+type PendingRider,
 type OnHitEffect,
 type PendingCheck,
 type PendingD20,
 type ReactorOption,UNDEAD_FORTITUDE,
-applyDamage,armorClass,assertDeclaredByOwner,attackModifier,changeInventory,describePending,findCharacter,initBonusOf,
+applyDamage,armorClass,assertDeclaredByOwner,attackModifier,changeInventory,checkAllAirborneCrashes,describePending,findCharacter,initBonusOf,
 findWeapon,isOut,inInitiative,isSurprised,
 isRangedWeapon,
 isTwoHandedWeapon,outsideRooms,nextRollId,pushCombatLedger,pushLog,
@@ -72,7 +73,17 @@ updateNpc
 import { ABILITIES,ABILITY_NAMES,type Ability,type Skill,SKILLS,parseAbility,parseSkill,skillLabel } from '../rules.ts';
 import { type SrdEntry,type SrdKind,candidatesText,resolveSrdQuery,zhTable } from '../srd-lookup.ts';
 import { type AbilityActionKind,type CardEntryKind,type SpellInput,type UrlCheck,spellLine } from '../spell-links.ts';
-import { effectiveMaxHp,formatCharacterStates,turnLedgerLine } from '../conditions.ts';
+import {
+  type CollectedRider,
+  breakConcentration,
+  computeDefenseStateMod,
+  effectiveMaxHp,
+  ensureTurnState,
+  formatCharacterStates,
+  recordTurnSpellCast,
+  turnLedgerLine,
+} from '../conditions.ts';
+import type { CustomEffectDef } from '../custom-effects.ts';
 import {
 type Placement,canReact,mapOf,turnPositionNote
 } from '../battlefield.ts';
@@ -229,12 +240,66 @@ export function onHitArg(value: unknown): OnHitEffect | undefined {
     ...(raw.critical_only === true ? { criticalOnly: true } : {}), ...(defense !== undefined ? { defense } : {}) };
 }
 
+/** 将自动收集的命中附伤掷骰并计算各自独立抗性 */
+export function rollCollectedRiders(
+  c: Campaign,
+  target: Character,
+  riders: readonly CollectedRider[],
+  crit: boolean,
+  roller: Roller,
+  ignoreStateMods = false,
+  globalEffects?: Record<string, CustomEffectDef>,
+): PendingRider[] {
+  return riders.map((r) => {
+    const expr = crit ? critExpression(r.expression) : r.expression;
+    const rolled = rollExpression(expr, roller);
+    const defMod = ignoreStateMods
+      ? { defense: undefined }
+      : computeDefenseStateMod(target, r.damageType, undefined, c, globalEffects);
+    return {
+      label: r.label,
+      expression: r.expression,
+      rawDamage: rolled.total,
+      detail: rolled.detail,
+      damageType: r.damageType,
+      ...(defMod.defense !== undefined ? { defense: defMod.defense } : {}),
+      ...(r.oncePerTurnRule !== undefined ? { oncePerTurnRule: r.oncePerTurnRule } : {}),
+    };
+  });
+}
+
 /** 同一击的不同伤害分开过抗性，再合并扣血，避免多记死亡豁免或先触发一次不死坚韧。 */
-export function settleAttackDamage(c: Campaign, attacker: string, target: string, raw: number, crit: boolean, damageType: string | undefined,
-  defense: PendingAttack['defense'], onHit: OnHitEffect | undefined, roller: Roller): string[] {
+export function settleAttackDamage(
+  c: Campaign,
+  attacker: string,
+  target: string,
+  raw: number,
+  crit: boolean,
+  damageType: string | undefined,
+  defense: PendingAttack['defense'],
+  onHit: OnHitEffect | undefined,
+  roller: Roller,
+  riders: readonly PendingRider[] = [],
+): string[] {
   let amount = saveDamage(raw, false, 'half', defense);
   let type = amount > 0 ? damageType : undefined;
   const lines: string[] = [];
+  for (const r of riders) {
+    let rRaw = r.rawDamage;
+    let rDetail = r.detail;
+    if (rRaw === undefined) {
+      const rolled = rollExpression(crit ? critExpression(r.expression) : r.expression, roller);
+      rRaw = rolled.total;
+      rDetail = rolled.detail;
+    }
+    const added = saveDamage(rRaw, false, 'half', r.defense);
+    amount += added;
+    if (added > 0 && /光耀|radiant/i.test(r.damageType)) type = '光耀';
+    lines.push(`附伤「${r.label}」${rDetail ?? rRaw} ${r.damageType}${r.defense !== undefined ? `，${DEFENSE_NAMES[r.defense]} → ${added}` : ''}`);
+    if (r.oncePerTurnRule !== undefined && c.initiative?.turnState?.actor === attacker) {
+      c.initiative.turnState.oncePerTurnUsed = [...new Set([...(c.initiative.turnState.oncePerTurnUsed ?? []), r.oncePerTurnRule])];
+    }
+  }
   if (onHit !== undefined && (!onHit.criticalOnly || crit)) {
     const [, resource] = requireResource(requireCharacter(c, attacker), onHit.spend);
     if (resource.current <= 0) lines.push(`${onHit.name} 未追加：${onHit.spend} 已用完，没有扣资源。`);
@@ -263,6 +328,7 @@ export function parsePlacements(value: unknown): Placement[] {
       name,
       ...(o.x !== undefined ? { x: o.x as number } : {}),
       ...(o.y !== undefined ? { y: o.y as number } : {}),
+      ...(o.z !== undefined ? { z: o.z as number } : {}),
       ...(near !== undefined ? { near } : {}),
       ...(o.mark === true ? { mark: true } : {}),
     };
@@ -413,7 +479,7 @@ export function sheet(ch: Character, who: (openid: string) => string = (id) => i
   const effMax = effectiveMaxHp(ch);
   const lines = [
     `${ch.name}${ch.player ? `〈${ch.player}${ch.playerId ? ` ${who(ch.playerId)}` : ''}〉` : ''}｜${ch.kind === 'pc' ? 'PC' : (ch.kind === 'npc' ? 'NPC' : '怪物')}${ch.className ? ` ${ch.className}` : ''} ${ch.level} 级`,
-    `HP ${ch.hp}/${ch.maxHp}${effMax < ch.maxHp ? `（力竭有效上限 ${effMax}）` : ''}${ch.tempHp > 0 ? ` +${ch.tempHp}` : ''}  AC ${armorClass(campaign, ch)}${campaign?.initiative?.shielded?.includes(ch.name) ? `（基础 ${ch.ac}；护盾术 +5，到自己下回合开始）` : ''}${ch.speed !== undefined ? `  速度 ${ch.speed}` : ''}`,
+    `HP ${ch.hp}/${ch.maxHp}${effMax < ch.maxHp ? `（力竭有效上限 ${effMax}）` : ''}${ch.tempHp > 0 ? ` +${ch.tempHp}` : ''}  AC ${armorClass(campaign, ch)}${campaign?.initiative?.shielded?.includes(ch.name) ? `（基础 ${ch.ac}；护盾术 +5，到自己下回合开始）` : ''}${ch.speed !== undefined ? `  速度 ${ch.speed}` : ''}${ch.flySpeed !== undefined ? `  飞行 ${ch.flySpeed}${ch.hover ? '(悬浮)' : ''}` : ''}`,
     abilities,
     `固定先攻 ${initBonusOf(ch) >= 0 ? '+' : ''}${initBonusOf(ch)}${ch.initBonus === undefined ? '（敏捷；备注中的额外被动不会自动计入）' : '（角色卡总加值，开战时不要重复添加）'}`,
   ];
@@ -423,7 +489,8 @@ export function sheet(ch: Character, who: (openid: string) => string = (id) => i
   if (ch.attackBonus !== undefined || ch.damage !== undefined) lines.push(`攻击 +${attackModifier(ch)} 伤害 ${ch.damage ?? '?'}`);
   for (const w of ch.weapons ?? []) {
     const hit = weaponAttackModifier(ch, w);
-    lines.push(`武器 ${w.name}${weaponTags(w)}：命中 ${hit >= 0 ? '+' : ''}${hit}，伤害 ${weaponDamage(ch, w)}${w.notes ? `（${w.notes}）` : ''}`);
+    const riderSuffix = w.riders?.length ? ` + 附伤[${w.riders.map((r) => `${r.damage} ${r.damageType}`).join(' + ')}]` : '';
+    lines.push(`武器 ${w.name}${weaponTags(w)}：命中 ${hit >= 0 ? '+' : ''}${hit}，伤害 ${weaponDamage(ch, w)}${riderSuffix}${w.notes ? `（${w.notes}）` : ''}`);
   }
   if ((ch.reactions?.length ?? 0) > 0) lines.push(`反应：${ch.reactions!.map((r) => r.name).join('、')}`);
   if ((ch.spells?.length ?? 0) > 0) lines.push(spellLine(ch.spells!));
@@ -516,6 +583,19 @@ export function parseWeapons(value: unknown): Weapon[] | undefined {
     if (w.proficient === false) weapon.proficient = false;
     if (typeof w.ranged === 'boolean') weapon.ranged = w.ranged;
     if (typeof w.two_handed === 'boolean') weapon.twoHanded = w.two_handed;
+    if (Array.isArray(w.riders)) {
+      const riders = w.riders.map((rr, idx) => {
+        const ro = (rr ?? {}) as Record<string, unknown>;
+        const rDmg = str(ro.damage);
+        const rType = str(ro.damage_type ?? ro.damageType);
+        if (rDmg === undefined || rType === undefined) {
+          throw new Error(`武器「${name}」的 riders[${idx}] 需要 damage 和 damage_type`);
+        }
+        rollExpression(rDmg);
+        return { damage: rDmg, damageType: rType };
+      });
+      if (riders.length > 0) weapon.riders = riders;
+    }
     return weapon;
   });
 }
@@ -859,8 +939,12 @@ export function srdMonsterInput(data: Record<string, unknown>): Omit<CharacterIn
   if (attack !== undefined) input.attackBonus = num(attack.attack_bonus)!;
   if (typeof dice === 'string') input.damage = dice.replace(/\s+/g, '');
   if (traits.length > 0) input.traits = traits;
-  const walk = /(\d+)/.exec(String((data.speed as { walk?: unknown } | undefined)?.walk ?? ''));
+  const speedObj = data.speed as { walk?: unknown; fly?: unknown; hover?: unknown } | undefined;
+  const walk = /(\d+)/.exec(String(speedObj?.walk ?? ''));
   if (walk !== null) input.speed = Number(walk[1]);
+  const fly = /(\d+)/.exec(String(speedObj?.fly ?? ''));
+  if (fly !== null && Number(fly[1]) > 0) input.flySpeed = Number(fly[1]);
+  if (speedObj?.hover === true) input.hover = true;
   const notes = [attack !== undefined ? `攻击：${String(attack.name)}` : '', specials.map((s) => String(s.name)).join('、')].filter(Boolean).join('；');
   if (notes) input.notes = notes;
   return input;
@@ -991,6 +1075,10 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     Object.assign(p, { natural: r.natural, total: r.total, rollDetail: r.detail, crit: r.natural >= (p.critThreshold ?? 20) });
     delete p.rawDamage;
     delete p.damageDetail;
+    for (const rider of p.riders ?? []) {
+      delete rider.rawDamage;
+      delete rider.detail;
+    }
     return `重掷 #R${id}：${old} 作废 → ${r.detail}`;
   };
   const rerollCheck = (c: Campaign, entry: PendingD20, exec: Exec): string => {
@@ -1016,6 +1104,8 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       ...(p.damage !== undefined ? { damage: Math.max(0, p.damage.total + p.damageMod), onSave: p.damage.onSave } : {}),
       ...(p.damage?.type !== undefined ? { damageType: p.damage.type } : {}),
       ...(p.onFail !== undefined ? { onFail: p.onFail } : {}),
+      ...(p.concentrationSource !== undefined ? { concentrationSource: p.concentrationSource } : {}),
+      ...(p.failRounds !== undefined ? { failRounds: p.failRounds } : {}),
       roller: service.roller,
     });
     return [`落账：${describePending(p)}`, ...saveOutcomeLines(outcomes)];
@@ -1139,7 +1229,17 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
         const dmg = rollAttackDamage(attacker, weapon, expression, effectiveCrit, service.roller);
         p.rawDamage = dmg.total;
         p.damageDetail = dmg.detail;
-        lines.push(`现在命中${effectiveCrit ? '（重击）' : ''}，伤害 ${dmg.detail}`);
+        for (const rider of p.riders ?? []) {
+          if (rider.rawDamage === undefined) {
+            const rr = rollExpression(effectiveCrit ? critExpression(rider.expression) : rider.expression, service.roller);
+            rider.rawDamage = rr.total;
+            rider.detail = rr.detail;
+          }
+        }
+        const riderInfo = p.riders?.length
+          ? `；附伤 ${p.riders.map((r) => `${r.label} ${r.detail ?? r.rawDamage} ${r.damageType}`).join(' + ')}`
+          : '';
+        lines.push(`现在命中${effectiveCrit ? '（重击）' : ''}，伤害 ${dmg.detail}${riderInfo}`);
       }
     }
 
@@ -1195,9 +1295,9 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       const effectiveCrit = p.crit || p.autoCritOnHit === true;
       const raw = Math.max(0, p.rawDamage + p.damageMod);
       const amount = saveDamage(raw, false, 'half', p.defense);
-      if (usedNote.length > 0) pushCombatLedger(c, `${p.attacker}→${p.target} 落账：受 ${amount}${usedNote}`, p.seq);
+      pushCombatLedger(c, `${p.attacker}→${p.target} 落账：受 ${amount}${p.riders?.length ? ` + 附伤(${p.riders.map((r) => `${r.label}`).join('+')})` : ''}${usedNote}`, p.seq);
       lines.push(`${p.attacker}→${p.target} 落账：${p.defense !== undefined ? `${DEFENSE_NAMES[p.defense]} ` : ''}受 ${amount}`);
-      lines.push(...settleAttackDamage(c, p.attacker, p.target, raw, effectiveCrit, p.damageType, p.defense, p.onHit, service.roller));
+      lines.push(...settleAttackDamage(c, p.attacker, p.target, raw, effectiveCrit, p.damageType, p.defense, p.onHit, service.roller, p.riders ?? []));
     } else {
       const effectiveCrit = p.crit || p.autoCritOnHit === true;
       lines.push(`${p.attacker}→${p.target} 落账：命中${effectiveCrit ? '（重击）' : ''}，用 dnd_roll 掷伤害再 dnd_apply 扣血。`);
@@ -1225,11 +1325,24 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     const damageType = str(args.damage_type);
     const onSave = args.on_save === 'none' ? 'none' : 'half';
     const onFail = strList(args.on_fail_conditions);
+    const failRounds = int(args.rounds);
+    const isConcControl = args.concentration === true && (onFail?.length ?? 0) > 0 && source !== undefined && hasSheet;
+    const concSource = isConcControl ? source : undefined;
     const spent = spendKey === undefined ? undefined : useResource(c, spender, spendKey);
+    const slotMatch = spent === undefined ? null : /([1-9])\s*环/.exec(spent.key);
+    const spellWarn = slotMatch !== null && args.reaction !== true && c.initiative?.order[c.initiative.turn]?.name === spender
+      ? recordTurnSpellCast(ensureTurnState(c), spender, spent!.key, Number(slotMatch[1]), 'action')
+      : undefined;
+    const concBroken = concSource !== undefined
+      ? [...breakConcentration(c, concSource, '施放新的专注效果'), ...checkAllAirborneCrashes(c, service.roller, service.globalEffects())]
+      : [];
     const rolled = rollSaveEffect(c, {
       targets, ability, dc, damage, damageType, onSave, ...(onFail !== undefined ? { onFail } : {}),
       advantage: advantageOf(args.advantage), bonus: int(args.bonus), bonusDice: str(args.bonus_dice),
       ignoreStateMods: args.ignore_state_mods === true,
+      ...(concSource !== undefined ? { concentrationSource: concSource } : {}),
+      ...(failRounds !== undefined ? { failRounds } : {}),
+      globalEffects: service.globalEffects(),
       roller: service.roller,
     });
     const id = rollId(c, exec);
@@ -1240,10 +1353,10 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       rolled.damageRoll !== undefined
         ? `，伤害 ${rolled.damageRoll.detail}${damageType ? ` ${damageType}` : ''}（成功${onSave === 'none' ? '无伤' : '减半'}）`
         : '',
-      onFail !== undefined && onFail.length > 0 ? `，失败得「${onFail.join('、')}」` : '',
+      onFail !== undefined && onFail.length > 0 ? `，失败得「${onFail.join('、')}」${concSource !== undefined ? `（${concSource}专注）` : ''}` : '',
       ` #R${id}`,
     ].join('');
-    const lines = [head];
+    const lines = [head, ...concBroken, ...(spellWarn !== undefined ? [spellWarn] : [])];
     const spentLine = spent === undefined ? undefined : `用掉「${spent.key}」，剩 ${spent.resource.current}/${spent.resource.max}`;
 
     if (hold !== undefined) {
@@ -1262,6 +1375,8 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
           ? { damage: { total: rolled.damageRoll.total, detail: rolled.damageRoll.detail, onSave, ...(damageType !== undefined ? { type: damageType } : {}) } }
           : {}),
         ...(onFail !== undefined && onFail.length > 0 ? { onFail } : {}),
+        ...(concSource !== undefined ? { concentrationSource: concSource } : {}),
+        ...(failRounds !== undefined ? { failRounds } : {}),
         damageMod: 0, reactors: hold, declined: [], claimed: [], used: [],
       };
       requireInitiative(c).pending = p;
@@ -1283,6 +1398,8 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       ...(damageType !== undefined ? { damageType } : {}),
       onSave,
       ...(onFail !== undefined ? { onFail } : {}),
+      ...(concSource !== undefined ? { concentrationSource: concSource } : {}),
+      ...(failRounds !== undefined ? { failRounds } : {}),
       roller: service.roller,
     });
     if (args.secret !== true) {

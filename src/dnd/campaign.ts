@@ -30,11 +30,16 @@ import { type MoveRequest, battleGridLines, battleLines, canReact, cellOf, dista
 import {
   type ActiveState,
   type TurnActionState,
+  INCAPACITATING_CONDITIONS,
+  ZERO_SPEED_CONDITIONS,
   actionRestriction,
   breakConcentration,
+  computeDefenseStateMod,
   concentratingOn,
   effectiveMaxHp,
+  effectiveStates,
   exhaustionLevel,
+  hasCondition,
   isIncapacitated,
   normalizeCondition,
   removeActiveState,
@@ -42,9 +47,12 @@ import {
   tickActiveStatesOnTurnChange,
   upsertActiveState,
 } from './conditions.ts';
+import type { CustomEffectDef } from './custom-effects.ts';
 import { pendingSummaryLine } from './pending-attack.ts';
+import { DEFENSE_NAMES } from './save-effect.ts';
 import type { BattleMap } from './terrain.ts';
 import { type NpcState, afterChange, describeCondition, evalCondition, locationKnown, roomView, storySummaryLines } from './story.ts';
+import { type BattleZone, settleTurnBoundaryHazards } from './zones.ts';
 
 export type { ActiveState, TurnActionState };
 
@@ -80,6 +88,10 @@ export interface Character {
   initBonus?: number;
   /** 步行速度（尺）；缺省按 30 算，只用来提醒超速 */
   speed?: number;
+  /** 飞行速度（尺）；有值时允许在战场地图上升空 z > 0 */
+  flySpeed?: number;
+  /** 悬浮（hover）：高空陷入倒地或速度归 0 时不会坠机 */
+  hover?: boolean;
   /** 能改写攻击结果的反应；工具按它决定要不要停下来等（见 pending-attack.ts）。缺省时从备注推断 */
   reactions?: ReactionDef[];
   /** 所在房间。怪物离开房间就不进先攻；PC/NPC 缺省时跟着队伍主位置（currentRoom） */
@@ -130,6 +142,8 @@ export interface Weapon {
   ranged?: boolean;
   /** 双手持用（双手或多用途双手握）：巨武器战斗只作用在这上面；缺省看备注里有没有「双手」 */
   twoHanded?: boolean;
+  /** 多段伤害附伤（如烈焰舌 +2d6 火焰、淬毒匕首 +2d6 毒素），各自按自身伤害类型独立结算抗性/免疫且重击自动翻倍骰数 */
+  riders?: Array<{ damage: string; damageType: string }>;
 }
 
 export interface InitiativeEntry {
@@ -183,10 +197,26 @@ const INFERRED_REACTIONS: Array<{ pattern: RegExp; def: ReactionDef }> = [
   { pattern: /长柄大师|Polearm Master/i, def: { name: '长柄大师', when: 'foe_attacks', enter: true, range: 10 } },
 ];
 
+function hasPositiveReactionMention(notes: string, pattern: RegExp): boolean {
+  const cleanPattern = new RegExp(pattern.source, pattern.flags.replace('g', ''));
+  for (const sub of notes.split(/[，,。\n；;！!]+/)) {
+    const m = cleanPattern.exec(sub);
+    if (m === null) continue;
+    const pre = sub.slice(0, m.index);
+    const post = sub.slice(m.index + m[0].length);
+    if (/(?:移除|取消|失去|没有|不含|未学|作废|放弃|删去)|(?:^|[^不])无\s*$/.test(pre)) continue;
+    if (/^原/.test(pre.trim()) && /(?:移除|取消|失去|作废|洗点|重修|改为)/.test(sub)) continue;
+    if (/^[^（(]*?(?:已移除|被移除|移除|已取消|取消|已失去|失去|作废|已删)/.test(post)) continue;
+    return true;
+  }
+  return false;
+}
+
 export function reactionsOf(ch: Character): ReactionDef[] {
   if (ch.reactions !== undefined) return ch.reactions;
   const notes = ch.notes ?? '';
-  return INFERRED_REACTIONS.filter(({ pattern }) => pattern.test(notes)).map(({ def }) => def);
+  if (!notes) return [];
+  return INFERRED_REACTIONS.filter(({ pattern }) => hasPositiveReactionMention(notes, pattern)).map(({ def }) => def);
 }
 
 export interface ReactorOption {
@@ -218,6 +248,16 @@ interface PendingBase {
   used: Array<{ by: string; name: string; effect: string; spendKey?: string; spendAmount?: number; consumedReaction?: boolean }>;
 }
 
+export interface PendingRider {
+  label: string;
+  expression: string;
+  rawDamage?: number;
+  detail?: string;
+  damageType: string;
+  defense?: 'resistant' | 'immune' | 'vulnerable';
+  oncePerTurnRule?: string;
+}
+
 /** 掷完骰、还没落账的一次攻击 */
 export interface PendingAttack extends PendingBase {
   kind: 'attack';
@@ -225,6 +265,8 @@ export interface PendingAttack extends PendingBase {
   /** 额外伤害表达式；未命中转命中时落账才掷，要留着 */
   extraDamage?: string;
   onHit?: OnHitEffect;
+  /** 自动收集的结构化命中附伤（脆弱诅咒、猎人印记、武器多段伤害、扩展规则附伤） */
+  riders?: PendingRider[];
   natural: number;
   rollDetail: string;
   total: number;
@@ -286,6 +328,10 @@ export interface PendingCheck extends PendingBase {
   damage?: { total: number; detail: string; type?: string; onSave: 'half' | 'none' };
   /** 豁免失败附带的状态 */
   onFail?: string[];
+  /** 豁免失败附加状态绑定的专注施法者 */
+  concentrationSource?: string;
+  /** 豁免失败附加状态的持续轮数 */
+  failRounds?: number;
   damageMod: number;
 }
 
@@ -315,6 +361,8 @@ export function describePending(p: ReactionWindow): string {
 export interface BattleCell {
   x: number;
   y: number;
+  /** 离地高度（尺，5 的非负整数倍；缺省或 0 为地面） */
+  z?: number;
   room: string;
 }
 
@@ -390,6 +438,12 @@ export interface InitiativeState {
   ledger?: CombatLedgerEntry[];
   /** 当前行动者本回合的结构化动作槽与起身记录（回合切换自动重置） */
   turnState?: TurnActionState;
+  /** 战场持续区域效果（黑暗术、毒雾、蛛网术、荆棘丛生等；随轮次倒计时、断专注或结束战斗自动清场） */
+  zones?: BattleZone[];
+  /** 当前回合内已触发过 enter 的区域键（`${zoneId}:${charName}`，推进回合自动清空） */
+  zoneTriggered?: string[];
+  /** 当前回合内已触发过伤害光环的键（`${caster}->${target}:${auraName}`，推进回合自动清空） */
+  auraTriggered?: string[];
   /** 梦境/幻境/切磋演练模式：战后自动恢复战前角色状态与房间场地图 */
   rehearsal?: boolean;
   rehearsalSnapshot?: RehearsalSnapshot;
@@ -464,6 +518,8 @@ export interface Campaign {
   enteredFrom?: Record<string, string>;
   /** 激活中的咒剑诅咒（1 分钟，战后或休息自动清除） */
   hexbladeCurses?: HexbladeCurse[];
+  /** 本战役注册的扩展/村规效果表（优先于全局 custom-effects.json） */
+  customEffects?: Record<string, CustomEffectDef>;
   /** 最近一场结束战斗的结构化摘要与账本（仅用于战后交接，不计入剧情哈希） */
   lastCombat?: LastCombatSummary;
 }
@@ -602,6 +658,8 @@ export interface CharacterInput {
   damage?: string;
   initBonus?: number;
   speed?: number;
+  flySpeed?: number;
+  hover?: boolean;
   reactions?: ReactionDef[];
   weapons?: Weapon[];
   spells?: CardSpell[];
@@ -658,6 +716,15 @@ export function upsertCharacter(c: Campaign, input: CharacterInput): { character
   if (input.damage !== undefined) next.damage = input.damage;
   if (input.initBonus !== undefined) next.initBonus = Math.trunc(input.initBonus);
   if (input.speed !== undefined) next.speed = clampInt(input.speed, 0, 300);
+  if (input.flySpeed !== undefined) {
+    const fs = clampInt(input.flySpeed, 0, 300);
+    if (fs > 0) next.flySpeed = fs;
+    else delete next.flySpeed;
+  }
+  if (input.hover !== undefined) {
+    if (input.hover) next.hover = true;
+    else delete next.hover;
+  }
   if (input.reactions !== undefined) next.reactions = input.reactions;
   if (input.weapons !== undefined) next.weapons = input.weapons;
   if (input.spells !== undefined) next.spells = input.spells;
@@ -789,6 +856,10 @@ export function applyDamage(c: Campaign, name: string, amount: number, options: 
     }
   }
   pushLog(c, `${ch.name} 受到 ${dmg} 点伤害（${hpTrail(ch, before)}）${events.length > 0 ? `，${events.join('、')}` : ''}`);
+  if (ch.hp === 0 || isIncapacitated(ch)) {
+    const crashLines = checkAllAirborneCrashes(c, options.roller ?? cryptoRoller);
+    events.push(...crashLines);
+  }
   if (events.includes('死亡') && c.hexbladeCurses !== undefined) {
     const triggered = c.hexbladeCurses.filter((x) => x.target === ch.name);
     c.hexbladeCurses = c.hexbladeCurses.filter((x) => x.target !== ch.name);
@@ -835,7 +906,102 @@ export function grantTempHp(c: Campaign, name: string, amount: number): HpChange
   return { name: ch.name, before: ch.hp, after: ch.hp, maxHp: ch.maxHp, tempHp: ch.tempHp, absorbed: 0, events: [] };
 }
 
-export function changeCondition(c: Campaign, name: string, condition: string, on: boolean): Character {
+/**
+ * 检查单个处于高空（z > 0）的角色是否因陷入倒地/失能/速度归 0 或失去飞行能力而坠机（PHB 高空坠落规则）：
+ * - 若具备 `hover: true` 或仍维持未死亡的 `飞行术`，可悬浮免于坠落；
+ * - 否则 `z` 归 0，每 10 尺掷 1d6（上限 20d6）钝击伤害，若受到至少 1 点坠落伤害则陷入「倒地」。
+ */
+export function checkAirborneCrash(
+  c: Campaign,
+  ch: Character,
+  roller: Roller = cryptoRoller,
+  globalEffects?: Record<string, CustomEffectDef>,
+): string[] {
+  const state = c.initiative;
+  if (state === undefined) return [];
+  const cell = state.positions?.[ch.name];
+  if (cell === undefined || cell.room !== roomOf(c, ch) || (cell.z ?? 0) <= 0) return [];
+
+  const fallFeet = cell.z!;
+  if (ch.conditions.includes('死亡')) {
+    delete cell.z;
+    const msg = `${ch.name} 从 ${fallFeet} 尺高空坠落地面`;
+    pushLog(c, msg);
+    return [msg];
+  }
+
+  const magicalAloft = hasCondition(ch, '飞行术');
+  const canHover = ch.hover === true || magicalAloft;
+  if (canHover) return [];
+
+  const lostFlight = (ch.flySpeed ?? 0) <= 0;
+  const incapacitatedOrPinned = hasCondition(ch, '倒地')
+    || effectiveStates(ch).some((s) => ZERO_SPEED_CONDITIONS.has(s.name) || INCAPACITATING_CONDITIONS.has(s.name))
+    || exhaustionLevel(ch) >= 5;
+  if (!lostFlight && !incapacitatedOrPinned) return [];
+
+  // 先落地归 0，防止后续 applyDamage 再次触发递归坠机
+  delete cell.z;
+  const diceCount = Math.min(20, Math.floor(fallFeet / 10));
+  if (diceCount <= 0) {
+    const msg = `【高空坠落】${ch.name} 从 ${fallFeet} 尺高度坠地（未满 10 尺无坠落伤害）`;
+    pushLog(c, msg);
+    return [msg];
+  }
+
+  const rolled = rollExpression(`${diceCount}d6`, roller);
+  const defMod = computeDefenseStateMod(ch, '钝击', undefined, c, globalEffects);
+  let finalDmg = rolled.total;
+  if (defMod.defense === 'immune') finalDmg = 0;
+  else if (defMod.defense === 'resistant') finalDmg = Math.floor(finalDmg / 2);
+  else if (defMod.defense === 'vulnerable') finalDmg *= 2;
+
+  let dmgTail = `${rolled.detail}${defMod.defense !== undefined ? `（${DEFENSE_NAMES[defMod.defense]}→${finalDmg}）` : ''} 钝击`;
+  if (finalDmg > 0) {
+    const change = applyDamage(c, ch.name, finalDmg, { damageType: '钝击', roller });
+    const trail = ch.kind === 'monster' ? (change.wound ?? woundLabel(ch)) : `HP ${change.before}→${change.after}/${change.maxHp}`;
+    dmgTail += `（${trail}）`;
+    if (!ch.conditions.includes('死亡') && !hasCondition(ch, '倒地')) {
+      upsertActiveState(c, ch, { name: '倒地' });
+      dmgTail += '，摔成倒地';
+    }
+  }
+  const msg = `【高空坠落】${ch.name} 从 ${fallFeet} 尺高空坠落地面：${dmgTail}`;
+  pushCombatLedger(c, msg);
+  return [msg];
+}
+
+export function checkAllAirborneCrashes(
+  c: Campaign,
+  roller: Roller = cryptoRoller,
+  globalEffects?: Record<string, CustomEffectDef>,
+): string[] {
+  if (c.initiative?.positions === undefined) return [];
+  const out: string[] = [];
+  for (const name of Object.keys(c.initiative.positions)) {
+    const ch = findCharacter(c, name);
+    if (ch !== undefined) out.push(...checkAirborneCrash(c, ch, roller, globalEffects));
+  }
+  return out;
+}
+
+export interface ChangeConditionOptions {
+  source?: string;
+  concentration?: boolean;
+  replaceConcentration?: boolean;
+  roundsLeft?: number;
+  expires?: ActiveState['expires'];
+  roller?: Roller;
+  globalEffects?: Record<string, CustomEffectDef>;
+}
+
+export function changeCondition(
+  c: Campaign,
+  name: string,
+  condition: string,
+  on: boolean,
+  options: ChangeConditionOptions = {},
+): Character {
   const ch = requireCharacter(c, name);
   const norm = normalizeCondition(condition);
   if (norm.length === 0) throw new Error('状态名不能为空');
@@ -844,15 +1010,26 @@ export function changeCondition(c: Campaign, name: string, condition: string, on
   }
   if (on) {
     const had = ch.conditions.some((x) => normalizeCondition(x) === norm);
-    const { broken } = upsertActiveState(c, ch, {
-      name: condition,
-      ...(norm === '闪避' ? { source: ch.name, expires: 'start_of_source_turn' } : {}),
-    });
+    const { broken } = upsertActiveState(
+      c,
+      ch,
+      {
+        name: condition,
+        ...(norm === '闪避' ? { source: ch.name, expires: 'start_of_source_turn' as const } : {}),
+        ...(options.source !== undefined ? { source: options.source } : {}),
+        ...(options.concentration !== undefined ? { concentration: options.concentration } : {}),
+        ...(options.roundsLeft !== undefined ? { roundsLeft: options.roundsLeft } : {}),
+        ...(options.expires !== undefined ? { expires: options.expires } : {}),
+      },
+      { ...(options.replaceConcentration !== undefined ? { replaceConcentration: options.replaceConcentration } : {}) },
+    );
     if (!had) pushLog(c, `${ch.name} 获得状态「${norm}」`);
     for (const line of broken) pushLog(c, line);
+    checkAllAirborneCrashes(c, options.roller ?? cryptoRoller, options.globalEffects);
   } else {
     const removed = removeActiveState(ch, condition);
     for (const r of removed) pushLog(c, `${ch.name} 解除状态「${r}」`);
+    checkAllAirborneCrashes(c, options.roller ?? cryptoRoller, options.globalEffects);
   }
   return ch;
 }
@@ -1073,8 +1250,12 @@ export function restoreReaction(c: Campaign, name: string): boolean {
   return had;
 }
 
-export function armorClass(c: Campaign | undefined, ch: Character): number {
-  return ch.ac + (c?.initiative?.shielded?.includes(ch.name) === true ? 5 : 0) + stateAcBonus(ch);
+export function armorClass(
+  c: Campaign | undefined,
+  ch: Character,
+  globalEffects?: Record<string, CustomEffectDef>,
+): number {
+  return ch.ac + (c?.initiative?.shielded?.includes(ch.name) === true ? 5 : 0) + stateAcBonus(ch, c, globalEffects);
 }
 
 /** 指针往后挪一格；回到表头算新一轮。新一轮开始时突袭已经结束 */
@@ -1244,10 +1425,21 @@ export function nextRollId(c: Campaign): number {
 }
 
 /** 推进到下一个还能行动的角色（跳过死亡的；昏迷的 PC 保留，要做死亡豁免） */
-export function nextTurn(c: Campaign): { round: number; current: InitiativeEntry; newRound: boolean; skipped: string[] } {
+export function nextTurn(
+  c: Campaign,
+  roller: Roller = cryptoRoller,
+  globalEffects?: Record<string, CustomEffectDef>,
+): {
+  round: number;
+  current: InitiativeEntry;
+  newRound: boolean;
+  skipped: string[];
+  expired: string[];
+  hazardNotes: string[];
+} {
   assertNoPending(c, '推进回合');
   const state = requireInitiative(c);
-  const prevActor = state.order[state.turn]?.name;
+  let prevActor = state.order[state.turn]?.name;
   for (const entry of [...state.order]) {
     const ch = findCharacter(c, entry.name);
     if (ch === undefined || isOut(ch)) removeFromInitiative(state, entry.name);
@@ -1258,19 +1450,45 @@ export function nextTurn(c: Campaign): { round: number; current: InitiativeEntry
   delete state.disengaged;
   delete state.fightingSpirit;
   delete state.counterAttacks;
-  let newRound = stepTurn(state);
-  const skip = skipSurprised(c);
-  newRound ||= skip.newRound;
-  // 反应到自己回合开始时恢复，并结算持续轮数与回合开始/结束状态
-  const current = state.order[state.turn]!;
-  if (state.shielded !== undefined) state.shielded = state.shielded.filter((name) => name !== current.name);
-  if (state.reacted !== undefined) {
-    state.reacted = state.reacted.filter((n) => n !== current.name);
-    if (state.reacted.length === 0) delete state.reacted;
+  delete state.zoneTriggered;
+  delete state.auraTriggered;
+
+  const allSkipped: string[] = [];
+  const allExpired: string[] = [];
+  const allHazards: string[] = [];
+  let newRound = false;
+  const maxHops = Math.max(1, state.order.length + 1);
+
+  for (let hop = 0; hop < maxHops; hop++) {
+    if (stepTurn(state)) newRound = true;
+    const skip = skipSurprised(c);
+    newRound ||= skip.newRound;
+    allSkipped.push(...skip.skipped);
+    const current = state.order[state.turn];
+    if (current === undefined) break;
+    if (state.shielded !== undefined) state.shielded = state.shielded.filter((name) => name !== current.name);
+    if (state.reacted !== undefined) {
+      state.reacted = state.reacted.filter((n) => n !== current.name);
+      if (state.reacted.length === 0) delete state.reacted;
+    }
+    const expired = tickActiveStatesOnTurnChange(c, prevActor, current.name);
+    for (const line of expired) pushLog(c, line);
+    allExpired.push(...expired);
+    allHazards.push(...checkAllAirborneCrashes(c, roller, globalEffects));
+    allHazards.push(...settleTurnBoundaryHazards(c, prevActor, current.name, roller, globalEffects));
+    allHazards.push(...checkAllAirborneCrashes(c, roller, globalEffects));
+
+    const curCh = findCharacter(c, current.name);
+    if (curCh !== undefined && !isOut(curCh)) {
+      return { round: state.round, current, newRound, skipped: allSkipped, expired: allExpired, hazardNotes: allHazards };
+    }
+    // 当前行动者在回合开始时被光环/持续地形直接击杀：移出先攻表并顺延到下一名存活角色
+    prevActor = undefined;
+    removeFromInitiative(state, current.name);
+    if (state.order.length === 0) break;
   }
-  const expired = tickActiveStatesOnTurnChange(c, prevActor, current.name);
-  for (const line of expired) pushLog(c, line);
-  return { round: state.round, current, newRound, skipped: skip.skipped };
+  const fallback = state.order[Math.max(0, state.turn)] ?? { name: '（全灭）', init: 0 };
+  return { round: state.round, current: fallback, newRound, skipped: allSkipped, expired: allExpired, hazardNotes: allHazards };
 }
 
 export interface EndInitiativeResult {
@@ -1732,6 +1950,8 @@ export function gotoTurn(c: Campaign, name: string, round?: number): InitiativeE
   delete state.dashed;
   delete state.disengaged;
   delete state.fightingSpirit;
+  delete state.zoneTriggered;
+  delete state.auraTriggered;
   state.turnState = { actor: ch.name, attacks: 0 };
   if (round !== undefined && round >= 1) state.round = Math.trunc(round);
   pushLog(c, `先攻指针调整到第 ${state.round} 轮 ${ch.name}`);
@@ -2027,7 +2247,8 @@ export function changeInventory(c: Campaign, name: string, add: string[] = [], r
 export function resourceTag(ch: Character, c?: Campaign): string {
   const parts = Object.entries(ch.resources ?? {}).map(([k, r]) => `${k}${r.current}/${r.max}`);
   if (c?.initiative !== undefined && inInitiative(c, ch.name)) parts.push(`反应${reactionBlocked(c, ch.name) === undefined && canReact(ch) ? 1 : 0}/1`);
-  if (ch.hitDie !== undefined) parts.push(`生命骰${ch.level - (ch.hitDiceUsed ?? 0)}/${ch.level}`);
+  const hasHitDieResource = Object.keys(ch.resources ?? {}).some((k) => k.startsWith('生命骰'));
+  if (ch.hitDie !== undefined && !hasHitDieResource) parts.push(`生命骰${ch.level - (ch.hitDiceUsed ?? 0)}/${ch.level}`);
   return parts.length > 0 ? ` {${parts.join(' ')}}` : '';
 }
 
@@ -2079,10 +2300,10 @@ export function ensureSessionSummary(c: Campaign, now = Date.now()): boolean {
 
 // ── 每回合注入的精简摘要 ──
 
-function hpTag(ch: Character, c?: Campaign): string {
+function hpTag(ch: Character, c?: Campaign, globalEffects?: Record<string, CustomEffectDef>): string {
   const temp = ch.tempHp > 0 ? `+${ch.tempHp}` : '';
   const cond = ch.conditions.length > 0 ? ` [${ch.conditions.join(',')}]` : '';
-  return `${ch.name} ${ch.hp}${temp}/${ch.maxHp} AC${armorClass(c, ch)}${cond}`;
+  return `${ch.name} ${ch.hp}${temp}/${ch.maxHp} AC${armorClass(c, ch, globalEffects)}${cond}`;
 }
 
 /** 队伍主位置所在的场景，以及这个场景探索了几个房间 */
@@ -2150,6 +2371,75 @@ export function summarize(c: Campaign, adv: Adventure): string {
   lines.push(...storySummaryLines(c, adv, occupied));
   if (c.log.length > 0) lines.push(`最近：${c.log.slice(-SUMMARY_LOG_LINES).join('；')}`);
   return lines.join('\n');
+}
+
+/** 专用战斗子代理的精简动态战况：只含当前战场、参战生物血量/状态/资源、先攻站位区域与待结算窗口，不含全图出口、场外角色全资源和主线剧情线索。 */
+export function summarizeCombat(
+  c: Campaign,
+  adv: Adventure,
+  globalEffects?: Record<string, CustomEffectDef>,
+): string {
+  const graph = roomGraph(adv);
+  const room = findRoom(graph, c.currentRoom);
+  const lines: string[] = [];
+  lines.push(`当前战场：${room?.name ?? c.currentRoom}（${c.currentRoom}）`);
+
+  const s = c.initiative;
+  const activeRooms = fightRooms(c);
+  if (activeRooms.size === 0) activeRooms.add(c.currentRoom);
+  const participantSet = new Set([
+    ...(s?.order.map((e) => e.name) ?? []),
+    ...(s?.allParticipants ?? []),
+  ]);
+
+  const party = c.characters.filter((ch) => ch.kind !== 'monster');
+  const combatParty = party.filter((ch) =>
+    participantSet.has(ch.name)
+    || (s?.rehearsal !== true && (ch.hp === 0 || ch.conditions.includes('昏迷') || ch.conditions.includes('稳定')) && activeRooms.has(roomOf(c, ch) ?? '')),
+  );
+  const bystanders = s?.rehearsal === true
+    ? []
+    : party.filter((ch) => !combatParty.includes(ch) && !isOut(ch) && activeRooms.has(roomOf(c, ch) ?? ''));
+
+  if (combatParty.length > 0) {
+    lines.push(`参战我方：${combatParty.map((ch) => `${hpTag(ch, c, globalEffects)}${ch.player ? `〈${ch.player}〉` : ''}${resourceTag(ch, c)}`).join('；')}`);
+  }
+  if (bystanders.length > 0) {
+    lines.push(`同房未入战：${bystanders.map((ch) => ch.name).join('、')}（中途入战先 dnd_initiative join）`);
+  }
+
+  const foes = c.characters.filter((ch) =>
+    ch.kind === 'monster'
+    && !isOut(ch)
+    && (inInitiative(c, ch.name) || (s?.rehearsal !== true && activeRooms.has(ch.room ?? ''))),
+  );
+  if (foes.length > 0) {
+    lines.push(`敌方：${foes.map((ch) => `${ch.name}${!inInitiative(c, ch.name) ? '(未入先攻)' : ''}${ch.conditions.length > 0 ? ` [${ch.conditions.join(',')}]` : ''} ${woundLabel(ch)}`).join('；')}`);
+  }
+
+  if (s !== undefined) {
+    const order = s.order.map((e, i) => (i === s.turn ? `▶${e.name}(${e.init})` : `${e.name}(${e.init})`)).join(' > ');
+    lines.push(`${s.rehearsal === true ? '【演练模式·战后自动还原状态与场地图】' : ''}战斗第 ${s.round} 轮：${order}`);
+    lines.push(...battleLines(c, (id) => findRoom(graph, id)?.name ?? id));
+    if (s.reacted?.length) lines.push(`已用反应：${s.reacted.join('、')}`);
+    if (s.fightingSpirit?.length) lines.push(`战斗英姿生效：${s.fightingSpirit.join('、')}（本回合武器攻击自动具优势）`);
+    if (c.hexbladeCurses?.length) {
+      lines.push(`咒剑诅咒生效：${c.hexbladeCurses.map((x) => {
+        const caster = findCharacter(c, x.caster);
+        const bonus = caster === undefined ? 0 : proficiencyBonus(caster.level);
+        return `${x.caster}→${x.target}（19-20 重击，伤害自动 +${bonus}，勿在 damage 重复填常数）`;
+      }).join('；')}`);
+    }
+    if (s.shielded?.length) lines.push(`护盾术生效：${s.shielded.join('、')}（到各自下回合开始）`);
+    if (s.disengaged?.length) lines.push(`本回合已撤离：${s.disengaged.join('、')}`);
+    if (s.counterAttacks?.length) lines.push(`待还击（反应已扣）：${s.counterAttacks.map((r) => `${r.by}→${r.target}·${r.name}`).join('、')}，原攻击落账后 dnd_check attack reaction=true；不再另扣反应。`);
+    if (s.moved && Object.keys(s.moved).length) lines.push(`本回合已移动：${Object.entries(s.moved).map(([name, feet]) => `${name} ${feet}尺`).join('、')}`);
+    if (s.dashed?.length) lines.push(`本回合已冲刺：${s.dashed.join('、')}`);
+    if (s.surprised?.length) lines.push(`受惊：${s.surprised.join('、')}`);
+    if (s.pending !== undefined) lines.push(pendingSummaryLine(s.pending));
+    if (s.movement !== undefined) lines.push(pendingSummaryLine(s.movement));
+  }
+  return lines.filter((l) => l.length > 0).join('\n');
 }
 
 /**

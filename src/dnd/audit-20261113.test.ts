@@ -385,7 +385,8 @@ describe('2026-11-13 D&D 跑团审计五项回归验证', () => {
     h.service.store.update(h.key, (c) => { requireCharacter(c, '牢爹').hp = 30; });
     await call('dnd_apply', { target: '丛云', damage: 60 }); // 丛云 0 HP 昏迷倒地
     const endRes = await call('dnd_initiative', { action: 'end' });
-    expect(concludeTurn).toHaveBeenCalledOnce();
+    expect(concludeTurn).not.toHaveBeenCalled();
+    expect(endRes.text).toContain('【收尾播报】');
     expect(endRes.text).toContain('共 10 轮');
     expect(endRes.text).toContain('仍存活敌方：牢爹');
 

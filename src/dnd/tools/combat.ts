@@ -13,16 +13,19 @@ type AreaRequest,
 type MoveRequest,
 areaReport,battleGridLines,
 battleLines,
+cellOf,
 clearBattleMap,
 distancesFrom,
 hiddenFromPlayers,
 mapOf,
+removeBattleZone,
 removePosition,
 setBattleMap,
-setPositions,unplaced
+setPositions,unplaced,upsertBattleZone
 } from '../battlefield.ts';
 import { beginMovement } from '../movement.ts';
 import { terrainLine } from '../terrain.ts';
+import { formatZoneSummary,inferSpellSaveDc,type ZoneTrigger } from '../zones.ts';
 import {
 parsePlacements,
 str,
@@ -171,11 +174,13 @@ export function registerCombatTools(kit: ToolKit): void {
       }
       if (action === 'next') {
         assertCanEndTurn(c, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec), dmOverride: args.dm_override === true });
-        const { round, current, newRound, skipped } = nextTurn(c);
+        const { round, current, newRound, skipped, expired, hazardNotes } = nextTurn(c, service.roller, service.globalEffects());
         turnChanged();
         const skippedNote = skipped.length > 0 ? `受惊跳过：${skipped.join('、')}（这一回合什么都做不了，回复里一句带过）。\n` : '';
+        const expiredNote = expired.length > 0 ? `【状态/区域到期】${expired.join('；')}\n` : '';
+        const hazardBlock = hazardNotes.length > 0 ? `【回合切换自动结算（回复里照实播报掷骰过程）】\n${hazardNotes.map((h) => `- ${h}`).join('\n')}\n` : '';
         // 新一轮把顺序带上，DM 照着列给玩家，不用守则里再交代
-        return `${skippedNote}${newRound ? `进入第 ${round} 轮（回复里把这一轮的顺序列一遍）：${orderLine(c)}\n` : ''}${combatTurnPrompt(c, current.name, { recentSenders: sendersOf(exec) })}`;
+        return `${skippedNote}${expiredNote}${hazardBlock}${newRound ? `进入第 ${round} 轮（回复里把这一轮的顺序列一遍）：${orderLine(c)}\n` : ''}${combatTurnPrompt(c, current.name, { recentSenders: sendersOf(exec) })}`;
       }
       if (action === 'goto') {
         const entry = gotoTurn(c, String(args.name ?? ''), int(args.round));
@@ -184,9 +189,8 @@ export function registerCombatTools(kit: ToolKit): void {
       }
       if (action === 'end') {
         assertNoPending(c, '结束战斗');
+        const isChild = kit.manager.combatAgents?.isChild(recordOf(exec).agent) === true;
         const { rounds, defeated, restored } = endInitiative(c, { keepChanges: args.keep_changes === true });
-        // 专用子级在工具落账后直接交回主 DM，省掉一次收尾模型请求。
-        if (kit.manager.combatAgents?.isChild(recordOf(exec).agent)) exec.concludeTurn?.();
         const parts = [`战斗结束，共 ${rounds} 轮。`];
         if (defeated.length > 0) parts.push(`击败：${defeated.join('、')}。`);
         if (c.lastCombat && c.lastCombat.survivingMonsters.length > 0) {
@@ -194,6 +198,9 @@ export function registerCombatTools(kit: ToolKit): void {
         }
         if (restored) {
           parts.push('【演练还原】已自动恢复演练前的角色状态、资源与房间场地图，并清理演练临时怪物。');
+        }
+        if (isChild) {
+          parts.push('\n【收尾播报】请在本条回复中将刚才最后一轮的检定明细、最后一击与战斗收场过程完整播报给群内玩家（播报完战斗收尾即停，勿推进战后搜刮或新探索；你的回复发出后系统会自动交回主 DM 接续剧情）。');
         }
         return parts.join('');
       }
@@ -222,21 +229,22 @@ export function registerCombatTools(kit: ToolKit): void {
     + 'shape covers so the placement is checked on the grid instead of guessed; tell the players honestly if an ally is in it. '
     + 'show: everyone\'s positions; with `from`, distances from that creature. remove: drop a mark '
     + 'or placement (never remove someone who just stepped outside: move them `to` the corridor outside). '
+    + 'zone / remove_zone: place or clear persistent battlefield zones (黑暗术, 毒雾, 云雾术, 蛛网术, 荆棘丛生, 月华之光, 火墙术 or custom ground hazards); rendered on /dnd status map, integrated with move/nextTurn saves & obscurement, and auto-cleared on round expiry, concentration break or combat end. '
     + 'clear_terrain: clear an improvised/temporary arena map for the room, restoring the module\'s authored map if one exists.',
     {
-      action: { type: 'string', enum: ['terrain', 'clear_terrain', 'set', 'move', 'area', 'show', 'remove'] },
+      action: { type: 'string', enum: ['terrain', 'clear_terrain', 'set', 'move', 'area', 'zone', 'remove_zone', 'show', 'remove'] },
       shape: {
         type: 'string',
-        enum: ['sphere', 'cube', 'line'],
-        description: 'For area: sphere = radius around a point (fireball 20); cube = x/y is the north-west corner (hypnotic pattern 30); '
-          + 'line = from the caster toward x/y or `at` (lightning bolt 100, breath 30). Cones are not computed.',
+        enum: ['sphere', 'cube', 'line', 'rect'],
+        description: 'For area (sphere/cube/line) or zone (sphere/rect): sphere = radius around x/y or `at`; cube/rect = north-west corner x/y.',
       },
       size: { type: 'integer', description: 'For area: radius / side / length in feet.' },
-      at: { type: 'string', description: 'For area: centre (sphere) or direction (line) on this creature or mark instead of x/y.' },
-      caster: { type: 'string', description: 'For area: who casts it; sorts the covered into foes and allies, and is the start of a line.' },
-      room: { type: 'string', description: 'For terrain: room id (default: the room of the fight / the party).' },
+      at: { type: 'string', description: 'For area or zone: centre on this creature or mark instead of x/y.' },
+      caster: { type: 'string', description: 'For area or zone: who casts/creates it; binds concentration and spell save DC automatically.' },
+      room: { type: 'string', description: 'For terrain / zone: room id (default: the room of the fight / the party).' },
       width: { type: 'integer', description: 'For terrain: map width in cells, including walls and corridor cells (max 40).' },
       height: { type: 'integer', description: 'For terrain: map height in cells (max 40).' },
+      ceiling: { type: 'integer', description: 'For terrain: optional room ceiling height in feet (multiple of 5, e.g. 20 or 40); caps flying altitude z.' },
       areas: {
         type: 'array',
         description: 'For terrain: rectangles; later ones override earlier ones (draw a wall, then cut a door into it). '
@@ -270,6 +278,7 @@ export function registerCombatTools(kit: ToolKit): void {
             name: { type: 'string' },
             x: { type: 'integer' },
             y: { type: 'integer' },
+            z: { type: 'integer', description: 'Altitude in feet (multiple of 5, default 0 ground).' },
             near: { type: 'string', description: 'Instead of x/y: nearest free cell to this door / landmark / creature, in list order.' },
             mark: { type: 'boolean', description: 'Not a character sheet: landmark or uncarded captive (needs x/y).' },
           },
@@ -277,9 +286,27 @@ export function registerCombatTools(kit: ToolKit): void {
           additionalProperties: false,
         },
       },
-      name: { type: 'string', description: 'For move / remove: who.' },
-      x: { type: 'integer', description: 'For move: destination cell, only when the player named one.' },
-      y: { type: 'integer', description: 'For move: destination cell.' },
+      name: { type: 'string', description: 'For move / remove: creature or mark name. For zone / remove_zone: zone name (e.g. "黑暗术", "毒雾", "蛛网术", "荆棘丛生", "月华之光").' },
+      x: { type: 'integer', description: 'For move / area / zone: grid x cell.' },
+      y: { type: 'integer', description: 'For move / area / zone: grid y cell.' },
+      z: { type: 'integer', description: 'For move: target flying altitude in feet (multiple of 5, e.g. 15 or 30; 0 to land).' },
+      radius: { type: 'integer', description: 'For zone (sphere): radius in feet (multiple of 5, e.g. 15 for 黑暗术, 20 for 毒雾/云雾术).' },
+      w: { type: 'integer', description: 'For zone (rect): width in 5-ft cells.' },
+      h: { type: 'integer', description: 'For zone (rect): height in 5-ft cells.' },
+      zone_height: { type: 'integer', description: 'For zone: vertical height in feet (creatures flying higher than this are unaffected).' },
+      obscured: { type: 'string', enum: ['light', 'heavy', 'darkness'], description: 'For zone: obscurement level (darkness/heavy blocks sight-based opportunity attacks).' },
+      difficult: { type: 'boolean', description: 'For zone: true if entering cells costs double movement.' },
+      damage: { type: 'string', description: 'For zone: hazard damage dice expression, e.g. "2d4" or "5d8".' },
+      damage_type: { type: 'string', description: 'For zone: hazard damage type, e.g. "毒素", "火焰", "光耀", "穿刺".' },
+      save_ability: { type: 'string', description: 'For zone: saving throw ability, e.g. "体质", "敏捷", "感知".' },
+      save_dc: { type: 'integer', description: 'For zone: saving throw DC (auto-inferred from `caster` if omitted).' },
+      on_save: { type: 'string', enum: ['half', 'none'], description: 'For zone: damage taken on successful save (default half).' },
+      on_fail_conditions: { type: 'array', items: { type: 'string' }, description: 'For zone: conditions applied on failed save (e.g. ["束缚"]).' },
+      triggers: { type: 'array', items: { type: 'string', enum: ['enter', 'turn_start', 'turn_end'] }, description: 'For zone: hazard trigger timings (default ["enter", "turn_start"]).' },
+      per_step: { type: 'boolean', description: 'For zone: true to deal damage for every 5 ft moved inside the zone (e.g. 荆棘丛生).' },
+      rounds: { type: 'integer', description: 'For zone: duration in rounds (auto-ticks and clears on expiry or combat end).' },
+      concentration: { type: 'boolean', description: 'For zone: bind to `caster`\'s concentration.' },
+      target_side: { type: 'string', enum: ['all', 'enemies', 'allies'], description: 'For zone: which side is affected (default "all").' },
       to: { type: 'string', description: 'For move: a creature (ends adjacent), a door, the corridor outside, an obstacle or a landmark, by name.' },
       adjacent_to: { type: 'string', description: 'For move: same as `to` with a creature.' },
       away_from: { type: 'string', description: 'For move: get as far from this creature as the movement allows (or `feet`).' },
@@ -305,7 +332,7 @@ export function registerCombatTools(kit: ToolKit): void {
         const roomArg = str(args.room);
         const room = roomArg === undefined ? fightRoom(c) : resolveRoom(graph, roomArg)?.id;
         if (room === undefined) throw new Error(`没有这个房间: ${roomArg}`);
-        const { map, misplaced } = setBattleMap(c, room, { width: args.width, height: args.height, areas: args.areas });
+        const { map, misplaced } = setBattleMap(c, room, { width: args.width, height: args.height, ceiling: args.ceiling, areas: args.areas });
         const unknown = map.areas.filter((a) => a.to !== undefined && findRoom(graph, a.to) === undefined).map((a) => a.to);
         const lines = [`已存 ${roomName(room)} 的场地图（再进这间沿用）。${terrainLine(map)}`];
         if (unknown.length > 0) lines.push(`【DM】to 里的房间 id 不认识：${unknown.join('、')}，用 dnd_lookup 查准再画一次。`);
@@ -342,6 +369,69 @@ export function registerCombatTools(kit: ToolKit): void {
         if (y !== undefined) request.y = y;
         return areaReport(c, request);
       }
+      if (action === 'zone') {
+        assertNoPending(c, '放置持续区域');
+        const zoneName = str(args.name);
+        if (zoneName === undefined) throw new Error('dnd_position zone 要给 name（如 "黑暗术"、"毒雾"、"蛛网术"）');
+        const casterName = str(args.caster);
+        const casterCh = casterName !== undefined ? requireCharacter(c, casterName) : undefined;
+        let zx = int(args.x);
+        let zy = int(args.y);
+        let zRoom = str(args.room) === undefined ? undefined : resolveRoom(graph, str(args.room)!)?.id;
+        const at = str(args.at);
+        if (at !== undefined && (zx === undefined || zy === undefined)) {
+          const who = findCharacter(c, at);
+          const point = who !== undefined ? cellOf(c, who) : c.initiative?.marks?.[at];
+          if (point === undefined) throw new Error(`找不到定位对象「${at}」的坐标，请传 x 和 y`);
+          zx = point.x;
+          zy = point.y;
+          zRoom ??= point.room;
+        }
+        if (zx === undefined || zy === undefined) {
+          throw new Error('dnd_position zone 需要给 x/y 坐标，或传 at="角色/标记名"');
+        }
+        const shapeRaw = str(args.shape);
+        const shape = shapeRaw === 'rect' || shapeRaw === 'cube' ? 'rect' as const : (shapeRaw === 'sphere' ? 'sphere' as const : undefined);
+        const cubeCells = shapeRaw === 'cube' && int(args.size) !== undefined ? Math.max(1, Math.round(int(args.size)! / 5)) : undefined;
+        const explicitDc = int(args.save_dc);
+        const inferredDc = explicitDc ?? (casterCh !== undefined ? inferSpellSaveDc(casterCh) : undefined);
+        const rawTriggers = strList(args.triggers)?.filter((t): t is ZoneTrigger => t === 'enter' || t === 'turn_start' || t === 'turn_end');
+        const { zone, broken, affected } = upsertBattleZone(c, {
+          name: zoneName,
+          ...(zRoom !== undefined ? { room: zRoom } : {}),
+          ...(shape !== undefined ? { shape } : {}),
+          x: zx,
+          y: zy,
+          ...(int(args.radius) !== undefined ? { radius: int(args.radius)! } : (shapeRaw === 'sphere' && int(args.size) !== undefined ? { radius: int(args.size)! } : {})),
+          ...(int(args.w) !== undefined ? { w: int(args.w)! } : (cubeCells !== undefined ? { w: cubeCells } : {})),
+          ...(int(args.h) !== undefined ? { h: int(args.h)! } : (cubeCells !== undefined ? { h: cubeCells } : {})),
+          ...(int(args.zone_height) !== undefined ? { height: int(args.zone_height)! } : {}),
+          ...(casterCh !== undefined ? { source: casterCh.name } : {}),
+          ...(typeof args.concentration === 'boolean' ? { concentration: args.concentration } : {}),
+          ...(int(args.rounds) !== undefined ? { rounds: int(args.rounds)! } : {}),
+          ...(args.obscured === 'light' || args.obscured === 'heavy' || args.obscured === 'darkness' ? { obscured: args.obscured } : {}),
+          ...(typeof args.difficult === 'boolean' ? { difficult: args.difficult } : {}),
+          ...(str(args.damage) !== undefined ? { damage: str(args.damage)! } : {}),
+          ...(str(args.damage_type) !== undefined ? { damageType: str(args.damage_type)! } : {}),
+          ...(str(args.save_ability) !== undefined ? { saveAbility: str(args.save_ability)! } : {}),
+          ...(inferredDc !== undefined ? { saveDc: inferredDc } : {}),
+          ...(args.on_save === 'half' || args.on_save === 'none' ? { onSave: args.on_save } : {}),
+          ...(strList(args.on_fail_conditions) !== undefined ? { onFailConditions: strList(args.on_fail_conditions)! } : {}),
+          ...(rawTriggers !== undefined && rawTriggers.length > 0 ? { triggers: rawTriggers } : {}),
+          ...(typeof args.per_step === 'boolean' ? { perStep: args.per_step } : {}),
+          ...(args.target_side === 'all' || args.target_side === 'enemies' || args.target_side === 'allies' ? { targetSide: args.target_side } : {}),
+        });
+        const out = [`已放置持续区域：${formatZoneSummary(zone)}`];
+        if (affected.length > 0) out.push(`当前处于区域内的单位：${affected.join('、')}`);
+        if (broken.length > 0) out.push(...broken);
+        return `${out.join('\n')}${combatLedgerSuffix(c)}`;
+      }
+      if (action === 'remove_zone') {
+        assertNoPending(c, '移除持续区域');
+        const zRoom = str(args.room) === undefined ? undefined : resolveRoom(graph, str(args.room)!)?.id;
+        const removed = removeBattleZone(c, String(args.name ?? ''), zRoom);
+        return `已移除持续区域：${removed.map((z) => `${z.name}(${z.id})`).join('、')}${combatLedgerSuffix(c)}`;
+      }
       if (action === 'set') {
         assertNoPending(c, '重新摆位');
         const notes = setPositions(c, parsePlacements(args.placements));
@@ -377,15 +467,17 @@ export function registerCombatTools(kit: ToolKit): void {
         text('drag', args.drag);
         const x = int(args.x);
         const y = int(args.y);
+        const z = int(args.z);
         const feet = int(args.feet);
         if (x !== undefined) request.x = x;
         if (y !== undefined) request.y = y;
+        if (z !== undefined) request.z = z;
         if (feet !== undefined) request.feet = feet;
         if (args.dash === true) request.dash = true;
         if (args.disengage === true) request.disengage = true;
         if (args.crawl === true) request.crawl = true;
         if (args.ignore_state_mods === true) request.ignoreStateMods = true;
-        const result = beginMovement(c, ch.name, request);
+        const result = beginMovement(c, ch.name, request, { roller: service.roller, globalEffects: service.globalEffects() });
         if (c.initiative?.movement !== undefined) deps.onPendingAttack?.(recordOf(exec));
         return `${result}${combatLedgerSuffix(c)}`;
       }

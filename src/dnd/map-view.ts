@@ -12,6 +12,7 @@ import { type Campaign, explored, findCharacter, isOut, partyPositions, roomOf }
 import { findRoom } from './dungeon.ts';
 import { renderMapPng } from './map-render.ts';
 import { exitsLine } from './text-map.ts';
+import { activeVisualAurasInRoom, formatZonePlayerLegend, zonesInRoom } from './zones.ts';
 
 export type MapView = 'auto' | 'battle' | 'explore';
 
@@ -61,7 +62,8 @@ export function mapCaption(c: Campaign, adv: Adventure, kind: RenderedMap['kind'
     const allyGroup = (k: 'pc' | 'npc'): string => {
       const placed = tokens.filter((t) => t.kind === k && !t.down).map((t) => {
         const hp = `${t.hp}/${t.maxHp}${t.tempHp > 0 ? `(+${t.tempHp})` : ''}`;
-        return t.label === t.name ? `${t.name}${hp}` : `${t.label}=${t.name}${hp}`;
+        const alt = (t.z ?? 0) > 0 ? `↑${t.z}'` : '';
+        return t.label === t.name ? `${t.name}${alt}${hp}` : `${t.label}=${t.name}${alt}${hp}`;
       });
       const unplaced = (c.initiative?.order ?? [])
         .map((e) => findCharacter(c, e.name))
@@ -77,6 +79,15 @@ export function mapCaption(c: Campaign, adv: Adventure, kind: RenderedMap['kind'
     ];
     const down = tokens.filter((t) => t.down).map((t) => t.name);
     if (down.length > 0) lines.push(`⚪ 倒地：${down.join('、')}`);
+    const roomZones = zonesInRoom(c, room);
+    const roomAuras = activeVisualAurasInRoom(c, room, (ch) => !hiddenFromPlayers(ch));
+    if (roomZones.length > 0 || roomAuras.length > 0) {
+      const zParts = [
+        ...roomZones.map(formatZonePlayerLegend),
+        ...roomAuras.map((a) => `${a.name}（${a.caster}·${a.radius}尺光环）`),
+      ];
+      lines.push(`🌀 区域：${zParts.join('；')}`);
+    }
     const areas = mapOf(c, room)?.areas ?? [];
     const named = (k: 'object' | 'difficult'): string[] => [...new Set(areas.filter((a) => a.kind === k && a.name !== undefined).map((a) => a.name!))];
     const terrain = [
@@ -111,14 +122,15 @@ export function mapCaption(c: Campaign, adv: Adventure, kind: RenderedMap['kind'
  * 图例条目。同名带编号的怪合成一条（「翼1–8=翼手族」），八只怪逐个列要占一整行；
  * 编号不连续就列出来（「翼1,3,5=翼手族」）。
  */
-function legendEntries(tokens: readonly { name: string; label: string }[]): string[] {
+function legendEntries(tokens: readonly { name: string; label: string; z?: number }[]): string[] {
   const entries: string[] = [];
   const packs = new Map<string, { prefix: string; base: string; nums: number[] }>();
   for (const t of tokens) {
+    const alt = (t.z ?? 0) > 0 ? `↑${t.z}'` : '';
     const name = /^(.*?)(\d+)$/.exec(t.name);
     const label = /^(.*?)(\d+)$/.exec(t.label);
-    if (name === null || label === null || name[2] !== label[2]) {
-      entries.push(t.label === t.name ? t.name : `${t.label}=${t.name}`);
+    if (alt !== '' || name === null || label === null || name[2] !== label[2]) {
+      entries.push(t.label === t.name ? `${t.name}${alt}` : `${t.label}=${t.name}${alt}`);
       continue;
     }
     const key = `${label[1]}=${name[1]}`;
