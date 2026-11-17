@@ -17,10 +17,16 @@ cordis.patch.local.yml
 /tmp/
 /output/
 /.qqbot-browser/
-# 仅打包插件自带的 dnd-module-authoring 文档，排除外部装入的 skills 与本机私有脚本
+# 仅打包插件自带的技能目录，排除外部装入的 skills、本机测试脚本与参考图原件
 /skills/*
 !/skills/dnd-module-authoring/
 /skills/dnd-module-authoring/scripts/
+!/skills/dnd-rule-extension/
+!/skills/qqbot-sticker-maker/
+/skills/qqbot-sticker-maker/resources/*.png
+/skills/qqbot-sticker-maker/resources/**/*.png
+/skills/qqbot-sticker-maker/resources/**/*.jpg
+/skills/qqbot-sticker-maker/scripts/*.test.*
 AGENTS.md
 package-lock.json
 pnpm-lock.yaml

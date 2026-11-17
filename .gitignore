@@ -29,10 +29,16 @@ cordis.dev.yml
 /dnd/
 /tmp/
 /.qqbot-browser/
-# 仅跟踪插件自带的技能目录，忽略宿主/外部工具装进来的第三方 skills 与本机私有脚本
+# 仅跟踪插件自带的技能目录，忽略宿主/外部工具装进来的第三方 skills、本机私有脚本与未授权图片素材
 /skills/*
 !/skills/dnd-module-authoring/
 /skills/dnd-module-authoring/scripts/
+!/skills/dnd-rule-extension/
+!/skills/qqbot-sticker-maker/
+/skills/qqbot-sticker-maker/resources/*.png
+/skills/qqbot-sticker-maker/resources/**/*.png
+/skills/qqbot-sticker-maker/resources/**/*.jpg
+/skills/qqbot-sticker-maker/scripts/*.test.*
 
 # ── 日志 / 系统 / 编辑器 ──
 *.log

@@ -1,0 +1,105 @@
+{
+  "checkedOn": "2026-11-17",
+  "authorProfile": "https://space.bilibili.com/4168597",
+  "provenance": "Standing illustrations are attributed to the author Pixiv collection; binary images are excluded from npm redistribution and must be fetched/cached locally in accordance with creator terms. GPT turnaround is from the author Bilibili post.",
+  "assets": [
+    {
+      "character": "gemini",
+      "file": "gemini-original.jpg",
+      "creators": [
+        "ZipZipPipe"
+      ],
+      "source": "https://www.pixiv.net/artworks/148186519",
+      "downloadedFrom": "https://raw.githubusercontent.com/HABAI182/ai-girls-atlas/main/assets/zipzippipe/gemini/normal-zipzippipe-pixiv-148186519-p04.jpg",
+      "upstream": "https://raw.githubusercontent.com/shuaizenge/ai-girls/71defe761164407514c1db9bac582d74eab4cdac/characters/gemini/adult/zipzippipe-pixiv-148186519-p04.jpg",
+      "width": 3072,
+      "height": 5504,
+      "bytes": 9087735,
+      "sha256": "1353cf80c62b1841f0b59671a693aef945a297c586c9ad32f1a36efc5e3e15ab",
+      "supplierHashVerified": true,
+      "licenseAsReportedBySupplier": {
+        "status": "author_sharing_statement",
+        "identifier": null,
+        "evidence_url": "https://www.bilibili.com/video/BV1bARXBYEZz/",
+        "note": "作者说明作品开放分享与再创作，未核实这些角色适用统一标准许可证，不推断为 CC0 / MIT。"
+      }
+    },
+    {
+      "character": "claude",
+      "file": "claude-original.jpg",
+      "creators": [
+        "ZipZipPipe"
+      ],
+      "source": "https://www.pixiv.net/artworks/148186519",
+      "downloadedFrom": "https://raw.githubusercontent.com/HABAI182/ai-girls-atlas/main/assets/zipzippipe/claude/normal-zipzippipe-pixiv-148186519-p02.jpg",
+      "upstream": "https://raw.githubusercontent.com/shuaizenge/ai-girls/71defe761164407514c1db9bac582d74eab4cdac/characters/claude/adult/zipzippipe-pixiv-148186519-p02.jpg",
+      "width": 3072,
+      "height": 5504,
+      "bytes": 10689595,
+      "sha256": "6fb3d6568ccd23cea1437226947276ab052bcdd47d6b7d55d8b5ca148c779782",
+      "supplierHashVerified": true,
+      "licenseAsReportedBySupplier": {
+        "status": "author_sharing_statement",
+        "identifier": null,
+        "evidence_url": "https://www.bilibili.com/video/BV1bARXBYEZz/",
+        "note": "作者说明作品开放分享与再创作，未核实这些角色适用统一标准许可证，不推断为 CC0 / MIT。"
+      }
+    },
+    {
+      "character": "deepseek",
+      "file": "deepseek-original.jpg",
+      "creators": [
+        "上善无形（角色原型）",
+        "ZipZipPipe（女仆二次设计）"
+      ],
+      "source": "https://www.pixiv.net/artworks/148186519",
+      "downloadedFrom": "https://raw.githubusercontent.com/HABAI182/ai-girls-atlas/main/assets/zipzippipe/deepseek/normal-zipzippipe-pixiv-148186519-p00.jpg",
+      "upstream": "https://raw.githubusercontent.com/shuaizenge/ai-girls/71defe761164407514c1db9bac582d74eab4cdac/characters/deepseek/adult/zipzippipe-pixiv-148186519-p00.jpg",
+      "width": 1152,
+      "height": 2048,
+      "bytes": 1825859,
+      "sha256": "73264faff3511347b1b9668d5d937cbb3f2402f8bb03cc158fc8a81bfc2d077c",
+      "supplierHashVerified": true,
+      "licenseAsReportedBySupplier": {
+        "status": "author_declared",
+        "identifier": "CC-BY-NC-SA-4.0",
+        "evidence_url": "https://www.bilibili.com/video/BV1tE9XBbErS/",
+        "note": "上善无形原角色 → ZipZipPipe 女仆二次设计；社区补充图的具体绘制者仍未核实。"
+      }
+    },
+    {
+      "character": "gpt",
+      "file": "gpt-original.jpg",
+      "creators": [
+        "ZipZipPipe"
+      ],
+      "source": "https://www.pixiv.net/artworks/148186519",
+      "downloadedFrom": "https://raw.githubusercontent.com/HABAI182/ai-girls-atlas/main/assets/zipzippipe/gpt/normal-zipzippipe-pixiv-148186519-p03.jpg",
+      "upstream": "https://raw.githubusercontent.com/shuaizenge/ai-girls/71defe761164407514c1db9bac582d74eab4cdac/characters/gpt/adult/zipzippipe-pixiv-148186519-p03.jpg",
+      "width": 3072,
+      "height": 5504,
+      "bytes": 9828690,
+      "sha256": "c47948cd25efcf7ad4a5179288c8452445d57d6dfc379fb27ab6e809a6970157",
+      "supplierHashVerified": true,
+      "licenseAsReportedBySupplier": {
+        "status": "author_sharing_statement",
+        "identifier": null,
+        "evidence_url": "https://www.bilibili.com/video/BV1bARXBYEZz/",
+        "note": "作者说明作品开放分享与再创作，未核实这些角色适用统一标准许可证，不推断为 CC0 / MIT。"
+      }
+    },
+    {
+      "character": "gpt",
+      "file": "gpt-turnaround.png",
+      "creators": [
+        "ZipZipPipe"
+      ],
+      "source": "https://www.bilibili.com/opus/1238613841710940181",
+      "downloadedFrom": "https://i0.hdslb.com/bfs/new_dyn/84e0a7294b0defd91ead0616531454394168597.png",
+      "width": 2048,
+      "height": 1152,
+      "bytes": 3042341,
+      "sha256": "3f03ee1ac0d747ad43970dbfbc4b446db40ec780e21da162e9a9fdfdb3e25355"
+    }
+  ]
+}

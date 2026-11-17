@@ -6,6 +6,23 @@ This file records significant `dsh-dungeon-master` updates from a product perspe
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.7.0] - 2026-11-17
+
+### Added
+
+- **Persistent battlefield zones (`BattleZone`) & map rendering**: `dnd_position` adds `zone` / `remove_zone` with built-in presets (Darkness, Fog Cloud, Poison Mist, Cloudkill, Stinking Cloud, Web, Cloud of Daggers, Moonbeam, Spike Growth, Wall of Fire, Silence) and customizable save/damage/obscurement/terrain parameters; `/dnd status` and PNG/ASCII battle maps render zone overlays and remaining rounds live, automatically trigger saves and damage on movement entry/exit or turn boundaries, suppress opportunity attacks under heavy obscurement, link to caster concentration, and clean up automatically on expiry or combat end.
+- **2.5D flight altitude & crash falls**: characters and monsters support `fly_speed`, `hover`, `z` altitude, and room `ceiling` with 3D melee reach and opportunity checks; non-hovering flyers knocked prone, reduced to 0 speed, or incapacitated automatically fall and resolve `1d6 / 10 ft` bludgeoning damage plus prone.
+- **Aura engine, automatic on-hit riders & concentration closure**: natively resolves Paladin Aura of Protection dynamic save bonuses, Spirit Guardians 15 ft enemy slow and upcast radiant save damage, automatic on-hit riders (Hex, Hunter's Mark, Divine Favor, Enlarge, Rage, and multi-part weapon `riders`), Life Domain healing bonuses (Disciple of Life, Blessed Healer, Preserve Life), Protection from Poison, and explicit `dnd_apply(drop_concentration)` cleanup for derived states and zones.
+- **Extensible rule engine (`dnd_rule`) & `dnd-rule-extension` skill**: hot-registers `campaign`- or `global`-scoped custom attack, on-hit rider, defense/resistance, save, aura, and healing hooks evaluated by a sandboxed no-`eval` formula parser, paired with the bundled `dnd-rule-extension` skill guide for table house rules and third-party supplements (such as Warcraft 5e, signature weapons, and destiny passives).
+- **Chibi sticker creation & registration skill (`qqbot-sticker-maker`)**: bundled skill and offline `sharp`-powered `sticker-cli.cjs` tool supporting 1024 alignment grids, red/cyan overlay diffs, local patch splicing, white-background flood matting with enclosed-pocket detection, native-alpha export, 1:1 light/dark 256px previews, and atomic `stickers/index.json` registration.
+
+### Fixed
+
+- **Combat subagent final-round narration cutoff**: fixed combat ending transitions via `dnd_initiative(action="end")` handing control back before broadcasting the closing turn's rolls and outcome; the subagent now narrates the final round to the group before returning the post-combat handoff to the main DM.
+- **Model failover restart desync**: fixed `ModelWatch` starting out of sync when restarting on a backup channel with `modelFailover` enabled, preventing recovery back to primary, and automatically clears stale persisted `failover` markers when `modelFailover` is disabled.
+- **Combat subagent context growth & group history cursor continuity**: suppressed per-step host `Current runtime context` appends inside combat child agents (`suppressRuntimeContext`) in favor of a compact combat-only snapshot injected once per new turn only when combatant state changes (while legacy/fallback hosts also switch to the compact `combatStateSnapshot`), deduplicated hit-dice labels in `resourceTag`, pinned `SessionManager.sessionIdFor` to the main session ID so combat handoffs and failovers do not repeatedly flush full group chat history, and added multi-tier subagent failover (`combatAgent -> modelFailover backup -> subagent reusing the main DM's effective model route -> main DM`) with cross-model `reasoningEffort` isolation.
+- **Combat resolution guardrails**: `dnd_apply` rejects simultaneous `damage` and `heal` arguments in the same call, adds bonus-action spellcasting economy reminders, and filters negated phrases (such as "cannot take opportunity attacks") from `reactionsOf` trait scanning.
+
 ## [0.6.0] - 2026-11-16
 
 ### Added
