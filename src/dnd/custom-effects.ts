@@ -125,7 +125,7 @@ export interface CustomEffectDef {
 export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
   脆弱诅咒: {
     name: '脆弱诅咒',
-    aliases: ['hex'],
+    aliases: ['hex', '邪咒', '诅咒术'],
     description: '附赠动作专注法术：施法者每次攻击命中受诅咒目标额外造成 1d6 黯蚀伤害。',
     concentration: true,
     defaultRounds: 10,
@@ -133,7 +133,7 @@ export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
   },
   猎人印记: {
     name: '猎人印记',
-    aliases: ["hunter's mark", 'hunters mark'],
+    aliases: ["hunter's mark", 'hunters mark', '猎手印记'],
     description: '附赠动作专注法术：施法者每次武器攻击命中受印记目标额外造成 1d6 武器同型伤害。',
     concentration: true,
     defaultRounds: 10,
@@ -141,7 +141,7 @@ export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
   },
   神恩: {
     name: '神恩',
-    aliases: ['divine favor'],
+    aliases: ['divine favor', '神恩术'],
     description: '附赠动作专注法术：武器攻击命中额外造成 1d4 光耀伤害。',
     concentration: true,
     defaultRounds: 10,
@@ -149,7 +149,7 @@ export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
   },
   变巨术: {
     name: '变巨术',
-    aliases: ['enlarge', '成长药水'],
+    aliases: ['enlarge', 'enlarge/reduce', '变巨', '成长药水', '变巨缩小术'],
     description: '力量检定与力量豁免优势，武器攻击命中额外造成 1d4 伤害。',
     concentration: true,
     defaultRounds: 10,
@@ -158,7 +158,7 @@ export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
   },
   防护毒素: {
     name: '防护毒素',
-    aliases: ['protection from poison'],
+    aliases: ['protection from poison', '防毒术'],
     description: '非专注法术（1小时）：具有毒素伤害抗性，且对抗毒素与中毒的豁免具有优势。',
     concentration: false,
     defenseMod: { resistant: ['毒素'] },
@@ -166,7 +166,7 @@ export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
   },
   守护灵光: {
     name: '守护灵光',
-    aliases: ['aura of protection'],
+    aliases: ['aura of protection', '保护灵光', '守护光环'],
     description: '圣武士 6 级特性：自身未失能时，10 尺内（18 级起 30 尺）自己与友军所有豁免检定自动加 max(1, 魅力调整值)。',
     aura: {
       radius: 10,
@@ -178,7 +178,7 @@ export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
   },
   灵体卫士: {
     name: '灵体卫士',
-    aliases: ['spirit guardians'],
+    aliases: ['spirit guardians', '灵体守卫', '魂灵环绕', '圣灵守护'],
     description: '3 环专注光环（15 尺）：范围内敌方速度减半；敌方首次进入/被光环扫过或在其中开始回合时须过感知豁免，失败受 3d8（每升1环+1d8）光耀/黯蚀伤害，成功减半。',
     concentration: true,
     defaultRounds: 10,
@@ -198,19 +198,19 @@ export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
   },
   生命门徒: {
     name: '生命门徒',
-    aliases: ['disciple of life'],
+    aliases: ['disciple of life', '生命信徒'],
     description: '生命领域 1 级特性：使用 1 环及以上法术恢复生命值时，受术者额外恢复 2 + 法术环阶 HP。',
     healMod: { bonusFormula: '2 + slot_level' },
   },
   神佑医者: {
     name: '神佑医者',
-    aliases: ['blessed healer'],
+    aliases: ['blessed healer', '受祝医者'],
     description: '生命领域 6 级特性：对自身以外生物施放 1 环及以上治疗法术时，自身同步恢复 2 + 法术环阶 HP。',
     healMod: { selfHealOnOtherFormula: '2 + slot_level' },
   },
   保全生命: {
     name: '保全生命',
-    aliases: ['preserve life'],
+    aliases: ['preserve life', '保留生命'],
     description: '生命领域引导神力：动作分配 5×牧师等级 点治疗池给 30 尺内生物，最多恢复至其有效生命上限的一半。',
     healMod: { poolFormula: '5 * level', capAtHalfMaxHp: true },
   },

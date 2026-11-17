@@ -9,7 +9,9 @@ import { mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import type { Adventure } from './adventure.ts';
 import { cellOf, mapOf } from './battlefield.ts';
-import { type Campaign, type Character, isOut } from './campaign.ts';
+import type { Campaign, Character } from './campaign.ts';
+import { isOut } from './campaign.ts';
+import type { CustomEffectDef } from './custom-effects.ts';
 import { type BattleMap, areaName } from './terrain.ts';
 import {
   type BattleZone,
@@ -279,7 +281,13 @@ async function cropArt(sharp: SharpFactory, path: string, map: BattleMap): Promi
  * 这间屋还没有场地图、或 sharp 不可用时返回 undefined。
  */
 export async function renderBattleImage(
-  c: Campaign, adv: Adventure, room: string, title: string, outPath: string, visible: (ch: Character) => boolean,
+  c: Campaign,
+  adv: Adventure,
+  room: string,
+  title: string,
+  outPath: string,
+  visible: (ch: Character) => boolean,
+  globalEffects?: Record<string, CustomEffectDef>,
 ): Promise<string | undefined> {
   const map = mapOf(c, room);
   if (map === undefined) return undefined;
@@ -289,7 +297,7 @@ export async function renderBattleImage(
   const base = path === undefined ? undefined : await cropArt(sharp, path, map).catch(() => undefined);
   const marks = Object.entries(c.initiative?.marks ?? {}).filter(([, m]) => m.room === room).map(([name, m]) => ({ name, x: m.x, y: m.y }));
   const zones = zonesInRoom(c, room);
-  const auras = activeVisualAurasInRoom(c, room, visible);
+  const auras = activeVisualAurasInRoom(c, room, visible, globalEffects);
   const svg = Buffer.from(buildBattleSvg(map, roomTokens(c, room, visible), title, base !== undefined, marks, zones, auras));
   const W = MARGIN + map.width * CELL;
   const H = TITLE_H + MARGIN + map.height * CELL;

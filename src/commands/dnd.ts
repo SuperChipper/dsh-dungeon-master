@@ -160,9 +160,10 @@ export function dndCommand({ manager }: CommandDeps): CategorizedCommand {
         if (service.sendImage !== undefined) {
           try {
             const out = join(service.mapDir, `${key.replace(/[^a-zA-Z0-9_-]+/g, '_')}-cmd-${Date.now()}.png`);
-            const map = await renderPartyMap(found.campaign, found.adventure, out, view);
+            const globalEffects = service.globalEffects();
+            const map = await renderPartyMap(found.campaign, found.adventure, out, view, { globalEffects });
             if (map !== undefined) {
-              await service.sendImage(target, map.path, mapCaption(found.campaign, found.adventure, map.kind));
+              await service.sendImage(target, map.path, mapCaption(found.campaign, found.adventure, map.kind, globalEffects));
               return { kind: 'noop' as const };
             }
           } catch (err) {

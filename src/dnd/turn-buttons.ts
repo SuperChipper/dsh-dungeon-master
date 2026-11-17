@@ -184,7 +184,7 @@ export class DndTurnButtons {
   private async battleImage(key: string, campaign: Campaign, adventure: Adventure): Promise<string | undefined> {
     if (this.service.sendImage === undefined || campaign.initiative === undefined) return undefined;
     const out = join(this.service.mapDir, `${key.replace(/[^a-zA-Z0-9_-]+/g, '_')}-turn-${Date.now()}.png`);
-    const map = await renderPartyMap(campaign, adventure, out, 'battle').catch(() => undefined);
+    const map = await renderPartyMap(campaign, adventure, out, 'battle', { globalEffects: this.service.globalEffects() }).catch(() => undefined);
     return map?.path;
   }
 
@@ -198,7 +198,7 @@ export class DndTurnButtons {
     this.lastImage.set(record.sessionKey, mark);
     try {
       const path = await this.battleImage(record.sessionKey, campaign, adventure);
-      if (path !== undefined) await this.service.sendImage!(record.replyTarget, path, mapCaption(campaign, adventure, 'battle'));
+      if (path !== undefined) await this.service.sendImage!(record.replyTarget, path, mapCaption(campaign, adventure, 'battle', this.service.globalEffects()));
     } catch (err) {
       this.logger.warn(`im-qqbot: 每轮战斗图发送失败: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -313,7 +313,7 @@ export class DndTurnButtons {
       if (path !== undefined) {
         const text = [
           playerStatus(found.campaign, found.adventure, viewer, 'image'),
-          mapCaption(found.campaign, found.adventure, 'battle'),
+          mapCaption(found.campaign, found.adventure, 'battle', this.service.globalEffects()),
         ].filter((s) => s.length > 0).join('\n');
         await this.service.sendImage!(target, path, text);
         return true;

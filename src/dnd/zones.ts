@@ -79,20 +79,56 @@ interface ZonePreset {
   theme: ZoneTheme;
 }
 
+const PRESET_DARKNESS: ZonePreset = { shape: 'sphere', radius: 15, height: 15, concentration: true, roundsLeft: 100, obscured: 'darkness', theme: 'darkness' };
+const PRESET_FOG_CLOUD: ZonePreset = { shape: 'sphere', radius: 20, height: 20, concentration: true, roundsLeft: 600, obscured: 'heavy', theme: 'fog' };
+const PRESET_CLOUDKILL: ZonePreset = { shape: 'sphere', radius: 20, height: 20, concentration: true, roundsLeft: 100, obscured: 'heavy', damage: '5d8', damageType: '毒素', saveAbility: 'con', onSave: 'half', triggers: ['enter', 'turn_start'], theme: 'poison' };
+const PRESET_STINKING_CLOUD: ZonePreset = { shape: 'sphere', radius: 20, height: 20, concentration: true, roundsLeft: 10, obscured: 'heavy', saveAbility: 'con', onFailConditions: ['失能'], triggers: ['turn_start'], theme: 'poison' };
+const PRESET_WEB: ZonePreset = { shape: 'rect', w: 4, h: 4, height: 20, concentration: true, roundsLeft: 600, obscured: 'light', difficult: true, saveAbility: 'dex', onFailConditions: ['束缚'], triggers: ['enter', 'turn_start'], theme: 'nature' };
+const PRESET_CLOUD_OF_DAGGERS: ZonePreset = { shape: 'rect', w: 1, h: 1, height: 5, concentration: true, roundsLeft: 10, damage: '4d4', damageType: '挥砍', triggers: ['enter', 'turn_start'], theme: 'radiant' };
+const PRESET_MOONBEAM: ZonePreset = { shape: 'sphere', radius: 5, height: 40, concentration: true, roundsLeft: 10, damage: '2d10', damageType: '光耀', saveAbility: 'con', onSave: 'half', triggers: ['enter', 'turn_start'], theme: 'radiant' };
+const PRESET_SPIKE_GROWTH: ZonePreset = { shape: 'sphere', radius: 20, height: 5, concentration: true, roundsLeft: 100, difficult: true, damage: '2d4', damageType: '穿刺', triggers: ['enter'], perStep: true, theme: 'nature' };
+const PRESET_WALL_OF_FIRE: ZonePreset = { shape: 'rect', w: 12, h: 1, height: 20, concentration: true, roundsLeft: 10, obscured: 'heavy', damage: '5d8', damageType: '火焰', saveAbility: 'dex', onSave: 'half', triggers: ['enter', 'turn_end'], theme: 'fire' };
+const PRESET_SILENCE: ZonePreset = { shape: 'sphere', radius: 20, height: 20, concentration: true, roundsLeft: 100, onFailConditions: ['耳聋'], triggers: ['enter', 'turn_start'], theme: 'fog' };
+const PRESET_ENTANGLE: ZonePreset = { shape: 'rect', w: 4, h: 4, height: 5, concentration: true, roundsLeft: 10, difficult: true, theme: 'nature' };
+const PRESET_SLEET_STORM: ZonePreset = { shape: 'sphere', radius: 40, height: 20, concentration: true, roundsLeft: 10, obscured: 'heavy', difficult: true, saveAbility: 'dex', onFailConditions: ['倒地'], triggers: ['enter', 'turn_start'], theme: 'frost' };
+const PRESET_HUNGER_OF_HADAR: ZonePreset = { shape: 'sphere', radius: 20, height: 20, concentration: true, roundsLeft: 10, obscured: 'darkness', difficult: true, damage: '2d6', damageType: '寒冷', triggers: ['turn_start'], theme: 'darkness' };
+
 const ZONE_PRESETS: Record<string, ZonePreset> = {
-  黑暗术: { shape: 'sphere', radius: 15, height: 15, concentration: true, roundsLeft: 100, obscured: 'darkness', theme: 'darkness' },
-  darkness: { shape: 'sphere', radius: 15, height: 15, concentration: true, roundsLeft: 100, obscured: 'darkness', theme: 'darkness' },
-  云雾术: { shape: 'sphere', radius: 20, height: 20, concentration: true, roundsLeft: 600, obscured: 'heavy', theme: 'fog' },
-  'fog cloud': { shape: 'sphere', radius: 20, height: 20, concentration: true, roundsLeft: 600, obscured: 'heavy', theme: 'fog' },
+  黑暗术: PRESET_DARKNESS,
+  darkness: PRESET_DARKNESS,
+  云雾术: PRESET_FOG_CLOUD,
+  'fog cloud': PRESET_FOG_CLOUD,
   毒雾: { shape: 'sphere', radius: 20, height: 20, roundsLeft: 10, obscured: 'heavy', damageType: '毒素', saveAbility: 'con', onSave: 'half', triggers: ['enter', 'turn_start'], theme: 'poison' },
-  死云术: { shape: 'sphere', radius: 20, height: 20, concentration: true, roundsLeft: 100, obscured: 'heavy', damage: '5d8', damageType: '毒素', saveAbility: 'con', onSave: 'half', triggers: ['enter', 'turn_start'], theme: 'poison' },
-  臭云术: { shape: 'sphere', radius: 20, height: 20, concentration: true, roundsLeft: 10, obscured: 'heavy', saveAbility: 'con', onFailConditions: ['失能'], triggers: ['turn_start'], theme: 'poison' },
-  蛛网术: { shape: 'rect', w: 4, h: 4, height: 20, concentration: true, roundsLeft: 600, obscured: 'light', difficult: true, saveAbility: 'dex', onFailConditions: ['束缚'], triggers: ['enter', 'turn_start'], theme: 'nature' },
-  匕首之云: { shape: 'rect', w: 1, h: 1, height: 5, concentration: true, roundsLeft: 10, damage: '4d4', damageType: '挥砍', triggers: ['enter', 'turn_start'], theme: 'radiant' },
-  月华之光: { shape: 'sphere', radius: 5, height: 40, concentration: true, roundsLeft: 10, damage: '2d10', damageType: '光耀', saveAbility: 'con', onSave: 'half', triggers: ['enter', 'turn_start'], theme: 'radiant' },
-  荆棘丛生: { shape: 'sphere', radius: 20, height: 5, concentration: true, roundsLeft: 100, difficult: true, damage: '2d4', damageType: '穿刺', triggers: ['enter'], perStep: true, theme: 'nature' },
-  火墙术: { shape: 'rect', w: 12, h: 1, height: 20, concentration: true, roundsLeft: 10, obscured: 'heavy', damage: '5d8', damageType: '火焰', saveAbility: 'dex', onSave: 'half', triggers: ['enter', 'turn_end'], theme: 'fire' },
-  沉默术: { shape: 'sphere', radius: 20, height: 20, concentration: true, roundsLeft: 100, onFailConditions: ['耳聋'], triggers: ['enter', 'turn_start'], theme: 'fog' },
+  死云术: PRESET_CLOUDKILL,
+  cloudkill: PRESET_CLOUDKILL,
+  臭云术: PRESET_STINKING_CLOUD,
+  'stinking cloud': PRESET_STINKING_CLOUD,
+  蛛网术: PRESET_WEB,
+  web: PRESET_WEB,
+  匕首之云: PRESET_CLOUD_OF_DAGGERS,
+  匕首云: PRESET_CLOUD_OF_DAGGERS,
+  'cloud of daggers': PRESET_CLOUD_OF_DAGGERS,
+  月华之光: PRESET_MOONBEAM,
+  月光束: PRESET_MOONBEAM,
+  moonbeam: PRESET_MOONBEAM,
+  荆棘丛生: PRESET_SPIKE_GROWTH,
+  尖刺丛生: PRESET_SPIKE_GROWTH,
+  荆棘生长: PRESET_SPIKE_GROWTH,
+  'spike growth': PRESET_SPIKE_GROWTH,
+  火墙术: PRESET_WALL_OF_FIRE,
+  火墙: PRESET_WALL_OF_FIRE,
+  'wall of fire': PRESET_WALL_OF_FIRE,
+  沉默术: PRESET_SILENCE,
+  silence: PRESET_SILENCE,
+  纠缠术: PRESET_ENTANGLE,
+  entangle: PRESET_ENTANGLE,
+  雪雨暴: PRESET_SLEET_STORM,
+  雨夹雪: PRESET_SLEET_STORM,
+  雨雪暴: PRESET_SLEET_STORM,
+  'sleet storm': PRESET_SLEET_STORM,
+  哈达之饥渴: PRESET_HUNGER_OF_HADAR,
+  哈达饥渴: PRESET_HUNGER_OF_HADAR,
+  'hunger of hadar': PRESET_HUNGER_OF_HADAR,
 };
 
 export function inferZoneTheme(name: string, damageType?: string, obscured?: BattleZone['obscured']): ZoneTheme {

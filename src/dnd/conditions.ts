@@ -153,10 +153,13 @@ const CONDITION_ALIASES: Record<string, string> = {
 
   'shield of faith': '护盾信仰',
   虔诚护盾: '护盾信仰',
+  信仰护盾: '护盾信仰',
+  虔诚之盾: '护盾信仰',
   护盾信仰: '护盾信仰',
 
   haste: '加速术',
   加速: '加速术',
+  捷速术: '加速术',
   加速术: '加速术',
 
   dodge: '闪避',
@@ -167,39 +170,56 @@ const CONDITION_ALIASES: Record<string, string> = {
   狂暴: '狂暴',
 
   'faerie fire': '妖火',
+  妖火术: '妖火',
+  仙灵之火: '妖火',
   妖火: '妖火',
 
   'sacred weapon': '神圣武器',
   神圣武器: '神圣武器',
 
   hex: '脆弱诅咒',
+  邪咒: '脆弱诅咒',
+  诅咒术: '脆弱诅咒',
   脆弱诅咒: '脆弱诅咒',
 
   "hunter's mark": '猎人印记',
   'hunters mark': '猎人印记',
+  猎手印记: '猎人印记',
   猎人印记: '猎人印记',
 
   'divine favor': '神恩',
+  神恩术: '神恩',
   神恩: '神恩',
 
   'protection from poison': '防护毒素',
+  防毒术: '防护毒素',
   防护毒素: '防护毒素',
 
   'spirit guardians': '灵体卫士',
+  灵体守卫: '灵体卫士',
+  魂灵环绕: '灵体卫士',
+  圣灵守护: '灵体卫士',
   灵体卫士: '灵体卫士',
 
   'spiritual weapon': '灵体武器',
+  精神武器: '灵体武器',
   灵体武器: '灵体武器',
 
   enlarge: '变巨术',
+  'enlarge/reduce': '变巨术',
+  变巨: '变巨术',
+  成长药水: '变巨术',
+  变巨缩小术: '变巨术',
   变巨术: '变巨术',
 
   fly: '飞行术',
   飞行术: '飞行术',
 
   'hold person': '人类定身术',
+  定身人类: '人类定身术',
   人类定身术: '人类定身术',
   'hold monster': '怪物定身术',
+  定身怪物: '怪物定身术',
   怪物定身术: '怪物定身术',
   banishment: '放逐术',
   放逐术: '放逐术',
@@ -210,6 +230,7 @@ const CONDITION_ALIASES: Record<string, string> = {
   'wall of force': '力场墙',
   力场墙: '力场墙',
   'protection from evil and good': '防护善恶',
+  防护邪恶与善良: '防护善恶',
   防护善恶: '防护善恶',
   web: '蛛网术',
   蛛网术: '蛛网术',
@@ -219,13 +240,28 @@ const CONDITION_ALIASES: Record<string, string> = {
   月华之光: '月华之光',
   'hypnotic pattern': '催眠图纹',
   催眠图纹: '催眠图纹',
+  fear: '恐惧术',
+  恐惧术: '恐惧术',
   slow: '迟缓术',
+  缓慢术: '迟缓术',
+  缓慢: '迟缓术',
+  迟缓: '迟缓术',
+  减速术: '迟缓术',
   迟缓术: '迟缓术',
   polymorph: '变形术',
   变形术: '变形术',
+  invisibility: '隐形术',
+  隐身术: '隐形术',
+  隐形术: '隐形术',
   'greater invisibility': '高等隐形',
+  高等隐形术: '高等隐形',
+  大隐形术: '高等隐形',
+  高等隐身: '高等隐形',
+  高等隐身术: '高等隐形',
   高等隐形: '高等隐形',
   'spike growth': '荆棘丛生',
+  尖刺丛生: '荆棘丛生',
+  荆棘生长: '荆棘丛生',
   荆棘丛生: '荆棘丛生',
   'cloud of daggers': '匕首之云',
   匕首之云: '匕首之云',
@@ -233,6 +269,14 @@ const CONDITION_ALIASES: Record<string, string> = {
   火墙术: '火墙术',
   silence: '沉默术',
   沉默术: '沉默术',
+  'stinking cloud': '臭云术',
+  臭云术: '臭云术',
+  cloudkill: '死云术',
+  死云术: '死云术',
+  'sleet storm': '雪雨暴',
+  雨夹雪: '雪雨暴',
+  雨雪暴: '雪雨暴',
+  雪雨暴: '雪雨暴',
 };
 
 /** 含失能效果的状态：禁止动作/附赠动作/反应，且施加时自动打断专注 */
@@ -245,9 +289,9 @@ export const ZERO_SPEED_CONDITIONS = new Set(['死亡', '擒抱', '束缚', '麻
 export const DEFAULT_CONCENTRATION_STATES = new Set([
   '祝福术', '灾祸术', '护盾信仰', '加速术', '妖火', '猎人印记', '脆弱诅咒',
   '神恩', '灵体卫士', '变巨术', '飞行术', '人类定身术', '怪物定身术', '放逐术',
-  '云雾术', '黑暗术', '力场墙', '魂灵环绕', '防护善恶', '蛛网术', '纠缠术',
+  '云雾术', '黑暗术', '力场墙', '防护善恶', '蛛网术', '纠缠术',
   '月华之光', '催眠图纹', '恐惧术', '迟缓术', '变形术', '隐形术', '高等隐形',
-  '荆棘丛生', '匕首之云', '火墙术', '沉默术',
+  '荆棘丛生', '匕首之云', '火墙术', '沉默术', '臭云术', '死云术', '雪雨暴',
 ]);
 
 /** 把英文或中文同义词归一成标准状态名；未知自定义状态原样保留（仅去首尾空白） */
@@ -329,6 +373,10 @@ export function hasCondition(ch: Character, canonicalName: string): boolean {
 
 export function isIncapacitated(ch: Character): boolean {
   return effectiveStates(ch).some((s) => INCAPACITATING_CONDITIONS.has(s.name));
+}
+
+export function isInvisibleState(ch: Character): boolean {
+  return effectiveStates(ch).some((s) => s.name === '隐形' || s.name === '隐形术' || s.name === '高等隐形');
 }
 
 /** 角色无法执行动作/附赠动作/反应时的原因；可正常行动时返回 undefined */
@@ -754,7 +802,7 @@ export function computeAttackStateMods(
 
   // 3. 攻击者自身状态
   const atkFaerieFire = atkStates.some((s) => s.name === '妖火');
-  if ((atkStates.some((s) => s.name === '隐形') || atkStates.some((s) => s.name === '高等隐形')) && !atkFaerieFire) advReasons.push('自身隐形(优)');
+  if (isInvisibleState(attacker) && !atkFaerieFire) advReasons.push('自身隐形(优)');
   if (atkStates.some((s) => s.name === '失明')) disadvReasons.push('自身失明(劣)');
   if (atkStates.some((s) => s.name === '中毒')) disadvReasons.push('自身中毒(劣)');
   if (atkStates.some((s) => s.name === '倒地')) disadvReasons.push('自身倒地(劣)');
@@ -776,7 +824,7 @@ export function computeAttackStateMods(
   // 4. 受击目标状态
   const tgtFaerieFire = tgtStates.some((s) => s.name === '妖火');
   if (tgtFaerieFire) advReasons.push('目标妖火(优)');
-  if ((tgtStates.some((s) => s.name === '隐形') || tgtStates.some((s) => s.name === '高等隐形')) && !tgtFaerieFire) disadvReasons.push('目标隐形(劣)');
+  if (isInvisibleState(target) && !tgtFaerieFire) disadvReasons.push('目标隐形(劣)');
   if (tgtStates.some((s) => s.name === '失明')) advReasons.push('目标失明(优)');
   if (tgtStates.some((s) => s.name === '麻痹')) advReasons.push('目标麻痹(优)');
   if (tgtStates.some((s) => s.name === '石化')) advReasons.push('目标石化(优)');
@@ -867,6 +915,12 @@ export function computeAttackStateMods(
   const critCond = tgtStates.find((s) => s.name === '麻痹' || s.name === '昏迷');
   const autoCritOnHit = within5ft && critCond !== undefined;
   const autoCritReason = autoCritOnHit ? `目标5尺内${critCond!.name}(命中自动重击)` : undefined;
+
+  if (atkStates.some((s) => s.name === '迟缓术')
+    && c.initiative?.turnState?.actor === attacker.name
+    && (c.initiative.turnState.attacks ?? 0) >= 1) {
+    notes.push(`${attacker.name} 受迟缓术影响：本回合已攻击过，5e 规则下迟缓术受术者每回合至多只能进行 1 次近战或远程攻击`);
+  }
 
   return {
     advantage,
@@ -1079,6 +1133,10 @@ export function computeSaveStateMods(
 
   let flatBonus = 0;
   const flatBonusReasons: string[] = [];
+  if (ability === 'dex' && states.some((s) => s.name === '迟缓术')) {
+    flatBonus -= 2;
+    flatBonusReasons.push('迟缓术-2');
+  }
   const c = options.campaign;
   const tagsLower = (options.vsTags ?? []).map((t) => t.trim().toLowerCase()).filter(Boolean);
   const selfCtx = buildFormulaContext(ch);

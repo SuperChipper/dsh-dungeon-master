@@ -151,11 +151,12 @@ export function registerExploreTools(kit: ToolKit): void {
       const { campaign, adventure } = service.require(record.sessionKey);
       const out = join(service.mapDir, `${record.sessionKey.replace(/[^a-zA-Z0-9_-]+/g, '_')}-${Date.now()}.png`);
       const view = (['battle', 'explore'] as const).find((v) => v === args.view) ?? 'auto';
-      const map = await renderPartyMap(campaign, adventure, out, view, { schematic: args.schematic === true })
+      const globalEffects = service.globalEffects();
+      const map = await renderPartyMap(campaign, adventure, out, view, { schematic: args.schematic === true, globalEffects })
         .catch((err: unknown) => { throw new Error(`dnd_map: ${err instanceof Error ? err.message : String(err)}，先 dnd_position terrain 画一张`); });
       if (map === undefined) throw new Error('dnd_map: 地图渲染需要 sharp，当前环境没装上');
       // 地点、轮次、轮到谁画在图的标题条上；图例、能去哪附在图下面（DM 自己的话放最前）
-      const caption = [str(args.caption), mapCaption(campaign, adventure, map.kind)].filter((s) => s !== undefined && s.length > 0).join('\n');
+      const caption = [str(args.caption), mapCaption(campaign, adventure, map.kind, globalEffects)].filter((s) => s !== undefined && s.length > 0).join('\n');
       await deps.sendImage(record, map.path, caption);
       return map.kind === 'battle'
         ? '战斗图已发，图下附了图例（坐标和 dnd_position 一致）。图上和图例里有的别再复述。'

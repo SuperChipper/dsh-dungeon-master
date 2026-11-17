@@ -6,7 +6,7 @@ This file records significant `dsh-dungeon-master` updates from a product perspe
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [0.7.0] - 2026-11-17
+## [0.7.0] - 2026-11-18
 
 ### Added
 
@@ -21,7 +21,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Combat subagent final-round narration cutoff**: fixed combat ending transitions via `dnd_initiative(action="end")` handing control back before broadcasting the closing turn's rolls and outcome; the subagent now narrates the final round to the group before returning the post-combat handoff to the main DM.
 - **Model failover restart desync**: fixed `ModelWatch` starting out of sync when restarting on a backup channel with `modelFailover` enabled, preventing recovery back to primary, and automatically clears stale persisted `failover` markers when `modelFailover` is disabled.
 - **Combat subagent context growth & group history cursor continuity**: suppressed optional host runtime contexts via `suppressRuntimeContext` and forced `required: true` runtime contexts (`qqbot:dnd-state` / `qqbot:sticker-additions`) to return empty for combat child sessions (preventing per-step `Current runtime context` re-emissions), injecting a compact delta-only `combatStateSnapshot` once per turn only when combatant state changes, and deduplicating redundant hit-die keys in `resourceTag`; disabled both host-level automatic/overflow compaction (`compaction.compactIfNeeded`) and plugin `maybeAutoCompact` for disposable combat subagents so active fights are never summarized away or cache-busted mid-combat; pinned `SessionManager.sessionIdFor` to the main session ID so combat handoffs and failovers never flush full group chat history; and added multi-tier subagent failover (`combatAgent -> modelFailover backup -> subagent reusing the main DM's effective model route -> main DM`) with cross-model `reasoningEffort` isolation.
-- **Combat resolution guardrails**: `dnd_apply` rejects simultaneous `damage` and `heal` arguments in the same call, adds bonus-action spellcasting economy reminders, and filters negated phrases (such as "cannot take opportunity attacks") from `reactionsOf` trait scanning.
+- **Combat resolution guardrails, Chinese alias unification & `Slow` automation**: `dnd_apply` rejects simultaneous `damage` and `heal` arguments in the same call, adds bonus-action spellcasting economy reminders, and filters negated phrases (such as "cannot take opportunity attacks") from `reactionsOf` trait scanning; completes 5e `缓慢术`/`迟缓术` automation (-2 AC, halved speed, -2 DEX saves, blocked reactions/opportunity attacks, and multi-attack reminder), unifies multi-edition Chinese spell/condition/zone/aura/trait aliases across lookup and mechanics engines, and forwards `global`-scoped custom hazard auras to `/dnd status` and `/dnd map` rendering.
 
 ## [0.6.0] - 2026-11-16
 

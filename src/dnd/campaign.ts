@@ -1224,6 +1224,8 @@ export function isSurprised(c: Campaign, name: string): boolean {
 /** 此刻为什么不能反应；能反应时返回 undefined */
 export function reactionBlocked(c: Campaign, name: string): string | undefined {
   if (isSurprised(c, name)) return `${name} 受惊，自己第一个回合过去之前不能反应`;
+  const ch = findCharacter(c, name);
+  if (ch !== undefined && hasCondition(ch, '迟缓术')) return `${name} 受迟缓术影响，无法执行反应`;
   if (c.initiative?.reacted?.includes(name) === true) return `${name} 的反应已经用过了，要到他下个回合开始才恢复`;
   return undefined;
 }
@@ -1995,11 +1997,15 @@ export const ELVEN_ACCURACY = '精灵精准';
 const TRAIT_ALIASES: Record<string, string> = {
   'great weapon fighting': GREAT_WEAPON_FIGHTING,
   巨武器: GREAT_WEAPON_FIGHTING,
+  大武器战斗: GREAT_WEAPON_FIGHTING,
   巨武器战斗风格: GREAT_WEAPON_FIGHTING,
   archery: ARCHERY,
   箭术战斗风格: ARCHERY,
   弓术: ARCHERY,
+  射击: ARCHERY,
+  射术: ARCHERY,
   'elven accuracy': ELVEN_ACCURACY,
+  精灵准: ELVEN_ACCURACY,
   精灵精准专长: ELVEN_ACCURACY,
 };
 
@@ -2012,7 +2018,7 @@ export function normalizeTrait(trait: string): string {
 /** 精灵精准：优先看结构化 traits，旧角色卡未填 traits 时从备注兜底识别 */
 export function hasElvenAccuracy(ch: Character): boolean {
   if (ch.traits !== undefined) return ch.traits.includes(ELVEN_ACCURACY);
-  return /精灵精准|Elven Accuracy/i.test(ch.notes ?? '');
+  return /精灵精?准|Elven Accuracy/i.test(ch.notes ?? '');
 }
 
 /** 用敏捷/智力/感知/魅力进行的攻击检定具优势时可触发精灵精准（三骰取高） */

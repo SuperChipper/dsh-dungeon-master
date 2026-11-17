@@ -5,14 +5,16 @@ import { describe, expect, it, vi } from 'vitest';
 import type { DshAgent, SessionRecord } from '../session/types.ts';
 import { AdventureLibrary } from './adventure.ts';
 import { buildBattleSvg, roomTokens } from './battle-image.ts';
-import { battleGridLines, hiddenFromPlayers, mapOf } from './battlefield.ts';
-import { CampaignStore, reactionsOf, requireCharacter, setResource, upsertCharacter } from './campaign.ts';
+import { battleGridLines, canReact, hiddenFromPlayers, mapOf } from './battlefield.ts';
+import { armorClass, CampaignStore, hasElvenAccuracy, reactionBlocked, reactionsOf, requireCharacter, setResource, upsertCharacter } from './campaign.ts';
+import { computeAttackStateMods, computeSaveStateMods, movementSpeedInfo, normalizeCondition } from './conditions.ts';
 import { DndService } from './dnd-service.ts';
 import { registerDndTools } from './dnd-tools.ts';
 import { evalFormula, evalIntFormula, validateFormula } from './formula.ts';
 import { mapCaption } from './map-view.ts';
+import { SRD_SPELL_ZH } from './srd-lookup.ts';
 import type { DndToolDefinition } from './tool-views.ts';
-import { activeVisualAurasInRoom, zonesInRoom } from './zones.ts';
+import { activeVisualAurasInRoom, createBattleZoneInput, zonesInRoom } from './zones.ts';
 
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 type Tool = DndToolDefinition & { execute(args: unknown, exec: { agent?: unknown; concludeTurn?: () => void }): Promise<{ text: string }> };
@@ -660,5 +662,116 @@ describe('v0.7 战斗升级全链路回归测试', () => {
     expect(lifeHeal.text).toContain('【神佑医者】');
     expect(requireCharacter(h.service.store.load(h.key)!, '剑客').hp).toBe(36);
     expect(requireCharacter(h.service.store.load(h.key)!, '生命牧师').hp).toBe(34);
+  });
+
+  it('译名统一与缓慢术全规则结算（AC -2 / 速度减半 / 敏捷豁免 -2 / 禁反应 + 全局自定义光环地图绘制）', async () => {
+    const h = createUpgradeHarness();
+    h.service.store.update(h.key, (c) => {
+      upsertCharacter(c, {
+        name: '吟游诗人',
+        kind: 'pc',
+        playerId: 'U1',
+        className: '吟游诗人',
+        level: 6,
+        maxHp: 38,
+        ac: 16,
+        abilities: { str: 10, dex: 14, con: 14, int: 10, wis: 10, cha: 16 },
+        traits: ['精灵准'],
+      });
+      upsertCharacter(c, {
+        name: '游侠',
+        kind: 'pc',
+        playerId: 'U2',
+        className: '游侠',
+        level: 6,
+        maxHp: 45,
+        ac: 16,
+        speed: 30,
+        traits: ['大武器战斗'],
+      });
+      upsertCharacter(c, {
+        name: '怪物A',
+        kind: 'monster',
+        room: h.startRoom,
+        maxHp: 40,
+        ac: 15,
+        speed: 30,
+        abilities: { str: 14, dex: 14, con: 12, int: 8, wis: 10, cha: 8 }, // 敏调 +2
+      });
+    });
+
+    h.rolls.push(18, 14, 10);
+    await h.call('dnd_initiative', { action: 'start' });
+    await h.call('dnd_position', { action: 'terrain', width: 10, height: 10, areas: [] });
+    await h.call('dnd_position', {
+      action: 'set',
+      placements: [{ name: '吟游诗人', x: 2, y: 2 }, { name: '游侠', x: 3, y: 2 }, { name: '怪物A', x: 3, y: 3 }],
+    });
+
+    // 1. 施加「缓慢术」与「信仰护盾」/「高等隐形术」译名同义词
+    await h.call('dnd_apply', {
+      target: '怪物A',
+      add_conditions: ['缓慢术'],
+      caster: '吟游诗人',
+      concentration: true,
+      rounds: 10,
+    });
+    await h.call('dnd_apply', { target: '游侠', add_conditions: ['信仰护盾', '高等隐形术'] });
+
+    const camp = h.service.store.load(h.key)!;
+    const bard = requireCharacter(camp, '吟游诗人');
+    const ranger = requireCharacter(camp, '游侠');
+    const monster = requireCharacter(camp, '怪物A');
+
+    expect(normalizeCondition('缓慢术')).toBe('迟缓术');
+    expect(hasElvenAccuracy(bard)).toBe(true);
+    expect(ranger.traits).toContain('巨武器战斗');
+    expect(armorClass(camp, ranger)).toBe(18); // 信仰护盾 -> 护盾信仰 (+2 AC)
+    expect(armorClass(camp, monster)).toBe(13); // 缓慢术 -> 迟缓术 (-2 AC)
+    expect(movementSpeedInfo(monster).baseSpeed).toBe(15); // 速度减半
+    expect(canReact(monster)).toBe(false);
+    expect(reactionBlocked(camp, '怪物A')).toContain('迟缓术');
+    expect(computeSaveStateMods(monster, 'dex', { campaign: camp })).toMatchObject({
+      flatBonus: -2,
+      flatBonusReasons: expect.arrayContaining(['迟缓术-2']),
+    });
+    expect(monster.activeStates?.find((s) => s.name === '迟缓术')).toMatchObject({
+      source: '吟游诗人',
+      concentration: true,
+    });
+
+    // 高等隐形术生效：切到游侠回合后离开怪物A 触及不触发借机，且对怪物A 攻击具有优势
+    expect(computeAttackStateMods(camp, ranger, monster).advantage).toBe('advantage');
+    await h.call('dnd_initiative', { action: 'next', declared_by: 'U1' });
+    const rangerMove = await h.call('dnd_position', { action: 'move', name: '游侠', x: 6, y: 2, declared_by: 'U2' });
+    expect(rangerMove.text).not.toContain('【移动待结算】');
+
+    // 2. SRD / BattleZone 多译名一致性（尖刺丛生 / 荆棘生长 / 迟缓术 / 魂灵环绕 / 灵体守卫）
+    expect(SRD_SPELL_ZH['迟缓术']).toBe('slow');
+    expect(SRD_SPELL_ZH['荆棘生长']).toBe('spike-growth');
+    expect(SRD_SPELL_ZH['尖刺丛生']).toBe('spike-growth');
+    expect(SRD_SPELL_ZH['魂灵环绕']).toBe('spirit-guardians');
+    expect(SRD_SPELL_ZH['灵体守卫']).toBe('spirit-guardians');
+    expect(createBattleZoneInput({ name: '尖刺丛生', room: h.startRoom, x: 4, y: 4 })).toMatchObject({
+      radius: 20,
+      perStep: true,
+      damage: '2d4',
+    });
+
+    // 3. global 作用域自定义光环（含别名「魂灵环绕」及自定义风怒/毒雾光环）能在地图图例正确绘制
+    await h.call('dnd_rule', {
+      action: 'define',
+      scope: 'global',
+      name: '烈焰斗篷',
+      aura: {
+        radius: 10,
+        target: 'enemies',
+        hazard: { damage_dice: '2d6', damage_type: '火焰', save_ability: 'dex' },
+      },
+    });
+    await h.call('dnd_apply', { target: '吟游诗人', add_conditions: ['烈焰斗篷'], concentration: false });
+    const latest = h.service.active(h.key)!;
+    const captionWithGlobal = mapCaption(latest.campaign, latest.adventure, 'battle', h.service.globalEffects());
+    expect(captionWithGlobal).toContain('烈焰斗篷（吟游诗人·10尺光环）');
   });
 });

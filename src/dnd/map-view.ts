@@ -9,6 +9,7 @@ import { renderBattleImage, roomTokens } from './battle-image.ts';
 import { hiddenFromPlayers, mapOf } from './battlefield.ts';
 import { renderBookMap } from './book-map.ts';
 import { type Campaign, explored, findCharacter, isOut, partyPositions, roomOf } from './campaign.ts';
+import type { CustomEffectDef } from './custom-effects.ts';
 import { findRoom } from './dungeon.ts';
 import { renderMapPng } from './map-render.ts';
 import { exitsLine } from './text-map.ts';
@@ -54,7 +55,12 @@ const MAX_EXITS = 6;
  * 战斗图配图例（圆片上的字是谁、谁倒了、有名字的障碍和难行地形）；探索地图配「你们在哪、能去哪」。
  * 地点、轮次、轮到谁已经在图的标题条上，这里不重复。
  */
-export function mapCaption(c: Campaign, adv: Adventure, kind: RenderedMap['kind']): string {
+export function mapCaption(
+  c: Campaign,
+  adv: Adventure,
+  kind: RenderedMap['kind'],
+  globalEffects?: Record<string, CustomEffectDef>,
+): string {
   if (kind === 'battle') {
     const room = battleRoom(c);
     const tokens = roomTokens(c, room, (ch) => !hiddenFromPlayers(ch));
@@ -80,7 +86,7 @@ export function mapCaption(c: Campaign, adv: Adventure, kind: RenderedMap['kind'
     const down = tokens.filter((t) => t.down).map((t) => t.name);
     if (down.length > 0) lines.push(`⚪ 倒地：${down.join('、')}`);
     const roomZones = zonesInRoom(c, room);
-    const roomAuras = activeVisualAurasInRoom(c, room, (ch) => !hiddenFromPlayers(ch));
+    const roomAuras = activeVisualAurasInRoom(c, room, (ch) => !hiddenFromPlayers(ch), globalEffects);
     if (roomZones.length > 0 || roomAuras.length > 0) {
       const zParts = [
         ...roomZones.map(formatZonePlayerLegend),
@@ -160,12 +166,16 @@ function plainRoomName(adv: Adventure, room: string): string {
  * 其余情况画不出来（没装 sharp）返回 undefined，调用方退回文字地图。
  */
 export async function renderPartyMap(
-  c: Campaign, adv: Adventure, outPath: string, view: MapView = 'auto', options: { schematic?: boolean } = {},
+  c: Campaign,
+  adv: Adventure,
+  outPath: string,
+  view: MapView = 'auto',
+  options: { schematic?: boolean; globalEffects?: Record<string, CustomEffectDef> } = {},
 ): Promise<RenderedMap | undefined> {
   if (view === 'battle' || (view === 'auto' && c.initiative !== undefined)) {
     const room = battleRoom(c);
     if (mapOf(c, room) === undefined && view === 'battle') throw new Error(`「${roomName(adv, room)}」还没有场地图`);
-    const path = await renderBattleImage(c, adv, room, battleTitle(c, adv, room), outPath, (ch) => !hiddenFromPlayers(ch));
+    const path = await renderBattleImage(c, adv, room, battleTitle(c, adv, room), outPath, (ch) => !hiddenFromPlayers(ch), options.globalEffects);
     if (path !== undefined) return { path, kind: 'battle' };
     if (view === 'battle') return undefined;
   }

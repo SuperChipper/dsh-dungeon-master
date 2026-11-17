@@ -32,6 +32,7 @@ import {
   ensureTurnState,
   hasCondition,
   isIncapacitated,
+  isInvisibleState,
   movementSpeedInfo,
 } from './conditions.ts';
 import type { CustomEffectDef } from './custom-effects.ts';
@@ -97,7 +98,7 @@ function isHostile(a: Character, b: Character): boolean {
 }
 
 export function canReact(ch: Character): boolean {
-  return !isOut(ch) && ch.hp > 0 && !isIncapacitated(ch);
+  return !isOut(ch) && ch.hp > 0 && !isIncapacitated(ch) && !hasCondition(ch, '迟缓术');
 }
 
 /** 房间字段不能成为绕过战场路线、借机和出口位置的捷径。 */
@@ -499,7 +500,7 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
 
   const others = placedIn(c, from.room).filter(({ ch: o }) => o.name !== ch.name && o.name !== dragged?.name);
   const foes = others.filter(({ ch: o }) => isHostile(ch, o));
-  const moverInvisible = request.ignoreStateMods !== true && hasCondition(ch, '隐形') && !hasCondition(ch, '妖火');
+  const moverInvisible = request.ignoreStateMods !== true && isInvisibleState(ch) && !hasCondition(ch, '妖火');
   const reactors = moverInvisible ? [] : foes.filter(({ ch: o }) => inInitiative(c, o.name) && canReact(o) && !hasCondition(o, '失明') && reactionBlocked(c, o.name) === undefined
     && !request.ignoredReactors?.includes(o.name));
   const reachOf = (other: Character): number => Math.max(MELEE_REACH_FEET, ...(other.weapons ?? []).map((w) => weaponReach(w, true) ?? 0));
@@ -859,10 +860,9 @@ export function turnPositionNote(c: Campaign, name: string): string {
   return `${where}。${hint}${noMap}`;
 }
 
-/** 玩家看站位时要藏起来的：隐形、躲着的怪。位置正是它们要瞒的东西 */
-const HIDDEN = ['隐形', '躲藏', '隐匿'];
+/** 玩家看站位时要藏起来的：隐形、躲着的怪。位置正是它们要瞒的东西（被妖火照出形迹的不再藏） */
 export function hiddenFromPlayers(ch: Character): boolean {
-  return ch.kind === 'monster' && ch.conditions.some((cond) => HIDDEN.includes(cond));
+  return ch.kind === 'monster' && ((isInvisibleState(ch) && !hasCondition(ch, '妖火')) || ch.conditions.some((cond) => cond === '躲藏' || cond === '隐匿'));
 }
 
 const defaultVisible = (): boolean => true;
