@@ -57,8 +57,9 @@ function dayKey(now: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-/** 命中来源：两个以上同时成立时按优先级记，够用来分组，不必是完整组合 */
-function viaOf(hit: { exact?: unknown; similarity?: unknown }): string {
+/** 命中来源：显式触发词优先，其余两个以上同时成立时按优先级记 */
+function viaOf(hit: { triggeredBy?: readonly string[]; exact?: unknown; similarity?: unknown }): string {
+  if (hit.triggeredBy !== undefined && hit.triggeredBy.length > 0) return 'trigger';
   if (hit.exact !== undefined) return 'exact';
   if (hit.similarity !== undefined) return 'semantic';
   return 'bm25';
@@ -99,6 +100,7 @@ export class NoteMetricsStore {
     file: string;
     heading: string;
     score: number;
+    triggeredBy?: readonly string[];
     exact?: unknown;
     similarity?: unknown;
   }[]): void {

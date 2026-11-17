@@ -398,7 +398,10 @@ describe('bind-routes', () => {
       routes.get(BIND_CONFIG_PATH),
       fakeReq('POST', { host: '127.0.0.1:3080', 'content-type': 'application/json' },
         JSON.stringify({
-          notes: { enabled: false, root: 'C:/notes', autoInject: true, injectTopK: 3, injectMaxChars: 500, injectMinCoverage: 0.5 },
+          notes: {
+            enabled: false, root: 'C:/notes', autoInject: true, injectTopK: 3,
+            injectMaxChars: 500, injectPerNoteChars: 180, groupInjectMaxChars: 300, injectMinCoverage: 0.5,
+          },
           media: { enabled: true, maxMB: 100, ttlHours: 12, maxTotalMB: 512 },
           video: { enabled: false, ffmpegPath: 'C:/ffmpeg/bin/ffmpeg.exe', maxFrames: 4, maxSeconds: 60 },
           toolAccess: { enabled: true, fullAccessGroups: ['g1'], fullAccessUsers: [], readRoots: ['C:/x'] },
@@ -409,11 +412,31 @@ describe('bind-routes', () => {
     expect(res.statusCode).toBe(200);
     expect(updates).toHaveLength(1);
     expect(updates[0]).toMatchObject({
-      notes: { enabled: false },
+      notes: { enabled: false, injectPerNoteChars: 180, groupInjectMaxChars: 300 },
       video: { maxFrames: 4 },
       toolAccess: { fullAccessGroups: ['g1'] },
       dnd: { turnButtons: false },
     });
+  });
+
+  it.each([
+    { injectPerNoteChars: -1 },
+    { injectPerNoteChars: 4001 },
+    { injectPerNoteChars: '100' },
+    { groupInjectMaxChars: -5 },
+    { groupInjectMaxChars: 5000 },
+    { groupInjectMaxChars: false },
+  ])('POST config：拒绝非法 notes 注入预算字段 %j', async (badNotes) => {
+    const updates: Array<Record<string, unknown>> = [];
+    const { routes } = createHarness({ onUpdateConfig: (config) => { updates.push(config); return true; } });
+    const res = fakeRes();
+    await invoke(
+      routes.get(BIND_CONFIG_PATH),
+      fakeReq('POST', { host: '127.0.0.1:3080', 'content-type': 'application/json' }, JSON.stringify({ notes: badNotes })),
+      res,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(updates).toHaveLength(0);
   });
 
   it('POST config：战斗代理配置可保存，且只写 dnd 顶层键', async () => {

@@ -122,4 +122,37 @@ describe('SessionManager 笔记注入与完成回复后结算打分', () => {
       reply: 'posters/abyss-v3.png',
     }));
   });
+
+  it('notesHint 向 searchHybrid 传递人设与场景上下文，并在群聊使用 groupInjectMaxChars 预算', async () => {
+    const enqueue = vi.fn(async () => [1]);
+    const { stub } = makeManagerStub(enqueue);
+    (stub.config.notes as Record<string, unknown>).groupInjectMaxChars = 70;
+    (stub.config.notes as Record<string, unknown>).injectPerNoteChars = 200;
+    (stub as Record<string, unknown>).personaStore = {
+      current: () => ({ id: 'hakimi', name: '哈基米', names: ['猫猫'], prompt: '...' }),
+    };
+    (stub.notesStore.searchHybrid as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
+      file: '人设梗.md',
+      heading: '哈基米炸毛',
+      text: '被叫小笨猫会哈气。'.repeat(15),
+      score: 0.9,
+      coverage: 0.8,
+      matched: 2,
+    }]);
+
+    const hint = await SessionManager.prototype.notesHint.call(stub, '小笨猫哈气', 'group', 'g-rp');
+    expect(stub.notesStore.searchHybrid).toHaveBeenCalledWith(
+      '小笨猫哈气',
+      4,
+      'group_g-rp',
+      expect.objectContaining({
+        personas: ['hakimi', '哈基米', '猫猫'],
+        scenes: ['group'],
+        sharedOnly: false,
+      }),
+    );
+    expect(hint).toContain('预算 70/70 字');
+    const body = hint.split('\n')[2]!;
+    expect(body.length).toBeLessThanOrEqual(73);
+  });
 });

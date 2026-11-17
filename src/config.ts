@@ -330,6 +330,10 @@ export interface NotesConfig {
   injectTopK: number;
   /** 自动注入的总字数上限 */
   injectMaxChars: number;
+  /** 单段自动注入的字数上限（0 = 不单独限制，在总预算内按需分配） */
+  injectPerNoteChars?: number;
+  /** 群聊自动注入的总字数上限（0 = 与 injectMaxChars 相同） */
+  groupInjectMaxChars?: number;
   /** 自动注入的最低查询词覆盖率（0-1），越高越保守 */
   injectMinCoverage: number;
   /** 语义检索 */
@@ -540,6 +544,8 @@ export const NotesSchema: Schema<NotesConfig> = Schema.object({
   autoInject: Schema.boolean().default(true).description('是否自动在消息前注入相关笔记'),
   injectTopK: Schema.number().default(2).description('自动注入最多片段数'),
   injectMaxChars: Schema.number().default(600).description('自动注入总字数上限'),
+  injectPerNoteChars: Schema.number().min(0).max(4000).default(0).description('单段自动注入字数上限（0=不单限，按总上限分配）'),
+  groupInjectMaxChars: Schema.number().min(0).max(4000).default(0).description('群聊自动注入总字数上限（0=与总字数上限相同）'),
   injectMinCoverage: Schema.number().default(0.4).description('自动注入最低查询词覆盖率(0-1)'),
   semantic: NotesSemanticSchema.description('向量语义检索'),
   judge: NoteJudgeSchema.description('注入相关性打分'),

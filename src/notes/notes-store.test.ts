@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
-import { NotesStore, chatKeyOf, chunkMarkdown, formatNotesHint, tokenize } from './notes-store.ts';
+import { NotesStore, chatKeyOf, chunkMarkdown, formatNotesHint, planNoteInjection, selectNotesForInjection, tokenize } from './notes-store.ts';
 import { looksLikeCampaignNote } from './notes-tools.ts';
 import { EmbeddingCache, type Embedder } from './embedding.ts';
 
@@ -261,5 +261,135 @@ describe('looksLikeCampaignNote', () => {
   it('普通梗和知识不算', () => {
     expect(looksLikeCampaignNote('网络缩写小抄', 'ltp、admin、php 的意思')).toBe(false);
     expect(looksLikeCampaignNote('奶蛙迷因档案', '2026 年初在 B 站爆红')).toBe(false);
+  });
+});
+
+describe('范围隔离、新旧冲突、触发依据与注水预算', () => {
+  it('通用教训跨模型跨会话可用；项目笔记只在对应项目或授权点名时命中；角色设定按人设与场景隔离', () => {
+    const root = tempNotes({
+      '通用工程教训.md': '# 可靠Agent协作\n\n> 记录于 2026-11-13 · 来源：私聊\n\n完成状态必须对应真实证据，禁止用估计值冒充实测。',
+      'projects/voice-lab/破音定位.md': '---\nprojects: [voice-lab]\ntriggers: [RVC破音, hp5]\ndate: 2026-11-04\nsource: 私聊\n---\n# RVC 高音破音真因\n干声混有和声时先用 --lead-back hp5 拆主唱。',
+      '哈基米角色口癖.md': '---\npersonas: [哈基米]\nscenes: [group]\ndate: 2026-11-10\n---\n# 哈基米猫猫演绎\n被叫小笨猫会炸毛哈气，禁止使用霸总八股腔。',
+    });
+    const store = new NotesStore(root);
+
+    // 1. 通用教训在不同会话、不同模型下都能检索
+    const genA = store.search('真实证据 估计值', 5, 'group_X', { projects: ['dsh-qqbot'], models: ['claude'], scenes: ['group'] });
+    const genB = store.search('真实证据 估计值', 5, 'c2c_Y', { projects: ['voice-lab'], models: ['deepseek'], scenes: ['c2c'] });
+    expect(genA[0]!.file).toBe('通用工程教训.md');
+    expect(genA[0]!.scopeLabel).toBe('跨会话通用');
+    expect(genB[0]!.file).toBe('通用工程教训.md');
+
+    // 2. 项目笔记：在无关项目和受限群聊里不命中；在 voice-lab 或授权点名时命中
+    expect(store.search('高音破音怎么修 hp5', 5, 'group_X', { projects: ['dsh-qqbot'], scenes: ['group'], allowQueryProjectMatch: false })).toEqual([]);
+    expect(store.search('voice-lab 高音破音 hp5', 5, 'group_X', { projects: ['dsh-qqbot'], scenes: ['group'], allowQueryProjectMatch: false })).toEqual([]);
+    const inProj = store.search('高音破音怎么修', 5, undefined, { projects: ['voice-lab'], scenes: ['local'] });
+    expect(inProj[0]!.file).toBe('projects/voice-lab/破音定位.md');
+    expect(inProj[0]!.scopeLabel).toBe('项目:voice-lab');
+    const byQuery = store.search('voice-lab 高音破音', 5, 'c2c_OWNER', { allowQueryProjectMatch: true, scenes: ['c2c'] });
+    expect(byQuery[0]!.file).toBe('projects/voice-lab/破音定位.md');
+
+    // 3. 角色演绎：只在匹配人设 + 场景启用
+    expect(store.search('小笨猫 霸总八股', 5, 'group_X', { personas: ['大肥鱼'], scenes: ['group'] })).toEqual([]);
+    expect(store.search('小笨猫 霸总八股', 5, 'c2c_X', { personas: ['哈基米'], scenes: ['c2c'] })).toEqual([]);
+    const rpHit = store.search('小笨猫 霸总八股', 5, 'group_X', { personas: ['哈基米'], scenes: ['group'] });
+    expect(rpHit[0]!.file).toBe('哈基米角色口癖.md');
+    expect(rpHit[0]!.scopeLabel).toContain('人设:哈基米');
+  });
+
+  it('过期结论保留日期与来源，默认不自动注入，旧词检索时补召回并优先新记录；问历史时放行', () => {
+    const root = tempNotes({
+      '旧whisper方案.md': '# 本机 whisper 转写\n\n> 记录于 2026-10-28 · 来源：私聊\n\n本地启动 whisper.cpp 监听 127.0.0.1:8080 跑转写服务。',
+      '新音频链路.md': '---\ndate: 2026-11-05\nsource: 私聊\nsupersedes: 旧whisper方案.md\n---\n# 当前音频转写链路\n已改用 qqbot_transcribe 直传云端接口转写，不再开本地服务。',
+    });
+    const store = new NotesStore(root);
+
+    // 用旧词（8080 / whisper.cpp）搜：新记录虽然没写 8080，仍被替代关系补召回并排第一；旧记录带冲突提醒且不自动注入
+    const hits = store.search('whisper.cpp 8080 怎么转写');
+    expect(hits[0]!.file).toBe('新音频链路.md');
+    expect(hits[0]!.why).toContain('替代旧记录');
+    const oldHit = hits.find((h) => h.file === '旧whisper方案.md')!;
+    expect(oldHit.meta?.status).toBe('superseded');
+    expect(oldHit.meta?.date).toBe('2026-10-28');
+    expect(oldHit.meta?.source).toBe('私聊');
+    expect(oldHit.conflicts?.[0]).toMatchObject({ file: '新音频链路.md', relation: 'superseded-by' });
+
+    const injected = selectNotesForInjection(hits, { topK: 2, minCoverage: 0.4, query: 'whisper.cpp 8080 怎么转写' });
+    expect(injected.map((h) => h.file)).toEqual(['新音频链路.md']);
+
+    // 明确问历史沿革时，允许把旧记录注入参考并附带冲突提醒
+    const histHint = formatNotesHint(hits, { topK: 2, maxChars: 600, minCoverage: 0.2, query: '之前旧版 whisper 怎么跑的' });
+    expect(histHint).toContain('旧whisper方案.md');
+    expect(histHint).toContain('⚠️已过期·2026-10-28·私聊');
+    expect(histHint).toContain('⚠️ 冲突提醒：已被《新音频链路.md');
+  });
+
+  it('未标过期的同主题新旧笔记自动识别 deprecated-by 与 newer-evidence 冲突', () => {
+    const root = tempNotes({
+      '旧流程.md': '# 语音转写流程\n\n> 记录于 2026-10-28 · 来源：私聊\n\n通过本地 whisper 服务监听端口完成视频音轨抽帧与转写。',
+      '新流程.md': '# 音频转写当前链路\n\n> 记录于 2026-11-05 · 来源：私聊\n\n2026-11-05 整体重写：原有本地 whisper 服务已退役，视频音轨改由云端转写接口完成。',
+    });
+    const store = new NotesStore(root);
+    const hits = store.search('本地 whisper 视频音轨转写');
+    expect(hits[0]!.file).toBe('新流程.md');
+    const oldHit = hits.find((h) => h.file === '旧流程.md')!;
+    expect(oldHit.conflicts?.some((c) => c.file === '新流程.md' && c.relation === 'deprecated-by')).toBe(true);
+    const hint = formatNotesHint(hits, { topK: 2, maxChars: 800, minCoverage: 0.4 });
+    expect(hint).toContain('⚠️ 冲突提醒：新记录《新流程.md');
+  });
+
+  it('大库下纯泛化高频词不自动注入，显式 triggers 与高区分度词正常注入', () => {
+    const files: Record<string, string> = {};
+    for (let i = 1; i <= 9; i++) {
+      files[`泛化${i}.md`] = `# 测试报告 ${i}\n\n我们今天做了系统测试和日志核对工作。`;
+    }
+    files['专属触发.md'] = '---\ntriggers: [RVC破音]\n---\n# 测试报告补充\n\n先分离和声再检查日志。';
+    const store = new NotesStore(tempNotes(files));
+
+    // 只命中高频词（在 >= 90% 段里都出现的「测试」「系统」「日志」）：大库门控拦下不自动注入
+    const weakHits = store.search('系统测试日志核对');
+    expect(weakHits.length).toBeGreaterThan(0);
+    expect(weakHits[0]!.hasDistinctiveTerm).toBe(false);
+    expect(selectNotesForInjection(weakHits, { topK: 2, minCoverage: 0.4 })).toEqual([]);
+
+    // 命中显式触发词「RVC破音」：直接放行并说明触发依据
+    const trigHits = store.search('RVC破音 日志怎么看');
+    expect(trigHits[0]!.file).toBe('专属触发.md');
+    expect(trigHits[0]!.triggeredBy).toContain('RVC破音');
+    expect(trigHits[0]!.why).toContain('触发词「RVC破音」');
+    expect(selectNotesForInjection(trigHits, { topK: 2, minCoverage: 0.4 }).map((h) => h.file)).toEqual(['专属触发.md']);
+  });
+
+  it('注水式预算分配不浪费短段配额，并遵守 inject=search-only 与 budgetChars', () => {
+    const shortText = '短提示：先核对凭证。';
+    const longText = `长规约：${'甲乙丙丁'.repeat(110)}`; // 约 444 字
+    const root = tempNotes({
+      'a短.md': `# 凭证核对\n\n${shortText}`,
+      'b长.md': `# 长工程规约\n\n${longText}`,
+      'c仅搜.md': '---\ninject: search-only\n---\n# 仅检索归档\n\n凭证核对历史背景长篇记录。',
+      'd单条限.md': '---\nbudgetChars: 100\n---\n# 单条预算规约\n\n凭证核对单条限制：' + '戊己庚辛'.repeat(50),
+    });
+    const store = new NotesStore(root);
+    const hits = store.search('凭证核对 工程规约', 5);
+    expect(hits.some((h) => h.file === 'c仅搜.md')).toBe(true);
+
+    // c仅搜 不进自动注入；总预算 500 字，a短 只占 ~10 字，b长 能吃到 ~490 字，不会被均分拦腰截到 250 字
+    const plan = planNoteInjection(hits.filter((h) => h.file !== 'd单条限.md'), {
+      topK: 2,
+      maxChars: 500,
+      minCoverage: 0.3,
+    });
+    expect(plan.items.map((i) => i.hit.file)).not.toContain('c仅搜.md');
+    const longItem = plan.items.find((i) => i.hit.file === 'b长.md')!;
+    expect(longItem.snippet.length).toBeGreaterThan(400);
+    expect(plan.text).toContain(`预算 ${plan.usedChars}/500 字`);
+
+    // 单条 budgetChars=100 生效
+    const singlePlan = planNoteInjection(hits.filter((h) => h.file === 'd单条限.md'), {
+      topK: 2,
+      maxChars: 500,
+      minCoverage: 0.3,
+    });
+    expect(singlePlan.items[0]!.snippet.length).toBeLessThanOrEqual(101);
   });
 });
