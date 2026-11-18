@@ -62,6 +62,71 @@ function setup(opts?: { record?: SessionRecord | undefined; config?: ImQQBotConf
   return { outbound, bot, session, manager, logger };
 }
 
+describe('Outbound media review integration', () => {
+  const sess = { header: { id: 'sess-qq' } };
+  const message = (text: string) => ({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } });
+  const end = { type: 'turn/end', data: { reason: { kind: 'success' } } };
+
+  it('holds streaming and durable media replies until approved turn end', async () => {
+    const { outbound, bot } = setup();
+    outbound.armMediaReview('sess-qq', { evidence: { complete: false }, fallbackText: 'Review incomplete.' });
+    outbound.routeStreamFrame('sess-qq', start('a1'));
+    outbound.routeStreamFrame('sess-qq', delta('a1', 'truncated transient'));
+    outbound.routeSessionEvent(sess, message('Complete durable reply'));
+    expect(bot.openStream).not.toHaveBeenCalled();
+    expect(bot.sendMarkdown).not.toHaveBeenCalled();
+    expect(outbound.getMediaReviewState('sess-qq')?.drafts).toEqual(['Complete durable reply']);
+    await outbound.reviewMediaReply('sess-qq', async () => ({ action: 'approve' }));
+    expect(bot.sendMarkdown).not.toHaveBeenCalled();
+    outbound.routeSessionEvent(sess, end);
+    await Promise.resolve();
+    expect(bot.sendMarkdown).toHaveBeenCalledWith(c2cTarget, 'Complete durable reply');
+    outbound.clearMediaReview('sess-qq');
+    expect(outbound.getMediaReviewState('sess-qq')).toBeUndefined();
+  });
+
+  it('sends an explicit fallback without leaking unreviewed claims, retaining originals', async () => {
+    const { outbound, bot, manager } = setup();
+    outbound.armMediaReview('sess-qq', { evidence: 'failed', fallbackText: 'Review incomplete.' });
+    outbound.routeSessionEvent(sess, message('I watched the whole video.'));
+    expect(() => outbound.clearMediaReview('sess-qq')).toThrow('still active');
+    outbound.routeSessionEvent(sess, end);
+    await Promise.resolve();
+    expect(bot.sendMarkdown).toHaveBeenCalledExactlyOnceWith(c2cTarget, 'Review incomplete.');
+    expect(outbound.getMediaReviewState('sess-qq')).toMatchObject({ status: 'held', drafts: ['I watched the whole video.'] });
+    expect(manager.settleNoteInjection).toHaveBeenCalledWith(expect.anything(), true, { reply: 'Review incomplete.' });
+  });
+
+  it('keeps fallback delivery failures in the existing unsent lifecycle', async () => {
+    const { outbound, bot, manager } = setup();
+    vi.mocked(bot.sendMarkdown).mockRejectedValue(new Error('offline'));
+    outbound.armMediaReview('sess-qq', { evidence: 'failed', fallbackText: 'Review incomplete.' });
+    outbound.routeSessionEvent(sess, message('unsupported'));
+    outbound.routeSessionEvent(sess, end);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(manager.addUnsent).toHaveBeenCalledWith('k', 'Review incomplete.');
+  });
+
+  it('does not settle current note recall when a retired session turn ends', async () => {
+    const record = createRecord(c2cTarget, 'replacement-session');
+    const { outbound, manager, bot } = setup({ record });
+    outbound.armMediaReview('sess-qq', { evidence: 'partial', fallbackText: 'Review incomplete.' });
+    outbound.routeSessionEvent(sess, message('Retired session draft'));
+    outbound.routeSessionEvent(sess, end);
+    await Promise.resolve();
+    expect(bot.sendMarkdown).toHaveBeenCalledWith(c2cTarget, 'Review incomplete.');
+    expect(manager.settleNoteInjection).not.toHaveBeenCalled();
+    expect(outbound.getMediaReviewState('sess-qq')).toMatchObject({ status: 'held', drafts: ['Retired session draft'] });
+  });
+
+  it('rejects retroactive arming after an ordinary stream frame', () => {
+    const { outbound } = setup();
+    outbound.routeStreamFrame('sess-qq', delta('a1', 'already started'));
+    expect(() => outbound.armMediaReview('sess-qq', { evidence: {}, fallbackText: 'fallback' })).toThrow('before assistant output');
+  });
+});
+
 const delta = (attemptId: string, text: string) => ({ kind: 'text-delta' as const, attemptId, text });
 const start = (attemptId: string) => ({ kind: 'attempt-start' as const, attemptId });
 

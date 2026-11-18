@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import { NotesStore, cutSection } from './notes-store.ts';
 import { NoteMetricsStore } from './note-metrics.ts';
-import { NOTES_MANAGE_TOOL_NAME, registerNotesTools } from './notes-tools.ts';
+import { NOTES_MANAGE_TOOL_NAME, NOTES_SAVE_TOOL_NAME, NOTES_SEARCH_TOOL_NAME, registerNotesTools } from './notes-tools.ts';
 import { pickNoteStats, renderNoteStats } from '../features/note-stats.ts';
 import { parseNotesArgs } from '../commands/notes.ts';
 
@@ -33,10 +33,11 @@ const DIARY = [
   '',
 ].join('\n');
 
-type Tool = { name: string; execute(args: unknown, exec: { agent?: unknown }): Promise<{ message: string }> };
+type Tool = { name: string; execute(args: unknown, exec: { agent?: unknown }): Promise<Record<string, unknown>> };
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 
-function setup(record: Record<string, unknown> | undefined = { scope: 'c2c', peerId: 'OWNER' }) {
+function setup(recordOrNull: Record<string, unknown> | null = { scope: 'c2c', peerId: 'OWNER' }) {
+  const record = recordOrNull ?? undefined;
   const root = mkdtempSync(join(tmpdir(), 'notes-manage-'));
   mkdirSync(join(root, 'chats', 'group_G1'), { recursive: true });
   writeFileSync(join(root, '观察日记.md'), DIARY, 'utf8');
@@ -48,12 +49,15 @@ function setup(record: Record<string, unknown> | undefined = { scope: 'c2c', pee
   const ctx = { get: () => ({ register: (d: Tool) => tools.set(d.name, d) }) };
   const manager = { findByAgent: () => record, noteMetrics: metrics };
   registerNotesTools(ctx as never, store, manager as never, logger as never, { ownerOpenid: 'OWNER', judgeEnabled: () => true });
-  const call = (args: Record<string, unknown>) => tools.get(NOTES_MANAGE_TOOL_NAME)!.execute(args, record === undefined ? {} : { agent: {} });
+  const execCtx = (agentOver?: Record<string, unknown>) => (record === undefined && agentOver === undefined ? {} : { agent: agentOver ?? {} });
+  const call = (args: Record<string, unknown>) => tools.get(NOTES_MANAGE_TOOL_NAME)!.execute(args, execCtx()) as Promise<{ message: string }>;
+  const callSave = (args: Record<string, unknown>) => tools.get(NOTES_SAVE_TOOL_NAME)!.execute(args, execCtx());
+  const callSearch = (args: Record<string, unknown>, agentOver?: Record<string, unknown>) => tools.get(NOTES_SEARCH_TOOL_NAME)!.execute(args, execCtx(agentOver));
   const archived = (): string[] => {
     const dir = join(root, '.archive');
     return existsSync(dir) ? readdirSync(dir, { recursive: true }).map(String).filter((name) => name.endsWith('.md')) : [];
   };
-  return { root, store, metrics, call, archived };
+  return { root, store, metrics, call, callSave, callSearch, archived };
 }
 
 describe('cutSection', () => {
@@ -134,7 +138,7 @@ describe('qqbot_notes_manage', () => {
   it('只有主人私聊和本机会话能用', async () => {
     await expect(setup({ scope: 'group', peerId: 'G1' }).call({ action: 'stats' })).rejects.toThrow(/主人私聊/);
     await expect(setup({ scope: 'c2c', peerId: 'SOMEONE' }).call({ action: 'stats' })).rejects.toThrow(/主人私聊/);
-    await expect(setup(undefined).call({ action: 'stats' })).resolves.toBeDefined();
+    await expect(setup(null).call({ action: 'stats' })).resolves.toBeDefined();
   });
 
   it('stats 列出注入和均分', async () => {
@@ -167,6 +171,80 @@ describe('qqbot_notes_manage', () => {
     expect(existsSync(join(root, 'chats', 'group_G1', '点歌.md'))).toBe(false);
     expect(readFileSync(join(root, '观察日记.md'), 'utf8')).not.toContain('子条目正文');
     expect(archived()).toHaveLength(2);
+  });
+
+  it('supersede：原地标过期并保留原日期、来源与正文', async () => {
+    const { root, store, call } = setup();
+    writeFileSync(join(root, '旧实验.md'), '# 旧实验条件\n\n> 记录于 2026-10-30 · 来源：私聊\n\n使用旧参数 1080p 测试。', 'utf8');
+    const res = await call({ action: 'supersede', file: '旧实验.md', superseded_by: '新实验.md' });
+    expect(res.message).toContain('标记为已过期');
+    const content = readFileSync(join(root, '旧实验.md'), 'utf8');
+    expect(content).toContain('记录于 2026-10-30 · 来源：私聊');
+    expect(content).toContain('状态：已过期');
+    expect(content).toContain('已被替代：新实验.md');
+    expect(content).toContain('使用旧参数 1080p 测试');
+    const [hit] = store.search('旧参数 1080p');
+    expect(hit?.meta?.status).toBe('superseded');
+    // An unresolved target must not leak through retrieval metadata.
+    expect(hit?.conflicts).toBeUndefined();
+    expect(hit?.meta?.supersededBy).toBeUndefined();
+  });
+
+  it('qqbot_notes_save 与 qqbot_notes_search：支持范围元数据、本机 cwd 感知与 all_scopes 权限边界', async () => {
+    // 1. 本机会话保存项目笔记与角色笔记，并检验 budget_chars 校验
+    const local = setup(null);
+    await expect(local.callSave({ title: 'x', content: 'y', budget_chars: 20 })).rejects.toThrow(/60-2000/);
+
+    const savedProj = await local.callSave({
+      title: 'RVC 参数约定',
+      content: '保护指数设为 0.45，避免破音。',
+      projects: ['voice-lab'],
+      triggers: ['保护指数'],
+      operations: ['audio.convert'],
+      budget_chars: 200,
+    });
+    expect(String(savedProj.message)).toContain('项目:voice-lab');
+    expect(readFileSync(join(local.root, 'RVC 参数约定.md'), 'utf8')).toContain('操作：audio.convert');
+
+    const savedRp = await local.callSave({
+      title: '哈基米炸毛规则',
+      content: '被叫小笨猫要哈气，不许用霸总腔。',
+      personas: ['哈基米'],
+      scenes: ['group'],
+      inject: 'search-only',
+    });
+    expect(String(savedRp.message)).toContain('人设:哈基米');
+
+    // 本机会话下，agent cwd 在 voice-lab 子目录时自动匹配项目笔记；返回带 scope/why/date/source
+    const projRes = await local.callSearch(
+      { query: '保护指数怎么设' },
+      { session: { header: { cwd: join(local.root, '..', 'voice-lab', 'scripts') } } },
+    ) as { hits: Array<Record<string, unknown>> };
+    expect(projRes.hits[0]).toMatchObject({
+      file: 'RVC 参数约定.md',
+      scope: '项目:voice-lab',
+      source: '本机会话',
+    });
+    expect(String(projRes.hits[0]!.why)).toContain('触发词「保护指数」');
+
+    // 本机会话默认不命中仅限 group + 哈基米的人设笔记；传 all_scopes=true 可跨范围排查
+    const noRp = await local.callSearch({ query: '小笨猫 霸总腔' }) as { hits: Array<Record<string, unknown>> };
+    expect(noRp.hits).toEqual([]);
+    const allRp = await local.callSearch({ query: '小笨猫 霸总腔', all_scopes: true }) as { hits: Array<Record<string, unknown>> };
+    expect(allRp.hits[0]?.file).toBe('哈基米炸毛规则.md');
+    const privateSearch = await local.callSearch({ query: '点歌约定', all_scopes: true }) as { hits: Array<{ file: string }> };
+    expect(privateSearch.hits.some((hit) => hit.file.startsWith('chats/'))).toBe(false);
+
+    // 2. 普通群聊传 all_scopes=true 被忽略，既拿不到跨范围人设/项目，也绝对拿不到别的群或当前未匹配项目的私有记录
+    const groupTools = new Map<string, Tool>();
+    const groupCtx = { get: () => ({ register: (d: Tool) => groupTools.set(d.name, d) }) };
+    const groupManager = { findByAgent: () => ({ scope: 'group', peerId: 'G2' }), noteMetrics: local.metrics };
+    registerNotesTools(groupCtx as never, local.store, groupManager as never, logger as never, { ownerOpenid: 'OWNER', judgeEnabled: () => true });
+    const groupRes = await groupTools.get(NOTES_SEARCH_TOOL_NAME)!.execute(
+      { query: '小笨猫 点歌 保护指数', all_scopes: true, project: 'voice-lab', persona: '哈基米' },
+      { agent: {} },
+    ) as { hits: Array<Record<string, unknown>> };
+    expect(groupRes.hits.map((h) => h.file)).toEqual([]);
   });
 });
 

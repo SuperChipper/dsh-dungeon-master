@@ -1,3 +1,4 @@
+import { inboundOperations } from '../notes/operation-recall.ts';
 /**
  * 入站处理器 — 经 SDK 中间件链处理后的消息 → dsh Agent followup
  *
@@ -199,6 +200,13 @@ export async function handleInbound(
     return;
   }
 
+  // Arm before any assistant stream frame; late tool-result hooks cannot retract QQ output.
+  manager.mediaReview?.arm(record.agent, inboundOperations(msg.content ?? '', [
+    ...(msg.attachments ?? []).map(a => a.type),
+    ...(mwState.downloadedFiles ?? []).map(f => f.contentType),
+    ...(forwardImages.length ? ['image'] : []),
+  ].filter((value): value is string => typeof value === 'string')));
+
   // ── 构建 UserMessage → followup ──
   let text = steered ? agentBody : (manager.combatAgents?.decorateInboundText(record, agentBody) ?? agentBody);
   let nativeImages = false;
@@ -366,7 +374,11 @@ async function assembleAgentBody(
   const rawQuote = state.quote?.text || state.quote?.entry?.content || '';
   const quotedForNotes = rawQuote ? (splitQuote(rawQuote).quote ?? state.quote?.entry?.content ?? '') : '';
   const notesQuery = sanitizeNotesQuery([userContent, quotedForNotes].filter(Boolean).join('\n'));
-  const notesHint = await manager.notesHint(notesQuery, scope, peerId, msg.messageId, steered);
+  const mediaTypes = [...(msg.attachments ?? []).map(a => a.type),
+    ...(state.downloadedFiles ?? []).map(f => f.contentType), ...(state.downloadedQuoteFiles ?? []).map(f => f.contentType),
+    ...(forwardImages.length ? ['image'] : [])];
+  const operations = inboundOperations(notesQuery, mediaTypes.filter((value): value is string => typeof value === 'string'));
+  const notesHint = await manager.notesHint(notesQuery, scope, peerId, msg.messageId, steered, operations);
 
   const forwardHint = buildForwardHint(forwardImages);
   const replyStyleHint = buildReplyStyleHint(state.replyDesire as { mode?: string } | undefined);

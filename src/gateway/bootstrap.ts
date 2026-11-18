@@ -1,3 +1,5 @@
+import { isAutoSteerTurnEnd } from '../transport/turn-steer.ts';
+import { MediaReviewCoordinator } from '../features/media-review-coordinator.ts';
 /**
  * 网关组装 — 创建 bot、编排中间件、注册事件、出站、生命周期
  *
@@ -281,8 +283,18 @@ export async function bootstrapGateway(
   };
 
   const outbound = createOutboundHandler(manager, sender, config, logger, toolsRegistry, stickerStore);
+  const mediaReview = new MediaReviewCoordinator(outbound, message => logger.warn(message));
+  manager.mediaReview = mediaReview;
   (ctx as unknown as { on(event: string, handler: (...args: unknown[]) => void): void })
-    .on('session/event', outbound.routeSessionEvent as (...args: unknown[]) => void);
+    .on('session/event', ((session: Parameters<typeof outbound.routeSessionEvent>[0], event: Parameters<typeof outbound.routeSessionEvent>[1]) => {
+      outbound.routeSessionEvent(session, event);
+      if (event.type === 'turn/end' && !isAutoSteerTurnEnd((event as unknown as { data?: { reason?: unknown }; reason?: unknown }).data?.reason
+        ?? (event as unknown as { reason?: unknown }).reason)) mediaReview.ended(session.header.id);
+    }) as (...args: unknown[]) => void);
+  (ctx as unknown as { on(event: string, listener: (payload: { agent: DshAgent; signal: AbortSignal }) => Promise<void>, options: { global: boolean }): void })
+    .on('agent/turn-stopping', async ({ agent, signal }) => {
+      if (manager.findByAgent(agent)) await mediaReview.stopping(agent, signal);
+    }, { global: true });
 
   // ── 出站流式：agent/assistant-stream → 流式帧路由 ──
   // 实时流式走瞬态 agent/assistant-stream（chunk 不进 session log）。

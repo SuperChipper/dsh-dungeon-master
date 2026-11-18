@@ -112,6 +112,8 @@ interface NotesWire {
   autoInject: boolean;
   injectTopK: number;
   injectMaxChars: number;
+  injectPerNoteChars?: number;
+  groupInjectMaxChars?: number;
   injectMinCoverage: number;
   /** 密钥不上表单（GET 回显为空，POST 由服务端回填） */
   semantic?: NotesSemanticWire;
@@ -659,8 +661,10 @@ export function ConfigPanel(): ReactNode {
   };
   const video: VideoWire = form.video ?? { enabled: true, ffmpegPath: '', maxFrames: 8, maxSeconds: 300 };
   const notes: NotesWire = form.notes ?? {
-    enabled: true, root: '', autoInject: true, injectTopK: 2, injectMaxChars: 600, injectMinCoverage: 0.4,
+    enabled: true, root: '', autoInject: true, injectTopK: 2, injectMaxChars: 600, injectPerNoteChars: 0, groupInjectMaxChars: 0, injectMinCoverage: 0.4,
   };
+  const injectPerNoteChars = notes.injectPerNoteChars ?? 0;
+  const groupInjectMaxChars = notes.groupInjectMaxChars ?? 0;
   // 旧配置没有 semantic 组时按默认值显示
   const semantic: NotesSemanticWire = notes.semantic ?? {
     enabled: false, baseUrl: 'https://api.siliconflow.cn/v1', model: 'BAAI/bge-m3', minSimilarity: 0.5, minMargin: 0.16, timeoutMs: 3000,
@@ -1124,6 +1128,16 @@ export function ConfigPanel(): ReactNode {
     createElement(NumberRow, {
       label: '注入总字数上限', value: notes.injectMaxChars, min: 0, max: 4000, step: 50,
       onChange: (v) => { patch('notes', { ...notes, injectMaxChars: v }); },
+    }),
+    createElement(NumberRow, {
+      label: '单段注入字数上限', value: injectPerNoteChars, min: 0, max: 4000, step: 20,
+      help: '0 = 不单独限制，在总预算内按需分配',
+      onChange: (v) => { patch('notes', { ...notes, injectPerNoteChars: v }); },
+    }),
+    createElement(NumberRow, {
+      label: '群聊注入总字数上限', value: groupInjectMaxChars, min: 0, max: 4000, step: 50,
+      help: '0 = 与注入总字数上限相同；群聊可设更小预算',
+      onChange: (v) => { patch('notes', { ...notes, groupInjectMaxChars: v }); },
     }),
     createElement(NumberRow, {
       label: '最低查询词覆盖率', value: notes.injectMinCoverage, min: 0, max: 1, step: 0.05,

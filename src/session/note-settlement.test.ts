@@ -6,6 +6,8 @@ import type { SessionRecord } from './types.ts';
 
 function makeManagerStub(enqueue: ReturnType<typeof vi.fn>, recordJudgement = vi.fn(() => [] as string[])) {
   const pendingNoteInjections = new Map();
+  const operationRecalls = new Map();
+  const prototype = SessionManager.prototype as unknown as { recallAtOperation: (...args: unknown[]) => Promise<string> };
   const recordInjection = vi.fn();
   const stub = {
     config: {
@@ -35,6 +37,9 @@ function makeManagerStub(enqueue: ReturnType<typeof vi.fn>, recordJudgement = vi
     },
     noteMuted: () => false,
     pendingNoteInjections,
+    operationRecalls,
+    recallAtOperation: prototype.recallAtOperation,
+    buildNoteQueryContext: SessionManager.prototype.buildNoteQueryContext,
     noteMetrics: { recordInjection, recordJudgement },
     noteJudge: { enqueue },
     sessionKey: (scope: string, peerId: string) => `qqbot:app-note-settle:${scope}:${peerId}`,
@@ -121,5 +126,99 @@ describe('SessionManager 笔记注入与完成回复后结算打分', () => {
       ],
       reply: 'posters/abyss-v3.png',
     }));
+  });
+
+  it('notesHint 向 searchHybrid 传递人设与场景上下文，并在群聊使用 groupInjectMaxChars 预算', async () => {
+    const enqueue = vi.fn(async () => [1]);
+    const { stub, recordInjection } = makeManagerStub(enqueue);
+    (stub.config.notes as Record<string, unknown>).groupInjectMaxChars = 300;
+    (stub.config.notes as Record<string, unknown>).injectPerNoteChars = 200;
+    (stub as Record<string, unknown>).personaStore = {
+      current: () => ({ id: 'hakimi', name: '哈基米', names: ['猫猫'], prompt: '...' }),
+    };
+    (stub.notesStore.searchHybrid as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
+      file: '人设梗.md',
+      heading: '哈基米炸毛',
+      text: '被叫小笨猫会哈气。'.repeat(15),
+      score: 0.9,
+      coverage: 0.8,
+      matched: 2,
+    }]);
+
+    const hint = await SessionManager.prototype.notesHint.call(stub, '小笨猫哈气', 'group', 'g-rp');
+    expect(stub.notesStore.searchHybrid).toHaveBeenCalledWith(
+      '小笨猫哈气',
+      8,
+      'group_g-rp',
+      expect.objectContaining({
+        personas: ['hakimi', '哈基米', '猫猫'],
+        scenes: ['group'],
+        sharedOnly: false,
+      }),
+    );
+    expect(hint).toContain('哈基米炸毛');
+    expect(hint.length).toBeLessThanOrEqual(300);
+    const pending = stub.pendingNoteInjections.get('qqbot:app-note-settle:group:g-rp');
+    expect(pending.hits).toHaveLength(1);
+    expect(pending.snippets).toHaveLength(1);
+    expect(hint).toContain(pending.snippets[0]);
+    expect(stub.operationRecalls.get('qqbot:app-note-settle:group:g-rp').usedChars).toBe(hint.length);
+    SessionManager.prototype.settleNoteInjection.call(stub, {
+      sessionKey: 'qqbot:app-note-settle:group:g-rp', scope: 'group', peerId: 'g-rp', agent: {},
+    } as unknown as SessionRecord, true, { reply: '哈气' });
+    expect(recordInjection).toHaveBeenCalledWith(pending.hits);
+  });
+
+  it('同一轮多个 operation 共用版本去重、完整预算和实际注入账本', async () => {
+    const { stub, recordInjection } = makeManagerStub(vi.fn(async () => [1]));
+    const key = 'qqbot:app-note-settle:c2c:u-dedup';
+    const first = await SessionManager.prototype.notesHint.call(stub, '海报路径', 'c2c', 'u-dedup', undefined, false, ['media.image.inspect']);
+    const duplicate = await SessionManager.prototype.notesHint.call(stub, '海报路径', 'c2c', 'u-dedup', undefined, true, ['media.video.inspect']);
+    expect(first).toContain('海报存档.md');
+    expect(duplicate).toBe('');
+    expect(stub.notesStore.searchHybrid).toHaveBeenLastCalledWith(expect.stringContaining('海报路径\n视频理解 视频解析'), 8, 'c2c_u-dedup', expect.objectContaining({ operations: ['media.video.inspect'] }));
+
+    const revision = { ...(await stub.notesStore.searchHybrid())[0]!, text: '第三版路径已修正为 posters/abyss-v4.png' };
+    stub.notesStore.searchHybrid.mockResolvedValueOnce([revision]);
+    const corrected = await SessionManager.prototype.notesHint.call(stub, '海报路径更新', 'c2c', 'u-dedup', undefined, true, ['media.image.inspect']);
+    expect(corrected).toContain('abyss-v4.png');
+    expect(first.length + corrected.length).toBeLessThanOrEqual(stub.config.notes.injectMaxChars);
+    const pending = stub.pendingNoteInjections.get(key);
+    expect(pending.hits).toHaveLength(2);
+    expect(pending.snippets).toHaveLength(2);
+    expect(stub.operationRecalls.get(key).seen.size).toBe(2);
+    expect(stub.operationRecalls.get(key).usedChars).toBe(first.length + corrected.length);
+    SessionManager.prototype.settleNoteInjection.call(stub, {
+      sessionKey: key, scope: 'c2c', peerId: 'u-dedup', agent: {},
+    } as unknown as SessionRecord, true, { reply: '已更新' });
+    expect(recordInjection).toHaveBeenCalledTimes(1);
+    expect(recordInjection).toHaveBeenCalledWith(pending.hits);
+    expect(stub.operationRecalls.has(key)).toBe(false);
+  });
+
+  it('operation 检索超时后继续，迟到的结果不提交预算、去重集合或账本', async () => {
+    vi.useFakeTimers();
+    try {
+      const { stub, recordInjection } = makeManagerStub(vi.fn(async () => [1]));
+      const key = 'qqbot:app-note-settle:c2c:u-timeout';
+      const originalHits = await stub.notesStore.searchHybrid();
+      let finishSearch!: (hits: typeof originalHits) => void;
+      stub.notesStore.searchHybrid.mockReturnValueOnce(new Promise((resolve) => { finishSearch = resolve; }));
+      const hintPromise = SessionManager.prototype.notesHint.call(stub, '海报路径', 'c2c', 'u-timeout', undefined, false, ['media.image.inspect']);
+      await vi.advanceTimersByTimeAsync(1201);
+      expect(await hintPromise).toBe('');
+      finishSearch(originalHits);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(stub.operationRecalls.get(key).usedChars).toBe(0);
+      expect(stub.operationRecalls.get(key).seen.size).toBe(0);
+      expect(stub.pendingNoteInjections.has(key)).toBe(false);
+      SessionManager.prototype.settleNoteInjection.call(stub, {
+        sessionKey: key, scope: 'c2c', peerId: 'u-timeout', agent: {},
+      } as unknown as SessionRecord, true, { reply: '继续处理' });
+      expect(recordInjection).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
