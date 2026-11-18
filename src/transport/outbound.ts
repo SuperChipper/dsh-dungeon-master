@@ -17,6 +17,8 @@ import { OutboundBuffer, type QQBotSender } from './outbound-buffer.ts';
 import { formatToolResult, type ToolsRegistryLike, type ToolResultData } from './tool-presenter.ts';
 import { DND_TOOL_PREFIX } from '../dnd/dnd-tools.ts';
 import { getEngagementTracker } from '../features/reply-desire.ts';
+import { MediaReplyReviewBuffer, type ArmMediaReplyReview, type MediaReplyReviewState, type MediaReplyReviewer, type MediaReviewDecision } from '../features/media-reply-review.ts';
+export type { ArmMediaReplyReview, MediaReplyReviewState, MediaReplyReviewer, MediaReviewDecision } from '../features/media-reply-review.ts';
 import { isAutoSteerTurnEnd } from './turn-steer.ts';
 import {
   parseEvent,
@@ -41,6 +43,14 @@ export type OutboundHandler = (session: SessionLike, event: RawSessionEvent) => 
 
 /** 出站事件入口集合：durable 事件 + 实时流式帧 */
 export interface OutboundHandlers {
+  /** Arm before the turn's first stream frame; already published QQ output cannot be retracted. */
+  armMediaReview(sessionId: string, options: ArmMediaReplyReview): void;
+  updateMediaReviewEvidence(sessionId: string, evidence: unknown): void;
+  getMediaReviewState(sessionId: string): MediaReplyReviewState | undefined;
+  /** Parent awaits this in agent/turn-stopping and steers only a returned correct decision. */
+  reviewMediaReply(sessionId: string, reviewer: MediaReplyReviewer, timeoutMs?: number, signal?: AbortSignal): Promise<MediaReviewDecision | undefined>;
+  /** Parent persists the snapshot before clearing it. Pending turns cannot be cleared. */
+  clearMediaReview(sessionId: string): void;
   /** durable session 事件入口（注册到 ctx.on('session/event')） */
   routeSessionEvent(session: SessionLike, event: RawSessionEvent): void;
   /**
@@ -70,6 +80,36 @@ const EMPTY_RESPONSE_CODE = 'EMPTY_RESPONSE';
  * 出站路由器：持有会话级状态，按事件类型分发到处理器
  */
 class OutboundRouter {
+  private readonly mediaReviews = new Map<string, MediaReplyReviewBuffer>();
+  private readonly endedMediaReviews = new Set<string>();
+  private readonly publishedTurns = new Set<string>();
+
+  public armMediaReview(sessionId: string, options: ArmMediaReplyReview): void {
+    if (this.mediaReviews.has(sessionId)) throw new Error('Media review already armed; persist and clear previous state first');
+    if (this.buffers.has(sessionId) || this.publishedTurns.has(sessionId)) throw new Error('Media review must be armed before assistant output');
+    this.mediaReviews.set(sessionId, new MediaReplyReviewBuffer(sessionId, options));
+  }
+
+  public updateMediaReviewEvidence(sessionId: string, evidence: unknown): void {
+    const review = this.mediaReviews.get(sessionId);
+    if (review === undefined || this.endedMediaReviews.has(sessionId)) throw new Error('No active media review');
+    review.updateEvidence(evidence);
+  }
+
+  public getMediaReviewState(sessionId: string): MediaReplyReviewState | undefined {
+    return this.mediaReviews.get(sessionId)?.snapshot();
+  }
+
+  public reviewMediaReply(sessionId: string, reviewer: MediaReplyReviewer, timeoutMs?: number, signal?: AbortSignal): Promise<MediaReviewDecision | undefined> {
+    return this.mediaReviews.get(sessionId)?.review(reviewer, timeoutMs, signal) ?? Promise.resolve(undefined);
+  }
+
+  public clearMediaReview(sessionId: string): void {
+    if (this.mediaReviews.has(sessionId) && !this.endedMediaReviews.has(sessionId)) throw new Error('Media review turn is still active');
+    this.mediaReviews.delete(sessionId);
+    this.endedMediaReviews.delete(sessionId);
+  }
+
   private readonly buffers = new Map<string, OutboundBuffer>();
   private readonly toolCalls = new Map<string, ToolCallRecord>();
   /** 每会话当前流式 attemptId：LLM 重试会发布新 attempt，用于 reset 与迟到帧过滤 */
@@ -172,6 +212,7 @@ class OutboundRouter {
 
   /** 获取或创建会话 buffer 并追加增量 */
   private appendChunk(sessionId: string, record: SessionRecord, text: string): void {
+    if (!this.mediaReviews.has(sessionId)) this.publishedTurns.add(sessionId);
     let buffer = this.buffers.get(sessionId);
     if (buffer === undefined) {
       // 持有本轮 caption 列表的引用：flush 可能晚于 turn/end 清理才执行
@@ -181,7 +222,7 @@ class OutboundRouter {
         this.bot,
         this.config.textChunkLimit,
         this.logger,
-        this.shouldStream(record),
+        !this.mediaReviews.has(sessionId) && this.shouldStream(record),
         (raw) => this.casualTone(record, this.salvage(raw, captions)),
         (raw) => stripCaptionEcho(sanitizePseudoToolText(raw), captions),
         (raw) => this.markUnsent(record, stripCaptionEcho(sanitizePseudoToolText(raw), captions)),
@@ -218,6 +259,17 @@ class OutboundRouter {
     }
 
     const hasToolCall = event.content.some((b) => b.type === 'tool-call');
+    const review = this.mediaReviews.get(sessionId);
+    if (review !== undefined && !this.endedMediaReviews.has(sessionId)) {
+      // Durable content is authoritative: transient frames may be missing or truncated.
+      const text = event.content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('\n');
+      this.buffers.get(sessionId)?.cancel();
+      this.buffers.delete(sessionId);
+      if (!(hasToolCall && text.trimStart().startsWith('💭'))) review.append(text);
+      this.noteSkippedCalls(record, event.content);
+      return;
+    }
+    this.publishedTurns.add(sessionId);
     this.noteSkippedCalls(record, event.content);
     const buffer = this.buffers.get(sessionId);
     if (buffer !== undefined && buffer.text.trim()) {
@@ -354,6 +406,22 @@ class OutboundRouter {
       return;
     }
 
+    const review = this.mediaReviews.get(sessionId);
+    if (review !== undefined && !this.endedMediaReviews.has(sessionId)) {
+      const pending = this.buffers.get(sessionId);
+      if (pending?.text.trim()) review.append(pending.text);
+      pending?.cancel();
+      this.buffers.delete(sessionId);
+      this.endedMediaReviews.add(sessionId);
+      // Capture the target now: a later inbound turn can mutate record.replyTarget.
+      const deliveryRecord = { ...record, replyTarget: { ...record.replyTarget } };
+      for (const text of review.finish()) {
+        this.recordTurnReply(sessionId, text);
+        this.noteBotSaid(record, text, this.captions.get(sessionId));
+        void this.send(deliveryRecord, text, 'sendMarkdown', this.captionsOf(sessionId));
+      }
+    }
+    this.publishedTurns.delete(sessionId);
     const buffer = this.buffers.get(sessionId);
     if (buffer !== undefined) {
       if (buffer.text.trim()) {
@@ -388,7 +456,9 @@ class OutboundRouter {
       ...sentCaptions.map((c) => `[配文] ${c.trim()}`),
       ...replies,
     ].join('\n').trim();
-    if (ok && (replySummary !== '' || toolsUsed.length > 0)) {
+    if (record.sessionId !== sessionId) {
+      this.logger.debug(`im-qqbot: retired turn does not settle current note recall sessionId=${sessionId}`);
+    } else if (ok && (replySummary !== '' || toolsUsed.length > 0)) {
       this.manager.settleNoteInjection(record, true, {
         ...(replySummary !== '' ? { reply: replySummary } : {}),
         ...(toolsUsed.length > 0 ? { toolsUsed } : {}),
@@ -491,6 +561,11 @@ export function createOutboundHandler(
 ): OutboundHandlers {
   const router = new OutboundRouter(manager, bot, config, logger, toolsRegistry, stickerStore);
   return {
+    armMediaReview: (sessionId, options) => router.armMediaReview(sessionId, options),
+    updateMediaReviewEvidence: (sessionId, evidence) => router.updateMediaReviewEvidence(sessionId, evidence),
+    getMediaReviewState: (sessionId) => router.getMediaReviewState(sessionId),
+    reviewMediaReply: (sessionId, reviewer, timeoutMs, signal) => router.reviewMediaReply(sessionId, reviewer, timeoutMs, signal),
+    clearMediaReview: (sessionId) => router.clearMediaReview(sessionId),
     routeSessionEvent: (session, event) => router.route(session, event),
     routeStreamFrame: (agentId, delta) => router.routeStreamFrame(agentId, delta),
   };

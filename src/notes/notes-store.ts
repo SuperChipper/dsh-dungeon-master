@@ -100,6 +100,7 @@ export interface NoteHit extends NoteChunk {
   why?: string;
   /** 命中的显式触发词 */
   triggeredBy?: string[];
+  operationMatches?: string[];
   /** 命中的代表性关键词（按 IDF 从高到低） */
   matchedTerms?: string[];
   /** 是否命中至少一个非泛化高区分度词（大库防弱词面误注入） */
@@ -123,6 +124,7 @@ export interface SaveNoteInput {
   personas?: string[];
   scenes?: NoteScene[];
   models?: string[];
+  operations?: string[];
   triggers?: string[];
   inject?: NoteInjectPolicy;
   budgetChars?: number;
@@ -247,6 +249,11 @@ export function chunkMarkdown(file: string, markdown: string): NoteChunk[] {
     const heading = stack.length > 0 ? stack.join(' › ') : fallbackTitle;
     const parentMeta = currentLevel === 0 ? fileMeta : (metaStack[currentLevel - 1] ?? fileMeta);
     const { meta, bodyLines } = parseSectionMeta(rawLines, parentMeta, file, heading);
+    // Directory ownership cannot be rewritten by frontmatter or section metadata.
+    if (dirMeta.scope.chatKey !== undefined) {
+      meta.scope.chatKey = dirMeta.scope.chatKey;
+      meta.kind = 'chat';
+    }
     if (currentLevel >= 1) metaStack[currentLevel] = meta;
     const text = bodyLines.join('\n').trim();
     if (text.length === 0) return;
@@ -381,38 +388,45 @@ function matchTargetRef(ref: string, candidate: Pick<IndexedChunk, 'file' | 'hea
     || candidate.heading === normRef;
 }
 
+function compatibleReplacement(a: IndexedChunk, b: IndexedChunk): boolean {
+  // A narrower audience must never invalidate evidence for a broader audience.
+  const canonical = (meta: NoteMeta): string => JSON.stringify([
+    meta.scope.chatKey ?? '',
+    ...(['projects', 'personas', 'scenes', 'models'] as const).map((key) =>
+      (meta.scope[key] ?? []).map((v) => v.normalize('NFKC').toLowerCase()).sort()),
+  ]);
+  return canonical(a.rawMeta) === canonical(b.rawMeta);
+}
+
+function resolveTargetRef(ref: string, chunks: IndexedChunk[]): IndexedChunk[] {
+  const found = chunks.filter((chunk) => matchTargetRef(ref, chunk));
+  const norm = ref.replace(/\\/g, '/').replace(/^\.?\//, '').trim();
+  // A file reference intentionally selects the file; a bare heading must identify one section.
+  if (found.some((chunk) => chunk.file === norm)) return found;
+  const sections = new Set(found.map((chunk) => `${chunk.file} › ${chunk.heading}`));
+  return sections.size === 1 && found.length === 1 ? found : [];
+}
+
 function resolveSupersessionLinks(chunks: IndexedChunk[]): void {
-  for (let i = 0; i < chunks.length; i++) {
-    const newer = chunks[i]!;
-    if (newer.rawMeta.status === 'superseded' || !newer.rawMeta.supersedes?.length) continue;
-    for (const ref of newer.rawMeta.supersedes) {
-      for (let j = 0; j < chunks.length; j++) {
-        if (i === j) continue;
-        const older = chunks[j]!;
-        if (!matchTargetRef(ref, older)) continue;
-        if (newer.rawMeta.date && older.rawMeta.date && compareNoteDates(newer.rawMeta.date, older.rawMeta.date) < 0) {
-          continue;
-        }
+  for (const newer of chunks) {
+    if (newer.rawMeta.status === 'superseded') continue;
+    for (const ref of newer.rawMeta.supersedes ?? []) {
+      for (const older of resolveTargetRef(ref, chunks)) {
+        if (older === newer || !compatibleReplacement(older, newer)) continue;
+        if (compareNoteDates(newer.rawMeta.date, older.rawMeta.date) < 0) continue;
         older.meta.status = 'superseded';
-        older.meta.supersededBy ??= `${newer.file} › ${newer.heading}`;
-        if (!older.replacedByIndices.includes(i)) older.replacedByIndices.push(i);
+        const index = chunks.indexOf(newer);
+        if (!older.replacedByIndices.includes(index)) older.replacedByIndices.push(index);
       }
     }
   }
-
-  for (let i = 0; i < chunks.length; i++) {
-    const older = chunks[i]!;
-    const targetRef = older.rawMeta.supersededBy;
-    if (!targetRef) continue;
-    // 显式写了已被替代的段本身视为已过期（除非明确写着 active）
-    if (older.rawMeta.status !== 'superseded') older.meta.status = 'superseded';
-    for (let j = 0; j < chunks.length; j++) {
-      if (i === j) continue;
-      const newer = chunks[j]!;
-      if (newer.meta.status === 'superseded') continue;
-      if (matchTargetRef(targetRef, newer) && !older.replacedByIndices.includes(j)) {
-        older.replacedByIndices.push(j);
-      }
+  for (const older of chunks) {
+    if (!older.rawMeta.supersededBy) continue;
+    for (const newer of resolveTargetRef(older.rawMeta.supersededBy, chunks)) {
+      if (newer === older || newer.meta.status === 'superseded' || !compatibleReplacement(older, newer)) continue;
+      older.meta.status = 'superseded';
+      const index = chunks.indexOf(newer);
+      if (!older.replacedByIndices.includes(index)) older.replacedByIndices.push(index);
     }
   }
 }
@@ -516,7 +530,7 @@ export class NotesStore {
   ): NoteHit[] {
     const queryTerms = [...new Set(tokenize(query))];
     const normalizedQuery = query.normalize('NFKC').toLowerCase();
-    if (normalizedQuery.trim() === '' || this.chunks.length === 0) return [];
+    if ((normalizedQuery.trim() === '' && !queryCtx.operations?.length) || this.chunks.length === 0) return [];
 
     const total = this.chunks.length;
     const knownTerms = queryTerms.filter((term) => this.docFreq.has(term)).length;
@@ -528,6 +542,7 @@ export class NotesStore {
       matched: number;
       coverage: number;
       triggeredBy: string[];
+      operationMatches: string[];
       matchedTerms: string[];
       hasDistinctiveTerm: boolean;
       distinctiveSet: Set<string>;
@@ -560,6 +575,8 @@ export class NotesStore {
         ? matched > 0 || (similarity?.has(String(index)) ?? false)
         : matchedEntries.some((e) => e.df / total <= DISTINCTIVE_MAX_DF_RATIO);
 
+      const operationMatches = (chunk.meta.operations ?? []).filter((op) =>
+        queryCtx.operations?.some((queryOp) => queryOp.normalize('NFKC').trim().toLowerCase() === op.normalize('NFKC').trim().toLowerCase()));
       const triggeredBy = matchTriggerList(chunk.meta.triggers, normalizedQuery);
       if (triggeredBy.length > 0) anyTrigger = true;
 
@@ -576,16 +593,17 @@ export class NotesStore {
         matched,
         coverage: matched / (knownTerms || 1),
         triggeredBy,
+        operationMatches,
         matchedTerms,
         hasDistinctiveTerm,
         distinctiveSet,
       });
     });
 
-    if (queryTerms.length === 0 && (similarity?.size ?? 0) === 0 && !anyTrigger) return [];
+    if (queryTerms.length === 0 && (similarity?.size ?? 0) === 0 && !anyTrigger && !queryCtx.operations?.length) return [];
 
     const hits = candidates
-      .filter((c) => c.matched > 0 || c.triggeredBy.length > 0)
+      .filter((c) => c.matched > 0 || c.triggeredBy.length > 0 || c.operationMatches.length > 0)
       .sort((a, b) => (b.score - a.score) || (b.triggeredBy.length - a.triggeredBy.length));
 
     // 精确一路扫全部 BM25 命中段而不是只扫粗检索前几名：字面量的切词必然也是 BM25 词，
@@ -598,10 +616,10 @@ export class NotesStore {
 
     const exactForFusion = new Map<string, ExactScore>(exact);
     for (const c of hits) {
-      if (c.triggeredBy.length === 0) continue;
+      if (c.triggeredBy.length === 0 && c.operationMatches.length === 0) continue;
       const existing = exactForFusion.get(c.id);
       exactForFusion.set(c.id, {
-        score: Math.max(EXACT_STRONG_SCORE, (existing?.score ?? 0) + c.triggeredBy.length),
+        score: Math.max(EXACT_STRONG_SCORE, (existing?.score ?? 0) + c.triggeredBy.length + c.operationMatches.length),
         matched: existing?.matched ?? [],
       });
     }
@@ -673,28 +691,20 @@ export class NotesStore {
       const list: NoteConflict[] = [];
 
       if (chunk.meta.status === 'superseded') {
-        let addedActive = false;
         for (const repIdx of chunk.replacedByIndices) {
           const repChunk = this.chunks[repIdx];
-          if (repChunk === undefined || repChunk.meta.status === 'superseded') continue;
+          if (repChunk === undefined || repChunk.meta.status === 'superseded' || !matchesNoteScope(repChunk.meta, queryCtx, query)) continue;
           list.push({
             file: repChunk.file,
             heading: repChunk.heading,
             ...(repChunk.meta.date === undefined ? {} : { date: repChunk.meta.date }),
             relation: 'superseded-by',
           });
-          addedActive = true;
         }
-        if (!addedActive && chunk.meta.supersededBy) {
-          list.push({
-            file: chunk.meta.supersededBy,
-            heading: '',
-            relation: 'superseded-by',
-          });
-        }
+
       } else {
         for (const other of activePool) {
-          if (other.item.id === cand.id) continue;
+          if (other.item.id === cand.id || !compatibleReplacement(chunk, other.item.chunk)) continue;
           const b = other.item;
           if (compareNoteDates(b.chunk.meta.date, chunk.meta.date) <= 0) continue;
 
@@ -781,16 +791,21 @@ export class NotesStore {
         similarity: sim,
       });
 
+      const publicMeta = cloneNoteMeta(chunk.meta);
+      delete publicMeta.supersedes;
+      delete publicMeta.supersededBy;
+      const visibleReplacement = chunk.replacedByIndices.map((i) => this.chunks[i]!).find((c) => matchesNoteScope(c.meta, queryCtx, query));
+      if (visibleReplacement) publicMeta.supersededBy = `${visibleReplacement.file} › ${visibleReplacement.heading}`;
       result.push({
         file: chunk.file,
         heading: chunk.heading,
         text: chunk.text,
-        meta: cloneNoteMeta(chunk.meta),
+        meta: publicMeta,
         score: cand.score,
         matched: cand.matched,
         coverage: cand.coverage,
         scopeLabel: describeNoteScope(chunk.meta),
-        ...(why === undefined ? {} : { why }),
+        ...(cand.operationMatches.length ? { why: `操作「${cand.operationMatches.slice(0, 2).join('、')}」${why ? ` + ${why}` : ''}`, operationMatches: cand.operationMatches } : why === undefined ? {} : { why }),
         ...(cand.triggeredBy.length === 0 ? {} : { triggeredBy: cand.triggeredBy }),
         ...(cand.matchedTerms.length === 0 ? {} : { matchedTerms: cand.matchedTerms }),
         hasDistinctiveTerm: cand.hasDistinctiveTerm,
@@ -827,6 +842,7 @@ export class NotesStore {
       date: input.date ?? today(),
       ...(input.source ? { source: input.source } : {}),
       scope,
+      ...(input.operations?.length ? { operations: input.operations } : {}),
       ...(input.triggers?.length ? { triggers: input.triggers } : {}),
       ...(input.inject === 'search-only' ? { inject: 'search-only' } : {}),
       ...(input.budgetChars !== undefined && input.budgetChars >= 0 ? { budgetChars: input.budgetChars } : {}),
@@ -1183,6 +1199,7 @@ export function selectNotesForInjection(
       if (hit.meta?.inject === 'search-only' || hit.meta?.budgetChars === 0) return false;
       if (hit.meta?.status === 'superseded' && !allowSuperseded) return false;
       return hit.rescuedFromQualifying === true
+        || (hit.operationMatches?.length ?? 0) > 0
         || (hit.triggeredBy?.length ?? 0) > 0
         || (hit.exact?.score ?? 0) >= EXACT_STRONG_SCORE
         || hit.similarity !== undefined
@@ -1261,54 +1278,45 @@ export function planNoteInjection(
     return { items: [], text: '', usedChars: 0, maxChars };
   }
 
-  const minFloor = Math.min(60, maxChars);
-  while (active.length > 1) {
-    const allocs = allocateBudgets(active.map((a) => a.want), maxChars);
-    const lastIdx = active.length - 1;
-    // 只有段本身长于 minFloor 且被压到不足 minFloor 时才丢弃；短段全额装下后不必丢
-    if (allocs[lastIdx]! >= Math.min(active[lastIdx]!.want, minFloor)) break;
-    active.pop();
-  }
-
-  const finalAllocs = allocateBudgets(active.map((a) => a.want), maxChars);
-  const items: PlannedNoteItem[] = active.map((entry, idx) => {
-    const limit = finalAllocs[idx]!;
-    const truncated = entry.clean.length > limit;
-    const snippet = truncated
-      ? (limit > 1 ? `${entry.clean.slice(0, limit - 1)}…` : entry.clean.slice(0, limit))
-      : entry.clean;
-    return { hit: entry.hit, snippet, truncated };
-  });
-
-  const usedChars = items.reduce((sum, item) => sum + item.snippet.length, 0);
-  const lines = [`[共享笔记 · 可能相关]（预算 ${usedChars}/${maxChars} 字）`];
-  for (const { hit, snippet } of items) {
+  const bounded = (text: string, cap: number): string => text.length <= cap ? text : `${text.slice(0, cap - 1)}…`;
+  const header = '[共享笔记 · 可能相关]';
+  const footer = '（来自笔记库，仅供参考；共享笔记不代表本群经历。新旧冲突以新证据为准，无关则忽略；更多用 qqbot_notes_search。）';
+  const prefixFor = (hit: NoteHit): string => {
     const owner = chatOwnerOf(hit.file);
     const name = owner === undefined ? hit.file : `[本会话] ${hit.file.split('/').slice(2).join('/')}`;
+    const meta: string[] = [];
+    const provenance: string[] = [];
+    if (hit.meta?.status === 'superseded') provenance.push('⚠️已过期');
+    if (hit.meta?.date) provenance.push(bounded(hit.meta.date, 12));
+    if (hit.meta?.source) provenance.push(bounded(hit.meta.source, 40));
+    if (provenance.length) meta.push(provenance.join('·'));
+    const scope = hit.scopeLabel ?? (hit.meta ? describeNoteScope(hit.meta) : '跨会话通用');
+    meta.push(`适用:${bounded(scope, 80)}`);
+    if (hit.why) meta.push(`触发:${bounded(hit.why, 100)}`);
+    const conflict = bounded(formatConflictsSummary(hit.conflicts), 140);
+    return `- ${bounded(name, 100)} › ${bounded(hit.heading, 160)}（${meta.join(' | ')}）\n${conflict ? `  ⚠️ 冲突提醒：${conflict}\n` : ''}  `;
+  };
+  const render = (items: readonly PlannedNoteItem[]): string =>
+    [header, ...items.map(({ hit, snippet }) => `${prefixFor(hit)}${snippet}`), footer].join('\n');
 
-    const metaParts: string[] = [];
-    const provParts: string[] = [];
-    if (hit.meta?.status === 'superseded') provParts.push('⚠️已过期');
-    if (hit.meta?.date) provParts.push(hit.meta.date);
-    if (hit.meta?.source) provParts.push(hit.meta.source);
-    if (provParts.length > 0) metaParts.push(provParts.join('·'));
-
-    const scopeLabel = hit.scopeLabel ?? (hit.meta ? describeNoteScope(hit.meta) : undefined);
-    if (scopeLabel) metaParts.push(`适用:${scopeLabel}`);
-    if (hit.why) metaParts.push(`触发:${hit.why}`);
-
-    const metaSuffix = metaParts.length > 0 ? `（${metaParts.join(' | ')}）` : '';
-    lines.push(`- ${name} › ${hit.heading}${metaSuffix}`);
-    lines.push(`  ${snippet}`);
-
-    const conflictText = formatConflictsSummary(hit.conflicts);
-    if (conflictText !== '') {
-      lines.push(`  ⚠️ 冲突提醒：${conflictText}`);
+  // Reserve every rendered character before allocating body text, including separators.
+  while (active.length) {
+    const emptyItems = active.map(({ hit }) => ({ hit, snippet: '', truncated: true }));
+    const remaining = maxChars - render(emptyItems).length;
+    const allocations = allocateBudgets(active.map((entry) => entry.want), Math.max(0, remaining));
+    if (allocations.every((budget, i) => budget >= Math.min(40, active[i]!.want))) {
+      const items = active.map((entry, i): PlannedNoteItem => {
+        const limit = allocations[i]!;
+        const truncated = entry.clean.length > limit;
+        const snippet = truncated ? (limit > 1 ? `${entry.clean.slice(0, limit - 1)}…` : entry.clean.slice(0, limit)) : entry.clean;
+        return { hit: entry.hit, snippet, truncated };
+      });
+      const text = render(items);
+      return { items, text, usedChars: text.length, maxChars };
     }
+    active.pop();
   }
-  lines.push('（来自笔记库，仅供参考；不带 [本会话] 的是跨会话笔记，不是本群发生过的事。有新旧冲突时以新证据为准，无关则忽略；要看更多用 qqbot_notes_search。）');
-
-  return { items, text: lines.join('\n'), usedChars, maxChars };
+  return { items: [], text: '', usedChars: 0, maxChars };
 }
 
 /**

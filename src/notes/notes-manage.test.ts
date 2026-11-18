@@ -185,7 +185,9 @@ describe('qqbot_notes_manage', () => {
     expect(content).toContain('使用旧参数 1080p 测试');
     const [hit] = store.search('旧参数 1080p');
     expect(hit?.meta?.status).toBe('superseded');
-    expect(hit?.conflicts?.[0]).toMatchObject({ file: '新实验.md', relation: 'superseded-by' });
+    // An unresolved target must not leak through retrieval metadata.
+    expect(hit?.conflicts).toBeUndefined();
+    expect(hit?.meta?.supersededBy).toBeUndefined();
   });
 
   it('qqbot_notes_save 与 qqbot_notes_search：支持范围元数据、本机 cwd 感知与 all_scopes 权限边界', async () => {
@@ -198,9 +200,11 @@ describe('qqbot_notes_manage', () => {
       content: '保护指数设为 0.45，避免破音。',
       projects: ['voice-lab'],
       triggers: ['保护指数'],
+      operations: ['audio.convert'],
       budget_chars: 200,
     });
     expect(String(savedProj.message)).toContain('项目:voice-lab');
+    expect(readFileSync(join(local.root, 'RVC 参数约定.md'), 'utf8')).toContain('操作：audio.convert');
 
     const savedRp = await local.callSave({
       title: '哈基米炸毛规则',
@@ -228,6 +232,8 @@ describe('qqbot_notes_manage', () => {
     expect(noRp.hits).toEqual([]);
     const allRp = await local.callSearch({ query: '小笨猫 霸总腔', all_scopes: true }) as { hits: Array<Record<string, unknown>> };
     expect(allRp.hits[0]?.file).toBe('哈基米炸毛规则.md');
+    const privateSearch = await local.callSearch({ query: '点歌约定', all_scopes: true }) as { hits: Array<{ file: string }> };
+    expect(privateSearch.hits.some((hit) => hit.file.startsWith('chats/'))).toBe(false);
 
     // 2. 普通群聊传 all_scopes=true 被忽略，既拿不到跨范围人设/项目，也绝对拿不到别的群或当前未匹配项目的私有记录
     const groupTools = new Map<string, Tool>();
@@ -235,7 +241,7 @@ describe('qqbot_notes_manage', () => {
     const groupManager = { findByAgent: () => ({ scope: 'group', peerId: 'G2' }), noteMetrics: local.metrics };
     registerNotesTools(groupCtx as never, local.store, groupManager as never, logger as never, { ownerOpenid: 'OWNER', judgeEnabled: () => true });
     const groupRes = await groupTools.get(NOTES_SEARCH_TOOL_NAME)!.execute(
-      { query: '小笨猫 点歌 保护指数', all_scopes: true },
+      { query: '小笨猫 点歌 保护指数', all_scopes: true, project: 'voice-lab', persona: '哈基米' },
       { agent: {} },
     ) as { hits: Array<Record<string, unknown>> };
     expect(groupRes.hits.map((h) => h.file)).toEqual([]);

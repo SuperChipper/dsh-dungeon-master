@@ -58,7 +58,8 @@ function dayKey(now: number): string {
 }
 
 /** 命中来源：显式触发词优先，其余两个以上同时成立时按优先级记 */
-function viaOf(hit: { triggeredBy?: readonly string[]; exact?: unknown; similarity?: unknown }): string {
+function viaOf(hit: { triggeredBy?: readonly string[]; exact?: unknown; similarity?: unknown; operationMatches?: readonly string[] }): string {
+  if (hit.operationMatches?.length) return 'operation';
   if (hit.triggeredBy !== undefined && hit.triggeredBy.length > 0) return 'trigger';
   if (hit.exact !== undefined) return 'exact';
   if (hit.similarity !== undefined) return 'semantic';

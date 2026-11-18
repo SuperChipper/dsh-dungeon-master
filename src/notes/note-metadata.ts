@@ -25,6 +25,7 @@ export interface NoteScopeSpec {
 export interface NoteMeta {
   kind: NoteKind;
   scope: NoteScopeSpec;
+  operations?: string[];
   triggers?: string[];
   inject: NoteInjectPolicy;
   budgetChars?: number;
@@ -37,6 +38,9 @@ export interface NoteMeta {
 
 export interface NoteQueryContext {
   chatKey?: string;
+  operations?: readonly string[];
+  /** Explicit trusted local access; an unidentified caller is shared-only. */
+  trustedLocal?: boolean;
   sharedOnly?: boolean;
   projects?: readonly string[];
   /** 本机/主人私聊/终端白名单会话为 true，允许查询文本显式点名项目时命中对应项目笔记；普通受限水群为 false */
@@ -58,6 +62,7 @@ export interface NoteConflict {
 export interface RawMetaPatch {
   kind?: NoteKind;
   scope?: NoteScopeSpec;
+  operations?: string[];
   triggers?: string[];
   inject?: NoteInjectPolicy;
   budgetChars?: number;
@@ -75,7 +80,7 @@ const PERSONAS_NOTES_DIR = 'personas';
 const FRONT_MATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)([\s\S]*)$/;
 const DATE_RE = /(20\d{2}-\d{2}(?:-\d{2})?)/;
 const LEADING_QUOTE_DATE_RE = /^>\s*(20\d{2}-\d{2}(?:-\d{2})?)(?=\D|$)/;
-const META_FIELD_BOUNDARY_RE = /[；;]\s*(?=(?:记录于|来源|范围|项目|人设|场景|模型|触发|预算|注入|状态|替代|已被替代|已被|date|source|scope|project|persona|scene|model|trigger|budget|inject|status|supersedes|supersededBy)\s*[：: ])/iu;
+const META_FIELD_BOUNDARY_RE = /[；;]\s*(?=(?:记录于|来源|范围|项目|人设|场景|模型|操作|operations?|触发|预算|注入|状态|替代|已被替代|已被|date|source|scope|project|persona|scene|model|trigger|budget|inject|status|supersedes|supersededBy)\s*[：: ])/iu;
 
 /** 会话键 → 目录名，如 group:ABC → group_ABC */
 export function chatNotesDir(chatKey: string): string {
@@ -213,6 +218,7 @@ export function cloneNoteMeta(meta: NoteMeta): NoteMeta {
       ...(meta.scope.scenes === undefined ? {} : { scenes: [...meta.scope.scenes] }),
       ...(meta.scope.models === undefined ? {} : { models: [...meta.scope.models] }),
     },
+    ...(meta.operations === undefined ? {} : { operations: [...meta.operations] }),
     ...(meta.triggers === undefined ? {} : { triggers: [...meta.triggers] }),
     inject: meta.inject,
     ...(meta.budgetChars === undefined ? {} : { budgetChars: meta.budgetChars }),
@@ -251,6 +257,7 @@ export function mergeNoteMeta(base: NoteMeta, patch: RawMetaPatch): NoteMeta {
   const models = mergeUniqueStrings(scope.models, patch.scope?.models);
   if (models !== undefined) scope.models = models;
 
+  const operations = mergeUniqueStrings(base.operations, patch.operations);
   const triggers = mergeUniqueStrings(base.triggers, patch.triggers);
   const supersedes = mergeUniqueStrings(base.supersedes, patch.supersedes);
   const budgetChars = patch.budgetChars !== undefined ? patch.budgetChars : base.budgetChars;
@@ -260,6 +267,7 @@ export function mergeNoteMeta(base: NoteMeta, patch: RawMetaPatch): NoteMeta {
   const merged: NoteMeta = {
     kind: resolveKind(scope, patch.kind ?? base.kind),
     scope,
+    ...(operations === undefined ? {} : { operations }),
     ...(triggers === undefined ? {} : { triggers }),
     inject,
     ...(budgetChars === undefined ? {} : { budgetChars }),
@@ -326,6 +334,8 @@ function parseFrontmatterObject(head: Record<string, unknown>): RawMetaPatch {
   if (topModels.length > 0) scope.models = mergeUniqueStrings(scope.models, topModels);
   if (Object.keys(scope).length > 0) patch.scope = scope;
 
+  const operations = toStringList(head.operations ?? head.operation);
+  if (operations.length > 0) patch.operations = operations;
   const triggers = toStringList(head.triggers ?? head.trigger);
   if (triggers.length > 0) patch.triggers = triggers;
 
@@ -474,6 +484,10 @@ export function parseMetaBlockquote(line: string): RawMetaPatch | undefined {
       if (vals.length === 0) return undefined;
       hasScope = true;
       scope.models = mergeUniqueStrings(scope.models, vals);
+    } else if ((matched = /^(?:操作|operations?)\s*[：:]\s*(.+)$/i.exec(part)) !== null) {
+      const vals = toStringList(matched[1]!);
+      if (vals.length === 0) return undefined;
+      patch.operations = mergeUniqueStrings(patch.operations, vals);
     } else if ((matched = /^(?:触发|triggers?)\s*[：:]\s*(.+)$/i.exec(part)) !== null) {
       const vals = toStringList(matched[1]!);
       if (vals.length === 0) return undefined;
@@ -572,6 +586,7 @@ export function formatMetaBlockquote(meta: Partial<NoteMeta>, fallbackDate?: str
   if (meta.scope?.models?.length) scopeParts.push(`model=${meta.scope.models.join(',')}`);
   if (scopeParts.length > 0) parts.push(`范围：${scopeParts.join('; ')}`);
 
+  if (meta.operations?.length) parts.push(`操作：${meta.operations.join(', ')}`);
   if (meta.triggers?.length) parts.push(`触发：${meta.triggers.join(', ')}`);
   if (meta.inject === 'search-only') parts.push('注入：仅检索');
   if (meta.budgetChars !== undefined && meta.budgetChars > 0) parts.push(`预算：${meta.budgetChars}字`);
@@ -667,7 +682,7 @@ function hasIntersectionIgnoreCase(a: readonly string[] | undefined, b: readonly
 /** 判断某条笔记在当前上下文和查询下是否满足适用范围 */
 export function matchesNoteScope(meta: NoteMeta, context: NoteQueryContext = {}, query = ''): boolean {
   if (meta.scope.chatKey !== undefined) {
-    if (context.sharedOnly === true) return false;
+    if (context.sharedOnly === true || (context.chatKey === undefined && context.trustedLocal !== true)) return false;
     if (context.chatKey !== undefined && chatNotesDir(context.chatKey) !== meta.scope.chatKey) return false;
   }
 

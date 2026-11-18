@@ -25,6 +25,10 @@ import type { ModelRoute, ModelEntry } from '../model/types.ts';
 import { IdleEvictor } from './idle-evictor.ts';
 import type { StickerStore, StickerMatchResult } from '../media/sticker-store.ts';
 import { chatKeyOf, planNoteInjection, type NoteHit, type NoteQueryContext, type NotesStore } from '../notes/notes-store.ts';
+import type { MediaReviewCoordinator } from '../features/media-review-coordinator.ts';
+import { boundedRecall, noteRevisionKey, operationQueryTerms, RecallTurnState, toolOperationEvidence } from '../notes/operation-recall.ts';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { QQBOT_MESSAGE_SOURCE } from '../shared/message-source.ts';
 import { deriveProjectsFromCwd } from '../notes/note-metadata.ts';
 import type { NoteMetricsStore } from '../notes/note-metrics.ts';
 import type { NoteJudge } from '../features/note-judge.ts';
@@ -371,6 +375,7 @@ export class SessionManager {
   /** 笔记相关性打分（llm 服务不可用时缺省，只记账不打分） */
   public noteJudge?: NoteJudge;
   private readonly pendingNoteInjections = new Map<string, PendingNoteInjection>();
+  private readonly operationRecalls = new Map<string, RecallTurnState>();
   /** 会话 key → /new 时旧会话的压缩摘要（可能还在压缩）；新会话的第一条消息取走 */
   private readonly pendingHandoffs = new Map<string, Promise<string | undefined>>();
   /** 切换先完成落盘；期间到来的 QQ 消息等待，不得进入即将离开的人格历史。 */
@@ -388,6 +393,7 @@ export class SessionManager {
   private readonly promptLatch = new PromptLatch();
   /** 短时入站自动 steer 阶段跟踪器（与出站事件、流式帧同步） */
   public readonly turnSteer = new TurnSteerTracker();
+  public mediaReview?: MediaReviewCoordinator;
   /** 由 bootstrap 注入的跑团按钮（/dnd start 发签到）；按钮关闭时为空 */
   public dndButtons?: DndTurnButtons;
   public personaStore?: PersonaStore;
@@ -430,6 +436,7 @@ export class SessionManager {
     this.registerScopePromptInjection();
     this.registerRuntimeContexts();
     this.registerVoiceReplyDelivery();
+    this.registerOperationRecall();
   }
 
   /** 语音后的文字继续生成，出站层改用独立静态消息，投递队列负责发送间隔。 */
@@ -1000,60 +1007,88 @@ export class SessionManager {
     }, scope, peerId, { ...options, record });
   }
 
-  /** 按当前消息检索笔记（共享 + 本会话私有，按项目/人设/场景/预算筛选），返回要注入的提示块（未启用/无相关结果/出错时返回空串） */
-  async notesHint(query: string, scope: ChatScope, peerId: string, messageId?: string, preservePending = false): Promise<string> {
-    if (this.config.dnd?.combatAgent?.enabled && this.dndService?.active(this.sessionKey(scope, peerId))?.campaign.initiative) return '';
-    const notes = this.config.notes;
-    if (this.notesStore === undefined || !notes?.autoInject || query.trim().length === 0) return '';
-    try {
-      // 开着团时本群的跑团笔记（旧进度、旧待办）会和每回合注入的实时团况打架，只召回共享笔记
-      const key = this.sessionKey(scope, peerId);
-      const campaignRunning = this.dndService?.active(key) !== undefined;
-      const record = this.sessions?.get(key);
-      const queryCtx = buildNoteQueryContextFromDeps({
-        config: this.config,
-        notesStore: this.notesStore,
-        personaStore: this.personaStore,
-        toolAccess: this.toolAccess,
-        dndService: this.dndService,
-        sessionKey: (s, p) => this.sessionKey(s, p),
-        getEffectiveModel: this.getEffectiveModel ? (s, p) => this.getEffectiveModel(s, p) : undefined,
-      }, scope, peerId, { record, sharedOnly: campaignRunning });
-      const { chatKey, ...restCtx } = queryCtx;
-      const found = await this.notesStore.searchHybrid(query, notes.injectTopK * 2, chatKey, restCtx);
-      const hits = found.filter((hit) => !this.noteMuted(hit.file, hit.heading));
-      const maxChars = scope === 'group' && (notes.groupInjectMaxChars ?? 0) > 0
-        ? notes.groupInjectMaxChars!
-        : notes.injectMaxChars;
-      const plan = planNoteInjection(hits, {
-        topK: notes.injectTopK,
-        maxChars,
-        perNoteMaxChars: notes.injectPerNoteChars ?? 0,
-        minCoverage: notes.injectMinCoverage,
-        query,
-      });
-      // 这里只登记：消息还在组装，模型未必收得到。等这一轮正常结束再记账、打分（见 settleNoteInjection）
-      if (plan.items.length === 0) {
-        if (!preservePending) this.pendingNoteInjections.delete(key);
-      } else {
-        const contextLines = scope === 'group'
-          ? collectJudgeLines(this.config, peerId, messageId, { includeCurrent: false })
-          : undefined;
-        this.pendingNoteInjections.set(key, {
-          query,
-          at: Date.now(),
-          campaignRunning,
-          hits: plan.items.map((item) => item.hit),
-          // 打分要看模型实际看到的那段，与最终注入保持一致
-          snippets: plan.items.map((item) => item.snippet),
-          ...(contextLines !== undefined && contextLines.length > 0 ? { contextLines } : {}),
-        });
-      }
-      return plan.text;
-    } catch (err) {
-      this.logger.warn(`im-qqbot: 笔记检索失败: ${err instanceof Error ? err.message : String(err)}`);
-      return '';
+  /** All recall routes share scope checks, revision dedup and a turn-wide rendered-character budget. */
+  async notesHint(query: string, scope: ChatScope, peerId: string, messageId?: string, preservePending = false,
+    operations: readonly string[] = []): Promise<string> {
+    const key = this.sessionKey(scope, peerId);
+    if (!preservePending || !this.operationRecalls.has(key)) {
+      this.operationRecalls.set(key, new RecallTurnState(query, operations));
+      this.pendingNoteInjections.delete(key);
     }
+    const state = this.operationRecalls.get(key)!;
+    const operationQuery = [query, operationQueryTerms(operations)].filter(Boolean).join('\n');
+    return this.recallAtOperation(operationQuery, operations, scope, peerId, state, messageId, undefined, operations.length && state.usedChars === 0 ? 0.6 : 1);
+  }
+
+  private async recallAtOperation(query: string, operations: readonly string[], scope: ChatScope, peerId: string,
+    state: RecallTurnState, messageId?: string, signal?: AbortSignal, budgetFraction = 1): Promise<string> {
+    const key = this.sessionKey(scope, peerId);
+    const notes = this.config.notes;
+    if (!this.notesStore || !notes?.autoInject || (!query.trim() && !operations.length)) return '';
+    if (this.config.dnd?.combatAgent?.enabled && this.dndService?.active(key)?.campaign.initiative) return '';
+    return state.serialize(async () => {
+      if (signal?.aborted || this.operationRecalls.get(key) !== state || Date.now() - state.createdAt > NOTE_INJECTION_TTL_MS) return '';
+      const maxChars = scope === 'group' && (notes.groupInjectMaxChars ?? 0) > 0 ? notes.groupInjectMaxChars! : notes.injectMaxChars;
+      const remaining = Math.floor(maxChars * budgetFraction) - state.usedChars;
+      if (remaining <= 0) return '';
+      const campaignRunning = this.dndService?.active(key) !== undefined;
+      const context = this.buildNoteQueryContext(scope, peerId, { sharedOnly: campaignRunning });
+      const { chatKey, ...rest } = context;
+      let found: NoteHit[] | undefined;
+      try {
+        found = await boundedRecall(this.notesStore!.searchHybrid(query, notes.injectTopK * 4, chatKey,
+          { ...rest, operations: [...operations], allowQueryProjectMatch: false }), 1200, signal);
+      } catch {
+        this.logger.debug('im-qqbot: operation recall unavailable; continuing without notes');
+        return '';
+      }
+      if (!found || signal?.aborted || this.operationRecalls.get(key) !== state) return '';
+      const hits = found.filter(hit => !this.noteMuted(hit.file, hit.heading) && !state.seen.has(noteRevisionKey(hit)));
+      const plan = planNoteInjection(hits, { topK: notes.injectTopK, maxChars: remaining,
+        perNoteMaxChars: notes.injectPerNoteChars ?? 0, minCoverage: notes.injectMinCoverage, query });
+      if (!plan.items.length || !plan.text) return '';
+      state.usedChars += plan.text.length;
+      for (const item of plan.items) state.seen.add(noteRevisionKey(item.hit));
+      const pending = this.pendingNoteInjections.get(key);
+      const contextLines = scope === 'group' ? collectJudgeLines(this.config, peerId, messageId, { includeCurrent: false }) : undefined;
+      this.pendingNoteInjections.set(key, { query: pending?.query ?? query, at: pending?.at ?? Date.now(), campaignRunning,
+        hits: [...(pending?.hits ?? []), ...plan.items.map(item => item.hit)],
+        snippets: [...(pending?.snippets ?? []), ...plan.items.map(item => item.snippet)],
+        ...(pending?.contextLines ? { contextLines: pending.contextLines } : contextLines?.length ? { contextLines } : {}) });
+      return plan.text;
+    });
+  }
+
+  private registerOperationRecall(): void {
+    interface Exec { name: string; callId?: string; agent?: unknown; signal: AbortSignal }
+    interface Result { isError?: boolean; value?: unknown; error?: unknown }
+    interface Decision { kind: string; additionalContexts?: unknown[]; [key: string]: unknown }
+    const handler = async (exec: Exec, result: Result, next: () => Promise<Decision>): Promise<Decision> => {
+      const decision = await next();
+      const record = exec.agent ? this.findByAgent(exec.agent as DshAgent) : undefined;
+      if (!record || exec.signal.aborted || decision.kind === 'block') return decision;
+      const effectiveResult = Object.prototype.hasOwnProperty.call(decision, 'value')
+        ? { ...result, value: decision.value }
+        : Object.prototype.hasOwnProperty.call(decision, 'content') ? { ...result, value: undefined } : result;
+      const evidence = toolOperationEvidence(exec.name, effectiveResult);
+      if (!evidence) return decision;
+      this.mediaReview?.observe(record.agent, evidence);
+      const state = this.operationRecalls.get(record.sessionKey);
+      if (!state) return decision;
+      const eventKey = exec.callId ?? randomUUID();
+      if (state.events.has(eventKey) || state.events.size >= 16) return decision;
+      state.events.add(eventKey);
+      const hint = await this.recallAtOperation([state.query, evidence.query].filter(Boolean).join('\n'), evidence.operations,
+        record.scope, record.peerId, state, undefined, exec.signal);
+      if (exec.signal.aborted || this.operationRecalls.get(record.sessionKey) !== state) return decision;
+      const factsBudget = Math.max(0, 1200 - state.factChars);
+      const facts = `[媒体操作结果 · 执行事实]\n${evidence.facts.join('；')}\n`.slice(0, Math.min(220, factsBudget));
+      state.factChars += facts.length;
+      if (!facts && !hint) return decision;
+      return { ...decision, additionalContexts: [...(decision.additionalContexts ?? []), createUserMessage({
+        content: [{ type: 'text', text: facts + hint }], source: QQBOT_MESSAGE_SOURCE })] };
+    };
+    (this.ctx as unknown as { on(event: 'tools/post-execute', listener: typeof handler, options?: { global: boolean }): void }).on('tools/post-execute', handler, { global: true });
   }
 
   /** 这段笔记是否被静音（相关性打分长期偏低）。笔记文件在静音之后改过就解除：旧分数评的不是现在的内容 */
@@ -1082,6 +1117,7 @@ export class SessionManager {
    * 打分异步进行，不等结果。
    */
   settleNoteInjection(record: SessionRecord, ok: boolean, turn?: NoteTurnSummary): void {
+    this.operationRecalls.delete(record.sessionKey);
     const pending = this.pendingNoteInjections.get(record.sessionKey);
     if (pending === undefined) return;
     this.pendingNoteInjections.delete(record.sessionKey);

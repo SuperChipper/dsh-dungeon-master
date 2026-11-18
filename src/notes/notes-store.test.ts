@@ -94,7 +94,7 @@ describe('NotesStore.search', () => {
     expect(new NotesStore(join(tmpdir(), 'no-such-notes-dir-xyz')).search('任何')).toEqual([]);
   });
 
-  it('别的会话的私有笔记检索不到；本会话和本机会话都看得到', () => {
+  it('私有笔记要求匹配身份；本机全库访问必须显式授权', () => {
     const root = tempNotes({
       '共享.md': '# 跑团入门\n沉钟修道院是新手模组',
       'chats/group_A/沉钟.md': '# 沉钟修道院\n队伍已升 2 级',
@@ -105,7 +105,8 @@ describe('NotesStore.search', () => {
 
     expect(files('group_A')).toEqual(['chats/group_A/沉钟.md', '共享.md']);
     expect(files('group_C')).toEqual(['共享.md']);
-    expect(files(undefined)).toHaveLength(3);
+    expect(files(undefined)).toEqual(['共享.md']);
+    expect(store.search('沉钟修道院', 5, undefined, { trustedLocal: true })).toHaveLength(3);
   });
 });
 
@@ -247,8 +248,8 @@ describe('formatNotesHint', () => {
 
   it('按 maxChars 截断', () => {
     const hint = formatNotesHint(store.search('明天开家长会怎么办', 4), { ...hintOptions, maxChars: 80, topK: 1 });
-    const body = hint.split('\n')[2]!;
-    expect(body.length).toBeLessThanOrEqual(85);
+    expect(hint.length).toBeLessThanOrEqual(80);
+    expect(hint).toBe('');
   });
 });
 
@@ -381,8 +382,10 @@ describe('范围隔离、新旧冲突、触发依据与注水预算', () => {
     });
     expect(plan.items.map((i) => i.hit.file)).not.toContain('c仅搜.md');
     const longItem = plan.items.find((i) => i.hit.file === 'b长.md')!;
-    expect(longItem.snippet.length).toBeGreaterThan(400);
-    expect(plan.text).toContain(`预算 ${plan.usedChars}/500 字`);
+    expect(longItem.snippet.length).toBeGreaterThan(200);
+    expect(plan.usedChars).toBe(plan.text.length);
+    expect(plan.text.length).toBeLessThanOrEqual(500);
+    expect(plan.text).toContain('适用:');
 
     // 单条 budgetChars=100 生效
     const singlePlan = planNoteInjection(hits.filter((h) => h.file === 'd单条限.md'), {
@@ -391,5 +394,95 @@ describe('范围隔离、新旧冲突、触发依据与注水预算', () => {
       minCoverage: 0.3,
     });
     expect(singlePlan.items[0]!.snippet.length).toBeLessThanOrEqual(101);
+  });
+});
+
+
+describe('additive operations and safe replacement', () => {
+  it('operation tags add candidates without excluding background or semantic recall', async () => {
+    const store = new NotesStore(tempNotes({
+      'operation.md': '---\noperations: [notes.search]\n---\n# Pipeline\nA completely unrelated operational instruction.',
+      'background.md': '# Background\nRemember the orange cat.',
+      'other.md': '---\noperations: [other.action]\n---\n# Other\nThe orange cat likes fish.',
+    }));
+    const hits = store.search('orange cat', 8, 'group_A', { operations: ['NOTES.SEARCH'] });
+    expect(hits.map((h) => h.file)).toEqual(expect.arrayContaining(['operation.md', 'background.md', 'other.md']));
+    const tagged = hits.find((h) => h.file === 'operation.md')!;
+    expect(tagged.operationMatches).toEqual(['notes.search']);
+    expect(tagged.why).toContain('notes.search');
+    expect(store.search('', 5, 'group_A', { operations: ['notes.search'] })[0]?.file).toBe('operation.md');
+    expect(selectNotesForInjection([tagged], { topK: 1, minCoverage: 1 })).toHaveLength(1);
+    expect(store.search('orange cat').map((h) => h.file)).toContain('other.md');
+    store.setSemantic(new EmbeddingCache({ model: 'test', async embed(texts) { return texts.map((t) => t.includes('orange') || t.includes('feline') ? [1, 0] : [0, 1]); } }, 1000), { minSimilarity: 0.5, minMargin: 0 });
+    await new Promise((r) => setTimeout(r, 0));
+    const semantic = await store.searchHybrid('feline', 8, 'group_A', { operations: ['notes.search'] });
+    expect(semantic.find((h) => h.file === 'background.md')?.similarity).toBeCloseTo(1);
+  });
+
+  it('private replacements cannot suppress shared or other-chat evidence or disclose target metadata', () => {
+    const store = new NotesStore(tempNotes({
+      'shared.md': '# Orange cat\nShared orange cat evidence.',
+      'chats/group_A/private.md': '---\nscope: {chatKey: group_B}\nsupersedes: shared.md\n---\n# Hidden replacement\n> 范围：chat=group_B\n\nOrange cat private secret.',
+      'chats/group_B/old.md': '---\nsupersededBy: chats/group_A/private.md\n---\n# Old cat\nOrange cat older evidence.',
+    }));
+    const own = store.search('orange cat', 8, 'group_A');
+    expect(own.map((h) => h.file)).toContain('chats/group_A/private.md');
+    const other = store.search('orange cat', 8, 'group_B');
+    expect(other.map((h) => h.file)).not.toContain('chats/group_A/private.md');
+    expect(other.find((h) => h.file === 'shared.md')?.meta?.status).toBe('active');
+    expect(other.find((h) => h.file === 'chats/group_B/old.md')?.meta?.status).toBe('active');
+    expect(JSON.stringify(other)).not.toContain('private.md');
+    expect(store.search('orange cat', 8).every((h) => !h.file.startsWith('chats/'))).toBe(true);
+  });
+
+  it('same-chat qualified replacement is recalled only for that chat', () => {
+    const store = new NotesStore(tempNotes({
+      'chats/group_A/old.md': '# Original\nOrange cat old workflow.',
+      'chats/group_A/new.md': '---\nsupersedes: chats/group_A/old.md\n---\n# Current\nUse the updated process.',
+      'chats/group_B/old.md': '# Original\nOrange cat independent workflow.',
+    }));
+    const own = store.search('orange cat', 8, 'group_A');
+    expect(own[0]?.file).toBe('chats/group_A/new.md');
+    expect(own.find((h) => h.file.endsWith('/old.md'))?.meta?.status).toBe('superseded');
+    const other = store.search('orange cat', 8, 'group_B');
+    expect(other[0]?.file).toBe('chats/group_B/old.md');
+    expect(other[0]?.meta?.status).toBe('active');
+    expect(JSON.stringify(other)).not.toContain('group_A');
+  });
+
+  it('project-specific replacement does not suppress general evidence even in the matching project', () => {
+    const store = new NotesStore(tempNotes({
+      'general.md': '# Orange cat\nOriginal orange cat convention.',
+      'projects/app/new.md': '---\nsupersedes: general.md\n---\n# New rule\nNew project convention.',
+    }));
+    expect(store.search('orange cat', 5, 'group_A', { projects: ['app'] })[0]?.meta?.status).toBe('active');
+  });
+
+  it('ambiguous bare headings do not replace multiple files; qualified references still work', () => {
+    const root = tempNotes({
+      'a.md': '# Same heading\nOrange cat original A.',
+      'b.md': '# Same heading\nOrange cat original B.',
+      'new.md': '---\nsupersedes: Same heading\n---\n# New rule\nUpdated evidence.',
+    });
+    const store = new NotesStore(root);
+    expect(store.search('orange cat', 8).filter((h) => h.meta?.status === 'superseded')).toEqual([]);
+    store.save({ title: 'Qualified replacement', content: 'Now updated.', supersedes: ['a.md › Same heading'] });
+    const hits = store.search('orange cat', 8);
+    expect(hits.find((h) => h.file === 'a.md')?.meta?.status).toBe('superseded');
+    expect(hits.find((h) => h.file === 'b.md')?.meta?.status).toBe('active');
+  });
+
+  it('full rendered budget includes long provenance, headings, explanations and conflicts', () => {
+    const hit = { file: 'file'.repeat(100) + '.md', heading: 'heading'.repeat(100), text: 'body '.repeat(400), score: 1, coverage: 1, matched: 5, why: 'reason'.repeat(300), scopeLabel: 'scope'.repeat(200), conflicts: [{ file: 'replacement'.repeat(200), heading: 'target'.repeat(100), relation: 'newer-evidence' as const }] };
+    for (const maxChars of [0, 30, 80, 300, 800, 1200]) {
+      const plan = planNoteInjection([hit], { topK: 2, maxChars, minCoverage: 0 });
+      expect(plan.text.length).toBeLessThanOrEqual(maxChars);
+      expect(plan.usedChars).toBe(plan.text.length);
+      for (const item of plan.items) expect(plan.text).toContain(item.snippet);
+    }
+    const plan = planNoteInjection([hit], { topK: 1, maxChars: 800, minCoverage: 0 });
+    expect(plan.items).toHaveLength(1);
+    expect(plan.text).toContain('触发:');
+    expect(plan.text).toContain('冲突提醒');
   });
 });

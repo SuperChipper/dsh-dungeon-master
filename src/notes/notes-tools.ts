@@ -95,6 +95,7 @@ interface SaveArgs {
   projects?: string[];
   personas?: string[];
   scenes?: NoteScene[];
+  operations?: string[];
   triggers?: string[];
   inject?: NoteInjectPolicy;
   budget_chars?: number;
@@ -245,16 +246,17 @@ export function registerNotesTools(
         };
       }
 
-      if (typeof project === 'string' && project.trim() !== '') {
+      if (ownerOrLocal && typeof project === 'string' && project.trim() !== '') {
         queryCtx = { ...queryCtx, projects: [project.trim()] };
       }
-      if (typeof persona === 'string' && persona.trim() !== '') {
+      if (ownerOrLocal && typeof persona === 'string' && persona.trim() !== '') {
         queryCtx = { ...queryCtx, personas: [persona.trim()] };
       }
       if (all_scopes === true && ownerOrLocal) {
         queryCtx = { ...queryCtx, unscoped: true };
       }
 
+      if (record === undefined) queryCtx = { ...queryCtx, sharedOnly: true };
       const rawHits = await store.searchHybrid(query, n, chatKey, queryCtx);
       const hits: SearchOutputHit[] = rawHits.map((hit) => {
         const conflictStrings = hit.conflicts?.map((c) => formatConflictsSummary([c])).filter(Boolean);
@@ -306,6 +308,7 @@ export function registerNotesTools(
           items: { type: 'string', enum: ['group', 'c2c', 'dnd', 'local'] },
           description: 'Restrict to specific scene(s): group, c2c, dnd, local.',
         },
+        operations: { type: 'array', items: { type: 'string' }, description: 'Optional operation tags, e.g. ["notes.search"]. Adds a recall route without restricting ordinary recall.' },
         triggers: {
           type: 'array',
           items: { type: 'string' },
@@ -346,7 +349,7 @@ export function registerNotesTools(
       ],
     },
     async execute(args: unknown, exec: { agent?: unknown }): Promise<SaveNoteResult> {
-      const { title, content, file, scope, projects, personas, scenes, triggers, inject, budget_chars, supersedes } = args as SaveArgs;
+      const { title, content, file, scope, projects, personas, scenes, operations, triggers, inject, budget_chars, supersedes } = args as SaveArgs;
       if (typeof title !== 'string' || typeof content !== 'string') {
         throw new Error('qqbot_notes_save: `title` 和 `content` 必须是字符串');
       }
@@ -392,6 +395,7 @@ export function registerNotesTools(
         ...(cleanProjects === undefined ? {} : { projects: cleanProjects }),
         ...(cleanPersonas === undefined ? {} : { personas: cleanPersonas }),
         ...(cleanScenes === undefined || cleanScenes.length === 0 ? {} : { scenes: cleanScenes }),
+        ...(cleanStringArray(operations) === undefined ? {} : { operations: cleanStringArray(operations) }),
         ...(cleanTriggers === undefined ? {} : { triggers: cleanTriggers }),
         ...(inject === 'auto' || inject === 'search-only' ? { inject } : {}),
         ...(budgetChars === undefined ? {} : { budgetChars }),
