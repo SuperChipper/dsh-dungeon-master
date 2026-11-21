@@ -6,7 +6,8 @@
  * 解析失败或结构异常时拒绝写入、保留原文件（避免覆盖用户其他配置）。
  */
 import { resolve } from 'node:path';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import yaml from 'js-yaml';
 
 /** 凭据结果 */
@@ -180,6 +181,54 @@ export function updateProfileConfig(
   } catch (err) {
     log.warn(`保存配置失败: ${err instanceof Error ? err.message : String(err)}`);
     return false;
+  }
+}
+
+/** An owner-button approval edits one leaf, not a settings-panel snapshot. Preserve sibling
+ * settings (including unmaterialized defaults and credential references) and mixed patch rows. */
+export function updateProfileAllowedGroups(
+  section: 'browser' | 'imageGen', groups: readonly string[], profileDir?: string,
+  logger: { info(msg: string, ...args: unknown[]): void; warn(msg: string, ...args: unknown[]): void } = console,
+  expectedGroups?: readonly string[],
+): boolean {
+  if (!profileDir || !['browser', 'imageGen'].includes(section)) return false;
+  const isMap = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null && !Array.isArray(value) && !(value instanceof Date);
+  const validIds = (value: unknown): value is string[] => Array.isArray(value) && value.every((id) => typeof id === 'string' && id.trim() !== '');
+  const normalize = (ids: readonly string[]) => [...new Set(ids.map((id) => id.trim()))].sort();
+  const path = resolve(profileDir, 'cordis.patch.yml');
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  try {
+    if (!validIds(groups)) throw new Error('invalid groups');
+    const original = existsSync(path) ? readFileSync(path, 'utf8') : '';
+    const parsed: unknown = yaml.load(original);
+    if (parsed != null && !Array.isArray(parsed)) throw new Error('invalid patch');
+    const rows: unknown[] = [...(parsed ?? [])];
+    if (rows.length && (!rows.every(isMap) || !rows.some((row) => isMap(row) && typeof row.id === 'string'))) throw new Error('not a profile');
+    const indexes = rows.flatMap((row, i) => isMap(row) && row.id === 'im-qqbot' ? [i] : []);
+    if (indexes.length > 1) throw new Error('ambiguous plugin entry');
+    const index = indexes[0] ?? rows.length;
+    const row = (rows[index] ?? { id: 'im-qqbot' }) as Record<string, unknown>;
+    if (row.config !== undefined && !isMap(row.config)) throw new Error('invalid plugin config');
+    const config = row.config ?? {};
+    const part = config[section];
+    if (part !== undefined && !isMap(part)) throw new Error('invalid section');
+    const stored = part?.allowedGroups;
+    if (stored !== undefined && !validIds(stored)) throw new Error('invalid stored groups');
+    // If a settings save changed membership before the plugin was recomposed, ask for a new
+    // approval rather than overwriting that edit with the old in-memory list.
+    if (expectedGroups && stored !== undefined && JSON.stringify(normalize(stored)) !== JSON.stringify(normalize(expectedGroups))) throw new Error('stale groups');
+    rows[index] = { ...row, config: { ...config, [section]: { ...part, allowedGroups: [...new Set(groups.map((id) => id.trim()))] } } };
+    mkdirSync(profileDir, { recursive: true });
+    writeFileSync(tmp, yaml.dump(rows), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    renameSync(tmp, path);
+    return true;
+  } catch {
+    // YAML errors may quote the surrounding lines, which can contain credentials.
+    logger.warn(`im-qqbot: ${section}.allowedGroups 保存失败，配置未替换；请检查 profile 结构或是否有并发修改`);
+    return false;
+  } finally {
+    try { rmSync(tmp, { force: true }); } catch { /* leave the active profile untouched */ }
   }
 }
 

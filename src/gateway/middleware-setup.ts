@@ -20,7 +20,7 @@ import {
   envelopeFormatter,
 } from '@tencent-connect/qqbot-nodejs';
 import type { Middleware, RefIndexStore, ResolvedQuote } from '@tencent-connect/qqbot-nodejs';
-import type { ImQQBotConfig } from '../config.ts';
+import { resolveGroupTriggerPolicy, type ImQQBotConfig } from '../config.ts';
 import type { SessionManager } from '../session/index.ts';
 import type { Logger, RawAttachment } from '../types.ts';
 import { isImageContentType } from '../transport/attachment.ts';
@@ -182,17 +182,16 @@ export function setupMiddlewares(
     await next();
   });
 
-  // 5. 群聊 @bot 门控（含概率隐式 @：未 @ 时按 groupReplyProbability 随机放行）
-  //    开了回复欲望时 passthrough：没放行的消息不在这里丢，交给 5.5 打分决定
-  const replyDesireOn = config.replyDesire?.enabled === true;
+  // 5. 群聊 @bot 门控（由 groupTriggerMode 统一收敛；desire 模式 passthrough 给 5.5 打分）
+  const trigger = resolveGroupTriggerPolicy(config);
   bot.use(mentionGate({
-    requireMentionInGroup: config.requireMention,
-    passthrough: replyDesireOn,
+    requireMentionInGroup: trigger.requireMentionInGroup,
+    passthrough: trigger.passthroughToDecider,
     isImplicitMention: (ctx) => {
       if (ctx.message.kind !== 'group') return false;
       // 待结算期间的反应回应不靠 @ 也不靠概率：玩家等着它落账，漏了这条窗口就白开了
       if (pendingReactionReply(ctx.message, manager) !== undefined) return true;
-      const p = config.groupReplyProbability ?? 0;
+      const p = trigger.implicitProbability;
       if (!(p > 0 && Math.random() < p)) return false;
       // 跑团期间默认照样随机插嘴：这类消息不带 (@you)，DM 守则规定只吐槽、不当成行动宣告去结算。
       // dnd.interjections=false 时开团后只回 @
@@ -203,7 +202,7 @@ export function setupMiddlewares(
   }));
 
   // 5.5. 回复欲望门控：未 @ 的群消息按规则打分 + 对话窗口决定是否接话
-  if (replyDesireOn) {
+  if (trigger.replyDesireEnabled) {
     let judgeDeps: JudgeDeps | undefined;
     if (config.replyDesire.judge?.enabled === true) {
       if (llm?.stream === undefined) {

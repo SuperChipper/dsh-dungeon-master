@@ -16,7 +16,7 @@
  */
 import { createElement, useCallback, useEffect, useState, type CSSProperties, type ChangeEvent, type FormEvent, type ReactNode } from 'react';
 import { BIND_CONFIG_PATH } from '../shared/bind-protocol.ts';
-import type { BrowserConfig } from '../config.ts';
+import type { BrowserConfig, ElevenLabsOutputFormat, GroupTriggerMode, ImageGenComplexity, ImageGenQuality } from '../config.ts';
 
 /** 访问控制配置（与 src/config.ts 的 AccessControlConfig 对应的局部投影） */
 interface AccessControlWire {
@@ -40,6 +40,11 @@ interface StickersWire {
   maxAutoEntries: number;
 }
 
+/** 外置聊天人设配置（与 src/config.ts 的 PersonasConfig 对应） */
+interface PersonasWire {
+  root: string;
+}
+
 /** 富媒体理解（与 src/config.ts 的 MediaConfig 对应） */
 interface MediaWire {
   enabled: boolean;
@@ -60,13 +65,18 @@ interface VisionWire {
   timeoutMs: number;
 }
 
-/** 在线语音识别（与 src/config.ts 的 AsrConfig 对应；apiKey 走环境变量/patch，不进表单） */
+/** 在线语音识别（与 src/config.ts 的 AsrConfig 对应；apiKey/chatApiKey 走环境变量/patch，不进表单） */
 interface AsrWire {
   enabled: boolean;
-  /** 'chat' = 订阅网关（忽略 baseUrl/apiKey/model），'openai' = /audio/transcriptions */
+  /** 'chat' = chat/completions + input_audio，'openai' = /audio/transcriptions */
   mode: string;
   baseUrl: string;
+  apiKeyEnv?: string;
   model: string;
+  chatBaseUrl?: string;
+  chatModel?: string;
+  chatApiKeyEnv?: string;
+  chatReasoningEffort?: string;
   preferQQ: boolean;
   timeoutMs: number;
   fallback?: AsrFallbackWire;
@@ -76,22 +86,152 @@ interface AsrWire {
 interface AsrFallbackWire {
   enabled: boolean;
   baseUrl: string;
+  apiKeyEnv?: string;
   model: string;
   timeoutMs: number;
 }
 
-/** 视频理解（与 src/config.ts 的 VideoConfig 对应） */
+/** 视频理解（与 src/config.ts 的 VideoConfig 对应，不含 apiKey） */
 interface VideoWire {
   enabled: boolean;
   ffmpegPath: string;
   maxFrames: number;
   maxSeconds: number;
+  directEnabled?: boolean;
+  baseUrl?: string;
+  model?: string;
+  apiKeyEnv?: string;
+  reasoningEffort?: string;
+}
+
+/** 生图与参考图编辑（与 src/config.ts 的 ImageGenConfig 对应，不含 apiKey） */
+interface ImageGenWire {
+  enabled: boolean;
+  baseUrl: string;
+  apiKeyEnv: string;
+  model: string;
+  standardModel: string;
+  defaultQuality: ImageGenQuality;
+  defaultSize: string;
+  defaultComplexity: ImageGenComplexity;
+  timeoutMs: number;
+  allowAllGroups: boolean;
+  allowedGroups: string[];
 }
 
 /** 附件发送（与 src/config.ts 的 SendFileConfig 对应） */
 interface SendFileWire {
   restrictPaths: boolean;
   extraRoots: string[];
+}
+
+/** ElevenLabs 在线 TTS（与 src/config.ts 的 ElevenLabsSpeakConfig 对应，不含 apiKey） */
+interface ElevenLabsSpeakWire {
+  enabled: boolean;
+  baseUrl: string;
+  apiKeyEnv: string;
+  modelId: string;
+  outputFormat: ElevenLabsOutputFormat;
+  defaultVoiceId: string;
+  roleVoices: Record<string, string>;
+  speed: number;
+  stability: number;
+  similarityBoost: number;
+  styleExaggeration: number;
+  useSpeakerBoost: boolean;
+  timeoutMs: number;
+}
+
+const ELEVENLABS_SPEAK_WIRE_DEFAULTS: ElevenLabsSpeakWire = {
+  enabled: false,
+  baseUrl: 'https://api.elevenlabs.io/v1',
+  apiKeyEnv: 'ELEVENLABS_API_KEY',
+  modelId: 'eleven_v4',
+  outputFormat: 'mp3_44100_128',
+  defaultVoiceId: '',
+  roleVoices: {},
+  speed: 1.0,
+  stability: 0.5,
+  similarityBoost: 0.75,
+  styleExaggeration: 0.0,
+  useSpeakerBoost: true,
+  timeoutMs: 180000,
+};
+
+const BUILTIN_SPEAK_ROLES = new Set(['feiyu', 'dragon', 'hakimi']);
+
+function getRoleVoiceValue(roleVoices: Record<string, string>, key: string): string {
+  const needle = key.toLowerCase();
+  for (const [k, v] of Object.entries(roleVoices)) {
+    if (k.trim().toLowerCase() === needle) return v;
+  }
+  return '';
+}
+
+function setBuiltinRoleVoice(roleVoices: Record<string, string>, role: string, voiceId: string): Record<string, string> {
+  const next: Record<string, string> = {};
+  for (const [k, v] of Object.entries(roleVoices)) {
+    if (k.trim().toLowerCase() !== role) next[k] = v;
+  }
+  const trimmed = voiceId.trim();
+  if (trimmed !== '') next[role] = trimmed;
+  return next;
+}
+
+function formatExtraRoleVoices(roleVoices: Record<string, string>): string {
+  return Object.entries(roleVoices)
+    .filter(([k, v]) => !BUILTIN_SPEAK_ROLES.has(k.trim().toLowerCase()) && v.trim() !== '')
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+}
+
+function mergeExtraRoleVoices(current: Record<string, string>, raw: string): Record<string, string> {
+  const next: Record<string, string> = {};
+  for (const [k, v] of Object.entries(current)) {
+    if (BUILTIN_SPEAK_ROLES.has(k.trim().toLowerCase()) && v.trim() !== '') {
+      next[k.trim().toLowerCase()] = v.trim();
+    }
+  }
+  for (const line of raw.split('\n')) {
+    const idx = line.indexOf('=');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    const val = line.slice(idx + 1).trim();
+    if (key === '' || val === '' || BUILTIN_SPEAK_ROLES.has(key.toLowerCase())) continue;
+    next[key] = val;
+  }
+  return next;
+}
+
+/** DeepSeek 在线 TTS（与 src/config.ts 的 DeepSeekSpeakConfig 对应，不含 apiKey） */
+interface DeepSeekSpeakWire {
+  enabled: boolean;
+  baseUrl: string;
+  apiKeyEnv: string;
+  defaultVoiceId: string;
+  roleVoices: Record<string, string>;
+  speed: number;
+  timeoutMs: number;
+}
+
+const DEEPSEEK_SPEAK_WIRE_DEFAULTS: DeepSeekSpeakWire = {
+  enabled: false,
+  baseUrl: 'https://api.deepseek.com/v1',
+  apiKeyEnv: 'DEEPSEEK_API_KEY',
+  defaultVoiceId: '',
+  roleVoices: {},
+  speed: 1.0,
+  timeoutMs: 180000,
+};
+
+function cleanRoleVoicesMap(raw: Record<string, string> | undefined): Record<string, string> {
+  const clean: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw ?? {})) {
+    const tk = k.trim();
+    const tv = v.trim();
+    if (tk !== '' && tv !== '') clean[tk] = tv;
+  }
+  return clean;
 }
 
 /** 语音合成（与 src/config.ts 的 SpeakConfig 对应） */
@@ -103,6 +243,8 @@ interface SpeakWire {
   command: string;
   gsvUrl: string;
   gsvSpeed: number;
+  elevenlabs?: ElevenLabsSpeakWire;
+  deepseek?: DeepSeekSpeakWire;
 }
 
 /** 共享笔记库（与 src/config.ts 的 NotesConfig 对应） */
@@ -213,6 +355,7 @@ const REPLY_JUDGE_DEFAULTS: ReplyJudgeWire = {
 
 /** GET 回显的生效配置（appSecret / asr.apiKey 已剔除） */
 type ConfigWire = {
+  groupTriggerMode?: GroupTriggerMode;
   requireMention?: boolean;
   streaming?: boolean;
   showToolResults?: boolean;
@@ -244,6 +387,7 @@ type ConfigWire = {
   access?: AccessControlWire;
   fileAccess?: FileAccessWire;
   stickers?: StickersWire;
+  personas?: PersonasWire;
   notes?: NotesWire;
   toolAccess?: ToolAccessWire;
   modelFailover?: ModelFailoverWire;
@@ -251,6 +395,7 @@ type ConfigWire = {
   vision?: VisionWire;
   asr?: AsrWire;
   video?: VideoWire;
+  imageGen?: ImageGenWire;
   sendFile?: SendFileWire;
   speak?: SpeakWire;
   cleanup?: CleanupWire;
@@ -511,6 +656,13 @@ const MODE_OPTIONS: ReadonlyArray<{ value: AccessMode; label: string }> = [
   { value: 'disabled', label: '禁用' },
 ];
 
+const GROUP_TRIGGER_OPTIONS: Array<{ value: GroupTriggerMode; label: string }> = [
+  { value: 'mention', label: '仅 @ 回复（mention）' },
+  { value: 'probability', label: '随机概率接话（probability）' },
+  { value: 'desire', label: '回复欲望打分（desire）' },
+  { value: 'all', label: '回复全部群消息（all）' },
+];
+
 /** 深比较（表单值与初始回显值的 dirty 判断） */
 function shallowEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
@@ -529,6 +681,8 @@ export function ConfigPanel(): ReactNode {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [extraRoleVoicesText, setExtraRoleVoicesText] = useState<string>('');
+  const [extraDsRoleVoicesText, setExtraDsRoleVoicesText] = useState<string>('');
 
   useEffect(() => {
     let stopped = false;
@@ -539,6 +693,8 @@ export function ConfigPanel(): ReactNode {
         if (stopped) return;
         setInitial(body.config);
         setForm(body.config);
+        setExtraRoleVoicesText(formatExtraRoleVoices(body.config.speak?.elevenlabs?.roleVoices ?? {}));
+        setExtraDsRoleVoicesText(formatExtraRoleVoices(body.config.speak?.deepseek?.roleVoices ?? {}));
       })
       .catch((err: unknown) => {
         if (!stopped) setLoadError(err instanceof Error ? err.message : String(err));
@@ -584,6 +740,10 @@ export function ConfigPanel(): ReactNode {
       const s = changed.stickers as StickersWire;
       changed.stickers = { ...s, extraRoots: s.extraRoots.map((v) => v.trim()).filter(Boolean) };
     }
+    if (changed.personas !== undefined) {
+      const p = changed.personas as PersonasWire;
+      changed.personas = { ...p, root: p.root.trim() };
+    }
     if (changed.toolAccess !== undefined) {
       const t = changed.toolAccess as ToolAccessWire;
       changed.toolAccess = {
@@ -612,6 +772,49 @@ export function ConfigPanel(): ReactNode {
     if (changed.replyDesire !== undefined) {
       const r = changed.replyDesire as ReplyDesireWire;
       changed.replyDesire = { ...r, names: r.names.map((v) => v.trim()).filter(Boolean) };
+    }
+    if (changed.imageGen !== undefined) {
+      const g = changed.imageGen as ImageGenWire;
+      changed.imageGen = {
+        ...g,
+        baseUrl: g.baseUrl.trim(),
+        apiKeyEnv: g.apiKeyEnv.trim(),
+        model: g.model.trim(),
+        standardModel: g.standardModel.trim(),
+        defaultSize: g.defaultSize.trim(),
+        allowedGroups: g.allowedGroups.map((v) => v.trim()).filter(Boolean),
+      };
+    }
+    if (changed.speak !== undefined) {
+      const s = changed.speak as SpeakWire;
+      const el = s.elevenlabs;
+      const ds = s.deepseek;
+      changed.speak = {
+        ...s,
+        voice: s.voice.trim(),
+        rate: s.rate.trim(),
+        command: s.command.trim(),
+        gsvUrl: s.gsvUrl.trim(),
+        ...(el === undefined ? {} : {
+          elevenlabs: {
+            ...el,
+            baseUrl: el.baseUrl.trim(),
+            apiKeyEnv: el.apiKeyEnv.trim(),
+            modelId: el.modelId.trim(),
+            defaultVoiceId: el.defaultVoiceId.trim(),
+            roleVoices: cleanRoleVoicesMap(el.roleVoices),
+          },
+        }),
+        ...(ds === undefined ? {} : {
+          deepseek: {
+            ...ds,
+            baseUrl: ds.baseUrl.trim(),
+            apiKeyEnv: ds.apiKeyEnv.trim(),
+            defaultVoiceId: ds.defaultVoiceId.trim(),
+            roleVoices: cleanRoleVoicesMap(ds.roleVoices),
+          },
+        }),
+      };
     }
 
     setBusy(true);
@@ -651,15 +854,55 @@ export function ConfigPanel(): ReactNode {
     enabled: false, native: false, provider: '', model: '',
     defaultPrompt: 'Describe this image in detail.', maxBytes: 10 * 1024 * 1024, maxTokens: 1024, timeoutMs: 120000,
   };
-  const asr: AsrWire = form.asr ?? {
-    enabled: false, mode: 'chat', baseUrl: 'https://api.siliconflow.cn/v1',
-    model: 'Qwen/Qwen3-ASR-1.7B', preferQQ: true, timeoutMs: 30000,
+  const asr: AsrWire = {
+    enabled: false,
+    mode: 'chat',
+    baseUrl: 'https://api.siliconflow.cn/v1',
+    apiKeyEnv: '',
+    model: 'Qwen/Qwen3-ASR-1.7B',
+    chatBaseUrl: '',
+    chatModel: '',
+    chatApiKeyEnv: '',
+    chatReasoningEffort: 'none',
+    preferQQ: true,
+    timeoutMs: 30000,
+    ...form.asr,
   };
   // 旧配置没有 fallback 组时按默认值显示
-  const asrFallback: AsrFallbackWire = asr.fallback ?? {
-    enabled: false, baseUrl: 'https://api.siliconflow.cn/v1', model: 'FunAudioLLM/SenseVoiceSmall', timeoutMs: 30000,
+  const asrFallback: AsrFallbackWire = {
+    enabled: false,
+    baseUrl: 'https://api.siliconflow.cn/v1',
+    apiKeyEnv: '',
+    model: 'FunAudioLLM/SenseVoiceSmall',
+    timeoutMs: 30000,
+    ...asr.fallback,
   };
-  const video: VideoWire = form.video ?? { enabled: true, ffmpegPath: '', maxFrames: 8, maxSeconds: 300 };
+  const video: VideoWire = {
+    enabled: true,
+    ffmpegPath: '',
+    maxFrames: 8,
+    maxSeconds: 300,
+    directEnabled: true,
+    baseUrl: '',
+    model: '',
+    apiKeyEnv: '',
+    reasoningEffort: '',
+    ...form.video,
+  };
+  const imageGen: ImageGenWire = {
+    enabled: false,
+    baseUrl: 'https://api.openai.com/v1',
+    apiKeyEnv: 'OPENAI_API_KEY',
+    model: 'gpt-image-2.6-sunburst',
+    standardModel: 'gpt-image-2.6',
+    defaultQuality: 'auto',
+    defaultSize: '1024x1024',
+    defaultComplexity: '',
+    timeoutMs: 180000,
+    allowAllGroups: false,
+    allowedGroups: [],
+    ...form.imageGen,
+  };
   const notes: NotesWire = form.notes ?? {
     enabled: true, root: '', autoInject: true, injectTopK: 2, injectMaxChars: 600, injectPerNoteChars: 0, groupInjectMaxChars: 0, injectMinCoverage: 0.4,
   };
@@ -676,10 +919,24 @@ export function ConfigPanel(): ReactNode {
   const stickers: StickersWire = form.stickers ?? {
     enabled: true, root: '', extraRoots: [], maxBytes: 8 * 1024 * 1024, maxAutoEntries: 200,
   };
+  const personas: PersonasWire = { root: '', ...form.personas };
   const sendFile: SendFileWire = form.sendFile ?? { restrictPaths: true, extraRoots: [] };
-  const speak: SpeakWire = form.speak ?? {
-    enabled: true, voice: 'zh-CN-XiaoyiNeural', rate: '+8%', maxChars: 120, command: '', gsvUrl: '', gsvSpeed: 1.0,
+  const speak: SpeakWire = {
+    enabled: true, voice: 'zh-CN-XiaoyiNeural', rate: '+8%', maxChars: 1500, command: '', gsvUrl: '', gsvSpeed: 1.0,
+    ...form.speak,
+    elevenlabs: {
+      ...ELEVENLABS_SPEAK_WIRE_DEFAULTS,
+      ...form.speak?.elevenlabs,
+      roleVoices: { ...(form.speak?.elevenlabs?.roleVoices ?? {}) },
+    },
+    deepseek: {
+      ...DEEPSEEK_SPEAK_WIRE_DEFAULTS,
+      ...form.speak?.deepseek,
+      roleVoices: { ...(form.speak?.deepseek?.roleVoices ?? {}) },
+    },
   };
+  const elevenlabs = speak.elevenlabs!;
+  const deepseek = speak.deepseek!;
   const toolAccess: ToolAccessWire = form.toolAccess ?? {
     enabled: true, fullAccessGroups: [], fullAccessUsers: [], readRoots: [],
   };
@@ -711,9 +968,17 @@ export function ConfigPanel(): ReactNode {
     judge: { ...REPLY_JUDGE_DEFAULTS, ...form.replyDesire?.judge },
   };
   const judge = replyDesire.judge;
-  const patchJudge = (next: Partial<ReplyJudgeWire>): void => {
-    patch('replyDesire', { ...replyDesire, judge: { ...judge, ...next } });
+  const patchDesire = (next: Partial<ReplyDesireWire>): void => {
+    patch('replyDesire', { ...replyDesire, enabled: true, ...next });
   };
+  const patchJudge = (next: Partial<ReplyJudgeWire>): void => {
+    patchDesire({ judge: { ...judge, ...next } });
+  };
+  const effectiveTriggerMode: GroupTriggerMode = form.groupTriggerMode ?? (
+    form.requireMention === false
+      ? 'all'
+      : (replyDesire.enabled ? 'desire' : ((form.groupReplyProbability ?? 0) > 0 ? 'probability' : 'mention'))
+  );
 
   return createElement('form', { className: 'imqb2-form', onSubmit: submit },
     createElement('div', { className: 'imqb2-group-title' }, '服务范围'),
@@ -758,11 +1023,19 @@ export function ConfigPanel(): ReactNode {
     }),
 
     createElement('div', { className: 'imqb2-group-title' }, '基础设置'),
-    createElement(SwitchRow, {
-      label: '群聊仅回复 @机器人的消息', checked: form.requireMention ?? true,
-      help: '开启后，机器人仅可回复 @机器人的群聊消息',
-      onChange: (v) => { patch('requireMention', v); },
+    createElement(SelectRow, {
+      label: '群聊触发模式', value: effectiveTriggerMode, options: GROUP_TRIGGER_OPTIONS,
+      help: '统一控制群里未 @ 机器人时如何决定是否接话（私聊始终直接回复）',
+      onChange: (v) => { patch('groupTriggerMode', v as GroupTriggerMode); },
     }),
+    effectiveTriggerMode === 'probability'
+      ? createElement(NumberRow, {
+          label: '群聊未 @ 时回复概率', value: form.groupReplyProbability ?? 0,
+          min: 0, max: 1, step: 0.05,
+          help: '0.1 表示约 10% 的群消息会主动接话',
+          onChange: (v) => { patch('groupReplyProbability', v); },
+        })
+      : null,
     createElement(SwitchRow, {
       label: '流式输出', checked: form.streaming ?? true,
       help: '回复内容分段实时推送到聊天',
@@ -772,12 +1045,6 @@ export function ConfigPanel(): ReactNode {
       label: '显示工具调用结果', checked: form.showToolResults ?? false,
       help: '在聊天中展示 agent 工具调用的结构化结果',
       onChange: (v) => { patch('showToolResults', v); },
-    }),
-    createElement(NumberRow, {
-      label: '群聊未 @ 时回复概率', value: form.groupReplyProbability ?? 0,
-      min: 0, max: 1, step: 0.05,
-      help: '0 表示只在被 @ 时回复；0.1 表示约 10% 的群消息会主动接话',
-      onChange: (v) => { patch('groupReplyProbability', v); },
     }),
     createElement(NumberRow, {
       label: '群历史缓冲条数', value: form.historyLimit ?? 10,
@@ -862,71 +1129,68 @@ export function ConfigPanel(): ReactNode {
       onChange: (v) => { patch('debug', v); },
     }),
 
-    createElement('div', { className: 'imqb2-group-title' }, '回复欲望'),
-    createElement(SwitchRow, {
-      label: '未 @ 时按打分决定是否接话', checked: replyDesire.enabled,
-      help: '开启后，群里没 @ bot 的消息按规则打分，过阈值才接；关闭则只回 @ 和按概率随机插嘴',
-      onChange: (v) => { patch('replyDesire', { ...replyDesire, enabled: v }); },
-    }),
-    createElement(NumberRow, {
-      label: '放行阈值（0-1）', value: replyDesire.threshold, min: 0, max: 1, step: 0.05,
-      help: '越高越安静：点名 bot 得 0.7、窗口内的人 0.6、像提问再 +0.2；默认 0.6',
-      onChange: (v) => { patch('replyDesire', { ...replyDesire, threshold: v }); },
-    }),
-    createElement(ListRow, {
-      label: 'bot 的昵称/别名', help: '每行一个；群里提到这些词就算在叫 bot（大小写不敏感）',
-      value: replyDesire.names, rows: 2,
-      onChange: (v) => { patch('replyDesire', { ...replyDesire, names: v }); },
-    }),
-    createElement(NumberRow, {
-      label: '对话窗口时长（毫秒）', value: replyDesire.engagedMs, min: 5000, max: 600000, step: 5000,
-      help: '被 @ 或接话后开窗；没开模型打分时，窗口内刚聊过的人再说话基本都会被接，默认 90000（90 秒）',
-      onChange: (v) => { patch('replyDesire', { ...replyDesire, engagedMs: v }); },
-    }),
-    createElement(NumberRow, {
-      label: '窗口内连续接话轮数上限', value: replyDesire.engagedMaxTurns, min: 0, max: 50, step: 1,
-      help: '靠打分接的轮数到上限就关窗（这一条仍接）；0 = 不进入对话窗口，默认 8',
-      onChange: (v) => { patch('replyDesire', { ...replyDesire, engagedMaxTurns: v }); },
-    }),
-    createElement(SwitchRow, {
-      label: '规则拿不准时让模型打分', checked: judge.enabled,
-      help: '没点名的普通文字交给模型判断要不要接，打开后文字不再靠对话窗口直接放行；语气词、表情包、开团期间不调模型',
-      onChange: (v) => { patchJudge({ enabled: v }); },
-    }),
-    ...(judge.enabled ? [
-      createElement(FieldRow, {
-        label: '打分 provider', value: judge.provider, placeholder: '留空 = 这个群的主模型',
-        onChange: (v) => { patchJudge({ provider: v.trim() }); },
+    ...(effectiveTriggerMode === 'desire' ? [
+      createElement('div', { className: 'imqb2-group-title' }, '回复欲望'),
+      createElement(NumberRow, {
+        label: '放行阈值（0-1）', value: replyDesire.threshold, min: 0, max: 1, step: 0.05,
+        help: '越高越安静：点名 bot 得 0.7、窗口内的人 0.6、像提问再 +0.2；默认 0.6',
+        onChange: (v) => { patchDesire({ threshold: v }); },
       }),
-      createElement(FieldRow, {
-        label: '打分模型', value: judge.model, placeholder: '留空 = 这个群的主模型',
-        onChange: (v) => { patchJudge({ model: v.trim() }); },
-      }),
-      createElement(FieldRow, {
-        label: '推理档位', value: judge.reasoningEffort, placeholder: '留空 = 自动选最低档',
-        help: '启动后第一次打分会在日志里列出这个模型支持的档位',
-        onChange: (v) => { patchJudge({ reasoningEffort: v.trim() }); },
+      createElement(ListRow, {
+        label: 'bot 的昵称/别名', help: '每行一个；群里提到这些词就算在叫 bot（大小写不敏感）',
+        value: replyDesire.names, rows: 2,
+        onChange: (v) => { patchDesire({ names: v }); },
       }),
       createElement(NumberRow, {
-        label: '安静多久才打分（毫秒）', value: judge.debounceMs, min: 0, max: 60000, step: 500,
-        help: '连着说的几条只给最后一条打一次分，默认 2500',
-        onChange: (v) => { patchJudge({ debounceMs: v }); },
+        label: '对话窗口时长（毫秒）', value: replyDesire.engagedMs, min: 5000, max: 600000, step: 5000,
+        help: '被 @ 或接话后开窗；没开模型打分时，窗口内刚聊过的人再说话基本都会被接，默认 90000（90 秒）',
+        onChange: (v) => { patchDesire({ engagedMs: v }); },
       }),
       createElement(NumberRow, {
-        label: '最多攒多久也要打分（毫秒）', value: judge.maxWaitMs, min: 0, max: 300000, step: 1000,
-        help: '群里一直有人说话时的上限，默认 15000',
-        onChange: (v) => { patchJudge({ maxWaitMs: v }); },
+        label: '窗口内连续接话轮数上限', value: replyDesire.engagedMaxTurns, min: 0, max: 50, step: 1,
+        help: '靠打分接的轮数到上限就关窗（这一条仍接）；0 = 不进入对话窗口，默认 8',
+        onChange: (v) => { patchDesire({ engagedMaxTurns: v }); },
       }),
-      createElement(NumberRow, {
-        label: '给模型看的消息条数', value: judge.contextMessages, min: 1, max: 100, step: 1,
-        help: '越多越准也越贵，默认 20',
-        onChange: (v) => { patchJudge({ contextMessages: v }); },
+      createElement(SwitchRow, {
+        label: '规则拿不准时让模型打分', checked: judge.enabled,
+        help: '没点名的普通文字交给模型判断要不要接，打开后文字不再靠对话窗口直接放行；语气词、表情包、开团期间不调模型',
+        onChange: (v) => { patchJudge({ enabled: v }); },
       }),
-      createElement(NumberRow, {
-        label: '打分超时（毫秒）', value: judge.timeoutMs, min: 1000, max: 120000, step: 1000,
-        help: '超时按不接处理，默认 15000',
-        onChange: (v) => { patchJudge({ timeoutMs: v }); },
-      }),
+      ...(judge.enabled ? [
+        createElement(FieldRow, {
+          label: '打分 provider', value: judge.provider, placeholder: '留空 = 这个群的主模型',
+          onChange: (v) => { patchJudge({ provider: v.trim() }); },
+        }),
+        createElement(FieldRow, {
+          label: '打分模型', value: judge.model, placeholder: '留空 = 这个群的主模型',
+          onChange: (v) => { patchJudge({ model: v.trim() }); },
+        }),
+        createElement(FieldRow, {
+          label: '推理档位', value: judge.reasoningEffort, placeholder: '留空 = 自动选最低档',
+          help: '启动后第一次打分会在日志里列出这个模型支持的档位',
+          onChange: (v) => { patchJudge({ reasoningEffort: v.trim() }); },
+        }),
+        createElement(NumberRow, {
+          label: '安静多久才打分（毫秒）', value: judge.debounceMs, min: 0, max: 60000, step: 500,
+          help: '连着说的几条只给最后一条打一次分，默认 2500',
+          onChange: (v) => { patchJudge({ debounceMs: v }); },
+        }),
+        createElement(NumberRow, {
+          label: '最多攒多久也要打分（毫秒）', value: judge.maxWaitMs, min: 0, max: 300000, step: 1000,
+          help: '群里一直有人说话时的上限，默认 15000',
+          onChange: (v) => { patchJudge({ maxWaitMs: v }); },
+        }),
+        createElement(NumberRow, {
+          label: '给模型看的消息条数', value: judge.contextMessages, min: 1, max: 100, step: 1,
+          help: '越多越准也越贵，默认 20',
+          onChange: (v) => { patchJudge({ contextMessages: v }); },
+        }),
+        createElement(NumberRow, {
+          label: '打分超时（毫秒）', value: judge.timeoutMs, min: 1000, max: 120000, step: 1000,
+          help: '超时按不接处理，默认 15000',
+          onChange: (v) => { patchJudge({ timeoutMs: v }); },
+        }),
+      ] : []),
     ] : []),
 
     createElement('div', { className: 'imqb2-group-title' }, '表情收藏'),
@@ -967,6 +1231,15 @@ export function ConfigPanel(): ReactNode {
     createElement(FieldRow, {
       label: 'Preset', value: form.preset ?? '', placeholder: 'Agent preset id',
       onChange: (v) => { patch('preset', v); },
+    }),
+
+    createElement('div', { className: 'imqb2-group-title' }, '聊天人设'),
+    createElement(FieldRow, {
+      label: '人设目录',
+      value: personas.root,
+      placeholder: '留空 = 插件根目录/personas 或 ~/.dsh-qqbot/personas',
+      help: '存放 <id>.md / <id>.group.md / <id>.direct.md（相对路径按工作目录解析）；运行态会话绑定仍保存在 ~/.dsh-qqbot/persona-state.json',
+      onChange: (v) => { patch('personas', { ...personas, root: v }); },
     }),
 
     createElement('div', { className: 'imqb2-group-title' }, '个性化提示词'),
@@ -1043,6 +1316,32 @@ export function ConfigPanel(): ReactNode {
       help: '注册 qqbot_describe_video：长片按时间分段，视频直传失败才抽帧；音轨逐段转写，需要视觉模型和 ffmpeg',
       onChange: (v) => { patch('video', { ...video, enabled: v }); },
     }),
+    createElement(SwitchRow, {
+      label: '优先整段视频直传网关', checked: video.directEnabled !== false,
+      help: '开启时先压缩整段视频直传多模态网关，失败或关闭后仅走抽帧宫格 + 视觉模型',
+      onChange: (v) => { patch('video', { ...video, directEnabled: v }); },
+    }),
+    video.directEnabled !== false ? createElement(FieldRow, {
+      label: '视频直传网关地址', value: video.baseUrl ?? '',
+      placeholder: '留空 = QQBOT_VIDEO_BASE_URL 或跟随 chat 转写网关',
+      onChange: (v) => { patch('video', { ...video, baseUrl: v.trim() }); },
+    }) : null,
+    video.directEnabled !== false ? createElement(FieldRow, {
+      label: '视频直传模型', value: video.model ?? '',
+      placeholder: '留空 = QQBOT_VIDEO_MODEL 或跟随 chat 转写模型',
+      onChange: (v) => { patch('video', { ...video, model: v.trim() }); },
+    }) : null,
+    video.directEnabled !== false ? createElement(FieldRow, {
+      label: '视频直传凭证环境变量', value: video.apiKeyEnv ?? '',
+      placeholder: '留空 = QQBOT_VIDEO_KEY_REF 或跟随 chat 凭证',
+      help: '支持 credentials 凭证名或环境变量名；直填密钥仅可在 cordis.patch.yml 中配置',
+      onChange: (v) => { patch('video', { ...video, apiKeyEnv: v.trim() }); },
+    }) : null,
+    video.directEnabled !== false ? createElement(FieldRow, {
+      label: '视频直传思考档位 (reasoning_effort)', value: video.reasoningEffort ?? '',
+      placeholder: '留空 = 跟随 chat 转写（默认 none）；填 omit 不传',
+      onChange: (v) => { patch('video', { ...video, reasoningEffort: v.trim() }); },
+    }) : null,
     createElement(FieldRow, {
       label: 'ffmpeg 路径', value: video.ffmpegPath, placeholder: '留空 = PATH 里的 ffmpeg',
       help: '路径里有空格也直接填；ffprobe 取同目录',
@@ -1060,18 +1359,39 @@ export function ConfigPanel(): ReactNode {
     createElement('div', { className: 'imqb2-group-title' }, '语音识别'),
     createElement(SwitchRow, {
       label: '启用在线语音识别', checked: asr.enabled,
-      help: 'QQ 没给识别文本时，把语音转成文字（chat 模式不需要额外密钥，走订阅网关）',
+      help: 'QQ 没给识别文本时，把语音与视频音轨转成文字（qqbot_transcribe 同步跟随这里的协议与网关）',
       onChange: (v) => { patch('asr', { ...asr, enabled: v }); },
     }),
     createElement(SelectRow, {
       label: '转写协议', value: asr.mode,
       options: [
-        { value: 'chat', label: '订阅网关（chat）' },
+        { value: 'chat', label: '多模态对话网关（chat）' },
         { value: 'openai', label: '音频接口（openai）' },
       ],
-      help: 'chat 用 opencode-go 的 mimo，端点与密钥取自 QQBOT_TRANSCRIBE_* 环境变量；openai 才用下面的地址和模型（密钥 QQBOT_ASR_API_KEY）',
+      help: 'chat 走 /chat/completions + input_audio；openai 走 /audio/transcriptions（兼容 Whisper / SiliconFlow / Groq）',
       onChange: (v) => { patch('asr', { ...asr, mode: v }); },
     }),
+    asr.mode === 'chat' ? createElement(FieldRow, {
+      label: 'chat 转写网关地址', value: asr.chatBaseUrl ?? '',
+      placeholder: '留空 = QQBOT_TRANSCRIBE_BASE_URL 或 opencode-go 默认网关',
+      onChange: (v) => { patch('asr', { ...asr, chatBaseUrl: v.trim() }); },
+    }) : null,
+    asr.mode === 'chat' ? createElement(FieldRow, {
+      label: 'chat 转写模型', value: asr.chatModel ?? '',
+      placeholder: '留空 = QQBOT_TRANSCRIBE_MODEL 或 mimo-v2.6-flash',
+      onChange: (v) => { patch('asr', { ...asr, chatModel: v.trim() }); },
+    }) : null,
+    asr.mode === 'chat' ? createElement(FieldRow, {
+      label: 'chat 转写凭证环境变量', value: asr.chatApiKeyEnv ?? '',
+      placeholder: '留空 = QQBOT_TRANSCRIBE_KEY_REF 或 OPENCODE_GO_API_KEY',
+      help: '支持 credentials 凭证名或环境变量名；直填密钥仅可在 cordis.patch.yml 中配置',
+      onChange: (v) => { patch('asr', { ...asr, chatApiKeyEnv: v.trim() }); },
+    }) : null,
+    asr.mode === 'chat' ? createElement(FieldRow, {
+      label: 'chat 转写思考档位 (reasoning_effort)', value: asr.chatReasoningEffort ?? 'none',
+      placeholder: 'none（防思考耗尽 token）；填 omit 表示不传该字段',
+      onChange: (v) => { patch('asr', { ...asr, chatReasoningEffort: v.trim() }); },
+    }) : null,
     asr.mode === 'openai' ? createElement(FieldRow, {
       label: '接口地址', value: asr.baseUrl, placeholder: 'https://api.siliconflow.cn/v1',
       onChange: (v) => { patch('asr', { ...asr, baseUrl: v }); },
@@ -1079,6 +1399,12 @@ export function ConfigPanel(): ReactNode {
     asr.mode === 'openai' ? createElement(FieldRow, {
       label: '转写模型', value: asr.model, placeholder: 'Qwen/Qwen3-ASR-1.7B',
       onChange: (v) => { patch('asr', { ...asr, model: v }); },
+    }) : null,
+    asr.mode === 'openai' ? createElement(FieldRow, {
+      label: '接口密钥环境变量', value: asr.apiKeyEnv ?? '',
+      placeholder: '留空 = QQBOT_ASR_API_KEY',
+      help: '支持 credentials 凭证名或环境变量名；免鉴权本机 Whisper 留空即可',
+      onChange: (v) => { patch('asr', { ...asr, apiKeyEnv: v.trim() }); },
     }) : null,
     createElement(SwitchRow, {
       label: '优先用 QQ 自带识别文本', checked: asr.preferQQ,
@@ -1090,7 +1416,7 @@ export function ConfigPanel(): ReactNode {
     }),
     createElement(SwitchRow, {
       label: '主接口连不上时改用备用接口', checked: asrFallback.enabled,
-      help: '如本机 whisper 优先、在线服务兜底；只在连不上或服务端 5xx 时切换。密钥同样用 QQBOT_ASR_API_KEY 或 patch 配置',
+      help: '如本机 whisper 优先、在线服务兜底；只在连不上或服务端 5xx 时切换',
       onChange: (v) => { patch('asr', { ...asr, fallback: { ...asrFallback, enabled: v } }); },
     }),
     createElement(FieldRow, {
@@ -1101,10 +1427,83 @@ export function ConfigPanel(): ReactNode {
       label: '备用转写模型', value: asrFallback.model, placeholder: 'FunAudioLLM/SenseVoiceSmall',
       onChange: (v) => { patch('asr', { ...asr, fallback: { ...asrFallback, model: v } }); },
     }),
+    createElement(FieldRow, {
+      label: '备用接口密钥环境变量', value: asrFallback.apiKeyEnv ?? '',
+      placeholder: '留空 = QQBOT_ASR_FALLBACK_API_KEY 或 QQBOT_ASR_API_KEY',
+      onChange: (v) => { patch('asr', { ...asr, fallback: { ...asrFallback, apiKeyEnv: v.trim() } }); },
+    }),
     createElement(NumberRow, {
       label: '备用接口超时（毫秒）', value: asrFallback.timeoutMs, min: 5000, max: 120000, step: 5000,
       onChange: (v) => { patch('asr', { ...asr, fallback: { ...asrFallback, timeoutMs: v } }); },
     }),
+
+    createElement('div', { className: 'imqb2-group-title' }, '图片生成 (GPT Image)'),
+    createElement(SwitchRow, {
+      label: '启用 qqbot_image_gen 生图工具', checked: imageGen.enabled,
+      help: '对接 OpenAI Images API（支持文生图与 1~16 张参考图编辑），默认存盘返回路径并支持直接发图',
+      onChange: (v) => { patch('imageGen', { ...imageGen, enabled: v }); },
+    }),
+    ...(imageGen.enabled ? [
+      createElement(FieldRow, {
+        label: 'Images API 网关地址', value: imageGen.baseUrl, placeholder: 'https://api.openai.com/v1',
+        onChange: (v) => { patch('imageGen', { ...imageGen, baseUrl: v.trim() }); },
+      }),
+      createElement(FieldRow, {
+        label: 'API Key 环境变量 / 凭证名', value: imageGen.apiKeyEnv, placeholder: 'OPENAI_API_KEY',
+        help: '优先读取 patch 中的 imageGen.apiKey，留空时读取该 credentials 凭证或环境变量',
+        onChange: (v) => { patch('imageGen', { ...imageGen, apiKeyEnv: v.trim() }); },
+      }),
+      createElement(FieldRow, {
+        label: '默认精细模型 (sunburst)', value: imageGen.model, placeholder: 'gpt-image-2.6-sunburst',
+        onChange: (v) => { patch('imageGen', { ...imageGen, model: v.trim() }); },
+      }),
+      createElement(FieldRow, {
+        label: '标准/快速模型 (variant=standard)', value: imageGen.standardModel, placeholder: 'gpt-image-2.6',
+        help: '可填 gpt-image-2.6 或 gpt-image-2.6-flare，用于草图、批量出图或降本场景',
+        onChange: (v) => { patch('imageGen', { ...imageGen, standardModel: v.trim() }); },
+      }),
+      createElement(SelectRow, {
+        label: '默认画质 (quality)', value: imageGen.defaultQuality,
+        options: [
+          { value: 'auto', label: 'auto（模型自动）' },
+          { value: 'low', label: 'low（最快）' },
+          { value: 'medium', label: 'medium' },
+          { value: 'high', label: 'high' },
+          { value: 'xhigh', label: 'xhigh（2.6 高清）' },
+          { value: 'max', label: 'max（2.6 最高）' },
+        ],
+        onChange: (v) => { patch('imageGen', { ...imageGen, defaultQuality: v as ImageGenQuality }); },
+      }),
+      createElement(FieldRow, {
+        label: '默认尺寸 (size)', value: imageGen.defaultSize, placeholder: '1024x1024',
+        help: '支持 auto 或 256..3840 内的 16 倍数 WIDTHxHEIGHT（如 1024x1024 / 1536x1024 / 1024x1536）',
+        onChange: (v) => { patch('imageGen', { ...imageGen, defaultSize: v.trim() }); },
+      }),
+      createElement(SelectRow, {
+        label: '默认复杂度 (2.6 complexity)', value: imageGen.defaultComplexity,
+        options: [
+          { value: '', label: '留空（不传该参数）' },
+          { value: 'low', label: 'low' },
+          { value: 'medium', label: 'medium' },
+          { value: 'high', label: 'high' },
+        ],
+        onChange: (v) => { patch('imageGen', { ...imageGen, defaultComplexity: v as ImageGenComplexity }); },
+      }),
+      createElement(NumberRow, {
+        label: '请求超时（毫秒）', value: imageGen.timeoutMs, min: 5000, max: 600000, step: 5000,
+        onChange: (v) => { patch('imageGen', { ...imageGen, timeoutMs: v }); },
+      }),
+      createElement(SwitchRow, {
+        label: '允许全部群聊调用生图', checked: imageGen.allowAllGroups,
+        help: '关闭时仅主人私聊、完全工具权限会话与下方白名单群可调用（防群友刷爆额度）',
+        onChange: (v) => { patch('imageGen', { ...imageGen, allowAllGroups: v }); },
+      }),
+      !imageGen.allowAllGroups ? createElement(ListRow, {
+        label: '允许生图的群 group_openid', value: imageGen.allowedGroups, rows: 2,
+        help: '每行一个群 openid。群内可用 qqbot_image_gen_access 申请，主人在本群点击同意后写入；这不会授予浏览器或终端权限。移出此名单不影响已有的完全工具权限。',
+        onChange: (v) => { patch('imageGen', { ...imageGen, allowedGroups: v }); },
+      }) : null,
+    ] : []),
 
     createElement('div', { className: 'imqb2-group-title' }, '共享笔记'),
     createElement(SwitchRow, {
@@ -1287,8 +1686,8 @@ export function ConfigPanel(): ReactNode {
       onChange: (v) => { patch('speak', { ...speak, rate: v.trim() }); },
     }),
     createElement(NumberRow, {
-      label: '单条字数上限', value: speak.maxChars, min: 10, max: 600, step: 10,
-      help: 'QQ 语音最长约 60 秒，超过上限会被拒绝',
+      label: '单条字数上限', value: speak.maxChars, min: 10, max: 5000, step: 50,
+      help: '默认 1500 字（约 4～5 分钟）；QQ 语音单条上限 20MB，超过字数上限会被拒绝',
       onChange: (v) => { patch('speak', { ...speak, maxChars: v }); },
     }),
     createElement(FieldRow, {
@@ -1306,6 +1705,151 @@ export function ConfigPanel(): ReactNode {
       help: '倍率，1 = 原速；和上面 edge-tts 的百分比语速互不影响',
       onChange: (v) => { patch('speak', { ...speak, gsvSpeed: v }); },
     }),
+    createElement(SwitchRow, {
+      label: '启用 ElevenLabs 在线 TTS', checked: elevenlabs.enabled,
+      help: '启用后优先按当前人设对应音色走 ElevenLabs API，失败或未绑定的角色自动回退本地服务与 edge-tts',
+      onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, enabled: v } }); },
+    }),
+    ...(elevenlabs.enabled ? [
+      createElement(FieldRow, {
+        label: 'ElevenLabs API 地址', value: elevenlabs.baseUrl, placeholder: 'https://api.elevenlabs.io/v1',
+        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, baseUrl: v.trim() } }); },
+      }),
+      createElement(FieldRow, {
+        label: 'ElevenLabs 凭证 / 环境变量名', value: elevenlabs.apiKeyEnv, placeholder: 'ELEVENLABS_API_KEY',
+        help: '优先读取 patch 中的 speak.elevenlabs.apiKey，留空时读取凭证服务、环境变量或插件 .env.local',
+        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, apiKeyEnv: v.trim() } }); },
+      }),
+      createElement(FieldRow, {
+        label: 'ElevenLabs 模型 ID', value: elevenlabs.modelId, placeholder: 'eleven_v4',
+        help: '常用：eleven_v4（默认）、eleven_v4_turbo、eleven_v3、eleven_multilingual_v2、eleven_flash_v2_5',
+        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, modelId: v.trim() } }); },
+      }),
+      createElement(SelectRow, {
+        label: 'MP3 输出格式', value: elevenlabs.outputFormat,
+        options: [
+          { value: 'mp3_44100_128', label: 'mp3_44100_128（默认 128kbps）' },
+          { value: 'mp3_44100_192', label: 'mp3_44100_192（192kbps）' },
+          { value: 'mp3_44100_64', label: 'mp3_44100_64（64kbps）' },
+          { value: 'mp3_22050_32', label: 'mp3_22050_32（32kbps）' },
+        ],
+        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, outputFormat: v as ElevenLabsOutputFormat } }); },
+      }),
+      createElement(FieldRow, {
+        label: '大肥鱼 (feiyu) Voice ID', value: getRoleVoiceValue(elevenlabs.roleVoices, 'feiyu'), placeholder: '留空 = 走默认 Voice ID 或回退本地嗓子',
+        onChange: (v) => {
+          patch('speak', { ...speak, elevenlabs: { ...elevenlabs, roleVoices: setBuiltinRoleVoice(elevenlabs.roleVoices, 'feiyu', v) } });
+        },
+      }),
+      createElement(FieldRow, {
+        label: '大肥龙 (dragon) Voice ID', value: getRoleVoiceValue(elevenlabs.roleVoices, 'dragon'), placeholder: 'white-dragon 人设使用的 voice_id',
+        onChange: (v) => {
+          patch('speak', { ...speak, elevenlabs: { ...elevenlabs, roleVoices: setBuiltinRoleVoice(elevenlabs.roleVoices, 'dragon', v) } });
+        },
+      }),
+      createElement(FieldRow, {
+        label: '哈基米 (hakimi) Voice ID', value: getRoleVoiceValue(elevenlabs.roleVoices, 'hakimi'), placeholder: 'Gemini 人设使用的 voice_id',
+        onChange: (v) => {
+          patch('speak', { ...speak, elevenlabs: { ...elevenlabs, roleVoices: setBuiltinRoleVoice(elevenlabs.roleVoices, 'hakimi', v) } });
+        },
+      }),
+      createElement(FieldRow, {
+        label: '默认兜底 Voice ID', value: elevenlabs.defaultVoiceId, placeholder: '留空 = 未映射人设直接回退本地/edge-tts',
+        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, defaultVoiceId: v.trim() } }); },
+      }),
+      createElement(AreaRow, {
+        label: '额外人设音色映射',
+        value: extraRoleVoicesText,
+        rows: 2,
+        help: '每行一条 personaId=voiceId（可覆盖具体人设如 soft-whale=xxx；也可以直接写到人设 .md 的 voiceId 头字段）',
+        onChange: (raw) => {
+          setExtraRoleVoicesText(raw);
+          patch('speak', { ...speak, elevenlabs: { ...elevenlabs, roleVoices: mergeExtraRoleVoices(elevenlabs.roleVoices, raw) } });
+        },
+      }),
+      createElement(NumberRow, {
+        label: 'ElevenLabs 语速', value: elevenlabs.speed, min: 0.7, max: 1.2, step: 0.05,
+        help: '0.7 ~ 1.2（1.0 = 原速）',
+        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, speed: v } }); },
+      }),
+      createElement(NumberRow, {
+        label: 'Stability（稳定性）', value: elevenlabs.stability, min: 0, max: 1, step: 0.05,
+        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, stability: v } }); },
+      }),
+      createElement(NumberRow, {
+        label: 'Similarity Boost（相似度）', value: elevenlabs.similarityBoost, min: 0, max: 1, step: 0.05,
+        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, similarityBoost: v } }); },
+      }),
+      createElement(NumberRow, {
+        label: 'Style（风格夸张度）', value: elevenlabs.styleExaggeration, min: 0, max: 1, step: 0.05,
+        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, styleExaggeration: v } }); },
+      }),
+      createElement(SwitchRow, {
+        label: 'Speaker Boost（说话人增强）', checked: elevenlabs.useSpeakerBoost,
+        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, useSpeakerBoost: v } }); },
+      }),
+      createElement(NumberRow, {
+        label: 'ElevenLabs 请求超时（毫秒）', value: elevenlabs.timeoutMs, min: 3000, max: 600000, step: 1000,
+        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, timeoutMs: v } }); },
+      }),
+    ] : []),
+    createElement(SwitchRow, {
+      label: '启用 DeepSeek 在线 TTS', checked: deepseek.enabled,
+      help: '支持官方海星 (stella) / 暗潮 (tide) 音色，复用 DEEPSEEK_API_KEY；可与 ElevenLabs 分角色同时启用',
+      onChange: (v) => { patch('speak', { ...speak, deepseek: { ...deepseek, enabled: v } }); },
+    }),
+    ...(deepseek.enabled ? [
+      createElement(FieldRow, {
+        label: 'DeepSeek API 地址', value: deepseek.baseUrl, placeholder: 'https://api.deepseek.com/v1',
+        onChange: (v) => { patch('speak', { ...speak, deepseek: { ...deepseek, baseUrl: v.trim() } }); },
+      }),
+      createElement(FieldRow, {
+        label: 'DeepSeek 凭证 / 环境变量名', value: deepseek.apiKeyEnv, placeholder: 'DEEPSEEK_API_KEY',
+        help: '优先读取 patch 中的 speak.deepseek.apiKey，留空时读取凭证服务、环境变量或 ~/.dsh/.env',
+        onChange: (v) => { patch('speak', { ...speak, deepseek: { ...deepseek, apiKeyEnv: v.trim() } }); },
+      }),
+      createElement(FieldRow, {
+        label: 'DeepSeek 大肥鱼 (feiyu) 音色', value: getRoleVoiceValue(deepseek.roleVoices, 'feiyu'), placeholder: 'stella（海星）',
+        onChange: (v) => {
+          patch('speak', { ...speak, deepseek: { ...deepseek, roleVoices: setBuiltinRoleVoice(deepseek.roleVoices, 'feiyu', v) } });
+        },
+      }),
+      createElement(FieldRow, {
+        label: 'DeepSeek 大肥龙 (dragon) 音色', value: getRoleVoiceValue(deepseek.roleVoices, 'dragon'), placeholder: '留空 = 交给 ElevenLabs 或本地',
+        onChange: (v) => {
+          patch('speak', { ...speak, deepseek: { ...deepseek, roleVoices: setBuiltinRoleVoice(deepseek.roleVoices, 'dragon', v) } });
+        },
+      }),
+      createElement(FieldRow, {
+        label: 'DeepSeek 哈基米 (hakimi) 音色', value: getRoleVoiceValue(deepseek.roleVoices, 'hakimi'), placeholder: '留空 = 交给 ElevenLabs 或本地',
+        onChange: (v) => {
+          patch('speak', { ...speak, deepseek: { ...deepseek, roleVoices: setBuiltinRoleVoice(deepseek.roleVoices, 'hakimi', v) } });
+        },
+      }),
+      createElement(FieldRow, {
+        label: 'DeepSeek 默认兜底音色', value: deepseek.defaultVoiceId, placeholder: '留空 = 仅显式匹配角色时走 DeepSeek',
+        onChange: (v) => { patch('speak', { ...speak, deepseek: { ...deepseek, defaultVoiceId: v.trim() } }); },
+      }),
+      createElement(AreaRow, {
+        label: 'DeepSeek 额外人设映射',
+        value: extraDsRoleVoicesText,
+        rows: 2,
+        help: '每行一条 personaId=voiceId（如 soft-whale=stella）',
+        onChange: (raw) => {
+          setExtraDsRoleVoicesText(raw);
+          patch('speak', { ...speak, deepseek: { ...deepseek, roleVoices: mergeExtraRoleVoices(deepseek.roleVoices, raw) } });
+        },
+      }),
+      createElement(NumberRow, {
+        label: 'DeepSeek 语速', value: deepseek.speed, min: 0.5, max: 2, step: 0.05,
+        help: '倍率，1 = 原速；非 1.0 时在转码阶段调整',
+        onChange: (v) => { patch('speak', { ...speak, deepseek: { ...deepseek, speed: v } }); },
+      }),
+      createElement(NumberRow, {
+        label: 'DeepSeek 请求超时（毫秒）', value: deepseek.timeoutMs, min: 3000, max: 600000, step: 1000,
+        onChange: (v) => { patch('speak', { ...speak, deepseek: { ...deepseek, timeoutMs: v } }); },
+      }),
+    ] : []),
 
     createElement('div', { className: 'imqb2-group-title' }, '临时目录与清理'),
     createElement(FieldRow, {

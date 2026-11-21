@@ -18,6 +18,7 @@ import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
 import { parseAnswer } from './answer-parser.ts';
 import { buildKeyboard, formatQuestion } from './question-renderer.ts';
 import { decodeButtonData } from './button-utils.ts';
+import { resolveGroupTriggerPolicy, type GroupTriggerMode } from './group-trigger.ts';
 
 // ── 最小契约（对齐 dsh-user-questions，避免硬依赖） ──
 
@@ -77,7 +78,10 @@ export interface QuestionChannelSenderLike {
 }
 
 export interface QuestionChannelConfigLike {
-  requireMention: boolean;
+  groupTriggerMode?: GroupTriggerMode;
+  requireMention?: boolean;
+  groupReplyProbability?: number;
+  replyDesire?: { enabled?: boolean };
   askTimeoutMs: number;
 }
 
@@ -160,6 +164,10 @@ export class QuestionChannel {
       entry.reject(new QuestionChannelError('QQ question channel was unloaded before the user answered', ASK_ABORTED));
     }
     this.pending.clear();
+  }
+
+  public hasPending(sessionKey: string): boolean {
+    return this.pending.has(sessionKey);
   }
 
   /** 会话回收时清理其待答问题，避免 pending 悬挂导致 Promise 与闭包泄漏 */
@@ -280,7 +288,7 @@ export class QuestionChannel {
 
   /** 发送单个问题：优先带按钮，按钮发送失败降级纯文本 */
   private async sendQuestion(record: QuestionSessionRecordLike, question: UserQuestion): Promise<void> {
-    const hint = record.scope === 'group' && this.config.requireMention === true;
+    const hint = record.scope === 'group' && resolveGroupTriggerPolicy(this.config).requireMentionHint;
     const keyboard = buildKeyboard(question);
     try {
       if (keyboard) {

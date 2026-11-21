@@ -715,7 +715,9 @@ describe('bind-routes', () => {
     expect(await post({ enabled: true, baseUrl: 'https://api.siliconflow.cn/v1', model: 'FunAudioLLM/SenseVoiceSmall', timeoutMs: 20000 })).toBe(200);
     const asr = updates[0]?.asr as { apiKey: string; fallback: Record<string, unknown> };
     expect(asr.apiKey).toBe('sk-a');
-    expect(asr.fallback).toEqual({ enabled: true, baseUrl: 'https://api.siliconflow.cn/v1', model: 'FunAudioLLM/SenseVoiceSmall', timeoutMs: 20000, apiKey: 'sk-online' });
+    expect(asr.fallback).toEqual({
+      enabled: true, baseUrl: 'https://api.siliconflow.cn/v1', apiKeyEnv: '', model: 'FunAudioLLM/SenseVoiceSmall', timeoutMs: 20000, apiKey: 'sk-online',
+    });
     expect(await post({ timeoutMs: 10 })).toBe(400);
     expect(await post({ enabled: 'yes' })).toBe(400);
   });
@@ -820,6 +822,233 @@ describe('bind-routes', () => {
     );
     expect(res.statusCode).toBe(400);
     expect(json(res)).toMatchObject({ ok: false, error: expect.stringContaining('布尔') });
+  });
+
+  it('GET config：脱敏 asr.chatApiKey、video.apiKey、imageGen.apiKey 与 speak.{elevenlabs,deepseek}.apiKey，且保留其余字段', async () => {
+    const { routes } = createHarness({
+      currentConfig: () => ({
+        asr: { enabled: true, mode: 'chat', apiKey: 'sk-asr', chatApiKey: 'sk-chat', chatBaseUrl: 'https://custom.example/v1' },
+        video: { enabled: true, apiKey: 'sk-vid', directEnabled: true, model: 'gemini-vid' },
+        imageGen: { enabled: true, apiKey: 'sk-img', baseUrl: 'https://img.example/v1', model: 'gpt-image-2.6-sunburst' },
+        speak: {
+          enabled: true,
+          voice: 'zh-CN-XiaoyiNeural',
+          elevenlabs: { enabled: true, apiKey: 'xi-secret', modelId: 'eleven_v3', roleVoices: { feiyu: 'v-feiyu' } },
+          deepseek: { enabled: true, apiKey: 'ds-secret', roleVoices: { feiyu: 'stella' } },
+        },
+      }),
+    });
+    const res = fakeRes();
+    await invoke(routes.get(BIND_CONFIG_PATH), fakeReq('GET', { host: '127.0.0.1:3080' }), res);
+    expect(res.statusCode).toBe(200);
+    const body = json(res) as {
+      config: {
+        asr: { apiKey: string; chatApiKey: string; chatBaseUrl: string };
+        video: { apiKey: string; model: string };
+        imageGen: { apiKey: string; model: string };
+        speak: {
+          elevenlabs: { apiKey: string; modelId: string; roleVoices: Record<string, string> };
+          deepseek: { apiKey: string; roleVoices: Record<string, string> };
+        };
+      };
+    };
+    expect(body.config.asr).toMatchObject({ apiKey: '', chatApiKey: '', chatBaseUrl: 'https://custom.example/v1' });
+    expect(body.config.video).toMatchObject({ apiKey: '', model: 'gemini-vid' });
+    expect(body.config.imageGen).toMatchObject({ apiKey: '', model: 'gpt-image-2.6-sunburst' });
+    expect(body.config.speak.elevenlabs).toMatchObject({ apiKey: '', modelId: 'eleven_v3', roleVoices: { feiyu: 'v-feiyu' } });
+    expect(body.config.speak.deepseek).toMatchObject({ apiKey: '', roleVoices: { feiyu: 'stella' } });
+  });
+
+  it('POST config：留空保存保留已有 chatApiKey / video.apiKey / imageGen.apiKey / speak.{elevenlabs,deepseek}.apiKey；非空允许覆盖且兼容旧请求', async () => {
+    const updates: Array<Record<string, unknown>> = [];
+    const { routes } = createHarness({
+      currentConfig: () => ({
+        asr: { enabled: true, mode: 'chat', apiKey: 'sk-oai', chatApiKey: 'sk-chat-old' },
+        video: { enabled: true, apiKey: 'sk-vid-old' },
+        imageGen: { enabled: true, apiKey: 'sk-img-old' },
+        speak: {
+          enabled: true,
+          voice: 'zh-CN-XiaoyiNeural',
+          elevenlabs: { enabled: true, apiKey: 'xi-old', modelId: 'eleven_multilingual_v2', roleVoices: { feiyu: 'v1' } },
+          deepseek: { enabled: true, apiKey: 'ds-old', roleVoices: { feiyu: 'stella' } },
+        },
+      }),
+      onUpdateConfig: (config) => { updates.push(config); return true; },
+    });
+
+    const preserveRes = fakeRes();
+    await invoke(
+      routes.get(BIND_CONFIG_PATH),
+      fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({
+        asr: { enabled: true, mode: 'chat', chatBaseUrl: 'https://g.example/v1', chatModel: 'm2', chatApiKeyEnv: 'K_ENV', chatReasoningEffort: 'omit' },
+        video: { enabled: true, directEnabled: false, baseUrl: 'https://v.example/v1', model: 'v2', apiKeyEnv: 'V_ENV', reasoningEffort: 'low' },
+        imageGen: { enabled: true, baseUrl: 'https://api.openai.com/v1', model: 'gpt-image-2.6-sunburst', standardModel: 'gpt-image-2.6-flare', defaultQuality: 'xhigh', defaultComplexity: 'high', allowAllGroups: false, allowedGroups: ['G1'] },
+        speak: {
+          enabled: true,
+          voice: 'zh-CN-XiaoyiNeural',
+          elevenlabs: { enabled: true, modelId: 'eleven_v3', roleVoices: { feiyu: 'v1', dragon: 'v2' } },
+          deepseek: { enabled: true, roleVoices: { feiyu: 'stella', dragon: 'tide' } },
+        },
+      })),
+      preserveRes,
+    );
+    expect(preserveRes.statusCode).toBe(200);
+    expect(updates[0]).toMatchObject({
+      asr: { apiKey: 'sk-oai', chatApiKey: 'sk-chat-old', chatBaseUrl: 'https://g.example/v1', chatModel: 'm2', chatReasoningEffort: 'omit' },
+      video: { apiKey: 'sk-vid-old', directEnabled: false, baseUrl: 'https://v.example/v1', model: 'v2' },
+      imageGen: { apiKey: 'sk-img-old', standardModel: 'gpt-image-2.6-flare', defaultQuality: 'xhigh', defaultComplexity: 'high', allowedGroups: ['G1'] },
+      speak: {
+        elevenlabs: { apiKey: 'xi-old', modelId: 'eleven_v3', roleVoices: { feiyu: 'v1', dragon: 'v2' } },
+        deepseek: { apiKey: 'ds-old', roleVoices: { feiyu: 'stella', dragon: 'tide' } },
+      },
+    });
+
+    const legacySpeakRes = fakeRes();
+    await invoke(
+      routes.get(BIND_CONFIG_PATH),
+      fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({
+        speak: { enabled: true, voice: 'zh-CN-XiaoxiaoNeural', rate: '+5%', maxChars: 90, command: '' },
+      })),
+      legacySpeakRes,
+    );
+    expect(legacySpeakRes.statusCode).toBe(200);
+    expect(updates[1]?.speak).toMatchObject({
+      voice: 'zh-CN-XiaoxiaoNeural',
+      elevenlabs: { enabled: true, apiKey: 'xi-old', modelId: 'eleven_multilingual_v2', roleVoices: { feiyu: 'v1' } },
+      deepseek: { enabled: true, apiKey: 'ds-old', roleVoices: { feiyu: 'stella' } },
+    });
+
+    const rotateRes = fakeRes();
+    await invoke(
+      routes.get(BIND_CONFIG_PATH),
+      fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({
+        imageGen: { enabled: true, apiKey: 'sk-img-new' },
+        speak: {
+          enabled: true,
+          elevenlabs: { enabled: true, apiKey: 'xi-new' },
+          deepseek: { enabled: true, apiKey: 'ds-new' },
+        },
+      })),
+      rotateRes,
+    );
+    expect(rotateRes.statusCode).toBe(200);
+    expect((updates[2]?.imageGen as { apiKey?: string }).apiKey).toBe('sk-img-new');
+    expect((updates[2]?.speak as { elevenlabs?: { apiKey?: string } }).elevenlabs?.apiKey).toBe('xi-new');
+    expect((updates[2]?.speak as { deepseek?: { apiKey?: string } }).deepseek?.apiKey).toBe('ds-new');
+  });
+
+  it.each([
+    null,
+    { enabled: 'yes' },
+    { defaultQuality: 'ultra' },
+    { defaultComplexity: 'extreme' },
+    { timeoutMs: 1000 },
+    { timeoutMs: 700000 },
+    { allowedGroups: 'group1' },
+  ])('POST config：imageGen 非法值被拒绝 %j', async (imageGen) => {
+    const updates: Array<Record<string, unknown>> = [];
+    const { routes } = createHarness({ onUpdateConfig: (cfg) => { updates.push(cfg); return true; } });
+    const res = fakeRes();
+    await invoke(
+      routes.get(BIND_CONFIG_PATH),
+      fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({ imageGen })),
+      res,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(updates).toHaveLength(0);
+  });
+
+  it('POST config：personas.root 合法值通过、非法类型被拒绝', async () => {
+    const updates: Array<Record<string, unknown>> = [];
+    const { routes } = createHarness({ onUpdateConfig: (cfg) => { updates.push(cfg); return true; } });
+    const okRes = fakeRes();
+    await invoke(
+      routes.get(BIND_CONFIG_PATH),
+      fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({ personas: { root: 'C:/repo/personas' } })),
+      okRes,
+    );
+    expect(okRes.statusCode).toBe(200);
+    expect(updates[0]).toEqual({ personas: { root: 'C:/repo/personas' } });
+
+    for (const bad of [null, [], { root: 123 }, { root: null }]) {
+      const badRes = fakeRes();
+      await invoke(
+        routes.get(BIND_CONFIG_PATH),
+        fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({ personas: bad })),
+        badRes,
+      );
+      expect(badRes.statusCode, JSON.stringify(bad)).toBe(400);
+    }
+    expect(updates).toHaveLength(1);
+  });
+
+  it('POST config：groupTriggerMode 合法值通过、非法枚举或类型被拒绝', async () => {
+    for (const mode of ['mention', 'probability', 'desire', 'all']) {
+      const updates: Array<Record<string, unknown>> = [];
+      const { routes } = createHarness({ onUpdateConfig: (cfg) => { updates.push(cfg); return true; } });
+      const res = fakeRes();
+      await invoke(
+        routes.get(BIND_CONFIG_PATH),
+        fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({ groupTriggerMode: mode })),
+        res,
+      );
+      expect(res.statusCode, mode).toBe(200);
+      expect(updates[0]).toEqual({ groupTriggerMode: mode });
+    }
+    for (const bad of ['random', true, 123, null]) {
+      const updates: Array<Record<string, unknown>> = [];
+      const { routes } = createHarness({ onUpdateConfig: (cfg) => { updates.push(cfg); return true; } });
+      const res = fakeRes();
+      await invoke(
+        routes.get(BIND_CONFIG_PATH),
+        fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({ groupTriggerMode: bad })),
+        res,
+      );
+      expect(res.statusCode, JSON.stringify(bad)).toBe(400);
+      expect(updates).toHaveLength(0);
+    }
+  });
+
+  it('POST config：speak 放宽后的 maxChars 与在线超时通过校验，越界 maxChars 被拒', async () => {
+    const updates: Array<Record<string, unknown>> = [];
+    const { routes } = createHarness({ onUpdateConfig: (config) => { updates.push(config); return true; } });
+    const okRes = fakeRes();
+    await invoke(
+      routes.get(BIND_CONFIG_PATH),
+      fakeReq('POST', { host: '127.0.0.1:3080', 'content-type': 'application/json' }, JSON.stringify({
+        speak: {
+          enabled: true,
+          voice: 'zh-CN-XiaoyiNeural',
+          rate: '+8%',
+          maxChars: 1500,
+          command: '',
+          elevenlabs: { enabled: true, timeoutMs: 300000 },
+          deepseek: { enabled: true, timeoutMs: 300000 },
+        },
+      })),
+      okRes,
+    );
+    expect(okRes.statusCode).toBe(200);
+    expect(updates[0]).toMatchObject({
+      speak: {
+        maxChars: 1500,
+        elevenlabs: { timeoutMs: 300000 },
+        deepseek: { timeoutMs: 300000 },
+      },
+    });
+
+    for (const badMaxChars of [5, 6000]) {
+      const badRes = fakeRes();
+      await invoke(
+        routes.get(BIND_CONFIG_PATH),
+        fakeReq('POST', { host: '127.0.0.1:3080', 'content-type': 'application/json' }, JSON.stringify({
+          speak: { enabled: true, voice: 'zh-CN-XiaoyiNeural', rate: '+8%', maxChars: badMaxChars, command: '' },
+        })),
+        badRes,
+      );
+      expect(badRes.statusCode, String(badMaxChars)).toBe(400);
+    }
+    expect(updates).toHaveLength(1);
   });
 
   it('跨站 Origin：403（state 与 manual 均拦截）', async () => {

@@ -27,9 +27,14 @@ import {
   FanartSchema,
   BrowserSchema,
   FileAccessSchema,
+  GroupTriggerModeSchema,
+  IMAGE_GEN_COMPLEXITIES,
+  IMAGE_GEN_QUALITIES,
+  ImageGenSchema,
   MediaSchema,
   ModelFailoverSchema,
   NotesSchema,
+  PersonasSchema,
   ReplyDesireSchema,
   SendFileSchema,
   SpeakSchema,
@@ -113,7 +118,7 @@ export interface BindRoutesOptions {
 
 /** 可经 UI 编辑的配置键（白名单：只收用户必要的字段，其余走 patch/env） */
 const EDITABLE_CONFIG_KEYS = new Set([
-  'requireMention', 'streaming', 'showToolResults', 'debug',
+  'groupTriggerMode', 'requireMention', 'streaming', 'showToolResults', 'debug',
   'provider', 'model', 'preset',
   'groupPrompt', 'directPrompt',
   'groupReplyProbability', 'replyDesire', 'historyLimit', 'sessionIdleTimeout', 'ownerOpenid',
@@ -121,12 +126,16 @@ const EDITABLE_CONFIG_KEYS = new Set([
   'idleCompactMinutes', 'idleCompactTokens', 'idleCompactProviders', 'textChunkLimit', 'maxQueue',
   'steerWindowMs', 'processingTimeoutMs', 'askTimeoutMs',
   'tmpDir', 'tmpTtlHours', 'tmpMaxTotalMB',
-  'access', 'fileAccess', 'stickers', 'notes', 'toolAccess', 'modelFailover',
-  'media', 'vision', 'asr', 'video', 'sendFile', 'speak', 'cleanup', 'fanart', 'dnd', 'browser',
+  'access', 'fileAccess', 'stickers', 'personas', 'notes', 'toolAccess', 'modelFailover',
+  'media', 'vision', 'asr', 'video', 'imageGen', 'sendFile', 'speak', 'cleanup', 'fanart', 'dnd', 'browser',
 ]);
 
 /** 白名单键的子 Schema（服务端校验：客户端校验仅为体验，安全边界在宿主） */
 const EDITABLE_CONFIG_SCHEMAS: Record<string, (value: unknown) => unknown> = {
+  groupTriggerMode: (v) => {
+    if (typeof v !== 'string') throw new TypeError('groupTriggerMode 必须是字符串');
+    return GroupTriggerModeSchema(v as never);
+  },
   requireMention: (v) => booleanSchema(v, 'requireMention'),
   streaming: (v) => booleanSchema(v, 'streaming'),
   showToolResults: (v) => booleanSchema(v, 'showToolResults'),
@@ -158,13 +167,36 @@ const EDITABLE_CONFIG_SCHEMAS: Record<string, (value: unknown) => unknown> = {
   access: (v) => AccessControlSchema(v as never),
   fileAccess: (v) => FileAccessSchema(v as never),
   stickers: (v) => StickersSchema(v as never),
+  personas: (v) => {
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new TypeError('personas 必须是对象');
+    const obj = v as Record<string, unknown>;
+    if ('root' in obj && typeof obj.root !== 'string') throw new TypeError('personas.root 必须是字符串');
+    return PersonasSchema(v as never);
+  },
   notes: (v) => NotesSchema(v as never),
   toolAccess: (v) => ToolAccessSchema(v as never),
   modelFailover: (v) => ModelFailoverSchema(v as never),
   media: (v) => MediaSchema(v as never),
   vision: (v) => VisionSchema(v as never),
-  asr: (v) => AsrSchema(v as never),
-  video: (v) => VideoSchema(v as never),
+  asr: (v) => {
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new TypeError('asr 必须是对象');
+    return AsrSchema(v as never);
+  },
+  video: (v) => {
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new TypeError('video 必须是对象');
+    return VideoSchema(v as never);
+  },
+  imageGen: (v) => {
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new TypeError('imageGen 必须是对象');
+    const obj = v as Record<string, unknown>;
+    if ('defaultQuality' in obj && !IMAGE_GEN_QUALITIES.includes(obj.defaultQuality as never)) {
+      throw new TypeError(`imageGen.defaultQuality 必须是 ${IMAGE_GEN_QUALITIES.join('/')}`);
+    }
+    if ('defaultComplexity' in obj && !IMAGE_GEN_COMPLEXITIES.includes(obj.defaultComplexity as never)) {
+      throw new TypeError('imageGen.defaultComplexity 必须是空字符串或 low/medium/high');
+    }
+    return ImageGenSchema(v as never);
+  },
   sendFile: (v) => SendFileSchema(v as never),
   speak: (v) => SpeakSchema(v as never),
   cleanup: (v) => CleanupSchema(v as never),
@@ -442,13 +474,42 @@ async function handleConfig(req: IncomingMessage, res: ServerResponse, options: 
 
   if (req.method === 'GET') {
     const current = options.currentConfig?.() ?? {};
-    // appSecret / asr.apiKey / asr.fallback.apiKey / notes.semantic.apiKey 永不回传；其余（含只读 cwd）原样回显
-    const { appSecret: _s, asr: asrValue, notes: notesValue, ...safe } = current;
+    // appSecret / asr.apiKey / asr.chatApiKey / asr.fallback.apiKey / video.apiKey / imageGen.apiKey / speak.{elevenlabs,deepseek}.apiKey / notes.semantic.apiKey 永不回传；其余（含只读 cwd）原样回显
+    const {
+      appSecret: _s,
+      asr: asrValue,
+      video: videoValue,
+      imageGen: imageGenValue,
+      speak: speakValue,
+      notes: notesValue,
+      ...safe
+    } = current;
     const config: Record<string, unknown> = { ...safe };
     if (asrValue !== undefined) {
       const asr = asrValue as Record<string, unknown>;
       const fallback = asr.fallback as Record<string, unknown> | undefined;
-      config.asr = { ...asr, apiKey: '', ...(fallback === undefined ? {} : { fallback: { ...fallback, apiKey: '' } }) };
+      config.asr = {
+        ...asr,
+        apiKey: '',
+        chatApiKey: '',
+        ...(fallback === undefined ? {} : { fallback: { ...fallback, apiKey: '' } }),
+      };
+    }
+    if (videoValue !== undefined) {
+      config.video = { ...(videoValue as Record<string, unknown>), apiKey: '' };
+    }
+    if (imageGenValue !== undefined) {
+      config.imageGen = { ...(imageGenValue as Record<string, unknown>), apiKey: '' };
+    }
+    if (speakValue !== undefined) {
+      const speak = speakValue as Record<string, unknown>;
+      const elevenlabs = speak.elevenlabs as Record<string, unknown> | undefined;
+      const deepseek = speak.deepseek as Record<string, unknown> | undefined;
+      config.speak = {
+        ...speak,
+        ...(elevenlabs === undefined ? {} : { elevenlabs: { ...elevenlabs, apiKey: '' } }),
+        ...(deepseek === undefined ? {} : { deepseek: { ...deepseek, apiKey: '' } }),
+      };
     }
     if (notesValue !== undefined) {
       const notes = notesValue as Record<string, unknown>;
@@ -499,17 +560,57 @@ async function handleConfig(req: IncomingMessage, res: ServerResponse, options: 
   }
 
   // 嵌套组里没有表单控件的字段按当前生效值回填：Schema 默认值会补空，
-  // 直接写回会把已保存的 ASR 密钥 / 自定义清理规则冲掉
+  // 直接写回会把已保存的 ASR / 视频 / 生图密钥或自定义清理规则冲掉
   const current = options.currentConfig?.() ?? {};
   if (validated.asr !== undefined) {
     const currentAsr = (current.asr ?? {}) as Record<string, unknown>;
     const currentFallback = currentAsr.fallback as Record<string, unknown> | undefined;
     const asr = validated.asr as Record<string, unknown>;
+    const fallback = asr.fallback as Record<string, unknown>;
     validated.asr = {
       ...asr,
-      apiKey: currentAsr.apiKey ?? '',
-      fallback: { ...(asr.fallback as Record<string, unknown>), apiKey: currentFallback?.apiKey ?? '' },
+      apiKey: (typeof asr.apiKey === 'string' && asr.apiKey !== '' ? asr.apiKey : currentAsr.apiKey) ?? '',
+      chatApiKey: (typeof asr.chatApiKey === 'string' && asr.chatApiKey !== '' ? asr.chatApiKey : currentAsr.chatApiKey) ?? '',
+      fallback: {
+        ...fallback,
+        apiKey: (typeof fallback.apiKey === 'string' && fallback.apiKey !== '' ? fallback.apiKey : currentFallback?.apiKey) ?? '',
+      },
     };
+  }
+  if (validated.video !== undefined) {
+    const currentVideo = (current.video ?? {}) as Record<string, unknown>;
+    const video = validated.video as Record<string, unknown>;
+    validated.video = {
+      ...video,
+      apiKey: (typeof video.apiKey === 'string' && video.apiKey !== '' ? video.apiKey : currentVideo.apiKey) ?? '',
+    };
+  }
+  if (validated.imageGen !== undefined) {
+    const currentImageGen = (current.imageGen ?? {}) as Record<string, unknown>;
+    const imageGen = validated.imageGen as Record<string, unknown>;
+    validated.imageGen = {
+      ...imageGen,
+      apiKey: (typeof imageGen.apiKey === 'string' && imageGen.apiKey !== '' ? imageGen.apiKey : currentImageGen.apiKey) ?? '',
+    };
+  }
+  if (validated.speak !== undefined) {
+    const submittedSpeak = submitted.speak as Record<string, unknown> | undefined;
+    const currentSpeak = (current.speak ?? {}) as Record<string, unknown>;
+    const nextSpeak: Record<string, unknown> = { ...(validated.speak as Record<string, unknown>) };
+    for (const subKey of ['elevenlabs', 'deepseek'] as const) {
+      const currentSub = currentSpeak[subKey] as Record<string, unknown> | undefined;
+      if (submittedSpeak !== undefined && !(subKey in submittedSpeak) && currentSub !== undefined) {
+        // 旧客户端不传 speak.{elevenlabs,deepseek} 时保留存量配置，避免 Schema 默认值把已保存的音色与密钥冲掉
+        nextSpeak[subKey] = currentSub;
+      } else if (nextSpeak[subKey] !== undefined && typeof nextSpeak[subKey] === 'object' && nextSpeak[subKey] !== null) {
+        const sub = nextSpeak[subKey] as Record<string, unknown>;
+        nextSpeak[subKey] = {
+          ...sub,
+          apiKey: (typeof sub.apiKey === 'string' && sub.apiKey !== '' ? sub.apiKey : currentSub?.apiKey) ?? '',
+        };
+      }
+    }
+    validated.speak = nextSpeak;
   }
   if (validated.notes !== undefined) {
     const notes = validated.notes as Record<string, unknown>;

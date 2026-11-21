@@ -2,6 +2,23 @@
  * dsh-im-qqbot 插件配置 Schema
  */
 import Schema from '@deepseek-ai/schemastery';
+import {
+  GROUP_TRIGGER_MODES,
+  resolveGroupTriggerMode,
+  resolveGroupTriggerPolicy,
+  type GroupTriggerConfigLike,
+  type GroupTriggerMode,
+  type GroupTriggerPolicy,
+} from './features/group-trigger.ts';
+
+export {
+  GROUP_TRIGGER_MODES,
+  resolveGroupTriggerMode,
+  resolveGroupTriggerPolicy,
+  type GroupTriggerConfigLike,
+  type GroupTriggerMode,
+  type GroupTriggerPolicy,
+};
 
 export interface AccessControlConfig {
   /** C2C 访问模式 */
@@ -80,11 +97,23 @@ export interface VideoConfig {
   maxFrames: number;
   /** 每段最多分析秒数；最长300秒，长片自动逐段处理 */
   maxSeconds: number;
+  /** 是否优先尝试整段视频直传多模态网关（关闭则只走抽帧宫格 + 视觉模型） */
+  directEnabled?: boolean;
+  /** 整段视频直传网关地址（空 = QQBOT_VIDEO_BASE_URL 或跟随 chat 转写网关） */
+  baseUrl?: string;
+  /** 整段视频直传模型 id（空 = QQBOT_VIDEO_MODEL 或跟随 chat 转写模型） */
+  model?: string;
+  /** 整段视频直传凭证环境变量名（空 = QQBOT_VIDEO_KEY_REF 或跟随 chat 转写凭证） */
+  apiKeyEnv?: string;
+  /** 整段视频直填密钥（优先于环境变量，不上表单回显） */
+  apiKey?: string;
+  /** 视频直传 reasoning_effort（空 = 跟随 chat 转写；填 omit 表示不传该字段） */
+  reasoningEffort?: string;
 }
 
 /** 语音识别的两种协议 */
 export type AsrMode =
-  /** POST {baseUrl}/chat/completions + input_audio：能吃订阅制网关（默认 opencode-go 的 mimo），不需要单独 ASR key */
+  /** POST {baseUrl}/chat/completions + input_audio：能吃订阅制网关（默认 opencode-go 的 mimo），也可自定义兼容网关 */
   | 'chat'
   /** POST {baseUrl}/audio/transcriptions（multipart）：任何 OpenAI 兼容 ASR 服务 */
   | 'openai';
@@ -93,17 +122,28 @@ export interface AsrConfig {
   /** 是否启用在线语音识别（QQ 未给出识别文本时转写语音） */
   enabled: boolean;
   /**
-   * 走哪种协议。`chat` 时 baseUrl / apiKey / model 不参与，端点和凭证取自
-   * `QQBOT_TRANSCRIBE_*` 环境变量（默认 opencode-go 的 mimo，凭证 ref 是 OPENCODE_GO_API_KEY）。
-   * `fallback` 始终按 openai 协议走。
+   * 走哪种协议。`chat` 时优先读下面的 `chat*` 配置，留空退回 `QQBOT_TRANSCRIBE_*` 环境变量与默认网关；
+   * `openai` 时走 `/audio/transcriptions`。`fallback` 始终按 openai 协议走。
    */
   mode: AsrMode;
   /** OpenAI 兼容接口地址（POST {baseUrl}/audio/transcriptions） */
   baseUrl: string;
-  /** 接口密钥（空 = 环境变量 QQBOT_ASR_API_KEY） */
+  /** 接口密钥（空 = 按 apiKeyEnv 或 QQBOT_ASR_API_KEY 读取环境变量） */
   apiKey: string;
+  /** OpenAI 兼容接口密钥环境变量名（空 = QQBOT_ASR_API_KEY） */
+  apiKeyEnv?: string;
   /** 转写模型 id（如 FunAudioLLM/SenseVoiceSmall、whisper-large-v3） */
   model: string;
+  /** chat 转写网关地址（空 = QQBOT_TRANSCRIBE_BASE_URL 或默认网关） */
+  chatBaseUrl?: string;
+  /** chat 转写模型 id（空 = QQBOT_TRANSCRIBE_MODEL 或默认模型） */
+  chatModel?: string;
+  /** chat 转写凭证名/环境变量（空 = QQBOT_TRANSCRIBE_KEY_REF 或 OPENCODE_GO_API_KEY） */
+  chatApiKeyEnv?: string;
+  /** chat 转写直填密钥（优先于环境变量，不上表单回显） */
+  chatApiKey?: string;
+  /** chat 转写 reasoning_effort（默认 none 防思考耗尽 token；填 omit 表示不传该字段） */
+  chatReasoningEffort?: string;
   /** QQ 自带 asr_refer_text 存在时优先使用，不再调用接口 */
   preferQQ: boolean;
   /** 转写调用超时(ms) */
@@ -117,10 +157,46 @@ export interface AsrFallbackConfig {
   enabled: boolean;
   /** OpenAI 兼容接口地址（POST {baseUrl}/audio/transcriptions） */
   baseUrl: string;
-  /** 接口密钥（空 = 环境变量 QQBOT_ASR_API_KEY） */
+  /** 接口密钥（空 = 按 apiKeyEnv 或 QQBOT_ASR_API_KEY 读取环境变量） */
   apiKey: string;
+  /** 兜底接口密钥环境变量名（空 = QQBOT_ASR_FALLBACK_API_KEY 或 QQBOT_ASR_API_KEY） */
+  apiKeyEnv?: string;
   model: string;
   timeoutMs: number;
+}
+
+export const IMAGE_GEN_QUALITIES = ['auto', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type ImageGenQuality = (typeof IMAGE_GEN_QUALITIES)[number];
+
+export const IMAGE_GEN_COMPLEXITIES = ['', 'low', 'medium', 'high'] as const;
+export type ImageGenComplexity = (typeof IMAGE_GEN_COMPLEXITIES)[number];
+
+/** OpenAI GPT Image 生图与参考图编辑配置 */
+export interface ImageGenConfig {
+  /** 是否启用 qqbot_image_gen 工具 */
+  enabled: boolean;
+  /** OpenAI Images API 网关地址（默认 https://api.openai.com/v1） */
+  baseUrl: string;
+  /** 直填密钥（优先于环境变量，不上表单回显） */
+  apiKey: string;
+  /** 密钥环境变量或 credentials 凭证名（默认 OPENAI_API_KEY） */
+  apiKeyEnv: string;
+  /** 默认精细/编辑模型（默认 gpt-image-2.6-sunburst） */
+  model: string;
+  /** 标准/快速模型（variant=standard 时使用，默认 gpt-image-2.6） */
+  standardModel: string;
+  /** 默认画质 */
+  defaultQuality: ImageGenQuality;
+  /** 默认尺寸（auto 或 16 倍数 WIDTHxHEIGHT） */
+  defaultSize: string;
+  /** Images 2.6 complexity 参数（空 = 不传该字段） */
+  defaultComplexity: ImageGenComplexity;
+  /** 请求超时(ms) */
+  timeoutMs: number;
+  /** 是否允许全部群聊调用生图 */
+  allowAllGroups: boolean;
+  /** 允许调用生图的群 group_openid 列表 */
+  allowedGroups: string[];
 }
 
 export interface SendFileConfig {
@@ -130,6 +206,66 @@ export interface SendFileConfig {
   extraRoots: string[];
 }
 
+export const ELEVENLABS_OUTPUT_FORMATS = [
+  'mp3_44100_128',
+  'mp3_44100_192',
+  'mp3_44100_64',
+  'mp3_22050_32',
+] as const;
+export type ElevenLabsOutputFormat = (typeof ELEVENLABS_OUTPUT_FORMATS)[number];
+
+/** ElevenLabs 在线 TTS 配置 */
+export interface ElevenLabsSpeakConfig {
+  /** 是否优先使用 ElevenLabs 在线 TTS（失败或未配好时自动回退本地服务 / edge-tts） */
+  enabled: boolean;
+  /** ElevenLabs API 根地址（默认 https://api.elevenlabs.io/v1） */
+  baseUrl: string;
+  /** 直填 API Key（优先于凭证/环境变量，不上表单回显） */
+  apiKey: string;
+  /** API Key 凭证名或环境变量名（默认 ELEVENLABS_API_KEY） */
+  apiKeyEnv: string;
+  /** 语音合成模型 ID（默认 eleven_v4） */
+  modelId: string;
+  /** 输出音频格式（需 MP3 以便直接作为 QQ 语音发送） */
+  outputFormat: ElevenLabsOutputFormat;
+  /** 默认兜底 voice_id（当角色/人设未单独映射时使用） */
+  defaultVoiceId: string;
+  /** 角色/人设 ID 到 ElevenLabs voice_id 的映射（如 feiyu / dragon / hakimi 或具体 personaId） */
+  roleVoices: Record<string, string>;
+  /** 语速倍率（0.7 ~ 1.2，1.0 = 原速） */
+  speed: number;
+  /** 语音稳定性（0 ~ 1） */
+  stability: number;
+  /** 音色相似度增强（0 ~ 1） */
+  similarityBoost: number;
+  /** 说话风格夸张度（0 ~ 1） */
+  styleExaggeration: number;
+  /** 是否开启说话人增强（use_speaker_boost） */
+  useSpeakerBoost: boolean;
+  /** 请求超时（ms） */
+  timeoutMs: number;
+}
+
+/** DeepSeek 在线 TTS 配置（/v1/tools/tts，stella=海星 / tide=暗潮） */
+export interface DeepSeekSpeakConfig {
+  /** 是否启用 DeepSeek 在线 TTS（按角色/人设映射路由，失败时自动回退本地服务 / edge-tts） */
+  enabled: boolean;
+  /** DeepSeek API 根地址（默认 https://api.deepseek.com/v1） */
+  baseUrl: string;
+  /** 直填 API Key（优先于凭证/环境变量，不上表单回显） */
+  apiKey: string;
+  /** API Key 凭证名或环境变量名（默认 DEEPSEEK_API_KEY） */
+  apiKeyEnv: string;
+  /** 默认兜底 voice_id（如 stella / tide；留空则仅按 roleVoices 命中时走 DeepSeek） */
+  defaultVoiceId: string;
+  /** 角色/人设 ID 到 DeepSeek voice_id 的映射（如 feiyu -> stella） */
+  roleVoices: Record<string, string>;
+  /** 语速倍率（0.5 ~ 2.0，1.0 = 原速，非 1.0 时用 ffmpeg atempo 调整） */
+  speed: number;
+  /** 请求超时（ms） */
+  timeoutMs: number;
+}
+
 export interface SpeakConfig {
   /** 是否注册 qqbot_speak 语音合成工具 */
   enabled: boolean;
@@ -137,7 +273,7 @@ export interface SpeakConfig {
   voice: string;
   /** 语速调整，如 +8% / -5% */
   rate: string;
-  /** 单条语音最多合成多少字（QQ 语音上限约 60 秒） */
+  /** 单条语音最多合成多少字（QQ 语音单条上限 20MB，1500 字约 4～5 分钟） */
   maxChars: number;
   /** edge-tts 可执行命令；空 = 依次尝试 edge-tts / python -m edge_tts / py -m edge_tts */
   command: string;
@@ -148,6 +284,10 @@ export interface SpeakConfig {
   gsvUrl: string;
   /** GPT-SoVITS 语速倍率，1.0 = 原速（edge-tts 的 rate 是百分比，两者不通用） */
   gsvSpeed: number;
+  /** ElevenLabs 在线 TTS 配置（可选；启用后优先走 ElevenLabs） */
+  elevenlabs?: ElevenLabsSpeakConfig;
+  /** DeepSeek 在线 TTS 配置（可选；支持海星 stella / 暗潮 tide） */
+  deepseek?: DeepSeekSpeakConfig;
 }
 
 export interface FileAccessConfig {
@@ -205,6 +345,11 @@ export interface StickersConfig {
   maxBytes: number;
   /** 自动收藏条目上限（防止索引无限增长） */
   maxAutoEntries: number;
+}
+
+export interface PersonasConfig {
+  /** 人设目录（.md）；空 = 优先插件根目录/personas（含 .md 时），否则 ~/.dsh-qqbot/personas；相对路径按工作目录解析 */
+  root: string;
 }
 
 export interface BrowserConfig {
@@ -363,6 +508,8 @@ export interface ImQQBotConfig {
   tmpMaxTotalMB?: number;
   /** 定期清理（内置 media / tmp 规则之外的额外目录） */
   cleanup?: CleanupConfig;
+  /** 群聊触发门控模式：mention=仅@回复，probability=随机概率，desire=回复欲望打分，all=全部回复 */
+  groupTriggerMode?: GroupTriggerMode;
   /** 是否启用群消息 @mention 门控 */
   requireMention: boolean;
   /** 群聊未 @bot 时随机回复概率（0-1），0=关闭 */
@@ -423,6 +570,8 @@ export interface ImQQBotConfig {
   sendFile: SendFileConfig;
   /** 语音合成（qqbot_speak 工具） */
   speak: SpeakConfig;
+  /** 生图与参考图编辑（qqbot_image_gen 工具） */
+  imageGen: ImageGenConfig;
   /** bot 主人 QQ openid（私聊识别，用于文件访问白名单） */
   ownerOpenid?: string;
   /** 额外的配置管理员 QQ openid（可修改模型/preset、点击审批） */
@@ -436,6 +585,8 @@ export interface ImQQBotConfig {
   modelFailover: ModelFailoverConfig;
   /** 表情自动收藏（qqbot_save_sticker + 动态表情清单） */
   stickers: StickersConfig;
+  /** 外置聊天人设目录（personas/*.md） */
+  personas?: PersonasConfig;
   /** 共享笔记库（qqbot_notes_search / qqbot_notes_save + 自动召回） */
   notes: NotesConfig;
   /** 搜图工具（qqbot_fanart_pick） */
@@ -508,6 +659,13 @@ export const StickersSchema: Schema<StickersConfig> = Schema.object({
   maxBytes: Schema.number().default(8 * 1024 * 1024).description('单张表情大小上限（字节）'),
   maxAutoEntries: Schema.number().default(200).description('自动收藏条目上限'),
 });
+
+export const PERSONAS_DEFAULTS: PersonasConfig = { root: '' };
+
+/** 外置聊天人设子 Schema */
+export const PersonasSchema: Schema<PersonasConfig> = Schema.object({
+  root: Schema.string().default('').description('人设目录（空=插件根目录/personas 或 ~/.dsh-qqbot/personas；相对路径按工作目录解析）'),
+}).default(PERSONAS_DEFAULTS);
 
 /** 笔记语义检索子 Schema */
 export const NotesSemanticSchema: Schema<NotesSemanticConfig> = Schema.object({
@@ -667,7 +825,8 @@ export const VisionSchema: Schema<VisionConfig> = Schema.object({
 export const AsrFallbackSchema: Schema<AsrFallbackConfig> = Schema.object({
   enabled: Schema.boolean().default(false).description('主接口连不上时改用备用接口'),
   baseUrl: Schema.string().default('https://api.siliconflow.cn/v1').description('OpenAI 兼容接口地址'),
-  apiKey: Schema.string().default('').description('接口密钥（空=环境变量 QQBOT_ASR_API_KEY）'),
+  apiKey: Schema.string().default('').description('接口密钥（空=按环境变量读取，不上表单回显）'),
+  apiKeyEnv: Schema.string().default('').description('兜底接口密钥环境变量名（空=QQBOT_ASR_FALLBACK_API_KEY 或 QQBOT_ASR_API_KEY）'),
   model: Schema.string().default('Qwen/Qwen3-ASR-1.7B').description('转写模型 id'),
   timeoutMs: Schema.number().min(1000).max(300000).default(30000).description('转写调用超时(ms)'),
 });
@@ -675,12 +834,18 @@ export const AsrFallbackSchema: Schema<AsrFallbackConfig> = Schema.object({
 export const AsrSchema: Schema<AsrConfig> = Schema.object({
   enabled: Schema.boolean().default(false).description('是否启用在线语音识别（QQ 未给出识别文本时转写语音）'),
   mode: Schema.union([
-    Schema.const('chat').description('chat/completions + input_audio（订阅制网关，默认 opencode-go 的 mimo）'),
+    Schema.const('chat').description('chat/completions + input_audio（多模态对话网关）'),
     Schema.const('openai').description('POST {baseUrl}/audio/transcriptions（任何 OpenAI 兼容 ASR 服务）'),
-  ]).default('chat').description('转写协议：chat 忽略下面的地址/密钥/模型，改用 QQBOT_TRANSCRIBE_* 环境变量'),
+  ]).default('chat').description('转写协议：chat 走下方 chat* 参数（空则退回 QQBOT_TRANSCRIBE_*）；openai 走 baseUrl/model'),
   baseUrl: Schema.string().default('https://api.siliconflow.cn/v1').description('OpenAI 兼容接口地址（POST {baseUrl}/audio/transcriptions）'),
-  apiKey: Schema.string().default('').description('接口密钥（空=环境变量 QQBOT_ASR_API_KEY）'),
-  model: Schema.string().default('Qwen/Qwen3-ASR-1.7B').description('转写模型 id'),
+  apiKey: Schema.string().default('').description('OpenAI 接口直填密钥（不上表单回显）'),
+  apiKeyEnv: Schema.string().default('').description('OpenAI 兼容接口密钥环境变量名（空=QQBOT_ASR_API_KEY）'),
+  model: Schema.string().default('Qwen/Qwen3-ASR-1.7B').description('OpenAI 转写模型 id'),
+  chatBaseUrl: Schema.string().default('').description('chat 转写网关地址（空=QQBOT_TRANSCRIBE_BASE_URL 或默认网关）'),
+  chatModel: Schema.string().default('').description('chat 转写模型 id（空=QQBOT_TRANSCRIBE_MODEL 或 mimo-v2.6-flash）'),
+  chatApiKeyEnv: Schema.string().default('').description('chat 转写凭证名/环境变量（空=QQBOT_TRANSCRIBE_KEY_REF 或 OPENCODE_GO_API_KEY）'),
+  chatApiKey: Schema.string().default('').description('chat 转写直填密钥（优先于环境变量，不上表单回显）'),
+  chatReasoningEffort: Schema.string().default('none').description('chat 转写 reasoning_effort（默认 none 防思考耗尽 token；填 omit 表示不传）'),
   preferQQ: Schema.boolean().default(true).description('QQ 自带识别文本存在时优先使用'),
   timeoutMs: Schema.number().default(30000).description('转写调用超时(ms)'),
   fallback: AsrFallbackSchema.description('备用接口：主接口连不上或 5xx 时改用'),
@@ -689,13 +854,20 @@ export const AsrSchema: Schema<AsrConfig> = Schema.object({
   mode: 'chat',
   baseUrl: 'https://api.siliconflow.cn/v1',
   apiKey: '',
+  apiKeyEnv: '',
   model: 'Qwen/Qwen3-ASR-1.7B',
+  chatBaseUrl: '',
+  chatModel: '',
+  chatApiKeyEnv: '',
+  chatApiKey: '',
+  chatReasoningEffort: 'none',
   preferQQ: true,
   timeoutMs: 30000,
   fallback: {
     enabled: false,
     baseUrl: 'https://api.siliconflow.cn/v1',
     apiKey: '',
+    apiKeyEnv: '',
     model: 'FunAudioLLM/SenseVoiceSmall',
     timeoutMs: 30000,
   },
@@ -707,12 +879,55 @@ export const VideoSchema: Schema<VideoConfig> = Schema.object({
   ffmpegPath: Schema.string().default('').description('ffmpeg 路径（空=PATH 里的 ffmpeg）'),
   maxFrames: Schema.number().default(8).description('每段降级抽帧时的最大帧数（拼成宫格图）'),
   maxSeconds: Schema.number().default(300).description('每段最多秒数（实际封顶300；长片逐段处理，每次最多24段/2小时）'),
+  directEnabled: Schema.boolean().default(true).description('优先尝试整段视频直传多模态网关（关闭则只走抽帧宫格 + 视觉模型）'),
+  baseUrl: Schema.string().default('').description('整段视频直传网关地址（空=QQBOT_VIDEO_BASE_URL 或跟随 chat 转写网关）'),
+  model: Schema.string().default('').description('整段视频直传模型 id（空=QQBOT_VIDEO_MODEL 或跟随 chat 转写模型）'),
+  apiKeyEnv: Schema.string().default('').description('整段视频直传凭证环境变量名（空=QQBOT_VIDEO_KEY_REF 或跟随 chat 转写凭证）'),
+  apiKey: Schema.string().default('').description('整段视频直填密钥（优先于环境变量，不上表单回显）'),
+  reasoningEffort: Schema.string().default('').description('视频直传 reasoning_effort（空=跟随 chat 转写；填 omit 表示不传）'),
 }).default({
   enabled: true,
   ffmpegPath: '',
   maxFrames: 8,
   maxSeconds: 300,
+  directEnabled: true,
+  baseUrl: '',
+  model: '',
+  apiKeyEnv: '',
+  apiKey: '',
+  reasoningEffort: '',
 });
+
+export const IMAGE_GEN_DEFAULTS: ImageGenConfig = {
+  enabled: false,
+  baseUrl: 'https://api.openai.com/v1',
+  apiKey: '',
+  apiKeyEnv: 'OPENAI_API_KEY',
+  model: 'gpt-image-2.6-sunburst',
+  standardModel: 'gpt-image-2.6',
+  defaultQuality: 'auto',
+  defaultSize: '1024x1024',
+  defaultComplexity: '',
+  timeoutMs: 180000,
+  allowAllGroups: false,
+  allowedGroups: [],
+};
+
+/** OpenAI GPT Image 生图与参考图编辑子 Schema */
+export const ImageGenSchema: Schema<ImageGenConfig> = Schema.object({
+  enabled: Schema.boolean().default(IMAGE_GEN_DEFAULTS.enabled).description('是否启用 qqbot_image_gen 生图与参考图编辑工具'),
+  baseUrl: Schema.string().default(IMAGE_GEN_DEFAULTS.baseUrl).description('OpenAI Images API 网关地址（{baseUrl}/images/generations 与 /images/edits）'),
+  apiKey: Schema.string().default(IMAGE_GEN_DEFAULTS.apiKey).description('直填 API Key（优先于环境变量，不上表单回显）'),
+  apiKeyEnv: Schema.string().default(IMAGE_GEN_DEFAULTS.apiKeyEnv).description('API Key 环境变量或 credentials 凭证名'),
+  model: Schema.string().default(IMAGE_GEN_DEFAULTS.model).description('默认精细/参考图编辑模型（如 gpt-image-2.6-sunburst）'),
+  standardModel: Schema.string().default(IMAGE_GEN_DEFAULTS.standardModel).description('标准/快速版模型（variant=standard 时使用，如 gpt-image-2.6 或 gpt-image-2.6-flare）'),
+  defaultQuality: Schema.union(IMAGE_GEN_QUALITIES.map((q) => Schema.const(q))).default(IMAGE_GEN_DEFAULTS.defaultQuality).description('默认画质'),
+  defaultSize: Schema.string().default(IMAGE_GEN_DEFAULTS.defaultSize).description('默认尺寸（auto 或 16 倍数 WIDTHxHEIGHT，如 1024x1024）'),
+  defaultComplexity: Schema.union(IMAGE_GEN_COMPLEXITIES.map((c) => Schema.const(c))).default(IMAGE_GEN_DEFAULTS.defaultComplexity).description('GPT Image 2.6 complexity 参数（空=不传）'),
+  timeoutMs: Schema.number().min(5000).max(600000).step(1).default(IMAGE_GEN_DEFAULTS.timeoutMs).description('请求超时(ms)'),
+  allowAllGroups: Schema.boolean().default(IMAGE_GEN_DEFAULTS.allowAllGroups).description('是否允许全部群聊调用生图（关闭时仅主人私聊、完全权限会话与白名单群可用）'),
+  allowedGroups: Schema.array(Schema.string()).default(IMAGE_GEN_DEFAULTS.allowedGroups).description('生图白名单 group_openid；本群也可通过 qqbot_image_gen_access 申请，主人确认后写入，与浏览/终端授权分开'),
+}).default(IMAGE_GEN_DEFAULTS);
 
 /** 附件发送子 Schema */
 export const SendFileSchema: Schema<SendFileConfig> = Schema.object({
@@ -723,23 +938,91 @@ export const SendFileSchema: Schema<SendFileConfig> = Schema.object({
   extraRoots: [],
 });
 
+export const ELEVENLABS_SPEAK_DEFAULTS: ElevenLabsSpeakConfig = {
+  enabled: false,
+  baseUrl: 'https://api.elevenlabs.io/v1',
+  apiKey: '',
+  apiKeyEnv: 'ELEVENLABS_API_KEY',
+  modelId: 'eleven_v4',
+  outputFormat: 'mp3_44100_128',
+  defaultVoiceId: '',
+  roleVoices: {},
+  speed: 1.0,
+  stability: 0.5,
+  similarityBoost: 0.75,
+  styleExaggeration: 0.0,
+  useSpeakerBoost: true,
+  timeoutMs: 180000,
+};
+
+export const ElevenLabsSpeakSchema: Schema<ElevenLabsSpeakConfig> = Schema.object({
+  enabled: Schema.boolean().default(ELEVENLABS_SPEAK_DEFAULTS.enabled).description('是否优先使用 ElevenLabs 在线语音合成'),
+  baseUrl: Schema.string().default(ELEVENLABS_SPEAK_DEFAULTS.baseUrl).description('ElevenLabs API 根地址'),
+  apiKey: Schema.string().default(ELEVENLABS_SPEAK_DEFAULTS.apiKey).description('直填 API Key（不上表单回显）'),
+  apiKeyEnv: Schema.string().default(ELEVENLABS_SPEAK_DEFAULTS.apiKeyEnv).description('API Key 凭证名或环境变量名'),
+  modelId: Schema.string().default(ELEVENLABS_SPEAK_DEFAULTS.modelId).description('模型 ID（如 eleven_v4、eleven_v4_turbo、eleven_v3、eleven_multilingual_v2、eleven_flash_v2_5）'),
+  outputFormat: Schema.union(ELEVENLABS_OUTPUT_FORMATS.map((fmt) => Schema.const(fmt))).default(ELEVENLABS_SPEAK_DEFAULTS.outputFormat).description('MP3 输出格式'),
+  defaultVoiceId: Schema.string().default(ELEVENLABS_SPEAK_DEFAULTS.defaultVoiceId).description('默认兜底 voice_id'),
+  roleVoices: Schema.dict(Schema.string()).default(ELEVENLABS_SPEAK_DEFAULTS.roleVoices).description('角色/人设到 voice_id 的映射'),
+  speed: Schema.number().min(0.7).max(1.2).default(ELEVENLABS_SPEAK_DEFAULTS.speed).description('语速倍率（0.7-1.2）'),
+  stability: Schema.number().min(0).max(1).default(ELEVENLABS_SPEAK_DEFAULTS.stability).description('stability（0-1）'),
+  similarityBoost: Schema.number().min(0).max(1).default(ELEVENLABS_SPEAK_DEFAULTS.similarityBoost).description('similarity_boost（0-1）'),
+  styleExaggeration: Schema.number().min(0).max(1).default(ELEVENLABS_SPEAK_DEFAULTS.styleExaggeration).description('style 风格强度（0-1）'),
+  useSpeakerBoost: Schema.boolean().default(ELEVENLABS_SPEAK_DEFAULTS.useSpeakerBoost).description('是否开启 use_speaker_boost'),
+  timeoutMs: Schema.number().min(3000).max(600000).step(1).default(ELEVENLABS_SPEAK_DEFAULTS.timeoutMs).description('请求超时（ms）'),
+}).default(ELEVENLABS_SPEAK_DEFAULTS);
+
+export const DEEPSEEK_SPEAK_DEFAULTS: DeepSeekSpeakConfig = {
+  enabled: false,
+  baseUrl: 'https://api.deepseek.com/v1',
+  apiKey: '',
+  apiKeyEnv: 'DEEPSEEK_API_KEY',
+  defaultVoiceId: '',
+  roleVoices: {},
+  speed: 1.0,
+  timeoutMs: 180000,
+};
+
+export const DeepSeekSpeakSchema: Schema<DeepSeekSpeakConfig> = Schema.object({
+  enabled: Schema.boolean().default(DEEPSEEK_SPEAK_DEFAULTS.enabled).description('是否启用 DeepSeek 在线 TTS'),
+  baseUrl: Schema.string().default(DEEPSEEK_SPEAK_DEFAULTS.baseUrl).description('DeepSeek API 根地址'),
+  apiKey: Schema.string().default(DEEPSEEK_SPEAK_DEFAULTS.apiKey).description('直填 API Key（不上表单回显）'),
+  apiKeyEnv: Schema.string().default(DEEPSEEK_SPEAK_DEFAULTS.apiKeyEnv).description('API Key 凭证名或环境变量名'),
+  defaultVoiceId: Schema.string().default(DEEPSEEK_SPEAK_DEFAULTS.defaultVoiceId).description('默认兜底 voice_id（如 stella / tide）'),
+  roleVoices: Schema.dict(Schema.string()).default(DEEPSEEK_SPEAK_DEFAULTS.roleVoices).description('角色/人设到 voice_id 的映射'),
+  speed: Schema.number().min(0.5).max(2.0).default(DEEPSEEK_SPEAK_DEFAULTS.speed).description('语速倍率（0.5-2.0）'),
+  timeoutMs: Schema.number().min(3000).max(600000).step(1).default(DEEPSEEK_SPEAK_DEFAULTS.timeoutMs).description('请求超时（ms）'),
+}).default(DEEPSEEK_SPEAK_DEFAULTS);
+
 export const SpeakSchema: Schema<SpeakConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('是否注册 qqbot_speak 语音合成工具'),
   voice: Schema.string().default('zh-CN-XiaoyiNeural').description('edge-tts 音色名'),
   rate: Schema.string().default('+8%').description('语速调整，如 +8% / -5%'),
-  maxChars: Schema.number().default(120).description('单条语音字数上限（QQ 语音约 60 秒）'),
+  maxChars: Schema.number().min(10).max(5000).step(1).default(1500).description('单条语音字数上限（QQ 语音单条上限 20MB，1500 字约 4～5 分钟）'),
   command: Schema.string().default('').description('edge-tts 可执行命令（空=自动探测）'),
   gsvUrl: Schema.string().default('').description('本地 GPT-SoVITS 服务地址（空=edge-tts）'),
   gsvSpeed: Schema.number().default(1.0).description('GPT-SoVITS 语速倍率（1.0=原速）'),
+  elevenlabs: ElevenLabsSpeakSchema.description('ElevenLabs 在线 TTS 配置（启用后优先使用）'),
+  deepseek: DeepSeekSpeakSchema.description('DeepSeek 在线 TTS 配置（支持海星 stella 等音色）'),
 }).default({
   enabled: true,
   voice: 'zh-CN-XiaoyiNeural',
   rate: '+8%',
-  maxChars: 120,
+  maxChars: 1500,
   command: '',
   gsvUrl: '',
   gsvSpeed: 1.0,
+  elevenlabs: ELEVENLABS_SPEAK_DEFAULTS,
+  deepseek: DEEPSEEK_SPEAK_DEFAULTS,
 });
+
+/** 群聊触发模式子 Schema（不设 default，缺省时兼容读取存量三开关） */
+export const GroupTriggerModeSchema: Schema<GroupTriggerMode> = Schema.union([
+  Schema.const('mention'),
+  Schema.const('probability'),
+  Schema.const('desire'),
+  Schema.const('all'),
+]);
 
 export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   appId: Schema.string().default('').description('QQ 机器人 AppID'),
@@ -752,6 +1035,7 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   tmpTtlHours: Schema.number().default(72).description('临时目录条目多少小时未改动后自动清理（0=不清理）'),
   tmpMaxTotalMB: Schema.number().default(4096).description('临时目录总量上限(MB)，超出从最旧的条目删，0=不限'),
   cleanup: CleanupSchema.default({ dryRun: false, rules: [] }).description('定期清理（内置 media/tmp 之外的额外目录）'),
+  groupTriggerMode: GroupTriggerModeSchema.description('群聊触发模式：mention=仅@回复，probability=固定概率接话，desire=回复欲望打分，all=全部回复'),
   requireMention: Schema.boolean().default(true).description('群聊是否需要@bot触发'),
   groupReplyProbability: Schema.number().default(0).description('群聊未@时随机回复概率(0-1)，0=关闭'),
   replyDesire: ReplyDesireSchema.default({
@@ -799,6 +1083,7 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   video: VideoSchema.description('视频理解配置'),
   sendFile: SendFileSchema.description('附件发送工具配置'),
   speak: SpeakSchema.description('语音合成工具配置（qqbot_speak）'),
+  imageGen: ImageGenSchema.description('GPT Image 生图与参考图编辑配置'),
   ownerOpenid: Schema.string().description('bot 主人 QQ openid（私聊识别，文件访问白名单）'),
   adminOpenids: Schema.array(Schema.string()).default([]).description('额外的配置管理员 openid（可修改模型/preset、点击审批）'),
   fileAccess: FileAccessSchema.default({
@@ -831,6 +1116,7 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
     maxBytes: 8 * 1024 * 1024,
     maxAutoEntries: 200,
   }).description('表情自动收藏配置'),
+  personas: PersonasSchema.description('外置聊天人设目录配置'),
   notes: NotesSchema.default({
     enabled: true,
     root: '',
