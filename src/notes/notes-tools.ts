@@ -21,7 +21,7 @@ import {
 } from './notes-store.ts';
 import { deriveProjectsFromCwd } from './note-metadata.ts';
 import { findDmSecret } from '../features/campaign-secrets.ts';
-import { NOTE_STATS_VIEWS, renderNoteStats, type NoteStatsView } from '../features/note-stats.ts';
+import { NOTE_STATS_VIEWS, type NoteStatsView } from '../features/note-stats.ts';
 
 export const NOTES_SEARCH_TOOL_NAME = 'qqbot_notes_search';
 export const NOTES_SAVE_TOOL_NAME = 'qqbot_notes_save';
@@ -64,8 +64,6 @@ interface ManageArgs {
 export interface NotesToolsOptions {
   /** bot 主人的 openid；空 = 管理工具只有本机会话能用 */
   ownerOpenid?: string;
-  /** 相关性打分开没开（只用来在 stats 里提示） */
-  judgeEnabled: () => boolean;
 }
 
 /** 看起来像跑团存档/约定的内容：没指定 scope 时默认只记到本会话，免得串到别的群 */
@@ -151,7 +149,7 @@ export function registerNotesTools(
   store: NotesStore,
   manager: SessionManager,
   logger: Logger,
-  options: NotesToolsOptions = { judgeEnabled: () => false },
+  options: NotesToolsOptions = {},
 ): void {
   const tools = ctx.get('tools') as ToolsRegistryLike | undefined;
   if (!tools?.register) {
@@ -411,7 +409,7 @@ export function registerNotesTools(
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['stats', 'mute', 'unmute', 'archive', 'supersede'], description: 'What to do.' },
-        view: { type: 'string', enum: ['low', 'top', 'muted'], description: 'stats only: low = lowest relevance (default), top = most injected, muted = muted sections.' },
+        view: { type: 'string', enum: ['low', 'top', 'muted'], description: 'stats only: low = lowest relevance among sections currently eligible for auto-injection (default), top = most injected historically, muted = recorded mutes.' },
         limit: { type: 'integer', description: 'stats only: how many rows (1-30, default 10).' },
         file: { type: 'string', description: 'mute/unmute/archive/supersede: note path relative to the notes root, exactly as shown by stats or search.' },
         heading: { type: 'string', description: 'mute/unmute: full heading path ("一级 › 二级"). archive/supersede: target section; omit for whole file / first section.' },
@@ -437,14 +435,15 @@ export function registerNotesTools(
       const owner = options.ownerOpenid?.trim() ?? '';
       const ownerChat = record === undefined || (owner !== '' && record.scope === 'c2c' && record.peerId === owner);
       if (!ownerChat) throw new Error('qqbot_notes_manage: 只能在主人私聊里用');
-      const metrics = manager.noteMetrics;
-      if (metrics === undefined) throw new Error('qqbot_notes_manage: 笔记账本不可用');
-
       if (action === 'stats') {
         const picked: NoteStatsView = view !== undefined && NOTE_STATS_VIEWS.includes(view) ? view : 'low';
         const n = typeof limit === 'number' && Number.isFinite(limit) ? Math.min(30, Math.max(1, Math.floor(limit))) : 10;
-        return { message: renderNoteStats(metrics.summary(Number.POSITIVE_INFINITY), picked, n, options.judgeEnabled()) };
+        const message = manager.noteStats(picked, n);
+        if (message === undefined) throw new Error('qqbot_notes_manage: 笔记账本不可用');
+        return { message };
       }
+      const metrics = manager.noteMetrics;
+      if (metrics === undefined) throw new Error('qqbot_notes_manage: 笔记账本不可用');
       if (typeof file !== 'string' || file.trim() === '') throw new Error(`qqbot_notes_manage: ${action} 需要 file`);
       const path = file.trim().split('\\').join('/');
       const section = typeof heading === 'string' ? heading.trim() : '';

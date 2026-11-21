@@ -6,7 +6,8 @@ import { NotesStore, cutSection } from './notes-store.ts';
 import { NoteMetricsStore } from './note-metrics.ts';
 import { NOTES_MANAGE_TOOL_NAME, NOTES_SAVE_TOOL_NAME, NOTES_SEARCH_TOOL_NAME, registerNotesTools } from './notes-tools.ts';
 import { pickNoteStats, renderNoteStats } from '../features/note-stats.ts';
-import { parseNotesArgs } from '../commands/notes.ts';
+import { notesCommand, parseNotesArgs } from '../commands/notes.ts';
+import { SessionManager } from '../session/session-manager.ts';
 
 const DIARY = [
   '# 观察日记',
@@ -47,8 +48,11 @@ function setup(recordOrNull: Record<string, unknown> | null = { scope: 'c2c', pe
   const metrics = new NoteMetricsStore(join(root, '.metrics.json'));
   const tools = new Map<string, Tool>();
   const ctx = { get: () => ({ register: (d: Tool) => tools.set(d.name, d) }) };
-  const manager = { findByAgent: () => record, noteMetrics: metrics };
-  registerNotesTools(ctx as never, store, manager as never, logger as never, { ownerOpenid: 'OWNER', judgeEnabled: () => true });
+  const notes = { autoInject: true, injectTopK: 2, injectMaxChars: 600, judge: { enabled: true, muteBelow: 0.4 } };
+  const manager = Object.assign(Object.create(SessionManager.prototype) as SessionManager, {
+    findByAgent: () => record, noteMetrics: metrics, notesStore: store, config: { notes },
+  });
+  registerNotesTools(ctx as never, store, manager, logger as never, { ownerOpenid: 'OWNER' });
   const execCtx = (agentOver?: Record<string, unknown>) => (record === undefined && agentOver === undefined ? {} : { agent: agentOver ?? {} });
   const call = (args: Record<string, unknown>) => tools.get(NOTES_MANAGE_TOOL_NAME)!.execute(args, execCtx()) as Promise<{ message: string }>;
   const callSave = (args: Record<string, unknown>) => tools.get(NOTES_SAVE_TOOL_NAME)!.execute(args, execCtx());
@@ -57,7 +61,7 @@ function setup(recordOrNull: Record<string, unknown> | null = { scope: 'c2c', pe
     const dir = join(root, '.archive');
     return existsSync(dir) ? readdirSync(dir, { recursive: true }).map(String).filter((name) => name.endsWith('.md')) : [];
   };
-  return { root, store, metrics, call, callSave, callSearch, archived };
+  return { root, store, metrics, call, callSave, callSearch, archived, manager, notes };
 }
 
 describe('cutSection', () => {
@@ -152,6 +156,54 @@ describe('qqbot_notes_manage', () => {
     expect(message).toContain('均分 0.00（评 1 次）');
   });
 
+  it('两个低分入口只列当前可注入的小节，不会更新账本或改变历史视图', async () => {
+    const { root, store, metrics, manager, notes, call } = setup();
+    const archived = { file: '观察日记.md', heading: '观察日记 › 001 第一条' };
+    const add = (name: string, meta = '') => {
+      const file = `${name}.md`;
+      writeFileSync(join(root, file), `# ${name}\n\n${meta}\n\n内容：${name}。`, 'utf8');
+      return { file, heading: name };
+    };
+    const searchOnly = add('仅检索', '> 注入：仅检索');
+    const zeroBudget = add('零预算', '> 预算：0');
+    const outdated = add('过期结论', '> 状态：已过期');
+    const manual = add('手动静音');
+    const auto = add('仍自动静音');
+    const updated = add('已修订笔记');
+    const active = { file: '单篇.md', heading: '单篇' };
+    const filtered = [archived, searchOnly, zeroBudget, outdated, manual, auto];
+    const entries = [...filtered, updated, active];
+    metrics.recordInjection(entries.map((entry) => ({ ...entry, score: 1 })));
+    metrics.recordJudgement(entries, [0, 0, 0, 0, 0, 0, 0.5, 1], { minSamples: 1, muteBelow: 0 });
+    metrics.mute(manual.file, manual.heading, 1);
+    metrics.recordJudgement([auto], [0], { minSamples: 1, muteBelow: 1 }, Date.now() + 60_000);
+    metrics.recordJudgement([updated], [0], { minSamples: 1, muteBelow: 1 }, 1);
+    store.archive(archived);
+    const historical = metrics.summary(Number.POSITIVE_INFINITY);
+
+    const { message } = await call({ action: 'stats', limit: 2 });
+    expect(message).toContain('8 段、共注入 8 次');
+    expect(message).toContain('1. 均分 0.25（评 2 次） · 注入 1 次\n   已修订笔记.md › 已修订笔记');
+    expect(message).toContain('2. 均分 1.00（评 1 次） · 注入 1 次\n   单篇.md › 单篇');
+    for (const { file, heading } of filtered) expect(message).not.toContain(`${file} › ${heading}`);
+    const replyTarget = {};
+    const sendMarkdown = vi.fn(async () => undefined);
+    const command = notesCommand({ manager, config: { textChunkLimit: 4000 } } as never);
+    await command.handler({ bot: { sendMarkdown }, replyTarget, command: { raw: '' } } as never);
+    expect(sendMarkdown).toHaveBeenCalledExactlyOnceWith(replyTarget, message);
+
+    const top = (await call({ action: 'stats', view: 'top' })).message;
+    expect(top).toContain(`${archived.file} › ${archived.heading}`);
+    expect(top).toContain(`${searchOnly.file} › ${searchOnly.heading}`);
+    const muted = (await call({ action: 'stats', view: 'muted' })).message;
+    for (const row of [manual, auto, updated]) expect(muted).toContain(`${row.file} › ${row.heading}`);
+    expect(metrics.summary(Number.POSITIVE_INFINITY)).toEqual(historical);
+
+    notes.autoInject = false;
+    expect((await call({ action: 'stats' })).message).not.toContain(`${active.file} › ${active.heading}`);
+    expect((await call({ action: 'stats', view: 'top' })).message).toBe(top);
+  });
+
   it('mute / unmute：没注入过的段也能静音，写错路径会被拦下', async () => {
     const { metrics, call } = setup();
     await expect(call({ action: 'mute', file: '单篇.md', heading: '写错了' })).rejects.toThrow(/没有/);
@@ -239,7 +291,7 @@ describe('qqbot_notes_manage', () => {
     const groupTools = new Map<string, Tool>();
     const groupCtx = { get: () => ({ register: (d: Tool) => groupTools.set(d.name, d) }) };
     const groupManager = { findByAgent: () => ({ scope: 'group', peerId: 'G2' }), noteMetrics: local.metrics };
-    registerNotesTools(groupCtx as never, local.store, groupManager as never, logger as never, { ownerOpenid: 'OWNER', judgeEnabled: () => true });
+    registerNotesTools(groupCtx as never, local.store, groupManager as never, logger as never, { ownerOpenid: 'OWNER' });
     const groupRes = await groupTools.get(NOTES_SEARCH_TOOL_NAME)!.execute(
       { query: '小笨猫 点歌 保护指数', all_scopes: true, project: 'voice-lab', persona: '哈基米' },
       { agent: {} },
@@ -266,8 +318,8 @@ describe('笔记账本的查看', () => {
   });
 
   it('没开打分时在概览里提示；空清单说明原因', () => {
-    expect(renderNoteStats(rows, 'top', 3, false)).toContain('相关性打分没开');
-    expect(renderNoteStats([], 'low', 3, true)).toContain('还没有评过分的段');
+    expect(renderNoteStats(rows, 'top', 3, false, [])).toContain('相关性打分没开');
+    expect(renderNoteStats([], 'low', 3, true, [])).toContain('还没有评过分的段');
   });
 
   it('命令参数：视图和条数顺序不限，条数封顶，认不出的报用法', () => {

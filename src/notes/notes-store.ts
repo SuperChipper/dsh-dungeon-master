@@ -509,6 +509,14 @@ export class NotesStore {
     return this.chunks.some((chunk) => chunk.file === file && chunk.heading === heading);
   }
 
+  /** 低分榜只看索引里仍可参与常规自动注入的段；账本本身不跟随文件生命周期删除。 */
+  public filterAutoInjectableSections<T extends { file: string; heading: string }>(rows: readonly T[]): T[] {
+    this.refresh();
+    const active = new Set(this.chunks.filter((chunk) => allowsAutoInjection(chunk.meta))
+      .map((chunk) => `${chunk.file}\0${chunk.heading}`));
+    return rows.filter((row) => active.has(`${row.file}\0${row.heading}`));
+  }
+
   /** 会话私有笔记的标题（每个文件的一级标题，没有就用文件名），给团况注入列个目录 */
   public chatNoteTitles(chatKey: string): string[] {
     this.refresh();
@@ -1183,6 +1191,11 @@ export function formatConflictsSummary(conflicts: readonly NoteConflict[] | unde
 /** 自动注入至少要命中的不同查询词数：「哈哈」「随便」这类只撞上一个词的短消息不注入 */
 const INJECT_MIN_MATCHED_TERMS = 2;
 
+function allowsAutoInjection(meta: NoteHit['meta'], allowSuperseded = false): boolean {
+  return meta?.inject !== 'search-only' && meta?.budgetChars !== 0
+    && (allowSuperseded || meta?.status !== 'superseded');
+}
+
 /**
  * 从检索结果里挑出真正要注入的段。
  *
@@ -1196,8 +1209,7 @@ export function selectNotesForInjection(
   const allowSuperseded = options.query !== undefined && isHistoricalQuery(options.query);
   return hits
     .filter((hit) => {
-      if (hit.meta?.inject === 'search-only' || hit.meta?.budgetChars === 0) return false;
-      if (hit.meta?.status === 'superseded' && !allowSuperseded) return false;
+      if (!allowsAutoInjection(hit.meta, allowSuperseded)) return false;
       return hit.rescuedFromQualifying === true
         || (hit.operationMatches?.length ?? 0) > 0
         || (hit.triggeredBy?.length ?? 0) > 0

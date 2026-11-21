@@ -22,29 +22,32 @@ export function pickNoteStats(rows: readonly NoteStatRow[], view: NoteStatsView,
     .slice(0, n);
 }
 
-function line(row: NoteStatRow, index: number): string {
+function line(row: NoteStatRow, index: number, showMute: boolean): string {
   const relevance = row.avgRelevance === undefined ? '未评' : `均分 ${row.avgRelevance.toFixed(2)}（评 ${row.judged ?? 0} 次）`;
-  const muted = row.mutedAt === undefined ? '' : (row.mutedManually === true ? ' · 🔇手动' : ' · 🔇');
+  const muted = !showMute || row.mutedAt === undefined ? '' : (row.mutedManually === true ? ' · 🔇手动' : ' · 🔇');
   return `${index + 1}. ${relevance} · 注入 ${row.injected} 次${muted}\n   ${row.file} › ${row.heading}`;
 }
 
 const TITLES: Record<NoteStatsView, string> = {
-  low: '相关分最低',
+  low: '相关分最低（当前可自动注入）',
   top: '注入最多',
   muted: '已静音',
 };
 
 /** 概览一行 + 所选视图的清单 */
-export function renderNoteStats(rows: readonly NoteStatRow[], view: NoteStatsView, limit: number, judgeEnabled: boolean): string {
+export function renderNoteStats(
+  rows: readonly NoteStatRow[], view: NoteStatsView, limit: number, judgeEnabled: boolean,
+  lowRows: readonly NoteStatRow[],
+): string {
   const injected = rows.reduce((sum, row) => sum + row.injected, 0);
   const judged = rows.filter((row) => (row.judged ?? 0) > 0).length;
   const muted = rows.filter((row) => row.mutedAt !== undefined).length;
   const head = `📒 笔记注入账本：${rows.length} 段、共注入 ${injected} 次；已评 ${judged} 段，已静音 ${muted} 段`
     + (judgeEnabled ? '' : '\n（相关性打分没开：设置页「共享笔记 › 注入相关性打分」）');
-  const picked = pickNoteStats(rows, view, limit);
+  const picked = pickNoteStats(view === 'low' ? lowRows : rows, view, limit);
   if (picked.length === 0) {
-    const why = view === 'low' ? '还没有评过分的段' : view === 'muted' ? '没有被静音的段' : '账本是空的';
+    const why = view === 'low' ? '当前可自动注入的条目里还没有评过分的段' : view === 'muted' ? '没有被静音的段' : '账本是空的';
     return `${head}\n\n${TITLES[view]}：${why}。`;
   }
-  return `${head}\n\n${TITLES[view]}（前 ${picked.length}）：\n${picked.map(line).join('\n')}`;
+  return `${head}\n\n${TITLES[view]}（前 ${picked.length}）：\n${picked.map((row, i) => line(row, i, view !== 'low')).join('\n')}`;
 }

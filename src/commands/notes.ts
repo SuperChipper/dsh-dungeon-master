@@ -1,16 +1,16 @@
 /**
  * 笔记账本命令：/bot-notes（仅 owner/admin，仅私聊）
  *
- *   /bot-notes            相关分最低的 10 段
- *   /bot-notes top [n]    注入最多的
- *   /bot-notes muted [n]  已静音的
+ *   /bot-notes            当前可自动注入、相关分最低的 10 段
+ *   /bot-notes top [n]    历史注入最多的
+ *   /bot-notes muted [n]  账本中的静音记录
  *
  * 只在私聊里给看：清单里有各个群的私有笔记标题，发到群里等于把别的群的事贴出来。
  * 这里只查不改；静音、归档让私聊里的 agent 用 qqbot_notes_manage 做。
  */
 import type { CommandDeps, CategorizedCommand } from './types.ts';
 import { isPrivilegedSender, sendMarkdownChunked } from '../shared/index.ts';
-import { NOTE_STATS_VIEWS, renderNoteStats, type NoteStatsView } from '../features/note-stats.ts';
+import { NOTE_STATS_VIEWS, type NoteStatsView } from '../features/note-stats.ts';
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 30;
@@ -40,11 +40,10 @@ export function notesCommand({ manager, config }: CommandDeps): CategorizedComma
       return true;
     },
     handler: async (cmdCtx) => {
-      const metrics = manager.noteMetrics;
-      if (metrics === undefined) return '共享笔记库没有启用';
       const args = parseNotesArgs(cmdCtx.command?.raw ?? '');
       if (args === undefined) return '用法：/bot-notes [low|top|muted] [条数]';
-      const text = renderNoteStats(metrics.summary(Number.POSITIVE_INFINITY), args.view, args.limit, config.notes?.judge?.enabled === true);
+      const text = manager.noteStats(args.view, args.limit);
+      if (text === undefined) return '共享笔记库没有启用';
       await sendMarkdownChunked(cmdCtx, text, config.textChunkLimit);
       return { kind: 'noop' as const };
     },
