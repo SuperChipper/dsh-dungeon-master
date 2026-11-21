@@ -81,7 +81,9 @@ dnd:
 
 `dnd_check type=save targets=[…]` 一次掷公共伤害、逐人豁免并结算半伤、抗性和失败状态；每项可单独带 `bonus_dice="1d4"`，只给受到祝福的人加骰。普通 `dnd_apply targets=[{name,…}]` 可原子批量伤害、治疗、临时生命和状态；`damage_roll` / `heal_roll` 由工具统一掷一次，每人可覆盖数值或抗性，一次撤销整批回滚。`dnd_character update names=[…]` 可批量改卡。
 
-玩家预先授权「最终命中就用至圣斩」时，可传 `dnd_check on_hit={name:"至圣斩",damage:"2d8",damage_type:"光耀",spend:"1环法术位"}`：所有防守反应结束后才扣一次资源，最终未命中不扣；重击翻倍追加骰，武器与追加分别过抗性，再作为同一击扣血。`critical_only=true` 仅用于玩家明确授权「重击才用」。这不是替玩家在掷骰后选资源；同回合多次攻击、跨轮持续伤害和看到命中后再询问选择仍逐次处理。普通 `spend` 仍在掷骰前扣除。
+同回合已宣告用同一武器打同一目标 2–6 击时，可以传 `dnd_check type=attack attacks=[{},{}]`。每项独立掷命中、结算伤害并保留自己的 `#R` 和撤销点；各项可带 `damage`（有武器时是附加骰）、`damage_type`，也可用 `riders=[{damage:"1d4",damage_type:"火焰"}]` 给同一击增加一个单独算抗性的伤害类型。不要重复填已写在卡上的附伤。结果汇总已结击数、命中及伤害；遇到反应窗口、专注豁免或目标倒下就停止，剩余攻击不掷也不自动续跑。需要扣资源、手动挂反应或等玩家选择时，请逐击调用。
+
+玩家预先授权「最终命中就用至圣斩」时，可传 `dnd_check on_hit={name:"至圣斩",damage:"2d8",damage_type:"光耀",spend:"1环法术位"}`：所有防守反应结束后才扣一次资源，最终未命中不扣；重击翻倍追加骰，武器与追加分别过抗性，再作为同一击扣血。`critical_only=true` 仅用于玩家明确授权「重击才用」。这不是替玩家在掷骰后选资源，跨轮持续伤害和看到命中后再询问选择仍逐次处理。普通 `spend` 仍在掷骰前扣除。
 
 PC 的待结算反应（包括借机）必须使用真实按钮或明确短宣告生成的一次性 `authorization`，原样填入 `dnd_apply reaction.authorization` / `dnd_check authorization`；`declared_by` 只核对归属，不能代替同意。授权绑定当前窗口、角色和技能；本人改选「不用」立即撤回，排队的旧调用不会掷骰或扣资源。规则提问、纠正规则及「没有／没／算了」等含混短答不授权；不明确时继续询问。掷骰前用 `hold_for` 询问手动 PC 技能；已有窗口漏了技能，用 `dnd_apply ask_reactions=[{by,name}]` 补询问并停手，不重掷、不自动授权，也不能覆盖拒绝。旧存档中没有凭证的确认需本人重新选择。
 
@@ -150,8 +152,9 @@ PC 的待结算反应（包括借机）必须使用真实按钮或明确短宣�
 |------|------|
 | 💬 群聊 | 未 @ 时按概率或「回复欲望」打分接话；群消息落盘，重启后接得上；能看历史图片；合并消息保留各自发送者；上下文超限自动压缩；`/new` 时先压缩旧会话，把压缩摘要带进新会话（`/new blank` 完全从头） |
 | 🎭 人设 | 群聊和私聊都支持 `/persona`（或 `/人设`）按钮切换，也可用 `/persona 名字`；主人和管理员可操作。每个聊天独立选择，各人设保留自己的历史；切换前生成跨人格共同交接，接手时只补未接收的版本；`/persona 默认` 恢复对应的 `groupPrompt` / `directPrompt` |
-| 🧠 记忆 | `notes/` 下的 Markdown 笔记库，所有会话共用、按内容自动召回；`chat` 范围的笔记只在本群可见。主人私聊发 `/bot-notes` 查看注入情况 |
+| 🧠 记忆 | `notes/` 下的 Markdown 笔记库，所有会话共用、按内容自动召回；`chat` 范围的笔记只在本群可见。主人私聊发 `/bot-notes` 查看仍可自动注入的小节中相关分最低的条目；`top` 和 `muted` 保留账本历史 |
 | 😺 表情 | 按情绪自动收藏（`qqbot_save_sticker`）、按哈希匹配（`qqbot_match_sticker`）、梗图识别 skill，以及内置 Q 版透明表情制作与入库 skill（[`qqbot-sticker-maker`](./skills/qqbot-sticker-maker/SKILL.md)，支持源图网格对齐、叠影对比、局部拼接、泛洪抠图/原生 alpha 1:1 预览与原子注册） |
+| 🎨 创作 | [`qqbot-image-studio`](./skills/qqbot-image-studio/SKILL.md) 做动漫插画、头像、多图参考与局部编辑；透明表情和入库复用贴纸 skill。QQ 使用 `qqbot_image_gen`；Codex 会话仅在提供内置 `image_gen` 时使用它。把技能目录放入项目 `.agents/skills/` 或宿主配置的技能目录即可发现。 |
 | 🖼 媒体 | 图文同发（`caption`）、`deepseek-native` 原生读图、语音识别、整段视频理解与关键帧复查、音频转写、合并转发里的图片 |
 | 🔧 工具 | 以图搜图、B 站只读工具、同人图挑选、Playwright 浏览器（默认关闭，按群白名单授权）、Agent 临时目录与定期清理（`/bot-cleanup`） |
 | ⏰ 定时 | `/new` 和人设切换时自动迁移定时任务；群聊主动消息失败后补发 |
@@ -165,6 +168,7 @@ PC 的待结算反应（包括借机）必须使用真实按钮或明确短宣�
 - `allowlist` 为空时拒绝所有人（fail-closed）；`/model`、`/preset` 和审批按钮只有 `ownerOpenid` / `adminOpenids` 能操作。
 - **按会话限制工具**（`toolAccess`，默认开启）：主人私聊和白名单会话不受限；其他 QQ 会话不给终端和子 agent，文件工具只能碰 media、表情库、临时目录和 `toolAccess.readRoots`。本机会话（Web/Desktop）不受影响。
 - 主人在私聊里说「给 XX 群开终端」即可加白名单；在群里只能发起申请，由主人本人点按钮同意。
+- **仅给本群开生图**：先在「图片生成 (GPT Image)」启用生图并配置 `ownerOpenid`。群里说「申请给本群开生图」，Agent 调用 `qqbot_image_gen_access(action="grant")` 发本群审批卡，10 分钟内仅主人点击同意有效。也支持 `status` 和 `revoke`；主人私聊可指定目标群直接管理。审批只保存 `imageGen.allowedGroups`，不授予终端、文件或浏览器权限；若已开启全群生图或该群原有完全权限，移出专用名单不取消那些来源。
 - `fileAccess.sensitivePaths` 里的路径对受限会话一律拦（即使在 `readRoots` 里）；白名单会话有终端，不拦。关掉 `toolAccess` 后对所有 QQ 会话都拦。
 - B 站登录和字幕仅限私聊主人/管理员；以图搜图会把图片上传到第三方服务，只在用户明确问出处时才调用。
 

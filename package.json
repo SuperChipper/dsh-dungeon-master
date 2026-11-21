@@ -24,6 +24,7 @@
     "skills/dnd-module-authoring",
     "!skills/dnd-module-authoring/scripts/**",
     "skills/dnd-rule-extension",
+    "skills/qqbot-image-studio/SKILL.md",
     "skills/qqbot-sticker-maker",
     "!skills/qqbot-sticker-maker/resources/**/*.jpg",
     "!skills/qqbot-sticker-maker/resources/**/*.png",
