@@ -292,6 +292,20 @@ describe.runIf(hasFfmpeg())('qqbot_describe_video with real ffmpeg', () => {
     } finally { vi.unstubAllEnvs(); }
   }, 30_000);
 
+  it('directEnabled=false 时跳过整段视频直传，直接抽帧宫格分析', async () => {
+    vi.stubEnv('OPENCODE_GO_API_KEY', 'test');
+    const fetchMock = vi.fn(async () => new Response('should not call direct video endpoint', { status: 500 }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const { tool } = await register({ ...asr, enabled: false }, { ...video, directEnabled: false });
+      const out = await tool!.execute({ video: clip }, { signal: new AbortController().signal });
+      expect(out).toMatchObject({ mode: 'frames', frames: 3 });
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('aborted execution does not start media/model work', async () => {
     const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
     const { tool } = await register();

@@ -11,7 +11,7 @@
  * 音频来源：优先 QQ 网关给的 voice_wav_url（已是 WAV），否则下载 url 的 SILK 并用 silk-wasm 解码成 WAV。
  */
 import { decode, isSilk, isWav } from 'silk-wasm';
-import { chatEndpointFromEnv, transcribeViaChat } from './chat-gateway.ts';
+import { chatEndpointFromConfig, resolveOptionalKey, transcribeViaChat } from './chat-gateway.ts';
 import type { AsrConfig } from '../config.ts';
 import type { Logger, RawAttachment } from '../types.ts';
 import { fetchSafe } from '../transport/attachment.ts';
@@ -104,6 +104,7 @@ export function isConnectionError(err: unknown): boolean {
 interface AsrEndpoint {
   baseUrl: string;
   apiKey: string;
+  apiKeyEnv?: string;
   model: string;
   timeoutMs: number;
 }
@@ -116,9 +117,18 @@ class AsrServerError extends Error {
   }
 }
 
-/** 读取接口密钥（配置为空时退到环境变量） */
-function resolveApiKey(endpoint: AsrEndpoint): string {
-  return endpoint.apiKey || process.env.QQBOT_ASR_API_KEY || '';
+/** 读取接口密钥（配置直填 > apiKeyEnv 凭证/环境变量 > 默认环境变量；免鉴权本机服务允许空串） */
+async function resolveApiKey(endpoint: AsrEndpoint, isFallback = false): Promise<string> {
+  const direct = endpoint.apiKey?.trim();
+  if (direct) return direct;
+  const explicitRef = endpoint.apiKeyEnv?.trim();
+  if (explicitRef) return (await resolveOptionalKey(explicitRef)) ?? '';
+  if (isFallback) {
+    return (await resolveOptionalKey('QQBOT_ASR_FALLBACK_API_KEY'))
+      ?? (await resolveOptionalKey('QQBOT_ASR_API_KEY'))
+      ?? '';
+  }
+  return (await resolveOptionalKey('QQBOT_ASR_API_KEY')) ?? '';
 }
 
 /** 取消不能被当成服务故障，否则会向备用接口重复发送同一段音频。 */
@@ -127,20 +137,32 @@ function rethrowCancellation(err: unknown, signal?: AbortSignal): void {
   if (err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError')) throw err;
 }
 
+export interface TranscribeBufferOptions {
+  prompt?: string;
+  language?: string;
+  /** chat 模式未传 prompt 时的默认提示词（入站语音走 SPEECH_PROMPT，qqbot_transcribe 默认保留时间轴） */
+  defaultChatPrompt?: string;
+}
+
 /** 调用一个 OpenAI 兼容转写接口；连不上时抛 AsrOfflineError，5xx 抛 AsrServerError */
 async function postTranscription(
   audio: { data: Buffer; name: string },
   endpoint: AsrEndpoint,
   signal?: AbortSignal,
+  isFallback = false,
+  opts: { prompt?: string; language?: string } = {},
 ): Promise<string> {
+  signal?.throwIfAborted();
+  const apiKey = await resolveApiKey(endpoint, isFallback);
   signal?.throwIfAborted();
   const timeoutSignal = AbortSignal.timeout(endpoint.timeoutMs);
   const requestSignal = signal === undefined ? timeoutSignal : AbortSignal.any([timeoutSignal, signal]);
   const form = new FormData();
   form.append('file', new Blob([new Uint8Array(audio.data)]), audio.name);
   form.append('model', endpoint.model);
+  if (opts.prompt) form.append('prompt', opts.prompt);
+  if (opts.language) form.append('language', opts.language);
 
-  const apiKey = resolveApiKey(endpoint);
   let resp: Response;
   try {
     resp = await fetch(`${endpoint.baseUrl.replace(/\/+$/, '')}/audio/transcriptions`, {
@@ -166,7 +188,60 @@ async function postTranscription(
 }
 
 /**
- * 转写：`chat` 协议走订阅网关，`openai` 协议走 /audio/transcriptions（原有行为）。
+ * 音频块转写核心：同时返回转写文本与实际命中的模型名（含 fallback 切换）。
+ * `chat` 协议优先读 config.asr.chat*，缺省回落 env / opencode-go；`openai` 协议走 /audio/transcriptions。
+ */
+export async function transcribeAudioBuffer(
+  audio: { data: Buffer; name: string },
+  asr: AsrConfig,
+  logger?: Logger,
+  signal?: AbortSignal,
+  options: TranscribeBufferOptions = {},
+): Promise<{ text: string; model: string }> {
+  signal?.throwIfAborted();
+  const prompt = options.prompt?.trim() || undefined;
+  const language = options.language?.trim() || undefined;
+
+  if (asr.mode === 'chat') {
+    const endpoint = chatEndpointFromConfig(asr);
+    try {
+      const text = await transcribeViaChat(audio.data, chatFormatOf(audio.name), {
+        prompt: prompt ?? options.defaultChatPrompt,
+        language,
+        endpoint,
+        timeoutMs: asr.timeoutMs,
+        logger,
+        signal,
+      });
+      return { text, model: endpoint.model };
+    } catch (err) {
+      rethrowCancellation(err, signal);
+      if (isConnectionError(err)) throw new AsrOfflineError(endpoint.baseUrl, err);
+      const fallback = asr.fallback;
+      if (fallback?.enabled !== true) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      logger?.info(`im-qqbot: ASR chat 网关不可用（${reason}），改用备用接口 ${fallback.baseUrl}`);
+      const text = await postTranscription(audio, fallback, signal, true, { prompt, language });
+      return { text, model: fallback.model };
+    }
+  }
+
+  try {
+    const text = await postTranscription(audio, asr, signal, false, { prompt, language });
+    return { text, model: asr.model };
+  } catch (err) {
+    rethrowCancellation(err, signal);
+    const fallback = asr.fallback;
+    const switchable = err instanceof AsrOfflineError || err instanceof AsrServerError;
+    if (!switchable || fallback === undefined || !fallback.enabled) throw err;
+    logger?.info(`im-qqbot: ASR 主接口不可用（${err.message}），改用备用接口 ${fallback.baseUrl}`);
+    const text = await postTranscription(audio, fallback, signal, true, { prompt, language });
+    return { text, model: fallback.model };
+  }
+}
+
+/**
+ * 转写：`chat` 协议走配置或订阅网关，`openai` 协议走 /audio/transcriptions（原有行为）。
  * 两种协议都在连不上或 5xx 时改走 `fallback`（fallback 永远是 openai 协议）。
  * 超时不切换：长音频本来就要时间，再发一遍只会更久。
  */
@@ -176,38 +251,8 @@ export async function requestTranscription(
   logger?: Logger,
   signal?: AbortSignal,
 ): Promise<string> {
-  signal?.throwIfAborted();
-  if (asr.mode === 'chat') {
-    const endpoint = chatEndpointFromEnv();
-    try {
-      return await transcribeViaChat(audio.data, chatFormatOf(audio.name), {
-        prompt: SPEECH_PROMPT,
-        endpoint,
-        timeoutMs: asr.timeoutMs,
-        logger,
-        signal,
-      });
-    } catch (err) {
-      rethrowCancellation(err, signal);
-      if (isConnectionError(err)) throw new AsrOfflineError(endpoint.baseUrl, err);
-      const fallback = asr.fallback;
-      if (fallback?.enabled !== true) throw err;
-      const reason = err instanceof Error ? err.message : String(err);
-      logger?.info(`im-qqbot: ASR chat 网关不可用（${reason}），改用备用接口 ${fallback.baseUrl}`);
-      return postTranscription(audio, fallback, signal);
-    }
-  }
-
-  try {
-    return await postTranscription(audio, asr, signal);
-  } catch (err) {
-    rethrowCancellation(err, signal);
-    const fallback = asr.fallback;
-    const switchable = err instanceof AsrOfflineError || err instanceof AsrServerError;
-    if (!switchable || fallback === undefined || !fallback.enabled) throw err;
-    logger?.info(`im-qqbot: ASR 主接口不可用（${err.message}），改用备用接口 ${fallback.baseUrl}`);
-    return postTranscription(audio, fallback, signal);
-  }
+  const result = await transcribeAudioBuffer(audio, asr, logger, signal, { defaultChatPrompt: SPEECH_PROMPT });
+  return result.text;
 }
 
 /**
@@ -217,19 +262,21 @@ export async function transcribeVoice(
   att: RawAttachment,
   asr: AsrConfig,
   logger: Logger,
+  signal?: AbortSignal,
 ): Promise<VoiceTranscript | { offline: true } | undefined> {
   const wavUrl = typeof att.voice_wav_url === 'string' ? att.voice_wav_url : '';
   const url = wavUrl || att.url;
-  if (!url) return undefined;
+  if (!url || signal?.aborted) return undefined;
 
   try {
-    const bytes = await fetchSafe(url, MAX_VOICE_BYTES);
+    const bytes = await fetchSafe(url, MAX_VOICE_BYTES, { signal });
     const audio = await toUploadableAudio(bytes, att.filename);
-    const text = await requestTranscription(audio, asr, logger);
+    const text = await requestTranscription(audio, asr, logger, signal);
     if (!text) return undefined;
     logger.debug(`im-qqbot: voice transcribed (${text.length} chars): ${att.filename}`);
     return { text, duration: audio.duration };
   } catch (err) {
+    if (signal?.aborted) throw err;
     logger.warn(`im-qqbot: voice transcription failed: ${att.filename} — ${err instanceof Error ? err.message : String(err)}`);
     return err instanceof AsrOfflineError ? { offline: true } : undefined;
   }

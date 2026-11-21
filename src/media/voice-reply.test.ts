@@ -9,7 +9,8 @@ import { captionFromArgs } from '../transport/caption-echo.ts';
 
 interface Definition {
   name: string;
-  parameters?: { properties?: Record<string, { enum?: string[] }> };
+  description?: string;
+  parameters?: { properties?: Record<string, { enum?: string[]; description?: string }> };
   output: { render(args: unknown, value: unknown): Array<{ type: string; text?: string }> };
 }
 
@@ -40,6 +41,16 @@ describe('voice reply delivery guidance', () => {
     const definition = tools().get('qqbot_speak')!;
     const lang = definition.parameters?.properties?.lang;
     expect(lang?.enum).toEqual(['zh', 'ja', 'en']);
+  });
+
+  it('speak 工具描述与 text 参数说明覆盖大喊/念白/配音等触发词且禁止括号动作描写', () => {
+    const definition = tools().get('qqbot_speak')!;
+    for (const cue of ['大喊', '念', '朗读', '发语音', '配音']) {
+      expect(definition.description).toContain(cue);
+    }
+    const textDesc = definition.parameters?.properties?.text?.description ?? '';
+    expect(textDesc).toContain('（大声喊）');
+    expect(textDesc).toContain('NEVER include');
   });
 
   it.each(['song.mp3', 'VOICE.WAV', 'clip.silk'])('send_file 发语音 %s 不把被忽略的 caption 报成已送达', (fileName) => {

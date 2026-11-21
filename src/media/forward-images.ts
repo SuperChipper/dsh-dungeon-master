@@ -53,7 +53,9 @@ export async function downloadForwardImages(
   logger: Logger,
   limit: number = MAX_FORWARD_IMAGES,
   downloader?: Parameters<typeof downloadRecentHistoryImages>[4],
+  signal?: AbortSignal,
 ): Promise<void> {
+  if (signal?.aborted) return;
   const targets: HistoryImage[] = images.slice(0, Math.max(0, limit)).map((image, i) => ({
     index: i + 1,
     messageId: 'forward',
@@ -61,7 +63,7 @@ export async function downloadForwardImages(
     filename: image.filename || `forward_${i + 1}.jpg`,
   }));
   if (targets.length === 0) return;
-  await downloadRecentHistoryImages(targets, media, logger, targets.length, downloader);
+  await downloadRecentHistoryImages(targets, media, logger, targets.length, downloader, signal);
   targets.forEach((target, i) => {
     if (target.localPath !== undefined) images[i]!.localPath = target.localPath;
   });

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   chatCompletion,
+  chatEndpointFromConfig,
   describeVideoViaChat,
   setChatKeyResolver,
   transcribeViaChat,
+  videoEndpointFromConfig,
   videoEndpointFromEnv,
 } from './chat-gateway.ts';
 
@@ -19,6 +21,7 @@ function stubFetch(content: string | null, status = 200, finishReason?: string) 
 afterEach(() => {
   setChatKeyResolver(undefined);
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   delete process.env.QQBOT_VIDEO_MODEL;
 });
 
@@ -184,5 +187,66 @@ describe('transcribeViaChat', () => {
     const body = JSON.parse((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
     expect(body.messages[0].content[0].input_audio.format).toBe('mp3');
     expect(body.messages[0].content[1].text).toContain('ja');
+  });
+});
+
+describe('多模态端点解耦与兼容性', () => {
+  it('chatEndpointFromConfig / videoEndpointFromConfig 按 配置 > 环境变量 > 默认值 优先级解析', () => {
+    vi.stubEnv('QQBOT_TRANSCRIBE_BASE_URL', 'https://env-chat.example/v1/');
+    vi.stubEnv('QQBOT_TRANSCRIBE_MODEL', 'env-chat-model');
+    vi.stubEnv('QQBOT_TRANSCRIBE_KEY_REF', 'ENV_CHAT_KEY');
+    vi.stubEnv('QQBOT_VIDEO_MODEL', 'env-vid-model');
+
+    const chatFromEnv = chatEndpointFromConfig();
+    expect(chatFromEnv).toMatchObject({
+      baseUrl: 'https://env-chat.example/v1',
+      model: 'env-chat-model',
+      keyRef: 'ENV_CHAT_KEY',
+      reasoningEffort: 'none',
+    });
+
+    const vidInheritChat = videoEndpointFromConfig(
+      { enabled: true },
+      { chatBaseUrl: 'https://cfg-chat.example/v1/', chatModel: 'cfg-omni', chatApiKeyEnv: 'CFG_KEY', chatApiKey: 'sk-direct' },
+    );
+    expect(vidInheritChat).toMatchObject({
+      baseUrl: 'https://cfg-chat.example/v1',
+      model: 'env-vid-model',
+      keyRef: 'CFG_KEY',
+      apiKey: 'sk-direct',
+    });
+
+    const vidOverride = videoEndpointFromConfig(
+      { baseUrl: 'https://vid-only.example/v1/', model: 'vid-m', apiKeyEnv: 'VID_KEY', reasoningEffort: 'omit' },
+      { chatBaseUrl: 'https://cfg-chat.example/v1/', chatModel: 'cfg-omni', chatApiKeyEnv: 'CFG_KEY' },
+    );
+    expect(vidOverride).toMatchObject({
+      baseUrl: 'https://vid-only.example/v1',
+      model: 'vid-m',
+      keyRef: 'VID_KEY',
+      reasoningEffort: 'omit',
+    });
+  });
+
+  it('第三方网关不发送 x-opencode-session 和 opencode user-agent，reasoningEffort=omit 时不传该字段', async () => {
+    const fetchMock = stubFetch('ok');
+    await chatCompletion([{ type: 'text', text: 'hi' }], {
+      endpoint: {
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+        model: 'gemini-2.5-flash',
+        keyRef: 'UNUSED',
+        apiKey: 'sk-custom-direct',
+        reasoningEffort: 'omit',
+      },
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions');
+    const headers = init.headers as Record<string, string>;
+    expect(headers.authorization).toBe('Bearer sk-custom-direct');
+    expect(headers['x-opencode-session']).toBeUndefined();
+    expect(headers['user-agent']).toBeUndefined();
+    const body = JSON.parse(init.body as string);
+    expect('reasoning_effort' in body).toBe(false);
   });
 });

@@ -34,6 +34,7 @@ async function closedPortUrl(): Promise<string> {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe('toUploadableAudio', () => {
@@ -120,6 +121,47 @@ describe('requestTranscription', () => {
   it('throws on HTTP errors', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('bad key', { status: 401 })));
     await expect(requestTranscription({ data: Buffer.from(''), name: 'v.wav' }, asr)).rejects.toThrow('HTTP 401');
+  });
+
+  it('openai 协议支持通过 apiKeyEnv 指定独立环境变量', async () => {
+    vi.stubEnv('CUSTOM_GROQ_KEY', 'sk-groq-123');
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ text: 'groq ok' })));
+    vi.stubGlobal('fetch', fetchMock);
+    const text = await requestTranscription(
+      { data: Buffer.from('RIFF'), name: 'v.wav' },
+      { ...asr, apiKey: '', apiKeyEnv: 'CUSTOM_GROQ_KEY', model: 'whisper-large-v3' },
+    );
+    expect(text).toBe('groq ok');
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(init.headers).toEqual({ Authorization: 'Bearer sk-groq-123' });
+  });
+
+  it('chat 协议优先使用 chatBaseUrl / chatModel / chatApiKey', async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ choices: [{ message: { content: '自定义网关结果' } }] }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+    const text = await requestTranscription(
+      { data: Buffer.from('RIFF'), name: 'voice.wav' },
+      {
+        ...asr,
+        mode: 'chat',
+        chatBaseUrl: 'https://my-omni.example/v1',
+        chatModel: 'qwen-omni',
+        chatApiKey: 'sk-omni',
+        chatReasoningEffort: 'omit',
+      },
+    );
+    expect(text).toBe('自定义网关结果');
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://my-omni.example/v1/chat/completions');
+    const headers = init.headers as Record<string, string>;
+    expect(headers.authorization).toBe('Bearer sk-omni');
+    expect(headers['x-opencode-session']).toBeUndefined();
+    const body = JSON.parse(init.body as string);
+    expect(body.model).toBe('qwen-omni');
+    expect('reasoning_effort' in body).toBe(false);
   });
 });
 

@@ -1,6 +1,7 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Context } from '@deepseek-ai/cordis';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // transcribe-tool 在模块顶层 promisify(execFile)，所以必须在 import 之前 mock
@@ -29,7 +30,7 @@ function stubMediaBinaries(duration = '115.0'): void {
   }) as never);
 }
 
-function register(): ToolDef {
+function register(asr?: Parameters<typeof registerTranscribeTool>[2], ffmpegBins?: Parameters<typeof registerTranscribeTool>[3]): ToolDef {
   const registered: ToolDef[] = [];
   registerTranscribeTool({
     get: (name: string) => {
@@ -37,7 +38,7 @@ function register(): ToolDef {
       if (name === 'credentials') return { resolve: async () => ({ value: 'test-key' }) };
       return undefined;
     },
-  } as never, logger as never);
+  } as never, logger as never, asr, ffmpegBins);
   return registered[0]!;
 }
 
@@ -67,6 +68,48 @@ describe('qqbot_transcribe', () => {
     stubMediaBinaries();
     const tool = register();
     expect(tool.name).toBe(TRANSCRIBE_TOOL_NAME);
+  });
+
+  it('凭证服务晚于工具注册启动，转写时仍能读取；服务卸载后回退环境变量', async () => {
+    vi.stubEnv('QQBOT_TRANSCRIBE_KEY_REF', undefined);
+    vi.stubEnv('OPENCODE_GO_API_KEY', undefined);
+    stubMediaBinaries();
+    const fetchMock = stubFetch('0.00-1.00 | SPEAKER_00: 测试');
+    const ctx = new Context();
+    const registered: ToolDef[] = [];
+    ctx.provide('tools', { register: (def: ToolDef) => registered.push(def) });
+    try {
+      expect(ctx.get('credentials')).toBeUndefined();
+      registerTranscribeTool(ctx, logger);
+      const tool = registered[0]!;
+      const args = { file: sourceFile() };
+      await expect(tool.execute(args)).rejects.toThrow(/未配置多模态凭证 OPENCODE_GO_API_KEY/);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      const resolve = vi.fn(async () => ({ value: 'test-late-credential' }));
+      const provider = ctx.plugin({
+        apply(providerCtx: Context) {
+          providerCtx.provide('credentials', { resolve });
+        },
+      });
+      await provider;
+      await expect(tool.execute(args)).resolves.toMatchObject({ chunks: 1 });
+      expect(resolve).toHaveBeenCalledExactlyOnceWith('OPENCODE_GO_API_KEY');
+      expect(fetchMock).toHaveBeenLastCalledWith(expect.any(String), expect.objectContaining({
+        headers: expect.objectContaining({ authorization: 'Bearer test-late-credential' }),
+      }));
+
+      await provider.dispose();
+      vi.stubEnv('OPENCODE_GO_API_KEY', 'test-env-fallback');
+      await expect(tool.execute(args)).resolves.toMatchObject({ chunks: 1 });
+      expect(resolve).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenLastCalledWith(expect.any(String), expect.objectContaining({
+        headers: expect.objectContaining({ authorization: 'Bearer test-env-fallback' }),
+      }));
+    } finally {
+      await ctx.fiber.dispose();
+      vi.unstubAllEnvs();
+    }
   });
 
   it('file 为空或文件不存在时直接报错，不发请求', async () => {
@@ -130,5 +173,57 @@ describe('qqbot_transcribe', () => {
 
     await expect(tool.execute({ file: sourceFile() })).rejects.toThrow(/没抽出音轨/);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('跟随 config.asr：mode=openai 时走 /audio/transcriptions 并透传 model/language', async () => {
+    stubMediaBinaries();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ text: 'hello from whisper' }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const tool = register({
+      enabled: true,
+      mode: 'openai',
+      baseUrl: 'https://asr.example.com/v1',
+      apiKey: 'sk-asr-openai',
+      model: 'whisper-large-v3',
+      preferQQ: true,
+      timeoutMs: 10000,
+    });
+
+    const out = await tool.execute({ file: sourceFile(), language: 'en', prompt: 'keep names' } as unknown);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://asr.example.com/v1/audio/transcriptions');
+    expect(init.headers).toEqual({ Authorization: 'Bearer sk-asr-openai' });
+    const form = init.body as FormData;
+    expect(form.get('model')).toBe('whisper-large-v3');
+    expect(form.get('language')).toBe('en');
+    expect(form.get('prompt')).toBe('keep names');
+    expect(out.model).toBe('whisper-large-v3');
+    expect(out.text).toBe('hello from whisper');
+  });
+
+  it('跟随 config.asr：mode=chat 可换自定义网关与模型', async () => {
+    stubMediaBinaries();
+    const fetchMock = stubFetch('0.00-3.00 | SPEAKER_00: 自定义 chat 网关');
+    const tool = register({
+      enabled: true,
+      mode: 'chat',
+      baseUrl: 'https://unused.example/v1',
+      apiKey: '',
+      model: 'unused',
+      chatBaseUrl: 'https://custom-chat.example/v1',
+      chatModel: 'gemini-2.5-flash',
+      chatApiKey: 'sk-custom',
+      chatReasoningEffort: 'omit',
+      preferQQ: true,
+      timeoutMs: 10000,
+    });
+
+    const out = await tool.execute({ file: sourceFile() });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://custom-chat.example/v1/chat/completions');
+    expect((init.headers as Record<string, string>).authorization).toBe('Bearer sk-custom');
+    expect(JSON.parse(init.body as string).model).toBe('gemini-2.5-flash');
+    expect(out.model).toBe('gemini-2.5-flash');
+    expect(out.text).toContain('自定义 chat 网关');
   });
 });

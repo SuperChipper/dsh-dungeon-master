@@ -13,42 +13,54 @@ import type { Logger, ProcessedAttachment, QuotedAttachment, RawAttachment } fro
 
 export function attachmentProcessor(config: ImQQBotConfig, logger: Logger) {
   return async (ctx: MiddlewareContext, next: () => Promise<void>): Promise<void> => {
-    const msg = ctx.message as { content?: string; attachments?: RawAttachment[] };
-
-    try {
-      // 当前消息附件
-      const downloaded = await downloadMediaAttachments(msg.attachments, config.media, logger);
-      ctx.state.downloadedFiles = downloaded;
-
-      if (config.asr.enabled) {
-        ctx.state.processedAttachments = await transcribeVoices(msg.attachments, config.asr, logger);
-      }
-
-      // 引用消息附件：转成 RawAttachment 结构复用下载（voice 由 downloadMediaAttachments 自动跳过）
-      const quoteAttachments = (ctx.state as { quote?: { attachments?: QuotedAttachment[] } }).quote?.attachments;
-      if (quoteAttachments && quoteAttachments.length > 0) {
-        const rawQuote = quoteAttachments
-          .filter(a => a.url)
-          .map((a): RawAttachment => ({
-            content_type: a.contentType ?? '',
-            filename: a.filename ?? '',
-            size: 0,
-            url: a.url as string,
-          }));
-        const downloadedQuote = await downloadMediaAttachments(rawQuote, config.media, logger);
-        ctx.state.downloadedQuoteFiles = downloadedQuote;
-      }
-
-      // 合并转发（聊天记录）里的图片只以 URL 文本出现在 content / 引用原文里，单独提取下载
-      const quote = (ctx.state as { quote?: { text?: string; entry?: { content?: string } } }).quote;
-      const forwardImages = extractForwardImages(msg.content, quote?.text || quote?.entry?.content);
-      if (forwardImages.length > 0) {
-        await downloadForwardImages(forwardImages, config.media, logger);
-        ctx.state.forwardImages = forwardImages;
-      }
-    } catch (err) {
-      logger.warn(`im-qqbot: attachment download failed: ${err instanceof Error ? err.message : String(err)}`);
+    const signal = (ctx as { signal?: AbortSignal }).signal;
+    if (signal?.aborted) {
+      await next();
+      return;
     }
+    const msg = ctx.message as { content?: string; attachments?: RawAttachment[] };
+    const quote = (ctx.state as { quote?: { text?: string; entry?: { content?: string }; attachments?: QuotedAttachment[] } }).quote;
+    const quoteAttachments = quote?.attachments;
+    const forwardImages = extractForwardImages(msg.content, quote?.text || quote?.entry?.content);
+
+    await Promise.all([
+      downloadMediaAttachments(msg.attachments, config.media, logger, signal)
+        .then((downloaded) => { ctx.state.downloadedFiles = downloaded; })
+        .catch((err: unknown) => {
+          if (!signal?.aborted) logger.warn(`im-qqbot: attachment download failed: ${err instanceof Error ? err.message : String(err)}`);
+        }),
+      config.asr.enabled
+        ? transcribeVoices(msg.attachments, config.asr, logger, transcribeVoice, signal)
+            .then((processed) => { ctx.state.processedAttachments = processed; })
+            .catch((err: unknown) => {
+              if (!signal?.aborted) logger.warn(`im-qqbot: voice transcription failed: ${err instanceof Error ? err.message : String(err)}`);
+            })
+        : Promise.resolve(),
+      quoteAttachments && quoteAttachments.length > 0
+        ? (() => {
+            const rawQuote = quoteAttachments
+              .filter(a => a.url)
+              .map((a): RawAttachment => ({
+                content_type: a.contentType ?? '',
+                filename: a.filename ?? '',
+                size: 0,
+                url: a.url as string,
+              }));
+            return downloadMediaAttachments(rawQuote, config.media, logger, signal)
+              .then((downloadedQuote) => { ctx.state.downloadedQuoteFiles = downloadedQuote; })
+              .catch((err: unknown) => {
+                if (!signal?.aborted) logger.warn(`im-qqbot: quote attachment download failed: ${err instanceof Error ? err.message : String(err)}`);
+              });
+          })()
+        : Promise.resolve(),
+      forwardImages.length > 0
+        ? downloadForwardImages(forwardImages, config.media, logger, undefined, undefined, signal)
+            .then(() => { ctx.state.forwardImages = forwardImages; })
+            .catch((err: unknown) => {
+              if (!signal?.aborted) logger.warn(`im-qqbot: forward image download failed: ${err instanceof Error ? err.message : String(err)}`);
+            })
+        : Promise.resolve(),
+    ]);
 
     await next();
   };
@@ -63,16 +75,18 @@ export async function transcribeVoices(
   asr: AsrConfig,
   logger: Logger,
   transcribe: typeof transcribeVoice = transcribeVoice,
+  signal?: AbortSignal,
 ): Promise<ProcessedAttachment[]> {
   const results: ProcessedAttachment[] = [];
   for (const att of attachments ?? []) {
+    if (signal?.aborted) break;
     if (classifyContentType(att.content_type) !== 'voice') continue;
     const qqText = att.asr_refer_text?.trim();
     if (qqText && asr.preferQQ) {
       results.push({ type: 'voice', filename: att.filename, url: att.url, voiceText: qqText, voiceSource: 'asr' });
       continue;
     }
-    const transcript = await transcribe(att, asr, logger);
+    const transcript = await transcribe(att, asr, logger, signal);
     if (transcript && 'text' in transcript) {
       results.push({
         type: 'voice',

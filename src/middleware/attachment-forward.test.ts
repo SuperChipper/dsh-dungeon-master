@@ -48,4 +48,30 @@ describe('attachmentProcessor 合并转发图片', () => {
     await attachmentProcessor(config, logger)(ctx, async () => {});
     expect(ctx.state.forwardImages).toBeUndefined();
   });
+
+  it('向下载器透传 ctx.signal；signal 已中止时跳过下载直接放行 next', async () => {
+    const { downloadMediaAttachments } = await import('../transport/attachment.ts');
+    vi.mocked(downloadMediaAttachments).mockClear();
+
+    const ac = new AbortController();
+    const activeCtx = {
+      message: { content: '图', attachments: [{ content_type: 'image/png', filename: 'p.png', size: 10, url: 'https://x/p.png' }] },
+      state: {},
+      signal: ac.signal,
+    } as unknown as MiddlewareContext;
+    await attachmentProcessor(config, logger)(activeCtx, async () => {});
+    expect(downloadMediaAttachments).toHaveBeenCalledWith(expect.any(Array), config.media, logger, ac.signal);
+
+    vi.mocked(downloadMediaAttachments).mockClear();
+    ac.abort();
+    const abortedNext = vi.fn(async () => {});
+    const abortedCtx = {
+      message: { content: '图', attachments: [{ content_type: 'image/png', filename: 'p.png', size: 10, url: 'https://x/p.png' }] },
+      state: {},
+      signal: ac.signal,
+    } as unknown as MiddlewareContext;
+    await attachmentProcessor(config, logger)(abortedCtx, abortedNext);
+    expect(downloadMediaAttachments).not.toHaveBeenCalled();
+    expect(abortedNext).toHaveBeenCalledOnce();
+  });
 });

@@ -17,8 +17,10 @@ import { sniffImageMediaType } from '../media/native-image.ts';
 
 /** 默认富媒体下载大小上限（MB），可被 media.maxMB 覆盖 */
 const DEFAULT_MAX_MB = 200;
-/** 下载超时（毫秒） */
-const DOWNLOAD_TIMEOUT_MS = 120_000;
+/** 下载超时（毫秒）：限制单附件网络阻塞窗口 */
+const DOWNLOAD_TIMEOUT_MS = 30_000;
+/** 多附件并发下载上限，避免单条多图消息串行累加耗时 */
+const DOWNLOAD_CONCURRENCY = 4;
 
 /** 下载结果 */
 export interface DownloadedFile {
@@ -142,18 +144,29 @@ async function assertSafeHostname(hostname: string): Promise<void> {
   }
 }
 
-/** 安全拉取：仅 HTTPS + SSRF 防护 + 大小上限 + 超时，返回字节 */
-export async function fetchSafe(url: string, maxBytes: number): Promise<Buffer> {
+/** 安全拉取：仅 HTTPS + SSRF 防护 + 大小上限 + 超时（支持外部 AbortSignal 联动取消），返回字节 */
+export async function fetchSafe(
+  url: string,
+  maxBytes: number,
+  options?: { signal?: AbortSignal; timeoutMs?: number },
+): Promise<Buffer> {
+  options?.signal?.throwIfAborted();
   const parsed = new URL(normalizeUrl(url));
   if (parsed.protocol !== 'https:') {
     throw new Error(`Only HTTPS allowed: ${parsed.protocol}`);
   }
   await assertSafeHostname(parsed.hostname);
+  options?.signal?.throwIfAborted();
 
-  const resp = await fetch(parsed, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+  const timeoutSignal = AbortSignal.timeout(options?.timeoutMs ?? DOWNLOAD_TIMEOUT_MS);
+  const requestSignal = options?.signal === undefined
+    ? timeoutSignal
+    : AbortSignal.any([timeoutSignal, options.signal]);
+  const resp = await fetch(parsed, { signal: requestSignal });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
   const buf = Buffer.from(await resp.arrayBuffer());
+  options?.signal?.throwIfAborted();
   if (buf.length > maxBytes) {
     throw new Error(`Download exceeds ${Math.floor(maxBytes / 1024 / 1024)}MB`);
   }
@@ -164,14 +177,15 @@ export async function fetchSafe(url: string, maxBytes: number): Promise<Buffer> 
  * 下载消息中的富媒体附件（image/video/file）到本地
  *
  * 下载目录固定为 ~/.dsh-qqbot/media，文件名用时间戳+随机数防重名。
- * 下载失败不阻断（由调用方回退描述）。
+ * 下载失败或被取消时不阻断（由调用方回退描述）。
  */
 export async function downloadMediaAttachments(
   attachments: RawAttachment[] | undefined,
   media: MediaConfig,
   logger: Logger,
+  signal?: AbortSignal,
 ): Promise<DownloadedFile[]> {
-  if (!media.enabled) return [];
+  if (!media.enabled || signal?.aborted) return [];
 
   const targets = (attachments ?? []).filter(a =>
     classifyContentType(a.content_type) !== 'voice' && a.url,
@@ -181,31 +195,41 @@ export async function downloadMediaAttachments(
   mkdirSync(MEDIA_ROOT, { recursive: true });
 
   const maxBytes = (media.maxMB ?? DEFAULT_MAX_MB) * 1024 * 1024;
+  const slots: Array<DownloadedFile | undefined> = new Array(targets.length);
+  let cursor = 0;
 
-  const results: DownloadedFile[] = [];
-  for (const att of targets) {
-    const contentType = classifyContentType(att.content_type) as 'image' | 'video' | 'file';
+  const worker = async (): Promise<void> => {
+    while (cursor < targets.length) {
+      if (signal?.aborted) return;
+      const idx = cursor++;
+      const att = targets[idx]!;
+      const contentType = classifyContentType(att.content_type) as 'image' | 'video' | 'file';
 
-    if (att.size > maxBytes) {
-      logger.debug(`im-qqbot: skip download (${att.size}B too large): ${att.filename}`);
-      continue; // 超限不下载，由 buildDynamicCtx 回退为描述
+      if (att.size > maxBytes) {
+        logger.debug(`im-qqbot: skip download (${att.size}B too large): ${att.filename}`);
+        continue; // 超限不下载，由 buildDynamicCtx 回退为描述
+      }
+
+      let buf: Buffer;
+      try {
+        buf = await fetchSafe(att.url, maxBytes, { signal });
+      } catch (err) {
+        if (signal?.aborted) return;
+        logger.warn(`im-qqbot: download failed: ${att.filename} — ${err instanceof Error ? err.message : String(err)}`);
+        continue; // 下载失败不加入结果，由 buildDynamicCtx 回退为描述
+      }
+
+      // 扩展名按内容定，不用 QQ 给的（它常把 GIF 也叫 .jpg）
+      const localPath = toPosixPath(join(MEDIA_ROOT, uniqueFilename(withSniffedExtension(att.filename, buf))));
+      writeFileSync(localPath, buf);
+      logger.debug(`im-qqbot: attachment downloaded: ${att.filename} (${formatSize(buf.length)}) → ${localPath}`);
+
+      slots[idx] = { filename: att.filename, contentType, localPath };
     }
+  };
 
-    let buf: Buffer;
-    try {
-      buf = await fetchSafe(att.url, maxBytes);
-    } catch (err) {
-      logger.warn(`im-qqbot: download failed: ${att.filename} — ${err instanceof Error ? err.message : String(err)}`);
-      continue; // 下载失败不加入结果，由 buildDynamicCtx 回退为描述
-    }
+  const workers = Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, targets.length) }, () => worker());
+  await Promise.all(workers);
 
-    // 扩展名按内容定，不用 QQ 给的（它常把 GIF 也叫 .jpg）
-    const localPath = toPosixPath(join(MEDIA_ROOT, uniqueFilename(withSniffedExtension(att.filename, buf))));
-    writeFileSync(localPath, buf);
-    logger.debug(`im-qqbot: attachment downloaded: ${att.filename} (${formatSize(buf.length)}) → ${localPath}`);
-
-    results.push({ filename: att.filename, contentType, localPath });
-  }
-
-  return results;
+  return slots.filter((item): item is DownloadedFile => item !== undefined);
 }

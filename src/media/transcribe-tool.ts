@@ -14,7 +14,9 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import type { Context } from '@deepseek-ai/cordis';
 import type { ContentBlock } from '@deepseek-ai/dsh-llm';
-import { chatEndpointFromEnv, setChatKeyResolver, transcribeViaChat } from './chat-gateway.ts';
+import type { AsrConfig } from '../config.ts';
+import { transcribeAudioBuffer } from './asr.ts';
+import { chatEndpointFromConfig, chatEndpointFromEnv, setChatKeyResolver, transcribeViaChat } from './chat-gateway.ts';
 import type { Logger } from '../types.ts';
 
 const run = promisify(execFile);
@@ -63,38 +65,47 @@ interface TranscribeOutput {
   message: string;
 }
 
-async function ffmpeg(args: string[], ffmpegPath: string): Promise<void> {
-  await run(ffmpegPath, args, { maxBuffer: 8 * 1024 * 1024, windowsHide: true });
+async function ffmpeg(args: string[], ffmpegPath: string, signal?: AbortSignal): Promise<void> {
+  await run(ffmpegPath, args, { maxBuffer: 8 * 1024 * 1024, windowsHide: true, signal });
 }
 
-async function probeDuration(file: string, ffprobePath: string): Promise<number> {
+async function probeDuration(file: string, ffprobePath: string, signal?: AbortSignal): Promise<number> {
   try {
     const { stdout } = await run(ffprobePath, [
       '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', file,
-    ], { windowsHide: true });
+    ], { windowsHide: true, signal });
     const n = Number.parseFloat(stdout.trim());
     return Number.isFinite(n) ? n : 0;
-  } catch {
+  } catch (err) {
+    signal?.throwIfAborted();
     return 0;
   }
 }
 
-export function registerTranscribeTool(ctx: Context, logger: Logger): void {
+export function registerTranscribeTool(
+  ctx: Context,
+  logger: Logger,
+  asr?: AsrConfig,
+  ffmpegBins?: { ffmpeg: string; ffprobe: string },
+): void {
   const tools = ctx.get('tools') as ToolsRegistryLike | undefined;
   if (!tools?.register) {
     logger.warn('im-qqbot: tools 服务不可用，qqbot_transcribe 工具未注册');
     return;
   }
 
-  const endpoint = chatEndpointFromEnv();
-  const { model } = endpoint;
-  const ffmpegPath = process.env.QQBOT_FFMPEG ?? 'ffmpeg';
-  const ffprobePath = process.env.QQBOT_FFPROBE ?? 'ffprobe';
+  const legacyEndpoint = chatEndpointFromEnv();
+  const configuredModel = asr === undefined
+    ? legacyEndpoint.model
+    : (asr.mode === 'openai' ? asr.model : chatEndpointFromConfig(asr).model);
+  const ffmpegPath = ffmpegBins?.ffmpeg || process.env.QQBOT_FFMPEG || 'ffmpeg';
+  const ffprobePath = ffmpegBins?.ffprobe || process.env.QQBOT_FFPROBE || 'ffprobe';
 
-  // asr.ts 是纯模块、拿不到 ctx，凭证解析从这里注入一次，语音消息和视频音轨共用
-  const credentials = ctx.get('credentials') as CredentialsLike | undefined;
-  setChatKeyResolver(async (ref) => (await credentials?.resolve(ref))?.value);
-
+  // 共用的 resolver 只捕获 ctx：credentials 可能在工具注册之后才就绪，也可能重载。
+  setChatKeyResolver(async (ref) => {
+    const credentials = ctx.get('credentials') as CredentialsLike | undefined;
+    return (await credentials?.resolve(ref))?.value;
+  });
 
   tools.register({
     name: TRANSCRIBE_TOOL_NAME,
@@ -127,7 +138,9 @@ export function registerTranscribeTool(ctx: Context, logger: Logger): void {
         return [{ type: 'text', text: v.message }];
       },
     },
-    async execute(args: unknown): Promise<TranscribeOutput> {
+    async execute(args: unknown, exec?: { signal?: AbortSignal }): Promise<TranscribeOutput> {
+      const signal = exec?.signal;
+      signal?.throwIfAborted();
       const { file, prompt, language } = (args ?? {}) as TranscribeArgs;
       if (typeof file !== 'string' || file.trim() === '') throw new Error('qqbot_transcribe: `file` 不能为空');
       const path = file.trim();
@@ -138,19 +151,42 @@ export function registerTranscribeTool(ctx: Context, logger: Logger): void {
       const work = mkdtempSync(join(tmpdir(), 'transcribe-'));
       const instruction = prompt?.trim();
       try {
-        const duration = await probeDuration(path, ffprobePath);
+        const duration = await probeDuration(path, ffprobePath, signal);
         const parts: string[] = [];
         let chunks = 0;
+        let usedModel = configuredModel;
         for (let start = 0; ; start += CHUNK_SECONDS) {
+          signal?.throwIfAborted();
           const out = join(work, `chunk${chunks}.mp3`);
           // 48kbps 单声道：10 分钟约 3.6MB，稳在 8MB 上限内
           await ffmpeg([
             '-y', '-loglevel', 'error', '-ss', String(start), '-t', String(CHUNK_SECONDS),
             '-i', path, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k', out,
-          ], ffmpegPath);
+          ], ffmpegPath, signal);
+          signal?.throwIfAborted();
           if (!existsSync(out) || statSync(out).size < 1024) break;
           if (statSync(out).size > MAX_CHUNK_BYTES) throw new Error('qqbot_transcribe: 音频块超过上限');
-          const text = await transcribeViaChat(readFileSync(out), 'mp3', { prompt: instruction, language, endpoint, logger });
+          let text: string;
+          if (asr !== undefined) {
+            const res = await transcribeAudioBuffer(
+              { data: readFileSync(out), name: 'chunk.mp3' },
+              asr,
+              logger,
+              signal,
+              { prompt: instruction, language },
+            );
+            text = res.text;
+            usedModel = res.model;
+            if (text.trim() === '') throw new Error('qqbot_transcribe: 模型返回空文本');
+          } else {
+            text = await transcribeViaChat(readFileSync(out), 'mp3', {
+              prompt: instruction,
+              language,
+              endpoint: legacyEndpoint,
+              logger,
+              signal,
+            });
+          }
           parts.push(duration > CHUNK_SECONDS ? `【${Math.floor(start / 60)}分${start % 60}秒起】\n${text}` : text);
           chunks += 1;
           if (duration <= (start + CHUNK_SECONDS) || duration === 0) break;
@@ -158,13 +194,13 @@ export function registerTranscribeTool(ctx: Context, logger: Logger): void {
         if (parts.length === 0) throw new Error('qqbot_transcribe: 没抽出音轨（可能是无声视频）');
         const text = parts.join('\n\n');
         const segments = text.split('\n').filter((line) => /\d+\.\d+\s*-\s*\d+\.\d+/.test(line)).length;
-        logger.info(`im-qqbot: qqbot_transcribe ${path} → ${chunks} 块 / ${text.length} 字`);
-        return { text, segments, chunks, model, message: `${text}\n\n${MATERIAL_NOTE}` };
+        logger.info(`im-qqbot: qqbot_transcribe ${path} → ${chunks} 块 / ${text.length} 字 (${usedModel})`);
+        return { text, segments, chunks, model: usedModel, message: `${text}\n\n${MATERIAL_NOTE}` };
       } finally {
         rmSync(work, { recursive: true, force: true });
       }
     },
   });
 
-  logger.info(`im-qqbot: qqbot_transcribe 工具已注册 (${model})`);
+  logger.info(`im-qqbot: qqbot_transcribe 工具已注册 (${configuredModel})`);
 }

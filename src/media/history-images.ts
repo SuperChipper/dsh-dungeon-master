@@ -30,7 +30,7 @@ export interface HistoryImage {
   localPath?: string;
 }
 
-type Downloader = (attachments: RawAttachment[], media: MediaConfig, logger: Logger) => Promise<DownloadedFile[]>;
+type Downloader = (attachments: RawAttachment[], media: MediaConfig, logger: Logger, signal?: AbortSignal) => Promise<DownloadedFile[]>;
 
 /** 按时间正序给历史里的图片编号 */
 export function numberHistoryImages(
@@ -59,10 +59,12 @@ export async function downloadRecentHistoryImages(
   logger: Logger,
   limit: number = MAX_HISTORY_IMAGES,
   downloader: Downloader = downloadMediaAttachments,
+  signal?: AbortSignal,
 ): Promise<void> {
-  if (!media.enabled || limit <= 0) return;
+  if (!media.enabled || limit <= 0 || signal?.aborted) return;
 
   for (const image of images.slice(-limit)) {
+    if (signal?.aborted) break;
     const cached = downloadedByUrl.get(image.url);
     if (cached !== undefined && existsSync(cached)) {
       image.localPath = cached;
@@ -73,6 +75,7 @@ export async function downloadRecentHistoryImages(
       [{ content_type: 'image', filename: image.filename || `history_${image.index}.jpg`, size: 0, url: image.url }],
       media,
       logger,
+      signal,
     );
     if (file === undefined) continue;
 

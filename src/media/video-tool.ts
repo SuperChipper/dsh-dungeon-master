@@ -19,7 +19,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm';
 import type { AsrConfig, VideoConfig, VisionConfig } from '../config.ts';
 import type { Logger } from '../types.ts';
 import { ASR_OFFLINE_HINT, AsrOfflineError, requestTranscription } from './asr.ts';
-import { describeVideoViaChat, videoEndpointFromEnv } from './chat-gateway.ts';
+import { describeVideoViaChat, videoEndpointFromConfig } from './chat-gateway.ts';
 import { callVision, type AttachmentStoreLike, type LlmRuntimeLike } from './vision-tool.ts';
 import { PLUGIN_ROOT } from '../shared/index.ts';
 import { registerVideoFramesTool } from './video-frames-tool.ts';
@@ -376,6 +376,8 @@ export async function registerDescribeVideoTool(
       const visualModels = new Set<string>();
       // Bound returned text without concealing omitted detail; coverage still lists every processed segment.
       let remainingChars = 160_000;
+      const videoEndpoint = videoEndpointFromConfig(video, asr);
+      const directEnabled = video.directEnabled !== false;
       try {
         for (const [index, segment] of range.segments.entries()) {
           exec.signal.throwIfAborted();
@@ -389,25 +391,27 @@ export async function registerDescribeVideoTool(
           let visual = '', speech: string | undefined, note: string | undefined;
           try {
             let whole: string | undefined;
-            if (range.segments.length === 1 && segment.start === 0 && segment.end === duration && info.size <= DIRECT_MAX_BYTES) {
-              whole = path;
-            } else {
-              const compressed = `${prefix}.mp4`;
-              try {
-                await compressVideo(bins, path, compressed, segment, exec.signal);
-                if ((await stat(compressed)).size <= DIRECT_MAX_BYTES) whole = compressed;
-              } catch (err) {
-                exec.signal.throwIfAborted();
-                logger.warn(`im-qqbot: video segment encoding failed: ${err instanceof Error ? err.message : String(err)}`);
+            if (directEnabled) {
+              if (range.segments.length === 1 && segment.start === 0 && segment.end === duration && info.size <= DIRECT_MAX_BYTES) {
+                whole = path;
+              } else {
+                const compressed = `${prefix}.mp4`;
+                try {
+                  await compressVideo(bins, path, compressed, segment, exec.signal);
+                  if ((await stat(compressed)).size <= DIRECT_MAX_BYTES) whole = compressed;
+                } catch (err) {
+                  exec.signal.throwIfAborted();
+                  logger.warn(`im-qqbot: video segment encoding failed: ${err instanceof Error ? err.message : String(err)}`);
+                }
               }
             }
             if (whole !== undefined) {
               try {
                 visual = await describeVideoViaChat(await readFile(whole),
                   buildVideoSegmentPrompt(segment, asked),
-                  { logger, signal: exec.signal });
+                  { endpoint: videoEndpoint, logger, signal: exec.signal });
                 item.visualStatus = 'video';
-                visualModels.add(videoEndpointFromEnv().model);
+                visualModels.add(videoEndpoint.model);
               } catch (err) {
                 exec.signal.throwIfAborted();
                 logger.warn(`im-qqbot: video segment direct failed, sampling: ${err instanceof Error ? err.message : String(err)}`);

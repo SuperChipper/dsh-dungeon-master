@@ -67,7 +67,7 @@ const NATIVE_NOTE =
   + '"[图片未原生注入"); read them directly, text included — this tool is not for those.';
 
 /** 图片 magic bytes 嗅探 → 标准 MIME（不信声明，安全底线） */
-function sniffImageMediaType(bytes: Uint8Array): ImageMediaType | null {
+export function sniffImageMediaType(bytes: Uint8Array): ImageMediaType | null {
   if (bytes.length < 12) return null;
   // PNG: 89 50 4E 47
   if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';

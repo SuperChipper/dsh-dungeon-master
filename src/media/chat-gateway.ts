@@ -11,6 +11,7 @@
  *    把 max_tokens 花在思考上、`content` 回 null。症状看着像 token 不够，调大 max_tokens 没用。
  * 2. opencode-go 网关缺 `x-opencode-session` 直接 400 MissingSessionID。
  */
+import type { AsrConfig, VideoConfig } from '../config.ts';
 import type { Logger } from '../types.ts';
 
 export const DEFAULT_CHAT_BASE_URL = 'https://opencode.ai/inference/go/openai/v1';
@@ -23,11 +24,22 @@ export const DEFAULT_CHAT_MAX_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_CHAT_PROMPT =
   '逐句转写这段音频里的人声，保留时间轴，标注说话人（SPEAKER_00/01）。只输出转写结果，不要分析过程。';
 
-/** 一个 chat 形态的端点；和插件配置无关，全部来自环境变量 */
+/** 一个 chat 形态的多模态端点（音频转写 / 整段视频理解） */
 export interface ChatEndpoint {
   baseUrl: string;
   model: string;
   keyRef: string;
+  /** 可选直填密钥（优先于 keyRef）；留空按 keyRef 走 credentials / 环境变量 */
+  apiKey?: string;
+  /** reasoning_effort（默认 'none'；设为 'omit' 或 '-' 时不在请求体传该字段） */
+  reasoningEffort?: string;
+}
+
+const OPENCODE_HOST_RE = /(?:^https?:\/\/)?(?:[^/]+\.)?opencode\.ai(?:\/|$)/i;
+
+/** 仅向 opencode.ai 网关附带其要求的 x-opencode-session 与 user-agent，避免向第三方网关伪造请求头 */
+export function isOpenCodeGatewayUrl(baseUrl: string): boolean {
+  return OPENCODE_HOST_RE.test(baseUrl.trim());
 }
 
 export function chatEndpointFromEnv(): ChatEndpoint {
@@ -35,6 +47,18 @@ export function chatEndpointFromEnv(): ChatEndpoint {
     baseUrl: (process.env.QQBOT_TRANSCRIBE_BASE_URL ?? DEFAULT_CHAT_BASE_URL).replace(/\/+$/, ''),
     model: process.env.QQBOT_TRANSCRIBE_MODEL ?? DEFAULT_CHAT_MODEL,
     keyRef: process.env.QQBOT_TRANSCRIBE_KEY_REF ?? DEFAULT_CHAT_KEY_REF,
+  };
+}
+
+/** 结合插件配置与环境变量解析音频 chat 转写端点 */
+export function chatEndpointFromConfig(asr?: Partial<AsrConfig>): ChatEndpoint {
+  const apiKey = asr?.chatApiKey?.trim();
+  return {
+    baseUrl: (asr?.chatBaseUrl?.trim() || process.env.QQBOT_TRANSCRIBE_BASE_URL || DEFAULT_CHAT_BASE_URL).replace(/\/+$/, ''),
+    model: asr?.chatModel?.trim() || process.env.QQBOT_TRANSCRIBE_MODEL || DEFAULT_CHAT_MODEL,
+    keyRef: asr?.chatApiKeyEnv?.trim() || process.env.QQBOT_TRANSCRIBE_KEY_REF || DEFAULT_CHAT_KEY_REF,
+    ...(apiKey ? { apiKey } : {}),
+    reasoningEffort: asr?.chatReasoningEffort?.trim() || 'none',
   };
 }
 
@@ -51,6 +75,19 @@ export function videoEndpointFromEnv(): ChatEndpoint {
   return { ...chatEndpointFromEnv(), model: process.env.QQBOT_VIDEO_MODEL ?? DEFAULT_VIDEO_MODEL };
 }
 
+/** 结合视频配置、ASR chat 配置与环境变量解析视频直传端点 */
+export function videoEndpointFromConfig(video?: Partial<VideoConfig>, asr?: Partial<AsrConfig>): ChatEndpoint {
+  const chat = chatEndpointFromConfig(asr);
+  const directKey = video?.apiKey?.trim() || chat.apiKey;
+  return {
+    baseUrl: (video?.baseUrl?.trim() || process.env.QQBOT_VIDEO_BASE_URL || chat.baseUrl).replace(/\/+$/, ''),
+    model: video?.model?.trim() || process.env.QQBOT_VIDEO_MODEL || asr?.chatModel?.trim() || DEFAULT_VIDEO_MODEL,
+    keyRef: video?.apiKeyEnv?.trim() || process.env.QQBOT_VIDEO_KEY_REF || chat.keyRef,
+    ...(directKey ? { apiKey: directKey } : {}),
+    reasoningEffort: video?.reasoningEffort?.trim() || chat.reasoningEffort || 'none',
+  };
+}
+
 type KeyResolver = (ref: string) => Promise<string | undefined>;
 let keyResolver: KeyResolver | undefined;
 
@@ -62,14 +99,22 @@ export function setChatKeyResolver(fn: KeyResolver | undefined): void {
   keyResolver = fn;
 }
 
-export async function resolveChatKey(ref: string): Promise<string> {
+/** 可选凭证解析：先查 credentials 服务，再查环境变量，均无则返回 undefined */
+export async function resolveOptionalKey(ref: string): Promise<string | undefined> {
+  const trimmed = ref.trim();
+  if (trimmed === '') return undefined;
   if (keyResolver !== undefined) {
-    const value = await keyResolver(ref);
+    const value = await keyResolver(trimmed);
     if (value !== undefined && value !== '') return value;
   }
-  const fromEnv = process.env[ref];
-  if (fromEnv !== undefined && fromEnv !== '') return fromEnv;
-  throw new Error(`缺少凭证 ${ref}`);
+  const fromEnv = process.env[trimmed];
+  return fromEnv !== undefined && fromEnv !== '' ? fromEnv : undefined;
+}
+
+export async function resolveChatKey(ref: string): Promise<string> {
+  const resolved = await resolveOptionalKey(ref);
+  if (resolved !== undefined) return resolved;
+  throw new Error(`未配置多模态凭证 ${ref}（credentials 服务和环境变量均未找到）`);
 }
 
 export interface ChatCompletionOptions {
@@ -87,29 +132,37 @@ export interface ChatCompletionOptions {
 export async function chatCompletion(content: unknown[], options: ChatCompletionOptions = {}): Promise<string> {
   options.signal?.throwIfAborted();
   const endpoint = options.endpoint ?? chatEndpointFromEnv();
-  const key = await resolveChatKey(endpoint.keyRef);
+  const key = endpoint.apiKey?.trim() ? endpoint.apiKey.trim() : await resolveChatKey(endpoint.keyRef);
   options.signal?.throwIfAborted();
   const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? 300000);
   const signal = options.signal === undefined ? timeoutSignal : AbortSignal.any([timeoutSignal, options.signal]);
 
-  const body = JSON.stringify({
+  const effort = (endpoint.reasoningEffort ?? 'none').trim();
+  const payload: Record<string, unknown> = {
     model: endpoint.model,
     stream: false,
     max_tokens: options.maxTokens ?? 4096,
-    // 不关掉思考，它会把额度全花在「逐秒分析」上，正文回 null
-    reasoning_effort: 'none',
     messages: [{ role: 'user', content }],
-  });
+  };
+  if (effort !== '' && effort !== 'omit' && effort !== '-') {
+    // 默认关掉思考，免得把额度全花在「逐秒分析」上导致正文回 null；特殊网关可配 omit 跳过该字段
+    payload.reasoning_effort = effort;
+  }
+  const body = JSON.stringify(payload);
+
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${key}`,
+    'content-type': 'application/json',
+  };
+  if (isOpenCodeGatewayUrl(endpoint.baseUrl)) {
+    headers['user-agent'] = 'opencode/0.1.0';
+    // opencode-go 网关缺了它会 400 MissingSessionID
+    headers['x-opencode-session'] = crypto.randomUUID();
+  }
 
   const response = await fetch(`${endpoint.baseUrl}/chat/completions`, {
     method: 'POST',
-    headers: {
-      authorization: `Bearer ${key}`,
-      'content-type': 'application/json',
-      'user-agent': 'opencode/0.1.0',
-      // 这个网关缺了它会 400 MissingSessionID
-      'x-opencode-session': crypto.randomUUID(),
-    },
+    headers,
     body,
     signal,
   });
