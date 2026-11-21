@@ -5,11 +5,12 @@
  * 事件解析归一化在 events.ts，路由按事件类型分发到私有方法。
  */
 import type { SessionManager, SessionRecord } from '../session/index.ts';
-import type { ImQQBotConfig } from '../config.ts';
+import { resolveGroupTriggerPolicy, type ImQQBotConfig } from '../config.ts';
 import type { Logger } from '../types.ts';
 import type { StickerStore } from '../media/sticker-store.ts';
 import { extractBracketToolCalls, extractPseudoStickerCalls, sanitizePseudoToolText } from '../media/pseudo-sticker-call.ts';
 import { SEND_FILE_TOOL_NAME } from '../media/send-file-tool.ts';
+import { IMAGE_GEN_TOOL_NAME } from '../media/image-gen-tool.ts';
 import { captionFromArgs, stripCaptionEcho } from './caption-echo.ts';
 import { dropTrailingPeriod, isBlankReply } from './text-guard.ts';
 import { chunkMarkdownText } from './chunker.ts';
@@ -280,7 +281,6 @@ class OutboundRouter {
         return;
       }
       this.recordTurnReply(sessionId, buffer.text);
-      this.noteBotSaid(record, buffer.text, this.captions.get(sessionId));
       void buffer.flush();
       this.buffers.delete(sessionId);
       return;
@@ -297,7 +297,6 @@ class OutboundRouter {
       return;
     }
     this.recordTurnReply(sessionId, fullText);
-    this.noteBotSaid(record, fullText, this.captions.get(sessionId));
 
     void this.send(record, fullText, 'sendMarkdown', this.captionsOf(sessionId));
     this.buffers.delete(sessionId);
@@ -323,15 +322,6 @@ class OutboundRouter {
       this.turnReplies.set(sessionId, list);
     }
     list.push(cleaned);
-  }
-
-  /** 模型打分要知道 bot 刚说过什么（群记忆里没有 bot 自己的话） */
-  private noteBotSaid(record: SessionRecord, text: string, captions: readonly string[] = []): void {
-    if (record.scope !== 'group') return;
-    if (this.config.replyDesire?.judge?.enabled !== true && this.config.notes?.judge?.enabled !== true) return;
-    const cleaned = stripCaptionEcho(sanitizePseudoToolText(text), captions);
-    if (!cleaned.trim() || isBlankReply(cleaned)) return;
-    getEngagementTracker().noteBotSaid(record.peerId, cleaned, Date.now());
   }
 
   /** 取本轮 caption 列表（不存在则创建；同一轮内始终是同一个数组） */
@@ -364,11 +354,13 @@ class OutboundRouter {
     if (call === undefined) return;
 
     // caption 已随文件送达：记下来，过滤模型随后对它的复读
-    if (event.error === undefined && call.name === SEND_FILE_TOOL_NAME) {
+    if (
+      event.error === undefined
+      && (call.name === SEND_FILE_TOOL_NAME || (call.name === IMAGE_GEN_TOOL_NAME && isTruthySendArg(call.args)))
+    ) {
       const caption = captionFromArgs(call.args);
       if (caption !== undefined) {
         this.captionsOf(sessionId).push(caption);
-        this.noteBotSaid(record, caption);
       }
     }
 
@@ -417,7 +409,6 @@ class OutboundRouter {
       const deliveryRecord = { ...record, replyTarget: { ...record.replyTarget } };
       for (const text of review.finish()) {
         this.recordTurnReply(sessionId, text);
-        this.noteBotSaid(record, text, this.captions.get(sessionId));
         void this.send(deliveryRecord, text, 'sendMarkdown', this.captionsOf(sessionId));
       }
     }
@@ -444,7 +435,7 @@ class OutboundRouter {
 
     // 对话窗口从回复结束时起算（回复慢时不至于还没说完窗口就过期）
     const rd = this.config.replyDesire;
-    if (record.scope === 'group' && rd?.enabled === true) {
+    if (record.scope === 'group' && rd !== undefined && resolveGroupTriggerPolicy(this.config).replyDesireEnabled) {
       getEngagementTracker().touch(record.peerId, Date.now(), rd.engagedMs);
     }
 
@@ -541,6 +532,15 @@ class OutboundRouter {
   private markUnsent(record: SessionRecord, text: string): void {
     this.manager.addUnsent(record.sessionKey, text);
     this.logger.warn(`im-qqbot: 消息未送达，已挂起到下一次用户消息 session=${record.sessionKey}`);
+  }
+}
+
+/** 判断 qqbot_image_gen 是否显式传了 send: true */
+function isTruthySendArg(args: string): boolean {
+  try {
+    return (JSON.parse(args) as { send?: unknown }).send === true;
+  } catch {
+    return false;
   }
 }
 

@@ -186,4 +186,32 @@ describe('replyDecider', () => {
       spy.mockRestore();
     }
   });
+
+  it('collectJudgeLines 直接消费归档里的 bot 发言（省略 sender），且不与 noteBotSaid 重复', () => {
+    const gid = 'g-archived-bot';
+    const cfg = {
+      appId: 'app-ctx',
+      replyDesire: { judge: { ...REPLY_JUDGE_DEFAULTS, contextMessages: 6 } },
+    } as unknown as ImQQBotConfig;
+    const spy = vi.spyOn(groupMemory, 'readRecentGroupMessages').mockReturnValue([
+      { messageId: 'm1', senderId: 'u1', senderName: '阿明', content: '昨天那张海报改完了吗', timestamp: 1000 },
+      { messageId: 'b1', senderId: '__self__', senderName: '大肥鱼', role: 'assistant', content: '改完第三版了', timestamp: 1500 },
+      { messageId: 'm2', senderId: 'u2', senderName: '小红', content: '发出来看看', timestamp: 2000 },
+    ]);
+    getEngagementTracker().noteBotSaid(gid, '改完第三版了', 1500);
+
+    try {
+      expect(collectJudgeLines(cfg, gid, 'm2', { includeCurrent: false })).toEqual([
+        { sender: '阿明', text: '昨天那张海报改完了吗', timestamp: 1000 },
+        { text: '改完第三版了', timestamp: 1500 },
+      ]);
+      expect(collectJudgeLines(cfg, gid, 'm2')).toEqual([
+        { sender: '阿明', text: '昨天那张海报改完了吗', timestamp: 1000 },
+        { text: '改完第三版了', timestamp: 1500 },
+        { sender: '小红', text: '发出来看看', timestamp: 2000 },
+      ]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });

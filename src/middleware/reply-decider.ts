@@ -25,7 +25,7 @@ import {
   type DesireResult,
 } from '../features/reply-desire.ts';
 import type { JudgeLine, JudgeQueue, ReplyJudge } from '../features/reply-judge.ts';
-import { readRecentGroupMessages } from '../features/group-memory.ts';
+import { isBotMemoryEntry, readRecentGroupMessages } from '../features/group-memory.ts';
 
 interface MentionState {
   wasMentioned: boolean;
@@ -56,6 +56,7 @@ export function collectJudgeLines(
   const toLine = (e: (typeof recent)[number]): JudgeLine => {
     const { text, stickerId } = classifyMessage(e.content);
     const shown = text !== '' ? text : (stickerId !== undefined || (e.images?.length ?? 0) > 0 ? '[图片]' : '');
+    if (isBotMemoryEntry(e)) return { text: shown, timestamp: e.timestamp };
     return { sender: e.senderName ?? e.senderId.slice(-6), text: shown, timestamp: e.timestamp };
   };
 
@@ -63,18 +64,22 @@ export function collectJudgeLines(
     const beforeEntries = cut >= 0 ? recent.slice(0, cut) : recent;
     const cutoffTs = cut >= 0 ? recent[cut]!.timestamp : Number.POSITIVE_INFINITY;
     const userLines = beforeEntries.map(toLine).filter((line) => line.text !== '');
-    const bot = getEngagementTracker().botLines(groupId)
-      .filter((line) => line.timestamp <= cutoffTs)
-      .map((line) => ({ text: line.text, timestamp: line.timestamp }));
+    const bot = beforeEntries.some(isBotMemoryEntry)
+      ? []
+      : getEngagementTracker().botLines(groupId)
+          .filter((line) => line.timestamp <= cutoffTs)
+          .map((line) => ({ text: line.text, timestamp: line.timestamp }));
     return [...userLines, ...bot].sort((a, b) => a.timestamp - b.timestamp).slice(-limit);
   }
 
   const upto = cut >= 0 ? recent.slice(0, cut + 1) : recent;
   const lines = upto.map(toLine).filter((line) => line.text !== '');
   const current = lines[lines.length - 1];
-  const bot = getEngagementTracker().botLines(groupId)
-    .filter((line) => current === undefined || line.timestamp <= current.timestamp)
-    .map((line) => ({ text: line.text, timestamp: line.timestamp }));
+  const bot = upto.some(isBotMemoryEntry)
+    ? []
+    : getEngagementTracker().botLines(groupId)
+        .filter((line) => current === undefined || line.timestamp <= current.timestamp)
+        .map((line) => ({ text: line.text, timestamp: line.timestamp }));
   // 当前消息必须留在最后（模型按 ▶ 判断），bot 的话只往它前面插
   const before = [...lines.slice(0, -1), ...bot].sort((a, b) => a.timestamp - b.timestamp);
   return [...before, ...(current !== undefined ? [current] : [])].slice(-limit);
@@ -99,8 +104,11 @@ export function replyDecider(config: ImQQBotConfig, manager: SessionManager, log
     const mention = ctx.state.mention as MentionState | undefined;
     const queue = judgeDeps?.queue;
     const persona = manager.personaStore?.current(groupId);
-    // 换了人设，群里叫 bot 的称呼也跟着换；人设没写就沿用配置
-    const names = persona !== undefined && persona.names.length > 0 ? persona.names : rd.names;
+    const defaultGroupPersona = persona === undefined ? manager.personaStore?.defaultPersona?.('group') : undefined;
+    // 换了人设，群里叫 bot 的称呼也跟着换；人设没写就沿用配置，再兜底外置默认人设 names
+    const names = persona !== undefined && persona.names.length > 0
+      ? persona.names
+      : (rd.names.length > 0 ? rd.names : (defaultGroupPersona?.names ?? []));
     // 没有模型打分时不改门控：窗口一关又没有 judge，这个群就只剩 @ 才回了
     const judged = !dnd && judgeDeps !== undefined;
 
@@ -181,7 +189,7 @@ export function replyDecider(config: ImQQBotConfig, manager: SessionManager, log
       provider,
       model,
       names,
-      persona: persona?.prompt ?? config.groupPrompt,
+      persona: persona?.prompt ?? defaultGroupPersona?.prompt ?? config.groupPrompt,
       lines: collectJudgeLines(config, groupId, msg.messageId),
     });
     if (desire === undefined || desire < rd.threshold) {

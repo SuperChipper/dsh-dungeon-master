@@ -32,7 +32,8 @@ import { biliPermission } from '../bili/permissions.ts';
 import { decodeButtonData } from '../features/button-utils.ts';
 import { PLUGIN_ROOT, buildUserAgent, isPrivilegedSender, privilegedOpenids } from '../shared/index.ts';
 import { NOTE_JUDGE_DEFAULTS, type ImQQBotConfig } from '../config.ts';
-import type { ChatScope, Logger } from '../types.ts';
+import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
+import { appendBotGroupMessage, resolveBotSenderName } from '../features/group-memory.ts';
 import { setupMiddlewares } from './middleware-setup.ts';
 import { MEDIA_ROOT } from '../media/media-cleaner.ts';
 import { startCleanup } from '../media/cleanup.ts';
@@ -40,6 +41,7 @@ import { ensureVisionInputModal, registerDescribeImageTool } from '../media/visi
 import { locateFfmpeg, registerDescribeVideoTool } from '../media/video-tool.ts';
 import { registerTranscribeTool } from '../media/transcribe-tool.ts';
 import { registerSendFileTool, withFreshReplyTarget, type MediaSenderLike } from '../media/send-file-tool.ts';
+import { registerImageGenTool } from '../media/image-gen-tool.ts';
 import { registerVideoFetchTool } from '../media/video-fetch-tool.ts';
 import { registerSingTool } from '../media/sing-tool.ts';
 import { ModelWatch, isWatchedProvider } from '../model/status-watch.ts';
@@ -66,15 +68,15 @@ import { registerDndTools } from '../dnd/dnd-tools.ts';
 import { DndCombatAgents } from '../dnd/combat-agent.ts';
 import { DndToolScope } from '../dnd/tool-scope.ts';
 import { ACK, DndTurnButtons } from '../dnd/turn-buttons.ts';
-import { PersonaStore } from '../features/persona-store.ts';
+import { PersonaStore, resolvePersonasDir } from '../features/persona-store.ts';
 import { PersonaSwitch } from '../features/persona-switch.ts';
 import { ToolAccess, ToolAccessStore } from '../features/tool-access.ts';
 import { getSenderAliases, memberIdsFor } from '../features/sender-alias.ts';
 import { createToolGuard } from '../shared/tool-guard.ts';
 import { registerBrowserTool } from '../browser/browser-tool.ts';
-import { BrowserAccess } from '../browser/browser-access.ts';
+import { GroupAccess, type GroupAccessFeature } from '../features/group-access.ts';
 import { resolveProfileDir } from '../shared/utils.ts';
-import { updateProfileConfig } from '../setup/persist.ts';
+import { updateProfileAllowedGroups } from '../setup/persist.ts';
 import type { JudgeLlm } from '../features/reply-judge.ts';
 import { NoteJudge } from '../features/note-judge.ts';
 
@@ -83,12 +85,12 @@ import { NoteJudge } from '../features/note-judge.ts';
  * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
  * 避免多通道各自 try 导致误判。
  */
-function dispatchInteraction(
+export function dispatchInteraction(
   event: InteractionEvent,
   manager: SessionManager,
   dndButtons?: DndTurnButtons,
   toolAccess?: ToolAccess,
-  browserAccess?: BrowserAccess,
+  groupAccess?: Partial<Record<GroupAccessFeature, GroupAccess>>,
   personaSwitch?: PersonaSwitch,
 ): number {
   const raw = event.data?.resolved?.button_data;
@@ -99,7 +101,8 @@ function dispatchInteraction(
   if (button.t === 'dnd') return dndButtons?.handleInteraction(event) ?? ACK.duplicate;
   // 终端白名单确认：只认主人点击，别人点回 denied
   if (button.t === 'access') return toolAccess?.handleInteraction(event) ?? ACK.duplicate;
-  if (button.t === 'browser-access') return browserAccess?.handleInteraction(event) ?? ACK.duplicate;
+  if (button.t === 'browser-access') return groupAccess?.browser?.handleInteraction(event) ?? ACK.duplicate;
+  if (button.t === 'image-gen-access') return groupAccess?.imageGen?.handleInteraction(event) ?? ACK.duplicate;
   if (button.t === 'persona') return personaSwitch?.handleInteraction(event) ?? ACK.duplicate;
   const matched = button.t === 'question'
     ? manager.questionChannel?.handleInteraction(event) ?? false
@@ -179,6 +182,7 @@ function createDndService(config: ImQQBotConfig, logger: Logger): DndService | u
     store: new CampaignStore(join(root, 'campaigns')),
     library: new AdventureLibrary({ dungeons: join(root, 'dungeons'), adventures: join(root, 'adventures') }, logger),
     mapDir: join(resolveTmpDir(config), 'dnd-maps'),
+    cwd,
   });
 }
 
@@ -270,9 +274,21 @@ export async function bootstrapGateway(
     target.scope === 'group'
       ? renderOutboundMentions(content, (alias) => getSenderAliases().resolve(config.appId, target.targetId, alias))
       : content;
+  const archiveBotMessage = (target: ReplyTarget, content: string, result: unknown): void => {
+    if (target.scope !== 'group' || !target.targetId) return;
+    appendBotGroupMessage(config.appId, target.targetId, {
+      content,
+      senderName: resolveBotSenderName(target.targetId, config.replyDesire?.names, manager.personaStore),
+      result,
+    });
+  };
   const sender: QQBotSender = {
     sendMarkdown: (target, content, opts) => sendQueue.run(target,
-      () => sendResolvedMarkdown(bot, resolveReplyTarget(target, replyLimiter, true), withMentions(target, content), opts)),
+      () => sendResolvedMarkdown(bot, resolveReplyTarget(target, replyLimiter, true), withMentions(target, content), opts))
+      .then((result) => {
+        archiveBotMessage(target, content, result);
+        return result;
+      }),
     openStream: (target) => sendQueue.stream(target, () => bot.openStream({
       target: {
         scope: target.scope,
@@ -328,8 +344,10 @@ export async function bootstrapGateway(
     : undefined;
   manager.dndButtons = dndButtons;
 
-  // ── 聊天人设（/persona 卡片；选择按群或私聊持久化） ──
-  const personaStore = new PersonaStore({ logger });
+  // ── 聊天人设（/persona 卡片；选择按群或私聊持久化，目录可在 personas.root 指向仓库） ──
+  const personasDir = resolvePersonasDir({ root: config.personas?.root, cwd: config.cwd, pluginRoot: PLUGIN_ROOT });
+  const personaStore = new PersonaStore({ dir: personasDir, logger });
+  logger.info(`im-qqbot: 聊天人设已就绪 dir=${personaStore.dir}`);
   const personaSwitch = new PersonaSwitch(manager, personaStore, sender, config, logger);
   manager.personaStore = personaStore;
   manager.personaSwitch = personaSwitch;
@@ -349,6 +367,11 @@ export async function bootstrapGateway(
         isFullAccess: (session) => toolAccess.isFullAccess(session),
         findSession: (agent) => manager.findByAgent(agent as never),
         roots: [MEDIA_ROOT, resolveTmpDir(config), ...(stickerStore !== undefined ? [stickerStore.root] : []), ...(config.toolAccess?.readRoots ?? [])],
+        readOnlyRootsFor: (session) => {
+          if (dndService === undefined) return [];
+          const dir = dndService.adventureDir(manager.sessionKey(session.scope, session.peerId));
+          return dir !== undefined ? [dir] : [];
+        },
         noWriteRoots: dndService !== undefined ? [dndService.store.root] : [],
         cwd: config.cwd || process.cwd(),
       }));
@@ -358,12 +381,15 @@ export async function bootstrapGateway(
     logger.warn(`im-qqbot: 工具权限拦截注册失败: ${err instanceof Error ? err.message : String(err)}`);
   }
   toolAccess.register(ctx);
-  const browserAccess = config.browser?.enabled && config.ownerOpenid?.trim()
-    ? new BrowserAccess(config, manager, sender, logger, (allowedGroups) => updateProfileConfig(
-      { browser: { ...config.browser, allowedGroups } }, resolveProfileDir(ctx.baseUrl) ?? undefined, logger,
-    ))
-    : undefined;
-  browserAccess?.register(ctx);
+  const registerGroupAccess = (feature: GroupAccessFeature): GroupAccess | undefined => {
+    if (!config[feature]?.enabled || !config.ownerOpenid?.trim()) return undefined;
+    const access = new GroupAccess(feature, config, manager, sender, logger, (groups) => updateProfileAllowedGroups(
+      feature, groups, resolveProfileDir(ctx.baseUrl) ?? undefined, logger, config[feature]?.allowedGroups,
+    ));
+    access.register(ctx);
+    return access;
+  };
+  const groupAccess = { browser: registerGroupAccess('browser'), imageGen: registerGroupAccess('imageGen') };
 
   bot.on('interaction', async (_iCtx: unknown, event: InteractionEvent) => {
     // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
@@ -372,7 +398,7 @@ export async function bootstrapGateway(
     // 记录互动事件 id，作为后续被动回复候选（event_id）
     cacheEventId(scope, targetId, event.id);
 
-    const code = dispatchInteraction(event, manager, dndButtons, toolAccess, browserAccess, personaSwitch);
+    const code = dispatchInteraction(event, manager, dndButtons, toolAccess, groupAccess, personaSwitch);
     await bot.acknowledgeInteraction(event.id, code).catch(() => {});
   });
 
@@ -409,7 +435,7 @@ export async function bootstrapGateway(
   // ── 视觉工具注册（qqbot_describe_image，复用 dsh llm + attachments） ──
   ensureVisionInputModal(config.vision, logger);
   registerDescribeImageTool(ctx, config.vision, logger);
-  registerBrowserTool(ctx, config, manager, logger, browserAccess);
+  registerBrowserTool(ctx, config, manager, logger);
 
   // ── 视频理解工具（qqbot_describe_video：抽帧宫格 + 音轨 ASR；ffmpeg 不可用时跳过） ──
   // 先找 ffmpeg：winget 装的不在 PATH 里时，把它的目录补进本进程 PATH（终端工具会继承），并在 prompt 里点名路径
@@ -433,26 +459,34 @@ export async function bootstrapGateway(
     resolveTmpDir(config),
   );
 
-  // ── 听音频（qqbot_transcribe）：本机 whisper 常挂，改走能吃音频的模型 ──
-  registerTranscribeTool(ctx, logger);
+  // ── 听音频（qqbot_transcribe）：跟随 config.asr 协议/网关与 ffmpeg 路径 ──
+  registerTranscribeTool(ctx, logger, config.asr, ffmpegBins);
 
   // ── 附件发送工具注册（qqbot_send_file） ──
   // 包装 bot：让文件发送也走 msgId 兜底 + 被动回复限额管控。
   // 注意：SDK 文件发送暂不支持 event_id，故 allowEvent=false，跳过 event 候选。
-  // 媒体发送不走 onMessageSent，结果里的 ref_idx 自己记，群友引用表情/配图时才认得出是 bot 发的
-  const rememberMedia = <T,>(kind: Parameters<typeof mediaQuoteText>[0], caption: string | undefined) => (result: T): T => {
-    selfSent.record(mediaRefIdx(result), mediaQuoteText(kind, caption));
+  // 媒体发送不走 onMessageSent，结果里的 ref_idx 自己记，群友引用表情/配图时才认得出是 bot 发的；群聊同时写入归档
+  const rememberMedia = <T,>(
+    target: ReplyTarget,
+    kind: Parameters<typeof mediaQuoteText>[0],
+    caption: string | undefined,
+  ) => (result: T): T => {
+    const text = mediaQuoteText(kind, caption);
+    selfSent.record(mediaRefIdx(result), text);
+    archiveBotMessage(target, text, result);
     return result;
   };
+  const rawSendVoice = (target: ReplyTarget, source: { localPath?: string }) =>
+    sendQueue.run(target, () => bot.sendVoice(resolveReplyTarget(target, replyLimiter, false), source), true);
   const mediaSender: MediaSenderLike = {
     sendImage: (target, source, opts) => sendQueue.run(target, () => bot.sendImage(resolveReplyTarget(target, replyLimiter, false), source, opts))
-      .then(rememberMedia('图片', opts?.content)),
+      .then(rememberMedia(target, '图片', opts?.content)),
     sendVideo: (target, source, opts) => sendQueue.run(target, () => bot.sendVideo(resolveReplyTarget(target, replyLimiter, false), source, opts))
-      .then(rememberMedia('视频', opts?.content)),
-    sendVoice: (target, source) => sendQueue.run(target, () => bot.sendVoice(resolveReplyTarget(target, replyLimiter, false), source), true)
-      .then(rememberMedia('语音', undefined)),
+      .then(rememberMedia(target, '视频', opts?.content)),
+    sendVoice: (target, source) => rawSendVoice(target, source)
+      .then(rememberMedia(target, '语音', undefined)),
     sendFile: (target, source, opts) => sendQueue.run(target, () => bot.sendFile(resolveReplyTarget(target, replyLimiter, false), source, opts))
-      .then(rememberMedia('文件', opts?.content)),
+      .then(rememberMedia(target, '文件', opts?.content?.trim() ? opts.content : opts?.fileName)),
   };
   // ── 搜图工具（qqbot_fanart_pick）：候选落在 tmp/fanart，发出去的那张才记进 media/fanart 的 seen ──
   const fanartCandidatesDir = join(resolveTmpDir(config), 'fanart');
@@ -483,7 +517,14 @@ export async function bootstrapGateway(
   // ── 语音合成工具注册（qqbot_speak） ──
   // 放在插件里而不是让模型自己跑命令：沙箱里联网要人审批，开一次口弹一次确认太出戏。
   if (config.speak.enabled) {
-    registerSpeakTool(ctx, mediaSender, manager, config, logger);
+    registerSpeakTool(ctx, { sendVoice: rawSendVoice }, manager, config, logger, {
+      onSent: (target, spoken, result) => rememberMedia(target, '语音', spoken)(result),
+    });
+  }
+
+  // ── 生图与参考图编辑工具（qqbot_image_gen） ──
+  if (config.imageGen?.enabled === true) {
+    registerImageGenTool(ctx, mediaSender, manager, config, logger);
   }
 
   // ── Bilibili 只读工具（搜索/视频/评论/字幕/扫码登录） ──
@@ -583,10 +624,7 @@ export async function bootstrapGateway(
 
   // ── 共享笔记工具注册（qqbot_notes_search / qqbot_notes_save） ──
   if (notesStore !== undefined) {
-    registerNotesTools(ctx, notesStore, manager, logger, {
-      ownerOpenid: config.ownerOpenid,
-      judgeEnabled: () => config.notes?.judge?.enabled === true,
-    });
+    registerNotesTools(ctx, notesStore, manager, logger, { ownerOpenid: config.ownerOpenid });
   }
 
   // ── 历史归档检索（qqbot_history_search）：归档写得多、读得少，这里补一个查询口 ──

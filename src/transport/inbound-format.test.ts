@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { QUOTE_MISSING_NOTE } from '../features/chat-record.ts';
 import type { ResolvedQuote } from '@tencent-connect/qqbot-nodejs';
 import { buildAgentBody, buildQuotePart, buildUserMessage, sanitizeNotesQuery } from './inbound.ts';
@@ -63,6 +63,20 @@ describe('buildAgentBody', () => {
     expect(body).not.toMatch(/\(u\d\)/);
     expect(body.match(/^\[Current message\]/gm)).toHaveLength(1);
     expect(body.endsWith('[Current message] 21:05\n[甲 #U1] 在吗 (@you)')).toBe(true);
+  });
+
+  it('bot 历史发言标为 [你自己]，不给 __self__ 分配群内别名', () => {
+    const spyLabel = vi.fn(label);
+    const withBot = [
+      history[0]!,
+      { messageId: 'b1', senderId: SELF_SENDER_ID, senderName: '大肥鱼', role: 'assistant' as const, content: '昨天回过你了', timestamp: new Date(2026, 9, 29, 21, 0).getTime() },
+      history[1]!,
+    ];
+    const base = buildUserMessage('在吗', '', group);
+    const body = buildAgentBody(base, withBot, true, true, spyLabel, [], now);
+    expect(body).toContain('21:00 [你自己] 昨天回过你了');
+    expect(spyLabel).toHaveBeenCalledTimes(2);
+    expect(spyLabel).not.toHaveBeenCalledWith(SELF_SENDER_ID, expect.anything());
   });
 });
 

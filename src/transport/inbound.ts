@@ -23,6 +23,7 @@ import {
 } from './attachment.ts';
 import { clearGroupHistory } from '../features/history-store.ts';
 import {
+  isBotMemoryEntry,
   readGroupMessagesAfter,
   readHistoryCursor,
   writeHistoryCursor,
@@ -71,6 +72,7 @@ interface ResolvedQuote {
 interface HistoryEntry {
   senderId: string;
   senderName?: string;
+  role?: 'assistant';
   content: string;
   timestamp: number;
   messageId: string;
@@ -138,7 +140,9 @@ export async function handleInbound(
     ? cursor.messageId
     : undefined;
   const history: HistoryEntry[] | undefined = isGroupTrigger
-    ? readGroupMessagesAfter(config.appId, peerId, config.historyLimit, cursorMessageId, msg.messageId)
+    ? readGroupMessagesAfter(config.appId, peerId, config.historyLimit, cursorMessageId, msg.messageId, {
+      includeSelf: cursorMessageId === undefined,
+    })
     : mwState.history;
   const historyImages = isGroupTrigger ? numberHistoryImages(history ?? []) : [];
   if (historyImages.length > 0) {
@@ -701,7 +705,8 @@ export function buildAgentBody(
   const historyLines = history.map(h => {
     const tags = (imagesByMessage.get(h.messageId) ?? []).map(historyImageTag);
     const time = formatMessageTime(h.timestamp, now);
-    const line = `${label(h.senderId, h.senderName)} ${[renderChatRecord(h.content), ...tags].filter(Boolean).join(' ')}`;
+    const senderLabel = isBotMemoryEntry(h) ? '[你自己]' : label(h.senderId, h.senderName);
+    const line = `${senderLabel} ${[renderChatRecord(h.content), ...tags].filter(Boolean).join(' ')}`;
     return time ? `${time} ${line}` : line;
   });
 

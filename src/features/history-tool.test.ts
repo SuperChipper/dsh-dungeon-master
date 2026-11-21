@@ -26,7 +26,7 @@ afterEach(() => {
 });
 
 function setup(
-  entries: Array<{ id: string; name: string; content: string; ts: number }>,
+  entries: Array<{ id: string; senderId?: string; name?: string; role?: 'assistant'; content: string; ts: number }>,
   peerId = 'G1',
 ): Executed {
   const dir = mkdtempSync(join(tmpdir(), 'hist-'));
@@ -35,7 +35,12 @@ function setup(
   const memory = join(dir, '.dsh', 'qqbot-memory');
   mkdirSync(memory, { recursive: true });
   const lines = entries.map((e) => JSON.stringify({
-    messageId: e.id, senderId: `openid-${e.name}`, senderName: e.name, content: e.content, timestamp: e.ts,
+    messageId: e.id,
+    senderId: e.senderId ?? `openid-${e.name ?? 'u'}`,
+    ...(e.name !== undefined ? { senderName: e.name } : {}),
+    ...(e.role !== undefined ? { role: e.role } : {}),
+    content: e.content,
+    timestamp: e.ts,
   }));
   writeFileSync(join(memory, `app1-${peerId}.jsonl`), `${lines.join('\n')}\n`, 'utf8');
 
@@ -94,5 +99,24 @@ describe('qqbot_history_search', () => {
   it('日期写错要报可读的错', async () => {
     const tool = setup([]);
     await expect(tool.execute({ since: '10月4日' }, {})).rejects.toThrow(/YYYY-MM-DD/);
+  });
+
+  it('支持按人设名、bot、自己检索 bot 归档发言，并统一显示发送者', async () => {
+    const tool = setup([
+      { id: 'u1', name: '薯条', content: '昨天定啥了', ts: new Date(2026, 10, 4, 10).getTime() },
+      { id: 'b1', senderId: '__self__', name: '大肥鱼', role: 'assistant', content: '周六晚上八点开团', ts: new Date(2026, 10, 4, 10, 5).getTime() },
+      { id: 'b2', senderId: '__self__', role: 'assistant', content: '我记得很清楚', ts: new Date(2026, 10, 4, 10, 10).getTime() },
+    ]);
+
+    const byPersona = await tool.execute({ sender: '大肥鱼' }, {});
+    expect(byPersona.count).toBe(1);
+    expect(String(byPersona.message)).toContain('大肥鱼(bot)：周六晚上八点开团');
+
+    const byBot = await tool.execute({ sender: 'bot' }, {});
+    expect(byBot.count).toBe(2);
+    expect(String(byBot.message)).toContain('bot：我记得很清楚');
+
+    const bySelf = await tool.execute({ sender: '自己' }, {});
+    expect(bySelf.count).toBe(2);
   });
 });

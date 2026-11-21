@@ -14,7 +14,7 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import type { Logger } from '../types.ts';
 import type { SessionManager } from '../session/session-manager.ts';
-import { listMemoryChats, readAllGroupMessages } from './group-memory.ts';
+import { isBotMemoryEntry, listMemoryChats, readAllGroupMessages } from './group-memory.ts';
 
 export const HISTORY_SEARCH_TOOL_NAME = 'qqbot_history_search';
 
@@ -90,6 +90,7 @@ function renderHits(args: SearchArgs, hits: HistoryHit[], chat: string, truncate
 interface RawEntry {
   senderId?: string;
   senderName?: string;
+  role?: 'assistant';
   content?: string;
   timestamp?: number | string;
   ts?: number | string;
@@ -145,7 +146,7 @@ export function registerHistorySearchTool(
           type: 'string',
           description: 'Chat id to search, or "*" for every archived chat. Omit for the current conversation. Use a group openid only when the user asks about that specific chat.',
         },
-        sender: { type: 'string', description: 'Sender name or id substring, e.g. "薯条" or "U3".' },
+        sender: { type: 'string', description: 'Sender name or id substring, e.g. "薯条", "U3", or "bot".' },
         since: { type: 'string', description: 'Inclusive start: "YYYY-MM-DD" or "YYYY-MM-DD HH:mm" (local time).' },
         until: { type: 'string', description: 'Inclusive end, same format; a bare date covers the whole day.' },
         limit: { type: 'integer', description: `Max messages to return (1-${MAX_LIMIT}, default 20). Newest matches win.` },
@@ -214,19 +215,24 @@ export function registerHistorySearchTool(
             const haystack = content.toLowerCase();
             if (!terms.every((t) => haystack.includes(t))) continue;
           }
+          const isBot = isBotMemoryEntry(entry);
           if (sender !== undefined) {
             if (aliasOpenid !== undefined) {
               if ((entry.senderId ?? '').toUpperCase() !== aliasOpenid.toUpperCase()) continue;
             } else {
-              const who = `${entry.senderName ?? ''} ${entry.senderId}`.toLowerCase();
+              const who = `${entry.senderName ?? ''} ${entry.senderId ?? ''}${isBot ? ' bot assistant 自己 你自己' : ''}`.toLowerCase();
               if (!who.includes(sender)) continue;
             }
           }
           total += 1;
+          const trimmedName = entry.senderName?.trim();
+          const botDisplay = trimmedName && trimmedName.toLowerCase() !== 'bot'
+            ? `${trimmedName}(bot)`
+            : 'bot';
           hits.push({
             chat,
             time: new Date(ts).toISOString().replace('T', ' ').slice(0, 16),
-            sender: entry.senderName ?? entry.senderId ?? '(未知)',
+            sender: isBot ? botDisplay : (entry.senderName ?? entry.senderId ?? '(未知)'),
             text: content.length > SNIPPET_CHARS ? `${content.slice(0, SNIPPET_CHARS)}…` : content,
           });
         }
