@@ -152,7 +152,7 @@ export function hookLine(ch: Character, h: BackstoryHook): string {
 
 function liveHooks(c: Campaign): Array<{ ch: Character; hook: BackstoryHook }> {
   return c.characters
-    .filter((ch) => ch.kind === 'pc' && !ch.conditions.includes('死亡'))
+    .filter((ch) => ch.kind === 'pc' && !ch.conditions.includes('死亡') && ch.absent !== true)
     .flatMap((ch) => (ch.hooks ?? []).filter((h) => h.closed !== true).map((hook) => ({ ch, hook })));
 }
 
@@ -201,6 +201,6 @@ export function hookPromptLines(c: Campaign): string[] {
 /** 还没留过钩子的 PC：开场时提醒问一句 */
 export function pcsWithoutHooks(c: Campaign): string[] {
   return c.characters
-    .filter((ch) => ch.kind === 'pc' && !ch.conditions.includes('死亡') && (ch.hooks ?? []).every((h) => h.closed === true))
+    .filter((ch) => ch.kind === 'pc' && !ch.conditions.includes('死亡') && ch.absent !== true && (ch.hooks ?? []).every((h) => h.closed === true))
     .map((ch) => ch.name);
 }

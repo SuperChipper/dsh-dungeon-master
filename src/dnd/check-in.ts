@@ -36,6 +36,16 @@ export function createCheckIn(now = Date.now()): CheckIn {
   return { openedAt: now, arrived: new Map(), started: false };
 }
 
+/** bot 重启后内存签到表丢失时，按团档里的 absent 状态恢复签到态（已进入暂离态说明本场已开场） */
+export function rehydrateCheckIn(c: Campaign, now = Date.now()): CheckIn {
+  const pcs = c.characters.filter((ch) => ch.kind === 'pc' && !ch.conditions.includes('死亡') && ch.playerId !== undefined);
+  if (pcs.some((ch) => ch.absent === true)) {
+    const arrived = new Map(pcs.filter((ch) => ch.absent !== true).map((ch) => [ch.playerId!, now]));
+    return { openedAt: now, arrived, started: true };
+  }
+  return createCheckIn(now);
+}
+
 /** 签到；已经签过返回 false */
 export function markArrived(ci: CheckIn, openid: string, now = Date.now()): boolean {
   if (ci.arrived.has(openid)) return false;
@@ -48,8 +58,8 @@ export function rosterOf(ci: CheckIn, c: Campaign): Roster {
   const bound = pcs.filter((ch) => ch.playerId !== undefined);
   const owners = new Set(bound.map((ch) => ch.playerId!));
   return {
-    arrived: bound.filter((ch) => ci.arrived.has(ch.playerId!)),
-    missing: bound.filter((ch) => !ci.arrived.has(ch.playerId!)),
+    arrived: ci.started ? bound.filter((ch) => ch.absent !== true) : bound.filter((ch) => ci.arrived.has(ch.playerId!)),
+    missing: ci.started ? bound.filter((ch) => ch.absent === true) : bound.filter((ch) => !ci.arrived.has(ch.playerId!)),
     newcomers: [...ci.arrived.keys()].filter((id) => !owners.has(id)).length,
     unbound: pcs.filter((ch) => ch.playerId === undefined),
   };
@@ -65,14 +75,21 @@ function who(ch: Character): string {
 }
 
 /** 给群里看的签到名单 */
-export function rosterText(r: Roster): string {
+export function rosterText(r: Roster, started = false): string {
   const total = r.arrived.length + r.missing.length;
   const lines = [`📋 签到 ${r.arrived.length}/${total}${isComplete(r) ? ' · 全员到齐' : ''}`];
   lines.push(`✅ 已到：${r.arrived.map(who).join('、') || '还没人签到'}`);
-  if (r.missing.length > 0) lines.push(`⏳ 未到：${r.missing.map(who).join('、')}`);
+  if (r.missing.length > 0) {
+    lines.push(started ? `💤 暂离（未签到，已移出队伍）：${r.missing.map(who).join('、')}` : `⏳ 未到：${r.missing.map(who).join('、')}`);
+  }
   if (r.newcomers > 0) lines.push(`🆕 还有 ${r.newcomers} 位没有角色卡的玩家签到了，@ 我说名字和职业来建卡`);
   if (r.unbound.length > 0) lines.push(`（${r.unbound.map((ch) => ch.name).join('、')} 没绑定玩家，签不了到）`);
   return lines.join('\n');
+}
+
+/** 晚到或暂离角色在开场后点「签到」归队的群内提示 */
+export function lateReturnNotice(returned: readonly Character[], inCombat: boolean): string {
+  return `✅ ${returned.map((ch) => ch.name).join('、')} 签到归队（${inCombat ? '战斗进行中，请 @我 宣告入战或等 DM 用先攻加入' : '已回到队伍当前位置'}）`;
 }
 
 /**
@@ -94,16 +111,20 @@ export function arrivalNotice(openids: readonly string[], r: Roster): string {
 /** 签到表下面的说明：大家点什么、什么时候开场 */
 export function checkInHint(r: Roster): string {
   return r.arrived.length + r.missing.length > 0
-    ? '到了的点「签到」，人齐了自动开场；不等了就点「开始」。'
+    ? '到了的点「签到」，人齐了自动开场；不等了就点「开始」（未签到的角色会暂时移出队伍，晚到点「签到」即可归队）。'
     : '到了的点「签到」；还没有角色卡的先 @ 我说名字和职业建卡，准备好了点「开始」。';
 }
 
-/** 给 DM（模型）看的出勤：没到的人轮到时直接 dm_override 跳过，别等他 */
-export function rosterPrompt(r: Roster): string {
+/** 给 DM（模型）看的出勤：开场后未签到者已暂时移出队伍，不参与探索、先攻与战斗 */
+export function rosterPrompt(r: Roster, started = false): string {
   const parts = [`本次签到：已到 ${r.arrived.map((ch) => ch.name).join('、') || '无'}`];
   if (r.missing.length > 0) {
-    parts.push(`未签到 ${r.missing.map((ch) => ch.name).join('、')}（本人发了言就算到了，只是忘了点）。真没来的角色别替他行动：`
-      + '剧情里让他跟着队伍、不做主动行动；战斗中轮到他就 dnd_initiative next dm_override=true 跳过并在回复里说明');
+    const names = r.missing.map((ch) => ch.name).join('、');
+    parts.push(
+      started
+        ? `未签到 ${names}（已暂时移出队伍，不参与探索、先攻、战斗与休息；别替他们行动或拉入先攻；本人点「签到」会自动归队，或本人明确要求加入时用 dnd_character update absent=false 归队）`
+        : `未签到 ${names}（点「开始」后未签到的角色会自动暂时移出队伍；开场前不要替他们行动）`,
+    );
   }
   return parts.join('；');
 }
@@ -112,11 +133,17 @@ export function rosterPrompt(r: Roster): string {
  * 开场时发给 DM 的系统消息。群里不再单独发「人齐了」，由 DM 的开场白一句带过，
  * 少一条消息。begun=false 是新团（按开场叙述），否则先回顾上次进度。
  */
-export function kickoffMessage(r: Roster, begun: boolean, reason: 'complete' | 'manual'): string {
+export function kickoffMessage(
+  r: Roster,
+  begun: boolean,
+  reason: 'complete' | 'manual',
+  benched: readonly string[] = [],
+): string {
   const head = reason === 'complete'
     ? `[系统 · 签到] 人到齐了（${r.arrived.map((ch) => ch.name).join('、')}），开始这次跑团。`
     : `[系统 · 签到] 有人点了「开始」，不等了。已到：${r.arrived.map((ch) => ch.name).join('、') || '无'}`
-      + `${r.missing.length > 0 ? `；未到：${r.missing.map((ch) => ch.name).join('、')}` : ''}。`;
-  return `${head}开场第一句简短说明谁到了${r.missing.length > 0 ? '、谁没来' : ''}，然后`
+      + `${r.missing.length > 0 ? `；未到：${r.missing.map((ch) => ch.name).join('、')}` : ''}`
+      + `${benched.length > 0 ? `（${benched.join('、')} 已暂时移出队伍，本次不参与探索、先攻与战斗，晚到点「签到」自动归队）` : ''}。`;
+  return `${head}开场第一句简短说明谁到了${benched.length > 0 ? '、谁暂离队伍' : (r.missing.length > 0 ? '、谁没来' : '')}，然后`
     + `${begun ? '先核对最新团况、停团交接和玩家已定行动，再用两三句回顾上次的进度，接着描述现在的处境；大区域房间名不代表队伍退回起点，备团计划不代表事情已经发生；若战斗未完，沿原先攻与待结算继续' : '按开场要求叙述'}，最后问大家做什么。不要再列签到名单。`;
 }

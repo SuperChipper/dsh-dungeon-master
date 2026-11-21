@@ -21,6 +21,7 @@ import {
   describePending,
   findCharacter,
   inInitiative,
+  isAbsent,
   isOut,
   reactionBlocked,
   reactionWindow,
@@ -70,7 +71,7 @@ export function eligibleReactors(
   const preDamage: ReactorOption[] = [];
   const postDamage: ReactorOption[] = [];
   for (const ch of c.characters) {
-    if (ch.kind !== 'pc' || !canReact(ch) || roomOf(c, ch) !== room) continue;
+    if (ch.kind !== 'pc' || isAbsent(ch) || !canReact(ch) || roomOf(c, ch) !== room) continue;
     if (c.initiative !== undefined && !inInitiative(c, ch.name)) continue;
     // 用过反应或受惊：反手一击、挡攻击这类都不行（天赋类「自己攻击时」的不占反应，不受影响）
     const free = reactionBlocked(c, ch.name) === undefined;
@@ -122,6 +123,7 @@ export function manualReactors(c: Campaign, value: unknown): ReactorOption[] {
     if (ch.kind !== 'pc' || ch.playerId === undefined) {
       throw new Error(`hold_for 只用来等玩家：${ch.name} 不是绑了玩家的 PC。NPC/怪物的反应由你决定，传 hold=true 后直接 dnd_apply reaction`);
     }
+    if (isAbsent(ch)) throw new Error(`${ch.name} 已暂时移出队伍，不能加入反应`);
     if (c.initiative !== undefined && !inInitiative(c, ch.name)) {
       throw new Error(`${ch.name} 不在当前战斗的参战名单（先攻表）里，不能加入反应；如确已中途参战请先调用 dnd_initiative join`);
     }
@@ -278,7 +280,7 @@ export function assertReactionAuthorized(p: ReactionWindow, ch: Character, name:
 
 /** 这个玩家的角色 */
 function charactersOf(c: Campaign, senderId: string): Character[] {
-  return c.characters.filter((ch) => ch.playerId === senderId && !isOut(ch));
+  return c.characters.filter((ch) => ch.playerId === senderId && !isOut(ch) && !isAbsent(ch));
 }
 
 function stripCharacterPrefix(text: string, characterName: string): string {

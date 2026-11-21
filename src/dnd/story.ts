@@ -66,7 +66,8 @@ export function npcRoom(c: Campaign, npc: Npc): string {
 }
 
 function partyLevel(c: Campaign): number {
-  const pcs = c.characters.filter((ch) => ch.kind === 'pc');
+  const active = c.characters.filter((ch) => ch.kind === 'pc' && ch.absent !== true);
+  const pcs = active.length > 0 ? active : c.characters.filter((ch) => ch.kind === 'pc');
   return pcs.length === 0 ? 0 : Math.min(...pcs.map((ch) => ch.level));
 }
 
@@ -336,7 +337,7 @@ export function afterChange(c: Campaign, adv: Adventure): string[] {
   }
   const chapter = adv.chapters.find((ch) => ch.id === c.chapter);
   // 全队都走进了下一章的场景：自动翻章（只往前翻，回到旧场景不会翻回去；有人先去探路不算）
-  const party = c.characters.filter((ch) => ch.kind !== 'monster' && !ch.conditions.includes('死亡'));
+  const party = c.characters.filter((ch) => ch.kind !== 'monster' && !ch.conditions.includes('死亡') && ch.absent !== true);
   const allThere = party.length > 0 && party.every((ch) => siteOfRoom(adv, ch.room ?? c.currentRoom)?.chapter === chapter?.next);
   if (chapter?.next !== undefined && allThere) {
     lines.push(...setChapter(c, adv, chapter.next));
@@ -377,7 +378,7 @@ export function beginAdventure(c: Campaign, adv: Adventure): { lines: string[]; 
 export function openingLines(c: Campaign, adv: Adventure): string[] {
   if (!inOpening(c)) return [];
   const steps = adv.opening ?? [];
-  const pcs = c.characters.filter((ch) => ch.kind === 'pc');
+  const pcs = c.characters.filter((ch) => ch.kind === 'pc' && ch.absent !== true);
   const missing = pcsWithoutHooks(c);
   // 开场是问来历最自然的时候；带过来的老角色已经留过就不再问
   const hookStep = pcs.length > 0 && missing.length === 0
@@ -550,7 +551,7 @@ function statusTag(ch: Character): string {
 
 export function roomBrief(c: Campaign, adv: Adventure, room: DungeonRoom): string {
   // 和 campaign.roomOf 同一口径；这里只能引类型，所以内联
-  const here = c.characters.filter((ch) => (ch.kind === 'monster' ? ch.room : (ch.room ?? c.currentRoom)) === room.id);
+  const here = c.characters.filter((ch) => ch.absent !== true && (ch.kind === 'monster' ? ch.room : (ch.room ?? c.currentRoom)) === room.id);
   const npcs = npcsIn(c, adv, room.id);
   const pending = pendingTriggers(c, adv, room.id);
   const unsaid = (room.knowledge ?? []).flatMap((b) => b.facts).filter((f) => !c.facts.includes(f.id));

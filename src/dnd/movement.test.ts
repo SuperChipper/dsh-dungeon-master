@@ -329,4 +329,75 @@ describe('借机是持久化的移动停止点', () => {
     expect(text).not.toContain('不触发借机');
     expect(t.campaign().initiative!.positions!.狼.y).toBe(1);
   });
+
+  it('dash=true 在未超基础速度前遇借机暂停：不提前耗冲刺与主动作；取消不耗，settle 越过基础速度后才落账冲刺', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => { requireCharacter(c, '狼').speed = 30; });
+    const paused = await t.call('dnd_position', { action: 'move', name: '狼', x: 9, y: 0, dash: true });
+    expect(paused).toContain('移动待结算');
+    expect(paused).toContain('0/30 尺');
+    expect(paused).not.toContain('60 尺');
+    expect(paused).not.toContain('（冲刺）');
+    expect(t.campaign().initiative!.dashed).toBeUndefined();
+    expect(t.campaign().initiative!.turnState?.actionUsed).toBeUndefined();
+
+    // 取消剩余移动：冲刺动作未消耗，之后仍可在同一回合再按 dash=true 冲刺或做别的主动作
+    const canceled = await t.call('dnd_apply', { target: '狼', cancel: true });
+    expect(canceled).toContain('冲刺动作未消耗');
+    expect(t.campaign().initiative!.dashed).toBeUndefined();
+    expect(t.campaign().initiative!.turnState?.actionUsed).toBeUndefined();
+
+    // 重新带 dash=true 走 40 尺，decline 后 settle 走完越过基础速度的路段 -> 现在才真正落账冲刺
+    await t.call('dnd_position', { action: 'move', name: '狼', x: 9, y: 0, dash: true });
+    await t.call('dnd_apply', { target: '狼', decline: ['甲'], settle: true });
+    expect(t.campaign().initiative!.dashed).toEqual(['狼']);
+    expect(t.campaign().initiative!.turnState?.actionUsed).toBe('冲刺');
+    expect(t.campaign().initiative!.moved!.狼).toBe(40);
+    expect(t.campaign().initiative!.positions!.狼.x).toBe(9);
+  });
+
+  it('dash=true 走过基础速度 30 尺之后才遇借机暂停：暂停时即已落账冲刺与主动作', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => {
+      requireCharacter(c, '狼').speed = 30;
+      c.initiative!.positions!.甲 = { x: 8, y: 1, room: c.currentRoom };
+    });
+    // 从 (1,0) 走到 (10,0)，在 (9,0) 离开 (8,1) 甲 的 5 尺触及（已走 40 尺 > 30 尺基础速度）
+    const paused = await t.call('dnd_position', { action: 'move', name: '狼', x: 10, y: 0, dash: true });
+    expect(paused).toContain('移动待结算');
+    expect(paused).toContain('40/60 尺（冲刺）');
+    expect(t.campaign().initiative!.dashed).toEqual(['狼']);
+    expect(t.campaign().initiative!.turnState?.actionUsed).toBe('冲刺');
+  });
+
+  it('双武器（5尺近战 + 10尺长戟）：离开 5 尺即暂停并可直接用 5 尺武器打借机', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => {
+      requireCharacter(c, '甲').weapons = [
+        { name: '剑', damage: '1d8' },
+        { name: '长戟', damage: '1d10', notes: '触及' },
+      ];
+    });
+    const paused = await t.call('dnd_position', { action: 'move', name: '狼', x: 4, y: 0 });
+    expect(paused).toContain('移动待结算');
+    expect(t.campaign().initiative!.positions!.狼).toMatchObject({ x: 1, y: 0 });
+    t.rolls.push(15, 6);
+    const atk = await t.strike();
+    expect(atk).toContain('距离 5 尺');
+    expect(t.campaign().initiative!.reacted).toEqual(['甲']);
+    await t.call('dnd_apply', { target: '狼', settle: true });
+    expect(t.campaign().initiative!.positions!.狼).toMatchObject({ x: 4, y: 0 });
+  });
+
+  it('在某敌人的借机点中途暂停时，不对仍贴着的其他敌人误报「全程没离开触及，不触发借机」', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => {
+      // 甲 在 (0,0)，乙 在 (2,1)：狼 从 (1,0) 走到 (2,0) 离开 甲（触发借机暂停），此时还贴着 乙，若继续走到 (6,0) 会再离开 乙
+      c.initiative!.positions!.乙 = { x: 2, y: 1, room: c.currentRoom };
+    });
+    const paused = await t.call('dnd_position', { action: 'move', name: '狼', x: 6, y: 0 });
+    expect(paused).toContain('移动待结算');
+    expect(paused).toContain('甲·借机攻击');
+    expect(paused).not.toContain('全程没离开触及');
+  });
 });

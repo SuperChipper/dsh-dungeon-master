@@ -2,7 +2,7 @@
 import { join } from 'node:path';
 import { roomGraph } from '../adventure.ts';
 import {
-assertNoPending,moveParty,partyPositions,requireCharacter,isOut
+assertNoPending,isAbsent,moveParty,partyPositions,requireCharacter,isOut
 } from '../campaign.ts';
 import { findRoom,resolveRoom } from '../dungeon.ts';
 import { assertCombatExit } from '../battlefield.ts';
@@ -59,7 +59,7 @@ export function registerExploreTools(kit: ToolKit): void {
       const who = strList(args.who);
       const destination = resolveRoom(roomGraph(adventure), String(args.room ?? ''));
       if (destination !== undefined) {
-        const movers = who === undefined ? c.characters.filter((ch) => ch.kind !== 'monster' && !isOut(ch)) : who.map((name) => requireCharacter(c, name));
+        const movers = who === undefined ? c.characters.filter((ch) => ch.kind !== 'monster' && !isOut(ch) && !isAbsent(ch)) : who.map((name) => requireCharacter(c, name));
         for (const ch of movers) assertCombatExit(c, ch, destination.id);
       }
       if (who !== undefined && args.dm_override !== true) {

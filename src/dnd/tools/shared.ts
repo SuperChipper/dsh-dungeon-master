@@ -23,7 +23,7 @@ type PendingCheck,
 type PendingD20,
 type ReactorOption,UNDEAD_FORTITUDE,
 applyDamage,armorClass,assertDeclaredByOwner,attackModifier,changeInventory,checkAllAirborneCrashes,describePending,findCharacter,initBonusOf,
-findWeapon,isOut,inInitiative,isSurprised,
+findWeapon,isAbsent,isOut,inInitiative,isSurprised,
 isRangedWeapon,
 isTwoHandedWeapon,outsideRooms,nextRollId,pushCombatLedger,pushLog,
 recordDeathFailures,resourceTag,reactionBlocked,
@@ -280,7 +280,7 @@ export function settleAttackDamage(
   onHit: OnHitEffect | undefined,
   roller: Roller,
   riders: readonly PendingRider[] = [],
-): string[] {
+): { lines: string[]; damage: number; needsConcentrationSave: boolean } {
   let amount = saveDamage(raw, false, 'half', defense);
   let type = amount > 0 ? damageType : undefined;
   const lines: string[] = [];
@@ -312,8 +312,9 @@ export function settleAttackDamage(
       lines.push(`${onHit.name} ${extra.detail} ${onHit.damageType}${onHit.defense !== undefined ? `，${DEFENSE_NAMES[onHit.defense]} → ${added}` : ''}；用掉「${spent.key}」，剩 ${spent.resource.current}/${spent.resource.max}`);
     }
   }
-  lines.push(hpLine(applyAttackDamage(c, target, amount, crit, type, roller)));
-  return lines;
+  const change = applyAttackDamage(c, target, amount, crit, type, roller);
+  lines.push(hpLine(change));
+  return { lines, damage: amount, needsConcentrationSave: change.concentrationDc !== undefined };
 }
 
 export function parsePlacements(value: unknown): Placement[] {
@@ -478,7 +479,7 @@ export function sheet(ch: Character, who: (openid: string) => string = (id) => i
   const abilities = ABILITIES.map((a) => `${ABILITY_NAMES[a]}${ch.abilities[a]}`).join(' ');
   const effMax = effectiveMaxHp(ch);
   const lines = [
-    `${ch.name}${ch.player ? `〈${ch.player}${ch.playerId ? ` ${who(ch.playerId)}` : ''}〉` : ''}｜${ch.kind === 'pc' ? 'PC' : (ch.kind === 'npc' ? 'NPC' : '怪物')}${ch.className ? ` ${ch.className}` : ''} ${ch.level} 级`,
+    `${ch.name}${ch.player ? `〈${ch.player}${ch.playerId ? ` ${who(ch.playerId)}` : ''}〉` : ''}｜${ch.kind === 'pc' ? 'PC' : (ch.kind === 'npc' ? 'NPC' : '怪物')}${ch.className ? ` ${ch.className}` : ''} ${ch.level} 级${isAbsent(ch) ? '［暂离队伍］' : ''}`,
     `HP ${ch.hp}/${ch.maxHp}${effMax < ch.maxHp ? `（力竭有效上限 ${effMax}）` : ''}${ch.tempHp > 0 ? ` +${ch.tempHp}` : ''}  AC ${armorClass(campaign, ch)}${campaign?.initiative?.shielded?.includes(ch.name) ? `（基础 ${ch.ac}；护盾术 +5，到自己下回合开始）` : ''}${ch.speed !== undefined ? `  速度 ${ch.speed}` : ''}${ch.flySpeed !== undefined ? `  飞行 ${ch.flySpeed}${ch.hover ? '(悬浮)' : ''}` : ''}`,
     abilities,
     `固定先攻 ${initBonusOf(ch) >= 0 ? '+' : ''}${initBonusOf(ch)}${ch.initBonus === undefined ? '（敏捷；备注中的额外被动不会自动计入）' : '（角色卡总加值，开战时不要重复添加）'}`,
@@ -515,7 +516,7 @@ export function sheet(ch: Character, who: (openid: string) => string = (id) => i
 export function characterBrief(c: Campaign, ch: Character): string {
   const room = roomOf(c, ch);
   return `${ch.name} HP ${ch.hp}/${ch.maxHp}${ch.tempHp > 0 ? `+${ch.tempHp}` : ''} AC ${armorClass(c, ch)}`
-    + `${ch.conditions.length > 0 ? ` [${ch.conditions.join(',')}]` : ''}${resourceTag(ch, c)}${room !== undefined ? ` @${room}` : ''}`;
+    + `${ch.conditions.length > 0 ? ` [${ch.conditions.join(',')}]` : ''}${resourceTag(ch, c)}${isAbsent(ch) ? ' [暂离]' : (room !== undefined ? ` @${room}` : '')}`;
 }
 
 export function parseSkills(values: string[] | undefined): Skill[] | undefined {
@@ -786,7 +787,7 @@ export const DEFAULT_PARTY_SIZE = 4;
  * 也没先跟桌上说；规矩放在刷怪的结果里，DM 正好在决定这一场怎么打。
  */
 export function partySizeHint(c: Campaign, adventure: Adventure): string | undefined {
-  const pcs = c.characters.filter((ch) => ch.kind === 'pc' && !isOut(ch)).length;
+  const pcs = c.characters.filter((ch) => ch.kind === 'pc' && !isOut(ch) && !isAbsent(ch)).length;
   const design = adventure.partySize ?? DEFAULT_PARTY_SIZE;
   if (pcs <= design) return undefined;
   return `【DM】模组按 ${design} 人写，本桌 ${pcs} 人。要调就在开打前定：小怪最多 ${Math.floor(pcs * 1.5)} 只（PC 数 ×1.5）；`
@@ -1297,7 +1298,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       const amount = saveDamage(raw, false, 'half', p.defense);
       pushCombatLedger(c, `${p.attacker}→${p.target} 落账：受 ${amount}${p.riders?.length ? ` + 附伤(${p.riders.map((r) => `${r.label}`).join('+')})` : ''}${usedNote}`, p.seq);
       lines.push(`${p.attacker}→${p.target} 落账：${p.defense !== undefined ? `${DEFENSE_NAMES[p.defense]} ` : ''}受 ${amount}`);
-      lines.push(...settleAttackDamage(c, p.attacker, p.target, raw, effectiveCrit, p.damageType, p.defense, p.onHit, service.roller, p.riders ?? []));
+      lines.push(...settleAttackDamage(c, p.attacker, p.target, raw, effectiveCrit, p.damageType, p.defense, p.onHit, service.roller, p.riders ?? []).lines);
     } else {
       const effectiveCrit = p.crit || p.autoCritOnHit === true;
       lines.push(`${p.attacker}→${p.target} 落账：命中${effectiveCrit ? '（重击）' : ''}，用 dnd_roll 掷伤害再 dnd_apply 扣血。`);

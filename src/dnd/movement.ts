@@ -36,14 +36,22 @@ export function resolveMovement(
   if (p === undefined) throw new Error('现在没有待结算的移动');
   if (requireCharacter(c, String(args.target ?? '')).name !== p.target) throw new Error(`待结算移动的是 ${p.target}`);
   if (args.cancel === true) {
+    const dashRefundNote = p.resume.dash === true && state.dashed?.includes(p.target) !== true
+      ? '（尚未进入冲刺阶段，冲刺动作未消耗）'
+      : '';
     delete state.movement;
     pushLog(c, `${p.target} 取消剩余移动`);
-    return `${p.target} 取消剩余移动，停在当前格；已经花掉的移动力和反应不退。`;
+    return `${p.target} 取消剩余移动，停在当前格；已经花掉的移动力和反应不退${dashRefundNote}。`;
   }
   if (Array.isArray(args.decline)) for (const name of args.decline) declineReaction(p, requireCharacter(c, String(name)).name);
   if (args.settle !== true) return `${p.target} 仍停在借机触发处；全部答复且借机落账后 dnd_apply target=${p.target} settle=true 继续移动。`;
   assertWindowClosed(p);
   delete state.movement;
-  if (stopped(c, p.target, p.resume.ignoreStateMods === true)) return `${p.target} 在借机后无法继续移动，停在当前格。`;
+  if (stopped(c, p.target, p.resume.ignoreStateMods === true)) {
+    const dashRefundNote = p.resume.dash === true && state.dashed?.includes(p.target) !== true
+      ? '（尚未进入冲刺阶段，冲刺动作未消耗）'
+      : '';
+    return `${p.target} 在借机后无法继续移动，停在当前格${dashRefundNote}。`;
+  }
   return beginMovement(c, p.target, p.resume, options);
 }

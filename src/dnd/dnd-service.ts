@@ -4,11 +4,12 @@
  * 开团后，这个会话每回合多两段 system prompt：DM 守则 + 精简团况。
  * 不需要切换 preset 或开新会话，/dnd end 之后自动恢复成普通聊天。
  */
-import { join } from 'node:path';
+import { existsSync, readdirSync, statSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { Roller } from './dice.ts';
 import { cryptoRoller } from './dice.ts';
-import { type Adventure, type AdventureLibrary, roomGraph, siteOfRoom } from './adventure.ts';
-import { type Campaign, CampaignStore, addSummary, campaignState, createCampaign, ensureSessionSummary, reconcileKnownSites, summarize, summarizeCombat } from './campaign.ts';
+import { type Adventure, type AdventureLibrary, findSite, roomGraph, siteOfRoom } from './adventure.ts';
+import { type Campaign, CampaignStore, addSummary, campaignState, createCampaign, ensureSessionSummary, reconcileKnownSites, restoreAllAbsent, summarize, summarizeCombat } from './campaign.ts';
 import { CustomEffectStore, type CustomEffectDef } from './custom-effects.ts';
 import { PREPARATION_MAX_CHARS, preparationLines, recoveryLines } from './session-recovery.ts';
 import { type CheckIn, rosterOf, rosterPrompt } from './check-in.ts';
@@ -16,7 +17,7 @@ import { chronicleLines } from './chronicle.ts';
 import { hookPromptLines } from './hooks.ts';
 import { PromptLatch } from '../features/prompt-latch.ts';
 import type { ReplyTarget } from '../types.ts';
-import { findRoom } from './dungeon.ts';
+import { exitKey, exitsOf, findRoom } from './dungeon.ts';
 import { inOpening, openingLines, roomView } from './story.ts';
 
 export interface DndPromptSection {
@@ -72,6 +73,7 @@ const DM_RULES = [
   '- PC 的回合只有他本人说「没了/结束」或点按钮才结束（next 传他的 declared_by），别人催不算。收到「[系统 · 按钮] X 点了结束回合」说明工具已经推进，不要再为 X next。',
   '- 不是当前回合的人宣告了行动：说「记下了，等你的回合」，不提前结算；借机攻击和反应传 reaction=true。叙事里的「轮到谁」必须和工具一致，对不上先 goto。敌人倒光就 end。',
   '- 结果里有「待结算」时先停手：掷骰窗口报成败、问反应；移动借机窗口在触发格等玩家，不先把人走完或 next。PC 反应只认本人明确选择后的服务器 authorization，提问或 declared_by 都不算同意。豁免和检定要不要挂反应窗口由你判（dnd_check hold_for），尤其敌人对奇塔露自己法术的豁免。',
+  '- 连击提前返回时先处理停点，照已结击数和骰号继续，不把整批重掷，也不自动向倒下的目标补刀。',
   '- 站位只认 dnd_position 和最新团况的站位行，不凭记忆和前面的叙述。开战按【场地】提示画图、摆位；移动把玩家的原话交给工具（to、keep_adjacent、away_from、dash、drag、disengage），玩家报了坐标才用 x/y；退到门外的人 move 到门外。走错了 dnd_undo 重走，不用 set 瞬移改正。',
   '- 跟玩家讲站位用人话，只讲角色看得见的人，不念坐标。要看图就原样贴 show 返回的「玩家视角示意图」（含 ``` 两行），或让他们点「查看状态」、发 /dnd status，不要手画。',
   '- 上下文压缩后第一次裁定之前，先对一遍最新团况的 HP、先攻指针、站位和最近记录。谁已行动、挂在目标身上的效果（猎人印记、专注）最容易走样，拿不准就查或问。',
@@ -81,7 +83,7 @@ const DM_RULES = [
   '- 玩家提到以前的事，或你要说「没有这人」「没去过」「没发生过」之前，先查（dnd_chronicle search、dnd_character show、dnd_lookup）。查不到只说「我这边没记录」再问玩家；玩家说得对就照他说的补记。',
   '- 玩家讲的角色来历里没了结的事（找的人、欠的债、逃开的地方），用 dnd_hook add 记成钩子；工具结果里的「背景钩子」接不接你定，1-2 档随手用，再往上先 plan，那个人亲自出现之前先问玩家。',
   '- 工具记不到的（临场编的人和事、俘虏、承诺和欠账、线头、背景新发现、本桌裁定）用 dnd_chronicle add 记；一段剧情告一段落、接交任务、快下线时用 dnd_progress 记进度。',
-  '- 收团用 dnd_end（与玩家 /dnd end 同一暂停流程），只存档用 dnd_progress；交接记清具体停点、刚发生的事、已定行动、同行与留守、未结事项和下次第一步。dnd_prepare 用来提前准备下一次团的内容（先用 dnd_lookup 查候选下一站，卡片只给概括时再去读 dnd/adventures/<id>/ 下的原书表格与机关细则），不重复总结过去发生的事，也不能当作已发生事实或念给玩家。',
+  '- 收团用 dnd_end（与玩家 /dnd end 同一暂停流程），只存档用 dnd_progress；交接记清具体停点、刚发生的事、已定行动、同行与留守、未结事项和下次第一步。dnd_prepare 用来提前准备下一次团的内容（先用 dnd_prepare show 看候选下一站与模组原书目录，再用 dnd_lookup 查卡片，未展开的表格与细则可只读查阅该模组目录并提炼进 dnd_prepare save，避免下次开团临时翻书），不重复总结过去发生的事，也不能当作已发生事实或念给玩家。',
   '- 笔记（qqbot_notes_save）只记跨团通用、玩家知道的东西（玩家偏好、DM 约定、角色梗）：DC、怪物数值、DM 笔记、秘密不写；跑团进度只写团档。',
   '- 没有角色卡的玩家，问清名字和职业再建卡。玩家问规则可以提醒他用 /dnd search、/dnd spells 查 wiki；要看地图用 dnd_map。',
   '- 如果现在是要你写对话的压缩摘要（checkpoint）：技术类小节没有必要就写 (none)，工具用法、文件路径不用留。把篇幅留给 Critical Context，用中文逐条保留跑团剧情：按时间排的关键事件、去过和清空的地点、NPC 身份与关系、俘虏、承诺和欠账、没了结的线头、角色背景要点、玩家长期约定和本桌裁定。战斗中还要写明：这一轮谁已行动、谁用过反应、挂在目标身上的效果（猎人印记、专注、神圣武器）；站位和 HP 团况里有，不用转述。',
@@ -102,7 +104,7 @@ const PAUSED_RULES = [
   '- 说错了就一句改正、给出正确说法；不检讨、不讲自己怎么记混的。',
   CHARACTER_RULE,
   '- 玩家要求建卡或改卡：直接用 dnd_character create/update 写 PC，再用 dnd_resource set 配置法术位和职业资源，不用先开团。player_id 填消息标签里的 U 编号；不翻文件找 openid、不手改团档。工具成功后才说已入库；停团不能建怪、删卡、移动或结算行动。',
-  '- 明确要求备团时可用 dnd_prepare show/save 提前准备下一次团的内容（用 dnd_lookup 查候选下一站，卡片没展开的随机遭遇表、机关与支线去读 dnd/adventures/<id>/ 原书文件，不写过去总结），计划仅 DM 可见，不推进剧情。收团后补写交接可用 dnd_end summary，不用重新 start；不把 DM 计划发到群里。',
+  '- 明确要求备团时可用 dnd_prepare show/save 提前准备下一次团的内容（先用 dnd_prepare show 看候选下一站与模组原书目录，再用 dnd_lookup 查卡片，未展开的随机遭遇表、机关与支线可只读查阅该模组目录并提炼进 dnd_prepare save，避免下次开团临时翻书；不写过去总结），计划仅 DM 可见，不推进剧情，禁止修改原书文件或发给玩家。收团后补写交接可用 dnd_end summary，不用重新 start；不把 DM 计划发到群里。',
 ].join('\n');
 
 /** 跟着队伍位置和章节变的背景：本章要点、当前场景的通用规则 */
@@ -113,6 +115,90 @@ function sceneLines(campaign: Campaign, adventure: Adventure): string[] {
     ...(chapter?.dmGuide ? [`本章要点：${chapter.dmGuide}`] : []),
     ...(site?.features ? [`「${site.name}」通用规则：${site.features}`] : []),
   ];
+}
+
+const SKIP_SOURCE_ENTRIES = new Set(['adventure.json', 'sites', 'img', 'build', '_source.json']);
+
+function formatAdventureDir(dir: string, cwd: string): string {
+  const absCwd = resolve(cwd);
+  const absDir = resolve(dir);
+  const rel = relative(absCwd, absDir);
+  if (rel === '') return '.';
+  if (!rel.startsWith('..') && !isAbsolute(rel)) return rel.replace(/\\/g, '/');
+  return absDir;
+}
+
+function listModuleSourceEntries(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  try {
+    const items = readdirSync(dir)
+      .filter((name) => !name.startsWith('.') && !SKIP_SOURCE_ENTRIES.has(name))
+      .map((name) => {
+        let isDir = false;
+        try { isDir = statSync(join(dir, name)).isDirectory(); } catch { /* treat as file */ }
+        return { label: isDir ? `${name}/` : name, isDir };
+      });
+    items.sort((a, b) => (a.isDir === b.isDir ? a.label.localeCompare(b.label) : a.isDir ? -1 : 1));
+    return items.map((x) => x.label);
+  } catch {
+    return [];
+  }
+}
+
+function upcomingCandidateLines(campaign: Campaign, adventure: Adventure): string[] {
+  const graph = roomGraph(adventure);
+  const currentSite = siteOfRoom(adventure, campaign.currentRoom);
+  const lines: string[] = [];
+
+  if (currentSite?.kind === 'hub') {
+    const unvisited = currentSite.rooms.filter((r) => r.id !== campaign.currentRoom && !campaign.revealed.includes(r.id));
+    if (unvisited.length > 0) {
+      const shown = unvisited.slice(0, 12).map((r) => `${r.name}(${r.id})`).join('；');
+      const tail = unvisited.length > 12 ? `（等共 ${unvisited.length} 处）` : '';
+      lines.push(`当前城镇未探访地点：${shown}${tail}`);
+    }
+  } else {
+    const exits = exitsOf(graph, campaign.currentRoom);
+    if (exits.length > 0) {
+      const items = exits.map((e) => {
+        const target = findRoom(graph, e.to);
+        const tags = [campaign.revealed.includes(e.to) ? '去过' : '未去过'];
+        if (e.hidden === true) {
+          tags.push(campaign.discoveredExits.includes(exitKey(campaign.currentRoom, e.to)) ? '暗门已发现' : '暗门未发现');
+        }
+        return `${target?.name ?? e.to}(${e.to}，${tags.join('、')})`;
+      });
+      lines.push(`当前房间相邻去向：${items.join('；')}`);
+    }
+  }
+
+  const candidateSites: string[] = [];
+  const seenSites = new Set<string>(currentSite !== undefined ? [currentSite.id] : []);
+  for (const id of campaign.knownSites) {
+    if (seenSites.has(id)) continue;
+    const site = findSite(adventure, id);
+    if (site === undefined || !site.rooms.some((r) => !campaign.revealed.includes(r.id))) continue;
+    seenSites.add(id);
+    candidateSites.push(`${site.name}(${site.id})`);
+  }
+  if (currentSite !== undefined) {
+    for (const route of adventure.routes ?? []) {
+      const otherId = route.from === currentSite.id ? route.to : route.to === currentSite.id ? route.from : undefined;
+      if (otherId === undefined || seenSites.has(otherId)) continue;
+      const site = findSite(adventure, otherId);
+      if (site === undefined) continue;
+      seenSites.add(otherId);
+      const isKnown = campaign.knownSites.includes(otherId);
+      candidateSites.push(`${site.name}(${site.id}${isKnown ? '' : '，未公开'})`);
+    }
+  }
+  if (candidateSites.length > 0) {
+    const shown = candidateSites.slice(0, 10).join('；');
+    const tail = candidateSites.length > 10 ? `（等共 ${candidateSites.length} 个）` : '';
+    lines.push(`其他候选场景：${shown}${tail}`);
+  }
+
+  return lines.length === 0 ? [] : ['【候选下一站 · DM 参考】', ...lines];
 }
 
 export class DndService {
@@ -144,13 +230,22 @@ export class DndService {
   public onStateChange?: (key: string) => void;
   /** 这段对话 system prompt 里锁住的背景，见 promptSections */
   private readonly background = new PromptLatch();
+  private readonly cwd: string;
 
-  public constructor(options: { store: CampaignStore; library: AdventureLibrary; mapDir: string; roller?: Roller }) {
+  public constructor(options: { store: CampaignStore; library: AdventureLibrary; mapDir: string; roller?: Roller; cwd?: string }) {
     this.store = options.store;
     this.library = options.library;
     this.mapDir = options.mapDir;
     this.roller = options.roller ?? cryptoRoller;
+    this.cwd = options.cwd ?? process.cwd();
     this.customEffects = new CustomEffectStore(join(options.store.root, '..', 'custom-effects.json'));
+  }
+
+  /** 当前会话团档对应的目录形式模组根目录（开团与停团均有效；无团档或单文件/内置模组返回 undefined） */
+  public adventureDir(key: string): string | undefined {
+    const campaign = this.store.load(key);
+    if (campaign === undefined) return undefined;
+    return this.library.get(campaign.adventureId)?.dir;
   }
 
   public globalEffects(): Record<string, CustomEffectDef> {
@@ -203,6 +298,7 @@ export class DndService {
     if (existing !== undefined && existing.adventureId === adventure.id && !fresh) {
       existing.active = true;
       existing.sessionStartedAt = Date.now();
+      restoreAllAbsent(existing);
       reconcileKnownSites(existing, adventure);
       this.store.save(existing);
       this.onStateChange?.(key);
@@ -215,6 +311,7 @@ export class DndService {
       for (const ch of existing.characters.filter((x) => x.kind === 'pc')) {
         const copy = structuredClone(ch);
         delete copy.room;
+        delete copy.absent;
         campaign.characters.push(copy);
       }
     }
@@ -232,6 +329,7 @@ export class DndService {
       addSummary(campaign, summary);
     }
     campaign.active = false;
+    restoreAllAbsent(campaign);
     ensureSessionSummary(campaign);
     this.store.save(campaign);
     this.background.forget(key);
@@ -254,13 +352,27 @@ export class DndService {
     const found = this.active(key) ?? this.saved(key);
     if (found === undefined) throw new Error('这个群没有团档（或模组文件丢失）');
     const { campaign, adventure } = found;
+    const sourceGuide = adventure.dir !== undefined
+      ? (() => {
+          const displayDir = formatAdventureDir(adventure.dir, this.cwd);
+          const entries = listModuleSourceEntries(adventure.dir);
+          return [
+            `模组原书目录（只读，供 DM 备团用 read/glob/grep 查阅；禁止修改或用 qqbot_send_file 发给玩家）：${displayDir}${entries.length > 0 ? `（含：${entries.join('、')}）` : ''}`,
+            '备团要提前准备下一次可能涉及的候选地点、原书表格（随机遭遇/战利品/局势）、机关检定、NPC 与个人钩子，不重复总结已发生的事。先用 dnd_lookup 查候选场景与角色，卡片未展开的表格与细则直接只读查阅上述模组目录，再将要点提炼进 dnd_prepare save，避免下次开团临时翻书；未来安排不是事实，不替玩家选路，不自动修改任务或资源。',
+          ];
+        })()
+      : [
+          '当前模组没有独立原书目录；先用 dnd_lookup 提前查好候选场景、房间、NPC、任务与线索，将要点提炼进 dnd_prepare save，避免下次开团临时翻查；未来安排不是事实，不替玩家选路，不自动修改任务或资源。',
+        ];
     return [
       '【备团资料 · DM 私有】以下已记录事实与候选计划分别列出；不要向玩家转发。',
       summarize(campaign, adventure),
       `最近进度：${campaign.summaries.at(-1)?.text ?? '尚未写过；需查账本确认具体停点。'}`,
+      ...(campaign.log.length > 5 ? [`近期完整日志（共 ${campaign.log.length} 条）：${campaign.log.join('；')}`] : []),
+      ...upcomingCandidateLines(campaign, adventure),
       ...recoveryLines(campaign), ...chronicleLines(campaign), ...sceneLines(campaign, adventure),
       ...hookPromptLines(campaign), ...preparationLines(campaign),
-      `备团要提前准备下一次可能涉及的候选地点、原书表格（随机遭遇/战利品/局势）、机关检定、NPC 与个人钩子，不重复总结已发生的事。先用 dnd_lookup 查候选场景，卡片未展开的表格与细则去读 dnd/adventures/${campaign.adventureId}/ 下的原书文件；未来安排不是事实，不替玩家选路，不自动修改任务或资源。`,
+      ...sourceGuide,
     ].join('\n');
   }
 
@@ -316,10 +428,10 @@ export class DndService {
     const held = this.background.peek(key);
     if (held !== undefined) lines.push(...sceneLines(campaign, adventure).filter((line) => !held.includes(line)));
     if (campaign.preparation && campaign.preparation.state !== campaignState(campaign)) {
-      lines.push('DM 备团计划对应的团况已变化：先 dnd_prepare show 重新核对，不能按旧计划自动推进。');
+      lines.push('DM 备团计划对应的团况已变化：旧计划仅作参考（仍适用的后续设定可直接沿用，不能照演或当作已发生事实）；需更新或清空时再调 dnd_prepare save/clear，不必每回合重复 show。');
     }
     const checkIn = this.checkIns.get(key);
-    if (checkIn !== undefined) lines.push(rosterPrompt(rosterOf(checkIn, campaign)));
+    if (checkIn !== undefined) lines.push(rosterPrompt(rosterOf(checkIn, campaign), checkIn.started));
     return lines.join('\n');
   }
 

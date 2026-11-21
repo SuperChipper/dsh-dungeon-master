@@ -16,9 +16,9 @@ import { mapCaption, renderPartyMap } from './map-view.ts';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { Adventure } from './adventure.ts';
-import { type Campaign, type ReactionWindow, describePending, findCharacter, nextTurn, playerStatus, reactionWindow } from './campaign.ts';
+import { type Campaign, type ReactionWindow, describePending, findCharacter, isAbsent, nextTurn, playerStatus, reactionWindow, setCharacterAbsent } from './campaign.ts';
 import { chooseReaction, reactionsOf, reactionReplyNote, waitingOn } from './pending-attack.ts';
-import { type CheckIn, arrivalNotice, checkInHint, createCheckIn, isComplete, kickoffMessage, markArrived, rosterOf, rosterText } from './check-in.ts';
+import { type CheckIn, arrivalNotice, checkInHint, createCheckIn, isComplete, kickoffMessage, lateReturnNotice, markArrived, rehydrateCheckIn, rosterOf, rosterText } from './check-in.ts';
 import type { DndService } from './dnd-service.ts';
 import { combatTurnPrompt } from './dnd-tools.ts';
 import { spellListText } from './spell-links.ts';
@@ -134,7 +134,7 @@ export class DndTurnButtons {
   /** 每个会话最后一次发按钮的回合，同一回合不重复发 */
   private readonly lastSent = new Map<string, string>();
   /** 还没发出去的签到提醒（会话 key → 这一批刚签到的 openid） */
-  private readonly pendingArrivals = new Map<string, { openids: string[]; timer: ReturnType<typeof setTimeout> }>();
+  private readonly pendingArrivals = new Map<string, { openids: string[]; timer: ReturnType<typeof setTimeout>; target: ReplyTarget }>();
   private disabled = false;
   /** 每个会话最后一次自动发战斗图的那一轮：一轮只发一张，每回合都发会刷屏 */
   private readonly lastImage = new Map<string, string>();
@@ -341,10 +341,10 @@ export class DndTurnButtons {
     const found = this.service.active(key);
     if (found === undefined) return false;
     const existed = this.service.checkIns.get(key);
-    const checkIn = reset || existed === undefined ? createCheckIn() : existed;
+    const checkIn = reset ? createCheckIn() : (existed ?? rehydrateCheckIn(found.campaign));
     this.service.checkIns.set(key, checkIn);
     const roster = rosterOf(checkIn, found.campaign);
-    const text = [intro, rosterText(roster), checkIn.started ? '已经开场了，晚到的点「签到」就行。' : checkInHint(roster)]
+    const text = [intro, rosterText(roster, checkIn.started), checkIn.started ? '已经开场了，暂离/晚到的点「签到」即可自动归队。' : checkInHint(roster)]
       .filter((s) => s.length > 0).join('\n\n');
     try {
       await this.sender.sendMarkdown(target, text, { keyboard: buildCheckInKeyboard() });
@@ -358,11 +358,11 @@ export class DndTurnButtons {
     }
   }
 
-  /** bot 重启后点旧消息上的按钮：签到表丢了，重新开一张接着用 */
-  private checkInOf(key: string): CheckIn {
+  /** bot 重启后点旧消息上的按钮：按团档恢复签到态，或重新开一张接着用 */
+  private checkInOf(key: string, campaign: Campaign): CheckIn {
     let checkIn = this.service.checkIns.get(key);
     if (checkIn === undefined) {
-      checkIn = createCheckIn();
+      checkIn = rehydrateCheckIn(campaign);
       this.service.checkIns.set(key, checkIn);
     }
     return checkIn;
@@ -370,42 +370,100 @@ export class DndTurnButtons {
 
   /**
    * 开场：把出勤交给 DM，让它直接开讲。群里不另发「人齐了」，开场白本身就是信号。
-   * 没有会话（bot 刚重启、群里还没人说过话）时开不了，留着下次点。
+   * 点「开始」时还没签到的绑定 PC 自动暂时移出队伍；群里没创建过会话时按 groupId 兜底建会话。
    */
-  private kickoff(checkIn: CheckIn, record: SessionRecord | undefined, campaign: Campaign, reason: 'complete' | 'manual'): boolean {
-    if (checkIn.started || record === undefined) return false;
+  private kickoff(
+    checkIn: CheckIn,
+    key: string,
+    groupId: string,
+    record: SessionRecord | undefined,
+    campaign: Campaign,
+    reason: 'complete' | 'manual',
+    clicker?: string,
+  ): boolean {
+    if (checkIn.started) return false;
+    const canGetOrCreate = typeof (this.manager as { getOrCreate?: unknown }).getOrCreate === 'function';
+    if (record === undefined && !canGetOrCreate) return false;
+
+    const benchedNames: string[] = [];
+    if (reason === 'manual') {
+      const beforeRoster = rosterOf(checkIn, campaign);
+      if (beforeRoster.arrived.length > 0 && beforeRoster.missing.length > 0) {
+        this.service.store.update(key, (c) => {
+          for (const ch of beforeRoster.missing) {
+            if (setCharacterAbsent(c, ch.name, true).changed) benchedNames.push(ch.name);
+          }
+        }, '签到开场：未签到暂离', { recordHistory: false });
+      }
+    }
+
     checkIn.started = true;
     // 开场叙述会说谁到了，攒着的签到提醒不用再发
-    this.cancelArrivals(record.sessionKey);
-    const text = kickoffMessage(rosterOf(checkIn, campaign), campaign.begun === true, reason);
-    this.notifyDm(record, text);
+    this.cancelArrivals(key);
+    const latest = this.service.active(key)?.campaign ?? campaign;
+    const text = kickoffMessage(rosterOf(checkIn, latest), latest.begun === true, reason, benchedNames);
+    if (record !== undefined) {
+      this.notifyDm(record, text);
+    } else {
+      const fallbackTarget: ReplyTarget = { scope: 'group', targetId: groupId };
+      void this.manager.getOrCreate('group', groupId, clicker ?? 'system', fallbackTarget)
+        .then((created) => this.notifyDm(created, text))
+        .catch((err: unknown) => this.logger.warn(`im-qqbot: 跑团开场创建会话失败: ${err instanceof Error ? err.message : String(err)}`));
+    }
     return true;
   }
 
-  /** 签到：给点击者回执，群里攒一行小提醒；签完人齐了就自动开场（不再发提醒） */
-  private checkIn(event: InteractionEvent, key: string, record: SessionRecord | undefined, campaign: Campaign): number {
+  /** 签到：开场前攒一行小提醒、人齐自动开场；开场后晚到或暂离者点击自动归队 */
+  private checkIn(
+    event: InteractionEvent,
+    key: string,
+    groupId: string,
+    record: SessionRecord | undefined,
+    campaign: Campaign,
+    target: ReplyTarget,
+  ): number {
     const clicker = event.group_member_openid ?? event.user_openid;
     if (clicker === undefined) return ACK.failed;
-    const checkIn = this.checkInOf(key);
+    const checkIn = this.checkInOf(key, campaign);
+    if (checkIn.started) {
+      const benchedOwned = campaign.characters.filter(
+        (ch) => ch.kind === 'pc' && ch.playerId === clicker && isAbsent(ch),
+      );
+      if (checkIn.arrived.has(clicker) && benchedOwned.length === 0) return ACK.duplicate;
+      checkIn.arrived.set(clicker, Date.now());
+      this.logger.info(`im-qqbot: 跑团晚到签到 key=${key} by=${clicker}`);
+      if (benchedOwned.length > 0) {
+        this.service.store.update(key, (c) => {
+          for (const ch of benchedOwned) setCharacterAbsent(c, ch.name, false);
+        }, `签到归队 ${benchedOwned.map((x) => x.name).join('、')}`, { recordHistory: false });
+        const latest = this.service.active(key)?.campaign ?? campaign;
+        void this.sender.sendMarkdown(target, lateReturnNotice(benchedOwned, latest.initiative !== undefined))
+          .catch((err: unknown) => this.logger.warn(`im-qqbot: 跑团归队提示发送失败: ${err instanceof Error ? err.message : String(err)}`));
+      } else {
+        void this.sender.sendMarkdown(target, '✅ 1 位还没角色卡的玩家到了（@我说名字和职业建卡）')
+          .catch((err: unknown) => this.logger.warn(`im-qqbot: 跑团签到提醒发送失败: ${err instanceof Error ? err.message : String(err)}`));
+      }
+      return ACK.ok;
+    }
     if (!markArrived(checkIn, clicker)) return ACK.duplicate;
     this.logger.info(`im-qqbot: 跑团签到 key=${key} by=${clicker}`);
-    if (isComplete(rosterOf(checkIn, campaign)) && this.kickoff(checkIn, record, campaign, 'complete')) {
+    if (isComplete(rosterOf(checkIn, campaign)) && this.kickoff(checkIn, key, groupId, record, campaign, 'complete', clicker)) {
       this.logger.info(`im-qqbot: 跑团人齐自动开场 key=${key}`);
-    } else if (record !== undefined) {
-      this.queueArrival(record, clicker);
+    } else {
+      this.queueArrival(key, target, clicker);
     }
     return ACK.ok;
   }
 
-  private queueArrival(record: SessionRecord, openid: string): void {
-    const key = record.sessionKey;
+  private queueArrival(key: string, target: ReplyTarget, openid: string): void {
     const pending = this.pendingArrivals.get(key);
     if (pending !== undefined) {
       pending.openids.push(openid);
+      pending.target = target;
       return;
     }
-    const timer = setTimeout(() => this.flushArrivals(record), ARRIVAL_BATCH_MS);
-    this.pendingArrivals.set(key, { openids: [openid], timer });
+    const timer = setTimeout(() => this.flushArrivals(key), ARRIVAL_BATCH_MS);
+    this.pendingArrivals.set(key, { openids: [openid], timer, target });
   }
 
   private cancelArrivals(key: string): void {
@@ -415,36 +473,40 @@ export class DndTurnButtons {
     this.pendingArrivals.delete(key);
   }
 
-  private flushArrivals(record: SessionRecord): void {
-    const key = record.sessionKey;
+  private flushArrivals(key: string): void {
     const pending = this.pendingArrivals.get(key);
     this.pendingArrivals.delete(key);
     const found = this.service.active(key);
     const checkIn = this.service.checkIns.get(key);
     // 这几秒里结团了、或者已经开场（开场白会说谁到了）就不发
     if (pending === undefined || found === undefined || checkIn === undefined || checkIn.started) return;
-    void this.sender.sendMarkdown(record.replyTarget, arrivalNotice(pending.openids, rosterOf(checkIn, found.campaign)))
+    void this.sender.sendMarkdown(pending.target, arrivalNotice(pending.openids, rosterOf(checkIn, found.campaign)))
       .catch((err: unknown) => this.logger.warn(`im-qqbot: 跑团签到提醒发送失败: ${err instanceof Error ? err.message : String(err)}`));
   }
 
   /** 「开始」：不等没到的人。点的人顺带算签到 */
-  private start(event: InteractionEvent, key: string, record: SessionRecord | undefined, campaign: Campaign): number {
-    const checkIn = this.checkInOf(key);
+  private start(
+    event: InteractionEvent,
+    key: string,
+    groupId: string,
+    record: SessionRecord | undefined,
+    campaign: Campaign,
+  ): number {
+    const checkIn = this.checkInOf(key, campaign);
     const clicker = event.group_member_openid ?? event.user_openid;
     if (clicker !== undefined) markArrived(checkIn, clicker);
     if (checkIn.started) return ACK.duplicate;
-    if (!this.kickoff(checkIn, record, campaign, 'manual')) return ACK.failed;
+    if (!this.kickoff(checkIn, key, groupId, record, campaign, 'manual', clicker)) return ACK.failed;
     this.logger.info(`im-qqbot: 跑团手动开场 key=${key} by=${clicker ?? '?'}`);
     return ACK.ok;
   }
 
   /** 「名单」：唯一会在群里发名单的地方，带冷却 */
-  private roster(key: string, record: SessionRecord | undefined, campaign: Campaign, now = Date.now()): number {
-    const checkIn = this.checkInOf(key);
-    if (record === undefined) return ACK.failed;
+  private roster(key: string, target: ReplyTarget, campaign: Campaign, now = Date.now()): number {
+    const checkIn = this.checkInOf(key, campaign);
     if (checkIn.rosterPostedAt !== undefined && now - checkIn.rosterPostedAt < ROSTER_COOLDOWN_MS) return ACK.duplicate;
     checkIn.rosterPostedAt = now;
-    void this.sender.sendMarkdown(record.replyTarget, rosterText(rosterOf(checkIn, campaign)))
+    void this.sender.sendMarkdown(target, rosterText(rosterOf(checkIn, campaign), checkIn.started))
       .catch((err: unknown) => this.logger.warn(`im-qqbot: 跑团名单发送失败: ${err instanceof Error ? err.message : String(err)}`));
     return ACK.ok;
   }
@@ -458,27 +520,27 @@ export class DndTurnButtons {
     if (groupId === undefined) return ACK.failed;
     const key = this.manager.sessionKey('group', groupId);
     const record = this.manager.getSessionRecord('group', groupId);
+    const target: ReplyTarget = record?.replyTarget ?? { scope: 'group', targetId: groupId };
     const found = this.service.active(key);
     if (found === undefined) return ACK.duplicate;
 
-    if (button.a === 'in') return this.checkIn(event, key, record, found.campaign);
-    if (button.a === 'go') return this.start(event, key, record, found.campaign);
-    if (button.a === 'roster') return this.roster(key, record, found.campaign);
+    if (button.a === 'in') return this.checkIn(event, key, groupId, record, found.campaign, target);
+    if (button.a === 'go') return this.start(event, key, groupId, record, found.campaign);
+    if (button.a === 'roster') return this.roster(key, target, found.campaign);
     if (button.a === 'react' || button.a === 'pass') return this.reactionClick(event, key, record, button);
 
     if (button.a === 'status') {
-      if (record !== undefined) void this.sendStatus(key, record.replyTarget, event.group_member_openid ?? event.user_openid);
+      void this.sendStatus(key, target, event.group_member_openid ?? event.user_openid);
       return ACK.ok;
     }
     if (button.a === 'spells') {
-      if (record === undefined) return ACK.failed;
       // 谁点就列谁的：按钮挂在当前回合那条消息上，别的玩家等回合时也想翻自己的法术
       const clicker = event.group_member_openid ?? event.user_openid;
       const ch = found.campaign.characters.find((x) => x.kind === 'pc' && x.playerId !== undefined && x.playerId === clicker)
         ?? findCharacter(found.campaign, String(button.n ?? ''));
       if (ch === undefined) return ACK.failed;
       void this.sender.sendMarkdown(
-        record.replyTarget,
+        target,
         spellListText(ch.name, ch.spells ?? [], ch.resources, { includeFallback: true, reactions: reactionsOf(ch) }),
       )
         .catch((err: unknown) => this.logger.warn(`im-qqbot: 法术清单发送失败: ${err instanceof Error ? err.message : String(err)}`));

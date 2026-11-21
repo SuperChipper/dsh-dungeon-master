@@ -15,6 +15,7 @@ import {
   type ReactorOption,
   changeCondition,
   findCharacter,
+  isAbsent,
   isOut,
   isRangedWeapon,
   inInitiative,
@@ -235,6 +236,7 @@ export function setPositions(c: Campaign, placements: readonly Placement[]): str
       continue;
     }
     const ch = requireCharacter(c, p.name);
+    if (isAbsent(ch)) throw new Error(`${ch.name} 已暂时移出队伍，不能摆位；等本人点「签到」归队或 dnd_character update absent=false`);
     const room = roomOf(c, ch);
     if (room === undefined) throw new Error(`${ch.name} 没有所在房间，先 dnd_character update room`);
     const map = mapOf(c, room);
@@ -462,14 +464,9 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
   }
   const disengaged = state.disengaged?.includes(ch.name) === true;
 
-  if (request.dash === true && !reaction) {
-    const dashed = state.dashed ?? [];
-    if (!dashed.includes(ch.name)) dashed.push(ch.name);
-    state.dashed = dashed;
-    const ts = ensureTurnState(c);
-    if (ts?.actor === ch.name) ts.actionUsed ??= '冲刺';
-  }
-  const isDashed = state.dashed?.includes(ch.name) === true;
+  const alreadyDashed = state.dashed?.includes(ch.name) === true;
+  const wantsDash = request.dash === true && !reaction;
+  const plannedDash = alreadyDashed || wantsDash;
   const rawBaseSpeed = isAirborneMove
     ? (ch.flySpeed ?? (hasCondition(ch, '飞行术') ? 60 : (ch.speed ?? DEFAULT_SPEED)))
     : (ch.speed ?? DEFAULT_SPEED);
@@ -477,15 +474,15 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
     ? { baseSpeed: rawBaseSpeed, zeroSpeed: false, zeroReasons: [] as string[], notes: [] as string[], fearSources: [] as string[], hasUnboundFear: false }
     : movementSpeedInfo(ch, rawBaseSpeed);
   const baseSpeed = moveInfo.zeroSpeed ? rawBaseSpeed : moveInfo.baseSpeed;
-  const speed = baseSpeed * (isDashed ? 2 : 1);
+  const plannedSpeed = baseSpeed * (plannedDash ? 2 : 1);
   const usedBefore = reaction ? 0 : state.moved?.[ch.name] ?? 0;
   const isProne = !reaction && request.ignoreStateMods !== true && hasCondition(ch, '倒地');
   const crawling = isProne && request.crawl === true;
   const ts = ensureTurnState(c);
   const autoStandUp = isProne && !crawling && ts?.stoodUp !== true;
   const standCost = autoStandUp ? Math.floor(baseSpeed / 2) : 0;
-  if (autoStandUp && request.interrupt === true && usedBefore + standCost > speed) {
-    throw new Error(`${ch.name} 处于「倒地」，起身需先消耗一半速度（${standCost} 尺），但本回合只剩 ${Math.max(0, speed - usedBefore)}/${speed} 尺移动力；若冲刺请传 dash=true，若倒地爬行请传 crawl=true`);
+  if (autoStandUp && request.interrupt === true && usedBefore + standCost > plannedSpeed) {
+    throw new Error(`${ch.name} 处于「倒地」，起身需先消耗一半速度（${standCost} 尺），但本回合只剩 ${Math.max(0, plannedSpeed - usedBefore)}/${plannedSpeed} 尺移动力；${plannedDash ? '' : '若冲刺请传 dash=true，'}若倒地爬行请传 crawl=true`);
   }
   const used = usedBefore + standCost;
 
@@ -503,7 +500,12 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
   const moverInvisible = request.ignoreStateMods !== true && isInvisibleState(ch) && !hasCondition(ch, '妖火');
   const reactors = moverInvisible ? [] : foes.filter(({ ch: o }) => inInitiative(c, o.name) && canReact(o) && !hasCondition(o, '失明') && reactionBlocked(c, o.name) === undefined
     && !request.ignoredReactors?.includes(o.name));
-  const reachOf = (other: Character): number => Math.max(MELEE_REACH_FEET, ...(other.weapons ?? []).map((w) => weaponReach(w, true) ?? 0));
+  const reachesOf = (other: Character): number[] => {
+    const reaches = (other.weapons ?? [])
+      .map((w) => weaponReach(w, true))
+      .filter((r): r is number => r !== undefined);
+    return reaches.length === 0 ? [MELEE_REACH_FEET] : [...new Set(reaches)].sort((a, b) => a - b);
+  };
 
   const highAltitude = fromZ >= 15 && targetZ >= 15;
   // 5e：能穿过友方的格子，不能穿过同一高度层的敌人的格子；高空飞越地面敌人不阻挡
@@ -520,7 +522,10 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
     : reactors.filter(({ ch: other, cell }) => {
       const a3: BattleCell = { ...a, ...(targetZ > 0 ? { z: targetZ } : {}), room: from.room };
       const b3: BattleCell = { ...b, ...(targetZ > 0 ? { z: targetZ } : {}), room: from.room };
-      return canReactorSeeAt(other, cell, a3).ok && distanceFeet(a3, cell) <= reachOf(other) && distanceFeet(b3, cell) > reachOf(other);
+      if (!canReactorSeeAt(other, cell, a3).ok) return false;
+      const dA = distanceFeet(a3, cell);
+      const dB = distanceFeet(b3, cell);
+      return reachesOf(other).some((reach) => dA <= reach && dB > reach);
     }).length;
   const factor = (dragged === undefined ? 1 : 2) * (crawling ? 2 : 1);
 
@@ -562,10 +567,10 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
   } else {
     if (target === undefined && request.awayFrom === undefined) throw new Error('move 要给 x/y/z，或者 to / adjacent_to / away_from 之一');
     if (target !== undefined && request.awayFrom !== undefined) throw new Error('to 和 away_from 二选一');
-    const remaining = reaction ? baseSpeed : speed - used;
+    const remaining = reaction ? baseSpeed : plannedSpeed - used;
     const maxFeet = request.feet ?? remaining;
     if (maxFeet < CELL_FEET * factor) {
-      throw new Error(`${ch.name} 这回合的移动力用完了（已走 ${used}/${speed} 尺）${isDashed ? '' : '；冲刺传 dash=true'}`);
+      throw new Error(`${ch.name} 这回合的移动力用完了（已走 ${used}/${plannedSpeed} 尺）${plannedDash ? '' : '；冲刺传 dash=true'}`);
     }
     let score: (at: Cell) => number;
     let goal: string;
@@ -651,9 +656,11 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
   if (request.interrupt === true && !disengaged) {
     const triggers: Array<{ stop: number; character: string; reaction: string }> = [];
     for (const { ch: other, cell } of reactors) {
-      const reach = reachOf(other);
+      const reaches = reachesOf(other);
       for (let i = 0; i + 1 < path3d.length; i++) {
-        if (distanceFeet(path3d[i]!, cell) <= reach && distanceFeet(path3d[i + 1]!, cell) > reach && wallBetween(map, path3d[i]!, cell) === undefined) {
+        const dA = distanceFeet(path3d[i]!, cell);
+        const dB = distanceFeet(path3d[i + 1]!, cell);
+        if (reaches.some((reach) => dA <= reach && dB > reach) && wallBetween(map, path3d[i]!, cell) === undefined) {
           const sight = canReactorSeeAt(other, cell, path3d[i]!);
           if (!sight.ok) {
             if (sight.reason) blockedSightNotes.add(sight.reason);
@@ -703,14 +710,34 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
     }
   }
 
+  // 未超出基础速度前就因借机暂停时，不提前扣掉冲刺和主动作；等后续 settle 继续超速路段时再落账
+  const actualTotal = usedBefore + standCost + feet;
+  const deferDash = opportunity !== undefined && wantsDash && !alreadyDashed && actualTotal <= baseSpeed;
+  if (deferDash && opportunity !== undefined) {
+    opportunity.resume.dash = true;
+    short = '已在借机触发处暂停，剩余路程与冲刺待反应结算后再继续';
+  }
+  const committedDash = alreadyDashed || (wantsDash && !deferDash);
+  if (committedDash && !alreadyDashed && !reaction) {
+    const dashed = state.dashed ?? [];
+    if (!dashed.includes(ch.name)) dashed.push(ch.name);
+    state.dashed = dashed;
+    if (ts?.actor === ch.name) ts.actionUsed ??= '冲刺';
+  }
+  const speed = baseSpeed * (committedDash ? 2 : 1);
+
   const provokes: string[] = [];
   const stayedIn: string[] = [];
   const enters: Array<{ name: string; reach: number; reaction: string }> = [];
   if (!disengaged) {
     for (const { ch: other, cell } of reactors) {
+      const reaches = reachesOf(other);
       const leaves = path3d.some((step, i) => {
         const next = path3d[i + 1];
-        if (next === undefined || distanceFeet(step, cell) > reachOf(other) || distanceFeet(next, cell) <= reachOf(other)) return false;
+        if (next === undefined) return false;
+        const dA = distanceFeet(step, cell);
+        const dB = distanceFeet(next, cell);
+        if (!reaches.some((reach) => dA <= reach && dB > reach)) return false;
         const sight = canReactorSeeAt(other, cell, step);
         if (!sight.ok) {
           if (sight.reason) blockedSightNotes.add(sight.reason);
@@ -719,7 +746,13 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
         return true;
       });
       if (leaves) provokes.push(other.name);
-      else if (!opportunity?.reactors.some((r) => r.character === other.name) && path3d.length > 1 && path3d.every((step) => distanceFeet(step, cell) <= reachOf(other))) stayedIn.push(other.name);
+      else if (opportunity === undefined && path3d.length > 1) {
+        const startDist = distanceFeet(path3d[0]!, cell);
+        const heldReach = reaches.find((reach) => startDist <= reach);
+        if (heldReach !== undefined && path3d.every((step) => distanceFeet(step, cell) <= heldReach)) {
+          stayedIn.push(other.name);
+        }
+      }
       // 长柄大师：拿着长柄武器时，敌人「进入」触及范围也吃借机——方向反着算，一回合至多一次
       for (const r of reactionsOf(other)) {
         if (r.enter !== true) continue;
@@ -783,7 +816,7 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
     feet,
     totalFeet: moved[ch.name] ?? 0,
     speed,
-    dashed: isDashed,
+    dashed: committedDash,
     provokes,
     enters,
     disengaged,

@@ -1,4 +1,4 @@
-import { armorClass, fightRooms, initBonusOf, reactionBlocked, roomOf, weaponAttackModifier, weaponDamage, type Campaign, type Character } from './campaign.ts';
+import { armorClass, fightRooms, initBonusOf, isAbsent, reactionBlocked, roomOf, weaponAttackModifier, weaponDamage, type Campaign, type Character } from './campaign.ts';
 import { canReact } from './battlefield.ts';
 
 /** 单个参战我方角色（PC / 同伴 NPC）的完整战斗机械卡，供开战快照与中途 dnd_initiative join 共用。 */
@@ -37,7 +37,7 @@ export function combatParticipantCard(campaign: Campaign, ch: Character) {
 /** 参战者携带完整机械卡；未参战者只带精简摘要，避免把全队背包与长篇背景故事塞进战斗上下文。 */
 export function combatPartyContext(campaign: Campaign): string {
   const activeRooms = fightRooms(campaign);
-  const cards = campaign.characters.filter((ch) => ch.kind !== 'monster').map((ch) => {
+  const cards = campaign.characters.filter((ch) => ch.kind !== 'monster' && !isAbsent(ch)).map((ch) => {
     const initiative = campaign.initiative?.order.find((entry) => entry.name === ch.name);
     const chRoom = roomOf(campaign, ch);
     if (initiative === undefined && activeRooms.size > 0 && (chRoom === undefined || !activeRooms.has(chRoom))) {

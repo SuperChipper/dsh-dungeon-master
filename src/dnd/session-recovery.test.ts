@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -176,5 +176,101 @@ describe('DM 私有备团', () => {
     expect(service.preparationContext(other)).not.toContain('秘密候选');
     await call('dnd_prepare', { action: 'clear' });
     expect(service.store.load(key)!.preparation).toBeUndefined();
+  });
+
+  it('目录模组提供真实原书目录与候选题材；单文件内置模组不造假路径；日志超 5 条给全且过期提醒不催每回合重查', async () => {
+    const { service, key, call } = setup();
+    // 内置单文件模组不应输出假的 dnd/adventures/<id>/ 路径，且返回 undefined 目录
+    expect(service.adventureDir(key)).toBeUndefined();
+    const builtinShown = await call('dnd_prepare', { action: 'show' });
+    expect(builtinShown).not.toContain('dnd/adventures/sunken-bell');
+    expect(builtinShown).toContain('当前模组没有独立原书目录');
+    expect(builtinShown).toContain('dnd_lookup');
+
+    // 目录模组：构建真实文件布局
+    const root = mkdtempSync(join(tmpdir(), 'dnd-dirprep-'));
+    const modDir = join(root, 'adventures', 'demo-dir');
+    mkdirSync(join(modDir, 'text-zh'), { recursive: true });
+    mkdirSync(join(modDir, 'data'), { recursive: true });
+    mkdirSync(join(modDir, 'img'), { recursive: true });
+    mkdirSync(join(modDir, 'build'), { recursive: true });
+    writeFileSync(join(modDir, 'text-zh', 'ch2.md'), '# ch2');
+    writeFileSync(join(modDir, 'data', 'tables.json'), '{}');
+    writeFileSync(join(modDir, 'img', 'map.png'), 'png');
+    writeFileSync(join(modDir, 'build', 'cache.json'), '{}');
+    writeFileSync(join(modDir, '译名对照表.md'), 'table');
+    writeFileSync(join(modDir, '_source.json'), '{}');
+    writeFileSync(join(modDir, '.hidden'), 'x');
+    writeFileSync(join(modDir, 'adventure.json'), JSON.stringify({
+      id: 'demo-dir',
+      name: '示例目录模组',
+      truth: ['秘密'],
+      hook: '开场',
+      start: 'r1',
+      chapters: [{ id: 'ch1', name: '第一章', mode: 'dungeon', goal: '探索', dmGuide: '注意陷阱' }],
+      sites: [{
+        id: 's1',
+        name: '地牢',
+        chapter: 'ch1',
+        entry: 'r1',
+        rooms: [
+          {
+            id: 'r1', name: '入口', x: 0, y: 0, w: 2, h: 2,
+            playerView: '入口', dmNotes: 'DM笔记',
+            exits: [
+              { to: 'r2', label: '北门' },
+              { to: 'r3', label: '暗道', hidden: true },
+            ],
+          },
+          { id: 'r2', name: '大厅', x: 0, y: 2, w: 2, h: 2, playerView: '大厅', dmNotes: '', exits: [] },
+          { id: 'r3', name: '密室', x: 2, y: 0, w: 2, h: 2, playerView: '密室', dmNotes: '', exits: [] },
+        ],
+      }],
+      npcs: [], leads: [], quests: [], flags: [],
+    }));
+
+    const dirService = new DndService({
+      store: new CampaignStore(join(root, 'campaigns')),
+      library: new AdventureLibrary({ adventures: join(root, 'adventures') }),
+      mapDir: root,
+      cwd: root,
+    });
+    const dirKey = 'group:GDIR';
+    dirService.start(dirKey, 'demo-dir', false);
+    dirService.store.update(dirKey, (c) => {
+      upsertCharacter(c, { name: '甲', maxHp: 20 });
+      for (let i = 1; i <= 7; i++) pushLog(c, `日志第${i}条`);
+    });
+
+    expect(dirService.adventureDir(dirKey)).toBe(modDir);
+    expect(dirService.adventureDir('group:MISSING')).toBeUndefined();
+    const activeCtx = dirService.preparationContext(dirKey);
+    expect(activeCtx).toContain('adventures/demo-dir');
+    expect(activeCtx).toContain('data/');
+    expect(activeCtx).toContain('text-zh/');
+    expect(activeCtx).toContain('译名对照表.md');
+    expect(activeCtx).not.toContain('img/');
+    expect(activeCtx).not.toContain('build/');
+    expect(activeCtx).not.toContain('_source.json');
+    expect(activeCtx).not.toContain('.hidden');
+    expect(activeCtx).not.toContain('（含：adventure.json');
+    expect(activeCtx).toContain('近期完整日志（共 7 条）');
+    expect(activeCtx).toContain('【候选下一站 · DM 参考】');
+    expect(activeCtx).toContain('大厅(r2，未去过)');
+    expect(activeCtx).toContain('密室(r3，未去过、暗门未发现)');
+
+    // 停团时也照常返回模组目录
+    dirService.stop(dirKey);
+    expect(dirService.adventureDir(dirKey)).toBe(modDir);
+
+    // 过期提醒：确定性且不催每回合重复 show
+    dirService.start(dirKey, undefined, false);
+    dirService.savePreparation(dirKey, '准备 r2 与 r3');
+    dirService.store.update(dirKey, (c) => { c.characters[0]!.hp = 10; });
+    const snap1 = dirService.stateSnapshot(dirKey);
+    const snap2 = dirService.stateSnapshot(dirKey);
+    expect(snap1).toBe(snap2);
+    expect(snap1).toContain('备团计划对应的团况已变化');
+    expect(snap1).toContain('不必每回合重复 show');
   });
 });

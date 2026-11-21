@@ -44,9 +44,11 @@ describe('主 DM 的探索工具视图', () => {
     expect(visible.has('dnd_move')).toBe(true);
     expect(visible.get('dnd_check')!.parameters.properties).not.toHaveProperty('on_hit');
     expect(visible.get('dnd_check')!.parameters.properties).not.toHaveProperty('hold_for');
+    expect(visible.get('dnd_check')!.parameters.properties).not.toHaveProperty('attacks');
     expect(visible.get('dnd_apply')!.parameters.properties).not.toHaveProperty('reaction');
     expect(visible.get('dnd_initiative')!.parameters.properties.action).toEqual({ type: 'string', enum: ['start'] });
     expect(t.full.get('dnd_check')!.parameters.properties).toHaveProperty('on_hit');
+    expect(t.full.get('dnd_check')!.parameters.properties).toHaveProperty('attacks');
     expect(t.full.get('dnd_apply')!.parameters.properties).toHaveProperty('reaction');
     await expect(t.call('dnd_check', { character: '甲', type: 'attack', target: '甲' })).rejects.toThrow('主 DM');
     await expect(t.call('dnd_initiative', { action: 'next' })).rejects.toThrow('主 DM');

@@ -62,6 +62,102 @@ describe('逐目标祝福骰', () => {
   });
 });
 
+function multiattack(t: ReturnType<typeof table>, attacks: unknown[], extra: Record<string, unknown> = {}) {
+  return t.call('dnd_check', { type: 'attack', character: '甲', target: '狼', declared_by: 'P1', attacks, ...extra });
+}
+
+describe('同一目标的多段攻击', () => {
+  it('各自掷命中、独立结算附伤与重击，汇总结果并可按单击撤销', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => { requireCharacter(c, '狼').conditions = ['狂暴']; });
+    t.rolls.push(10, 6, 3, 1, 20, 1, 5);
+    const text = await multiattack(t, [
+      { damage: '1d6+2', damage_type: '挥砍', riders: [{ damage: '1d4', damage_type: '火焰' }] },
+      { damage: '1d6' },
+      { damage: '1d6+3', damage_type: '雷鸣' },
+    ]);
+    expect(t.roller.mock.calls.map(([sides]) => sides)).toEqual([20, 6, 4, 20, 20, 6, 6]);
+    expect(text).toContain('已结 3/3 击，命中 2 击，伤害合计 16');
+    expect(text).toContain('附伤「火焰」1d4[3]');
+    expect(text).toContain('伤害 2d6[1,5] + 3 = 9');
+    expect(text).not.toMatch(/狼 HP|vs AC/);
+    expect(t.char('狼').hp).toBe(84);
+    expect(t.campaign().initiative!.turnState!.attacks).toBe(3);
+    const roll = /【第 3\/3 击】[^\n]*#(R\d+)/.exec(text)?.[1];
+    expect(roll).toBeDefined();
+    await t.call('dnd_undo', { action: 'undo', roll });
+    expect(t.char('狼').hp).toBe(93);
+    expect(t.campaign().initiative!.turnState!.attacks).toBe(2);
+  });
+
+  it('同一武器可省略伤害，目标倒下后不掷下一击', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => { requireCharacter(c, '狼').hp = 4; });
+    t.rolls.push(10, 4, 4, 20);
+    const text = await multiattack(t, [{}, {}], { weapon: '大剑' });
+    expect(text).toContain('已结 1/2 击，命中 1 击，伤害合计 12');
+    expect(text).toContain('目标已倒下；后续 1 击未掷');
+    expect(t.char('狼').hp).toBe(0);
+    expect(t.rolls).toEqual([20]);
+  });
+
+  it('中途挂起真实反应窗口，待结算这一击和之后的攻击都不提前扣血', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => {
+      const target = requireCharacter(c, '乙');
+      target.playerId = 'P2';
+      target.reactions = [{ name: '护盾术', when: 'attacked', resource: '1环法术位' }];
+      target.resources = { '1环法术位': { current: 1, max: 1, reset: 'long' } };
+      c.initiative!.order.push({ name: '乙', init: 5 });
+    });
+    t.rolls.push(1, 15, 4, 20);
+    const attacks = [{ damage: '5' }, { damage: '6', riders: [{ damage: '1d6', damage_type: '火焰' }] }, { damage: '7' }];
+    const text = await multiattack(t, attacks, { target: '乙' });
+    expect(text).toContain('已结 1/3 击，命中 0 击，伤害合计 0');
+    expect(text).toMatch(/#R\d+ 待结算，先处理反应窗口；后续 1 击未掷/);
+    expect(t.char('乙').hp).toBe(40);
+    const pending = t.campaign().initiative!.pending;
+    expect(pending).toMatchObject({ target: '乙', riders: [{ damageType: '火焰', rawDamage: 4 }] });
+    await expect(multiattack(t, attacks, { target: '乙' })).rejects.toThrow('待结算');
+    expect(t.rolls).toEqual([20]);
+    const authorization = t.consent('乙', '护盾术');
+    await t.call('dnd_apply', { target: '乙', reaction: { by: '乙', name: '护盾术', authorization, ac_mod: 5 }, settle: true });
+    expect(t.char('乙').hp).toBe(30);
+    expect(t.rolls).toEqual([20]);
+  });
+
+  it.each(['状态', '区域'])('命中后在专注%s的豁免处停止', async (effect) => {
+    const t = table();
+    t.service.store.update(t.key, (c) => {
+      if (effect === '区域') {
+        c.initiative!.zones = [{ id: 'fog', name: '云雾术', room: c.currentRoom, shape: 'sphere', x: 5, y: 5, radius: 20, source: '狼', concentration: true }];
+      } else {
+        requireCharacter(c, '狼').activeStates = [{ name: '祝福术', source: '狼', concentration: true }];
+      }
+    });
+    t.rolls.push(12, 20);
+    const text = await multiattack(t, [{ damage: '6' }, { damage: '8' }]);
+    expect(text).toContain('需过体质专注豁免 DC 10');
+    expect(text).toContain('先结算本击触发的专注豁免；后续 1 击未掷');
+    expect(t.char('狼').hp).toBe(94);
+    expect(t.rolls).toEqual([20]);
+  });
+
+  it.each([
+    { attacks: [{ damage: '5' }, { damage: '错误' }] },
+    { attacks: [{ damage: '5' }, { damage: '60d6' }] },
+    { attacks: [{ damage: '5' }, { damage: '5', riders: [{ damage: '5' }] }] },
+    { spend: '1环法术位' }, { hold: true }, { reaction: true }, { type: 'save' }, { declared_by: 'P2' },
+  ])('拒绝非法批次、越权或需要逐击授权的参数，零掷骰零落盘：%j', async (extra) => {
+    const t = table(), before = t.campaign();
+    const snapshots = t.service.store.snapshots(t.key);
+    await expect(multiattack(t, [{ damage: '5' }, { damage: '5' }], extra)).rejects.toThrow();
+    expect(t.campaign()).toEqual(before);
+    expect(t.service.store.snapshots(t.key)).toEqual(snapshots);
+    expect(t.roller).not.toHaveBeenCalled();
+  });
+});
+
 describe('普通批量结算', () => {
   it('公共伤害只掷一次，逐目标抗性、临时生命和覆写数值生效，怪物数值保密', async () => {
     const t = table();

@@ -153,15 +153,33 @@ export function spellLine(spells: readonly CardSpell[]): string {
   return parts.join('\n');
 }
 
+function parseSlotLevel(key: string): number | undefined {
+  if (!key.includes('法术位')) return undefined;
+  const match = /([1-9])\s*环/.exec(key);
+  return match === null ? undefined : Number(match[1]);
+}
+
+function findResourceEntry(
+  resources: Readonly<Record<string, Resource>>,
+  query: string | undefined,
+): [string, Resource] | undefined {
+  if (query === undefined) return undefined;
+  if (Object.hasOwn(resources, query)) return [query, resources[query]!];
+  const q = query.trim();
+  if (q.length === 0) return undefined;
+  if (Object.hasOwn(resources, q)) return [q, resources[q]!];
+  return Object.entries(resources).find(([k]) => k.includes(q) || q.includes(k));
+}
+
 /**
  * 某一环的法术位余量，贴在环阶标题后面：`　2/4`、`　契约 1/2`。
- * 邪术师的位叫「契约法术位（3环）」，环数在括号里，所以按 `${level}环` 找而不是按键名相等。
+ * 邪术师的位叫「契约法术位（3环）」，环数在括号里，所以按 parseSlotLevel 提取环阶而不是按键名相等。
  */
 function slotOf(level: number, resources: Readonly<Record<string, Resource>>): string {
   const found = Object.entries(resources)
-    .filter(([k, r]) => r.max > 0 && k.includes('法术位') && k.includes(`${level}环`))
+    .filter(([k, r]) => r.max > 0 && parseSlotLevel(k) === level)
     .map(([k, r]) => {
-      const label = k.replace(`${level}环`, '').replace('法术位', '').replace(/（\d+环）/, '').replace(/[（）()]/g, '').trim();
+      const label = k.replace(/\s*\d+\s*环/g, '').replace('法术位', '').replace(/[（）()]/g, '').trim();
       return `${label === '' ? '' : `${label} `}${r.current}/${r.max}`;
     });
   return found.length > 0 ? `　${found.join('、')}` : '';
@@ -187,16 +205,23 @@ function resourceBadge(
   resources: Readonly<Record<string, Resource>>,
 ): string {
   if (resourceName === undefined) return '';
-  const found = resources[resourceName];
+  const match = findResourceEntry(resources, resourceName);
   const costNote = cost !== undefined && cost > 1 ? `，每次耗${cost}` : '';
-  if (found === undefined) return `（耗${resourceName}${costNote}）`;
-  return `（${resourceName === '' ? '' : `${resourceName} `}${found.current}/${found.max}${costNote}）`;
+  if (match === undefined) return `（耗${resourceName}${costNote}）`;
+  const [matchedKey, found] = match;
+  return `（${matchedKey === '' ? '' : `${matchedKey} `}${found.current}/${found.max}${costNote}）`;
 }
 
 export interface SpellListOptions {
   /** 为旧角色卡自动兜底渲染未显式录入 spells 的非环位 resources 与 reactions */
   includeFallback?: boolean;
   reactions?: readonly ReactionDef[];
+}
+
+function spellResourceQuery(spell: CardSpell, resources: Readonly<Record<string, Resource>>): string | undefined {
+  if (spell.resource !== undefined) return spell.resource;
+  const exact = Object.hasOwn(resources, spell.name) ? resources[spell.name] : undefined;
+  return exact !== undefined && exact.max > 0 && parseSlotLevel(spell.name) === undefined ? spell.name : undefined;
 }
 
 /**
@@ -215,14 +240,24 @@ export function spellListText(
 
   const abilityLines: string[] = [];
   const coveredNames = new Set<string>(spells.map((s) => s.name));
-  const coveredResources = new Set<string>(
-    spells.map((s) => s.resource).filter((r): r is string => r !== undefined && r.length > 0),
-  );
+  const coveredResources = new Set<string>();
+
+  for (const s of onlySpells) {
+    const query = spellResourceQuery(s, resources);
+    const matched = findResourceEntry(resources, query);
+    if (matched !== undefined && parseSlotLevel(matched[0]) === undefined) {
+      coveredResources.add(matched[0]);
+    }
+  }
 
   for (const a of explicitAbilities) {
     const act = a.action !== undefined ? ` [${ACTION_LABELS[a.action]}]` : '';
-    const res = resourceBadge(a.resource ?? (resources[a.name] !== undefined ? a.name : undefined), a.cost, resources);
-    if (resources[a.name] !== undefined) coveredResources.add(a.name);
+    const query = a.resource ?? (Object.hasOwn(resources, a.name) && resources[a.name]!.max > 0 ? a.name : undefined);
+    const matched = findResourceEntry(resources, query);
+    if (matched !== undefined && parseSlotLevel(matched[0]) === undefined) {
+      coveredResources.add(matched[0]);
+    }
+    const res = resourceBadge(query, a.cost, resources);
     const sum = a.summary !== undefined && a.summary.length > 0 ? ` — ${a.summary}` : '';
     const en = a.wiki === undefined ? '' : `　[英](${a.wiki})`;
     abilityLines.push(`· ${a.name}${act}${res}${sum}　[中](${huijiSearchUrl(a.name)})${en}`);
@@ -232,34 +267,56 @@ export function spellListText(
     for (const r of options.reactions ?? []) {
       if (coveredNames.has(r.name)) continue;
       coveredNames.add(r.name);
-      if (r.resource === r.name) coveredResources.add(r.name);
-      const res = resourceBadge(r.resource ?? (resources[r.name] !== undefined ? r.name : undefined), r.cost, resources);
-      if (resources[r.name] !== undefined) coveredResources.add(r.name);
+      const query = r.resource ?? (Object.hasOwn(resources, r.name) && resources[r.name]!.max > 0 ? r.name : undefined);
+      const matched = findResourceEntry(resources, query);
+      if (matched !== undefined && (r.resource === undefined || matched[0] === r.name)) {
+        coveredResources.add(matched[0]);
+      }
+      const res = resourceBadge(query, r.cost, resources);
       abilityLines.push(`· ${r.name} [反应]${res}　[中](${huijiSearchUrl(r.name)})`);
     }
+    const hitDiceKeys = Object.keys(resources).filter((k) => k.startsWith('生命骰'));
+    const preferredHitDieKey = hitDiceKeys.length > 1
+      ? (hitDiceKeys.find((k) => k.length > '生命骰'.length) ?? hitDiceKeys.at(-1))
+      : undefined;
     for (const [k, res] of Object.entries(resources)) {
-      if (res.max <= 0 || k.includes('法术位') || coveredNames.has(k) || coveredResources.has(k)) continue;
-      coveredNames.add(k);
+      if (preferredHitDieKey !== undefined && k.startsWith('生命骰') && k !== preferredHitDieKey) continue;
+      if (res.max <= 0 || parseSlotLevel(k) !== undefined || coveredResources.has(k)) continue;
+      coveredResources.add(k);
       abilityLines.push(`· ${k}（${res.current}/${res.max}，${RESET_LABELS[res.reset]}）　[中](${huijiSearchUrl(k)})`);
     }
   }
 
-  if (onlySpells.length === 0 && abilityLines.length === 0) {
+  const spellsByLevel = new Map<number, CardSpell[]>();
+  for (const s of onlySpells) {
+    spellsByLevel.set(s.level, [...(spellsByLevel.get(s.level) ?? []), s]);
+  }
+  for (const [k, res] of Object.entries(resources)) {
+    if (res.max <= 0) continue;
+    const lv = parseSlotLevel(k);
+    if (lv !== undefined && !spellsByLevel.has(lv)) spellsByLevel.set(lv, []);
+  }
+  const allLevels = [...spellsByLevel.keys()].sort((a, b) => a - b);
+
+  if (allLevels.length === 0 && abilityLines.length === 0) {
     return `🔮 ${name} 的卡上还没有法术或能力清单。让 DM 用 dnd_character update spells 补上；先用 /dnd search 查。`;
   }
 
   const lines = [`🔮 **${name}** 的法术${abilityLines.length > 0 ? '与能力' : ''}`];
-  let level: number | undefined;
-  for (const s of onlySpells) {
-    if (s.level !== level) {
-      level = s.level;
-      lines.push('', `**${levelName(s.level)}**${slotOf(s.level, resources)}`);
+  for (const lv of allLevels) {
+    lines.push('', `**${levelName(lv)}**${slotOf(lv, resources)}`);
+    const items = spellsByLevel.get(lv) ?? [];
+    if (items.length === 0) {
+      lines.push('· （暂无该环法术记录，可用于升环施法或消耗）');
+      continue;
     }
-    const act = s.action !== undefined ? ` [${ACTION_LABELS[s.action]}]` : '';
-    const res = s.resource !== undefined ? resourceBadge(s.resource, s.cost, resources) : '';
-    const sum = s.summary !== undefined && s.summary.length > 0 ? ` — ${s.summary}` : '';
-    const en = s.wiki === undefined ? '' : `　[英](${s.wiki})`;
-    lines.push(`· ${s.name}${act}${res}${sum}　[中](${huijiSearchUrl(s.name)})${en}`);
+    for (const s of items) {
+      const act = s.action !== undefined ? ` [${ACTION_LABELS[s.action]}]` : '';
+      const res = resourceBadge(spellResourceQuery(s, resources), s.cost, resources);
+      const sum = s.summary !== undefined && s.summary.length > 0 ? ` — ${s.summary}` : '';
+      const en = s.wiki === undefined ? '' : `　[英](${s.wiki})`;
+      lines.push(`· ${s.name}${act}${res}${sum}　[中](${huijiSearchUrl(s.name)})${en}`);
+    }
   }
   if (abilityLines.length > 0) {
     lines.push('', '**职业与物品能力**', ...abilityLines);

@@ -36,6 +36,7 @@ import {
   breakConcentration,
   computeDefenseStateMod,
   concentratingOn,
+  concentratingZoneNames,
   effectiveMaxHp,
   effectiveStates,
   exhaustionLevel,
@@ -65,6 +66,8 @@ export interface Character {
   player?: string;
   /** 玩家 openid：绑定后只有这个人能宣告该角色的行动 */
   playerId?: string;
+  /** 本次开团未签到或中途暂离，暂时移出队伍（角色卡完整保留；晚到点「签到」或收团后自动归队） */
+  absent?: boolean;
   className?: string;
   level: number;
   abilities: Record<Ability, number>;
@@ -775,6 +778,8 @@ export interface HpChange {
   absorbed: number;
   /** 新增的状态，如 昏迷、死亡 */
   events: string[];
+  /** 受击后仍在维持专注时，这次伤害要求的豁免；不写入角色或团档。 */
+  concentrationDc?: number;
   /** 怪物/NPC：给玩家听的伤势描述（不报数字） */
   wound?: string;
 }
@@ -843,15 +848,15 @@ export function applyDamage(c: Campaign, name: string, amount: number, options: 
       events.push(...addDeathFailures(ch, 1));
     }
   }
+  let concentrationDc: number | undefined;
   if (dmg > 0) {
     if (ch.hp === 0 || isIncapacitated(ch)) {
       events.push(...breakConcentration(c, ch.name, '失去行动能力'));
     } else {
-      const conc = concentratingOn(c, ch.name);
-      if (conc.length > 0) {
-        const dc = Math.max(10, Math.floor(dmg / 2));
-        const spells = [...new Set(conc.map((x) => x.state.name))].join('、');
-        events.push(`专注受击（${spells}）：需过体质专注豁免 DC ${dc}`);
+      const spells = [...new Set([...concentratingOn(c, ch.name).map((x) => x.state.name), ...concentratingZoneNames(c, ch.name)])];
+      if (spells.length > 0) {
+        concentrationDc = Math.max(10, Math.floor(dmg / 2));
+        events.push(`专注受击（${spells.join('、')}）：需过体质专注豁免 DC ${concentrationDc}`);
       }
     }
   }
@@ -873,7 +878,8 @@ export function applyDamage(c: Campaign, name: string, amount: number, options: 
       }
     }
   }
-  return { name: ch.name, before, after: ch.hp, maxHp: ch.maxHp, tempHp: ch.tempHp, absorbed, events, ...woundOf(ch) };
+  return { name: ch.name, before, after: ch.hp, maxHp: ch.maxHp, tempHp: ch.tempHp, absorbed, events,
+    ...(concentrationDc === undefined ? {} : { concentrationDc }), ...woundOf(ch) };
 }
 
 /** 日志里的血量变化：日志会进团况的「最近」，怪物只写伤势词，免得数字被说出去 */
@@ -1113,6 +1119,122 @@ export function isOut(ch: Character): boolean {
   return ch.conditions.includes('死亡');
 }
 
+export function isAbsent(ch: Character): boolean {
+  return ch.kind === 'pc' && ch.absent === true;
+}
+
+/**
+ * 暂时移出队伍或归队（仅 PC）。
+ * 暂离时保留角色卡、HP、资源与物品，只在当前开团中把它从在队成员、房间位置、先攻表、战场站位与待结算反应中移出；
+ * 归队时放回队伍当前主房间（战斗中如需参战另走 dnd_initiative join）。
+ */
+export function setCharacterAbsent(
+  c: Campaign,
+  name: string,
+  absent: boolean,
+  options: { silent?: boolean } = {},
+): { character: Character; changed: boolean; leftCombat: boolean } {
+  const ch = requireCharacter(c, name);
+  if (ch.kind !== 'pc') throw new Error(`只有 PC 支持暂离/归队（${ch.name} 不是 PC）`);
+  if (absent) {
+    const inOrder = c.initiative?.order.some((e) => e.name === ch.name) ?? false;
+    if (ch.absent === true && !inOrder) {
+      return { character: ch, changed: false, leftCombat: false };
+    }
+    const prevAbsent = ch.absent === true;
+    ch.absent = true;
+    let leftCombat = false;
+    const state = c.initiative;
+    if (state !== undefined) {
+      const idx = state.order.findIndex((e) => e.name === ch.name);
+      if (idx !== -1) {
+        leftCombat = true;
+        state.order.splice(idx, 1);
+        delete state.positions?.[ch.name];
+        delete state.moved?.[ch.name];
+        if (state.surprised !== undefined) {
+          state.surprised = state.surprised.filter((n) => n !== ch.name);
+          if (state.surprised.length === 0) delete state.surprised;
+        }
+        if (state.dashed !== undefined) {
+          state.dashed = state.dashed.filter((n) => n !== ch.name);
+          if (state.dashed.length === 0) delete state.dashed;
+        }
+        if (state.disengaged !== undefined) {
+          state.disengaged = state.disengaged.filter((n) => n !== ch.name);
+          if (state.disengaged.length === 0) delete state.disengaged;
+        }
+        if (state.fightingSpirit !== undefined) {
+          state.fightingSpirit = state.fightingSpirit.filter((n) => n !== ch.name);
+          if (state.fightingSpirit.length === 0) delete state.fightingSpirit;
+        }
+        if (state.shielded !== undefined) {
+          state.shielded = state.shielded.filter((n) => n !== ch.name);
+          if (state.shielded.length === 0) delete state.shielded;
+        }
+        if (state.reacted !== undefined) {
+          state.reacted = state.reacted.filter((n) => n !== ch.name);
+          if (state.reacted.length === 0) delete state.reacted;
+        }
+        if (idx < state.turn) {
+          state.turn--;
+        } else if (idx === state.turn) {
+          if (state.order.length === 0) {
+            state.turn = 0;
+          } else {
+            if (state.turn >= state.order.length) {
+              state.turn = 0;
+              state.round++;
+              delete state.surprised;
+            }
+            delete state.moved;
+            delete state.dashed;
+            delete state.disengaged;
+            delete state.fightingSpirit;
+            delete state.zoneTriggered;
+            delete state.auraTriggered;
+            state.turnState = { actor: state.order[state.turn]!.name, attacks: 0 };
+          }
+        }
+      }
+      const win = reactionWindow(c);
+      if (
+        win !== undefined
+        && win.reactors.some((r) => r.character === ch.name)
+        && !win.used.some((u) => u.by === ch.name)
+        && !win.declined.includes(ch.name)
+      ) {
+        win.declined.push(ch.name);
+        win.claimed = win.claimed.filter((r) => r.character !== ch.name);
+      }
+    }
+    if (!options.silent && (!prevAbsent || leftCombat)) {
+      pushLog(c, `${ch.name} 暂时移出队伍${leftCombat ? '（已移出先攻表）' : ''}`);
+    }
+    return { character: ch, changed: !prevAbsent || leftCombat, leftCombat };
+  }
+  if (ch.absent !== true) {
+    return { character: ch, changed: false, leftCombat: false };
+  }
+  delete ch.absent;
+  ch.room = c.currentRoom;
+  if (!options.silent) pushLog(c, `${ch.name} 归队`);
+  return { character: ch, changed: true, leftCombat: false };
+}
+
+/** 将所有暂离 PC 恢复为在队状态（用于收团、续团前重置出勤） */
+export function restoreAllAbsent(c: Campaign): string[] {
+  const restored: string[] = [];
+  for (const ch of c.characters) {
+    if (ch.kind === 'pc' && ch.absent === true) {
+      delete ch.absent;
+      if (ch.room !== undefined) ch.room = c.currentRoom;
+      restored.push(ch.name);
+    }
+  }
+  return restored;
+}
+
 /**
  * 具名 NPC 的卡一删，npcAlive 就退回去看 campaign.npcs，默认算活着：格罗尔和维瑞丝死后都被当成活人，
  * 房间照旧列出他们。删卡前把死讯记下来。
@@ -1122,14 +1244,15 @@ function recordNpcDeath(c: Campaign, ch: Character): void {
   c.npcs[ch.npcId] = { ...c.npcs[ch.npcId], alive: false };
 }
 
-/** 角色所在房间：怪物看自己的 room；PC/NPC 没单独移动过时跟着队伍主位置 */
+/** 角色所在房间：暂离队伍的 PC 不在任何房间；怪物看自己的 room；PC/NPC 没单独移动过时跟着队伍主位置 */
 export function roomOf(c: Campaign, ch: Character): string | undefined {
+  if (isAbsent(ch)) return undefined;
   return ch.kind === 'monster' ? ch.room : (ch.room ?? c.currentRoom);
 }
 
 /** 某房间里参与战斗的角色（默认队伍主位置）：在场活着的 PC/NPC + 本房间活着的怪物 */
 export function combatants(c: Campaign, room = c.currentRoom): Character[] {
-  return c.characters.filter((ch) => !isOut(ch) && roomOf(c, ch) === room);
+  return c.characters.filter((ch) => !isOut(ch) && !isAbsent(ch) && roomOf(c, ch) === room);
 }
 
 export function initBonusOf(ch: Character): number {
@@ -1162,6 +1285,10 @@ export function startInitiative(
 ): InitiativeRoll[] {
   const members = names === undefined || names.length === 0 ? combatants(c, room) : names.map((n) => requireCharacter(c, n));
   if (members.length === 0) throw new Error('没有可以参战的角色');
+  const absentMembers = members.filter(isAbsent);
+  if (absentMembers.length > 0) {
+    throw new Error(`${absentMembers.map((ch) => ch.name).join('、')} 本次未签到、已暂时移出队伍，不能拉入先攻（等本人点「签到」自动归队，或确认本人到场后用 dnd_character update absent=false 归队）`);
+  }
   // 掷骰前查完：名字写错时什么都还没掷
   const surprised = [...new Set(surprisedNames.map((n) => requireCharacter(c, n).name))];
   const outsider = surprised.filter((n) => !members.some((m) => m.name === n));
@@ -1309,6 +1436,10 @@ export function joinInitiative(
   const state = requireInitiative(c);
   if (names.length === 0) throw new Error('join 要给 participants');
   const members = [...new Set(names.map((n) => requireCharacter(c, n)))];
+  const absentMembers = members.filter(isAbsent);
+  if (absentMembers.length > 0) {
+    throw new Error(`${absentMembers.map((ch) => ch.name).join('、')} 本次未签到、已暂时移出队伍，不能拉入先攻（等本人点「签到」自动归队，或确认本人到场后用 dnd_character update absent=false 归队）`);
+  }
   const already = members.filter((ch) => state.order.some((e) => e.name === ch.name));
   if (already.length > 0) throw new Error(`${already.map((ch) => ch.name).join('、')} 已经在先攻表里了`);
   const rehearsal = state.rehearsal === true;
@@ -1513,7 +1644,7 @@ export function endInitiative(c: Campaign, options: { keepChanges?: boolean } = 
     .filter((ch) => ch.kind === 'monster' && !isOut(ch) && (participants.includes(ch.name) || (ch.room !== undefined && rooms.has(ch.room))))
     .map((ch) => ({ name: ch.name, hp: ch.hp, maxHp: ch.maxHp, conditions: [...ch.conditions], wound: woundLabel(ch) }));
   const fallenParty = c.characters
-    .filter((ch) => ch.kind !== 'monster' && (ch.hp === 0 || isOut(ch) || ch.conditions.includes('昏迷')) && (participants.includes(ch.name) || rooms.has(roomOf(c, ch) ?? '')))
+    .filter((ch) => ch.kind !== 'monster' && !isAbsent(ch) && (ch.hp === 0 || isOut(ch) || ch.conditions.includes('昏迷')) && (participants.includes(ch.name) || rooms.has(roomOf(c, ch) ?? '')))
     .map((ch) => ({ name: ch.name, hp: ch.hp, maxHp: ch.maxHp, conditions: [...ch.conditions] }));
   const rehearsal = state?.rehearsal === true;
   const snap = state?.rehearsalSnapshot;
@@ -1534,6 +1665,7 @@ export function endInitiative(c: Campaign, options: { keepChanges?: boolean } = 
   };
 
   if (restored) {
+    const absentStates = new Map(c.characters.filter((ch) => ch.kind === 'pc').map((ch) => [ch.name, ch.absent === true]));
     const tempSet = new Set(snap.temporaryMonsters ?? []);
     const participantSet = new Set(participants);
     c.characters = structuredClone(snap.characters).filter((ch) => {
@@ -1541,6 +1673,16 @@ export function endInitiative(c: Campaign, options: { keepChanges?: boolean } = 
       if (ch.kind === 'monster' && ch.npcId === undefined && ch.srd === undefined && participantSet.has(ch.name) && /梦境|演练|幻境|幻象|加练/.test(ch.notes ?? '')) return false;
       return true;
     });
+    for (const ch of c.characters) {
+      if (ch.kind !== 'pc') continue;
+      const liveAbsent = absentStates.get(ch.name);
+      if (liveAbsent === undefined) continue;
+      if (liveAbsent) ch.absent = true;
+      else if (ch.absent === true) {
+        delete ch.absent;
+        ch.room = c.currentRoom;
+      }
+    }
     if (snap.battlemaps !== undefined) c.battlemaps = structuredClone(snap.battlemaps);
     else delete c.battlemaps;
     c.npcs = structuredClone(snap.npcs);
@@ -1742,9 +1884,13 @@ export function moveParty(
     if (others.length > 0) throw new Error(`战斗中只能移动当前回合的角色（${current ?? '无'}）：${others.join('、')} 要等自己的回合`);
   }
   const candidates = whole
-    ? c.characters.filter((ch) => ch.kind !== 'monster' && !isOut(ch))
+    ? c.characters.filter((ch) => ch.kind !== 'monster' && !isOut(ch) && !isAbsent(ch))
     : [...new Set(who.map((n) => requireCharacter(c, n)))];
   if (candidates.length === 0) throw new Error('没有可以移动的角色');
+  const absentMovers = candidates.filter(isAbsent);
+  if (absentMovers.length > 0) {
+    throw new Error(`${absentMovers.map((ch) => ch.name).join('、')} 已暂时移出队伍，不能移动（等本人点「签到」归队或 dnd_character update absent=false）`);
+  }
   const monster = candidates.find((ch) => ch.kind === 'monster');
   if (monster !== undefined) {
     throw new Error(`${monster.name} 是怪物，不用 dnd_move。怪物换房间/逃跑用 dnd_character update name=${monster.name} room=<房间 id>（战斗中会顺带移出先攻表）`);
@@ -1809,7 +1955,7 @@ export function moveParty(
     }
     // 没单独移动过的人跟着 currentRoom；它要变之前先把留下的人钉在原地，免得被一起带走
     for (const ch of c.characters) {
-      if (ch.kind !== 'monster' && ch.room === undefined && !movers.includes(ch)) ch.room = c.currentRoom;
+      if (ch.kind !== 'monster' && !isAbsent(ch) && ch.room === undefined && !movers.includes(ch)) ch.room = c.currentRoom;
     }
     for (const ch of movers) ch.room = room.id;
     (c.enteredFrom ??= {})[room.id] = from;
@@ -1850,11 +1996,11 @@ function mainRoom(c: Campaign, prefer: string): string {
   return best;
 }
 
-/** 按房间分组的队伍位置（活着的 PC/NPC）；全队在一起时只有一组 */
+/** 按房间分组的队伍位置（活着的且在队的 PC/NPC）；全队在一起时只有一组 */
 export function partyPositions(c: Campaign): Map<string, Character[]> {
   const groups = new Map<string, Character[]>();
   for (const ch of c.characters) {
-    if (ch.kind === 'monster' || isOut(ch)) continue;
+    if (ch.kind === 'monster' || isOut(ch) || isAbsent(ch)) continue;
     const room = roomOf(c, ch)!;
     groups.set(room, [...(groups.get(room) ?? []), ch]);
   }
@@ -1903,6 +2049,9 @@ export function assertDeclaredByOwner(ch: Character, options: ActOptions, what: 
  *   - 战斗中只有当前回合的角色能主动行动（反应除外）。
  */
 export function assertCanAct(c: Campaign, ch: Character, options: ActOptions = {}): void {
+  if (isAbsent(ch)) {
+    throw new Error(`${ch.name} 本次未签到、已暂时移出队伍，暂不能行动；本人点「签到」自动归队，或确认本人加入时用 dnd_character update absent=false 归队`);
+  }
   if (options.reaction === true) return;
   if (options.ignoreStateMods !== true) {
     const blocked = actionRestriction(ch);
@@ -2152,8 +2301,12 @@ export function rest(
   if (c.initiative !== undefined) throw new Error('战斗中不能休息');
   delete c.hexbladeCurses;
   const members = names === undefined || names.length === 0
-    ? c.characters.filter((ch) => ch.kind !== 'monster' && !isOut(ch))
+    ? c.characters.filter((ch) => ch.kind !== 'monster' && !isOut(ch) && !isAbsent(ch))
     : names.map((n) => requireCharacter(c, n));
+  const absentMembers = members.filter(isAbsent);
+  if (absentMembers.length > 0) {
+    throw new Error(`${absentMembers.map((ch) => ch.name).join('、')} 本次未签到、已暂时移出队伍，不参与休息（等本人点「签到」归队或 dnd_character update absent=false）`);
+  }
   const spendFor = new Map<Character, number>();
   for (const [n, dice] of Object.entries(spend)) spendFor.set(requireCharacter(c, n), dice);
   const results = members.map((ch) => {
@@ -2280,7 +2433,10 @@ export function addSummary(c: Campaign, text: string, now = Date.now()): void {
 /** 元数据变化不代表剧情推进；备团计划也不能混进已发生事实。 */
 export function campaignState(c: Campaign): string {
   const { summaries, handoff, preparation, lastCombat, active, updatedAt, sessionStartedAt, rollSeq, ...state } = c;
-  return createHash('sha256').update(JSON.stringify(state)).digest('hex');
+  const normalized = state.characters === undefined
+    ? state
+    : { ...state, characters: state.characters.map(({ absent: _absent, ...rest }) => rest) };
+  return createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
 }
 
 function fitHandoff(lines: string[], budget = 1000): string[] {
@@ -2342,8 +2498,12 @@ export function summarize(c: Campaign, adv: Adventure): string {
   const exits = visibleExits(c, adv).map((e) => `${e.name}(${e.to})${e.locked === true ? '[过不去]' : ''}`).join('、');
   lines.push(`可见出口：${exits || '无'}`);
 
-  const party = c.characters.filter((ch) => ch.kind !== 'monster');
-  lines.push(`队伍：${party.length > 0 ? party.map((ch) => `${hpTag(ch, c)}${ch.player ? `〈${ch.player}〉` : ''}${resourceTag(ch, c)}`).join('；') : '还没有角色卡'}`);
+  const activeParty = c.characters.filter((ch) => ch.kind !== 'monster' && !isAbsent(ch));
+  const absentParty = c.characters.filter(isAbsent);
+  lines.push(`队伍：${activeParty.length > 0 ? activeParty.map((ch) => `${hpTag(ch, c)}${ch.player ? `〈${ch.player}〉` : ''}${resourceTag(ch, c)}`).join('；') : '还没有角色卡'}`);
+  if (absentParty.length > 0) {
+    lines.push(`暂离队伍（未签到，不参与探索/战斗）：${absentParty.map((ch) => `${ch.name}${ch.player ? `〈${ch.player}〉` : ''}`).join('、')}（点「签到」自动归队，或本人明确要求加入时 dnd_character update absent=false）`);
+  }
   const positions = partyPositions(c);
   if (positions.size > 1) {
     lines.push(`队伍分头行动：${[...positions].map(([room, members]) => `${findRoom(graph, room)?.name ?? room}：${members.map((ch) => ch.name).join('、')}`).join('｜')}`);
@@ -2405,7 +2565,7 @@ export function summarizeCombat(
     ...(s?.allParticipants ?? []),
   ]);
 
-  const party = c.characters.filter((ch) => ch.kind !== 'monster');
+  const party = c.characters.filter((ch) => ch.kind !== 'monster' && !isAbsent(ch));
   const combatParty = party.filter((ch) =>
     participantSet.has(ch.name)
     || (s?.rehearsal !== true && (ch.hp === 0 || ch.conditions.includes('昏迷') || ch.conditions.includes('稳定')) && activeRooms.has(roomOf(c, ch) ?? '')),
@@ -2492,12 +2652,16 @@ export function playerStatus(c: Campaign, adv: Adventure, viewer?: string, forma
     }
     const foes = c.characters.filter((ch) => ch.kind === 'monster' && !isOut(ch) && positions.has(ch.room ?? ''));
     if (foes.length > 0) lines.push(`敌人：${foes.map((ch) => `${ch.name}（${woundLabel(ch)}${ch.conditions.length > 0 ? `，${ch.conditions.join(',')}` : ''}）`).join('、')}`);
+    const absentParty = c.characters.filter(isAbsent);
+    if (absentParty.length > 0) {
+      lines.push(`💤 暂离（未签到）：${absentParty.map((ch) => ch.name).join('、')}（点「签到」归队）`);
+    }
     return lines.join('\n');
   }
   const s = c.initiative;
   const activeRooms = fightRooms(c);
   if (activeRooms.size === 0) activeRooms.add(c.currentRoom);
-  const combatAllies = c.characters.filter((ch) => ch.kind !== 'monster' && (inInitiative(c, ch.name) || activeRooms.has(roomOf(c, ch) ?? '')));
+  const combatAllies = c.characters.filter((ch) => ch.kind !== 'monster' && !isAbsent(ch) && (inInitiative(c, ch.name) || activeRooms.has(roomOf(c, ch) ?? '')));
   if (combatAllies.length > 0) {
     lines.push(`我方：${combatAllies.map((ch) => `${ch.name} ${ch.hp}/${ch.maxHp}${(ch.tempHp ?? 0) > 0 ? `(+${ch.tempHp})` : ''}`).join('、')}`);
   }
@@ -2646,12 +2810,24 @@ export class CampaignStore {
     const list = this.snapshots(key);
     const n = Math.min(Math.max(1, Math.trunc(steps)), list.length);
     if (n === 0) throw new Error('没有可以撤销的改动');
+    const live = this.load(key);
+    const liveAbsent = new Set((live?.characters ?? []).filter(isAbsent).map((ch) => ch.name));
     const undone = list.splice(list.length - n, n);
     const restored = parseCampaign(undone[0]!.state);
     if (restored === undefined) throw new Error('快照格式不认识，没法撤销');
     restored.active = true;
+    // 签到暂离/归队属本次出勤，不随游戏状态回滚
+    for (const ch of restored.characters) {
+      if (ch.kind !== 'pc') continue;
+      if (liveAbsent.has(ch.name)) {
+        setCharacterAbsent(restored, ch.name, true, { silent: true });
+      } else if (ch.absent === true) {
+        delete ch.absent;
+        ch.room = restored.currentRoom;
+      }
+    }
     // 骰子编号不回退：退掉的 #R 不再复用（按钮序号也是它）
-    const seq = Math.max(this.load(key)?.rollSeq ?? 0, restored.rollSeq ?? 0);
+    const seq = Math.max(live?.rollSeq ?? 0, restored.rollSeq ?? 0);
     if (seq > 0) restored.rollSeq = seq;
     this.save(restored);
     this.writeSnapshots(key, list);

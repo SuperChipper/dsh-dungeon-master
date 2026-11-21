@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { InteractionEvent } from '@tencent-connect/qqbot-nodejs';
 import { AdventureLibrary, adventureFromDungeon } from './adventure.ts';
-import { type Campaign, CampaignStore, createCampaign, findCharacter, upsertCharacter } from './campaign.ts';
+import { type Campaign, CampaignStore, createCampaign, findCharacter, setResource, upsertCharacter } from './campaign.ts';
 import { DndService } from './dnd-service.ts';
 import { partySizeHint, registerDndTools } from './dnd-tools.ts';
 import { SUNKEN_BELL } from './dungeons/sunken-bell.ts';
@@ -144,6 +144,83 @@ describe('工具和按钮', () => {
     expect(krivMsg).toContain('🔮 **Kriv** 的法术与能力');
     expect(krivMsg).toContain('尖刻言语 [反应]（诗人激励 3/3）');
     expect(krivMsg).toContain('诗人激励（3/3，短休回）');
+  });
+
+  it('新资源同步：同名资源不被同名法术吞掉、新环位无条目法术位照常展示、简称模糊匹配、生命骰去重与冷启动点按钮', async () => {
+    // 1. 已有法术（如 脆弱诅咒 1环）后通过 dnd_resource set 新增同名资源，按钮必须渲染余量而不是被吞掉
+    const t = setup();
+    await t.call('dnd_character', {
+      action: 'update',
+      name: '恩佐',
+      spells: [{ name: '脆弱诅咒', level: 1, en: 'Hex' }],
+    });
+    await t.call('dnd_resource', { action: 'set', character: '恩佐', resource: '脆弱诅咒', max: 1, reset: 'none' });
+    await t.call('dnd_resource', { action: 'set', character: '恩佐', resource: '4环法术位', max: 1, reset: 'long' });
+    await t.call('dnd_resource', { action: 'set', character: '恩佐', resource: '2 环法术位', max: 3, current: 2, reset: 'long' });
+    await t.call('dnd_resource', { action: 'set', character: '恩佐', resource: '生命骰', max: 6, reset: 'long' });
+    await t.call('dnd_resource', { action: 'set', character: '恩佐', resource: '生命骰 d8', max: 7, current: 6, reset: 'long' });
+
+    expect(t.press({ a: 'spells', n: '恩佐' }, 'P1')).toBe(ACK.ok);
+    await Promise.resolve();
+    const enzoMsg = t.sender.sendMarkdown.mock.calls.at(-1)![1] as string;
+    expect(enzoMsg).toContain('脆弱诅咒（脆弱诅咒 1/1）');
+    expect(enzoMsg).toContain('**2 环**　2/3');
+    expect(enzoMsg).toContain('**4 环**　1/1');
+    expect(enzoMsg).toContain('暂无该环法术记录');
+    expect(enzoMsg).toContain('生命骰 d8（6/7，长休回）');
+    expect(enzoMsg).not.toContain('· 生命骰（6/6');
+    expect(spellListText('奇塔露', [{ name: '命运宠儿', level: 2 }], { 命运宠儿: { current: 1, max: 1, reset: 'none' } }, { includeFallback: true }))
+      .toContain('命运宠儿（命运宠儿 1/1）');
+
+    // 2. 只有新加的法术位、尚未录入 spells 条目时，也不报空卡提示
+    const slotOnly = spellListText('奇塔露', [], { '4环法术位': { current: 1, max: 1, reset: 'long' } });
+    expect(slotOnly).toContain('**4 环**　1/1');
+    expect(slotOnly).toContain('暂无该环法术记录');
+    expect(slotOnly).not.toContain('还没有法术或能力清单');
+
+    // 3. 能力与反应传资源简称也能模糊匹配并显示实时余量
+    const fuzzy = spellListText(
+      'Kriv',
+      [{ name: '激励', level: 0, kind: 'feature', action: 'bonus', resource: '诗人' }],
+      { 诗人激励: { current: 2, max: 3, reset: 'short' } },
+      { includeFallback: true, reactions: [{ name: '尖刻言语', when: 'foe_attacks', resource: '诗人' }] },
+    );
+    expect(fuzzy).toContain('激励 [附赠]（诗人激励 2/3）');
+    expect(fuzzy).toContain('尖刻言语 [反应]（诗人激励 2/3）');
+    expect(fuzzy).not.toContain('耗诗人');
+
+    // 4. 冷启动（getSessionRecord 返回 undefined）点「法术/能力」依然能按最新资源发出
+    const service = new DndService({
+      store: new CampaignStore(mkdtempSync(join(tmpdir(), 'dnd-coldspells-'))),
+      library: new AdventureLibrary(),
+      mapDir: tmpdir(),
+    });
+    const coldKey = 'group:COLD';
+    service.start(coldKey, 'sunken-bell', false);
+    service.store.update(coldKey, (c) => {
+      upsertCharacter(c, {
+        name: 'Kriv',
+        playerId: 'P2',
+        maxHp: 30,
+      });
+      setResource(c, 'Kriv', '诗人激励', 3, 'short', 2);
+    });
+    const coldSender = { sendMarkdown: vi.fn(() => Promise.resolve()) };
+    const coldButtons = new DndTurnButtons(
+      service,
+      { sessionKey: (_s: string, gid: string) => `group:${gid}`, getSessionRecord: () => undefined } as never,
+      coldSender,
+      logger as never,
+    );
+    expect(coldButtons.handleInteraction({
+      id: 'cold-1', type: 11, version: 1, group_openid: 'COLD', group_member_openid: 'P2',
+      data: { type: 11, resolved: { button_data: JSON.stringify({ t: 'dnd', a: 'spells', n: 'Kriv' }) } },
+    } as InteractionEvent)).toBe(ACK.ok);
+    await Promise.resolve();
+    expect(coldSender.sendMarkdown).toHaveBeenCalledWith(
+      { scope: 'group', targetId: 'COLD' },
+      expect.stringContaining('诗人激励（2/3，短休回）'),
+    );
   });
 });
 

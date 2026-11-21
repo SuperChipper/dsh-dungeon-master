@@ -11,7 +11,7 @@ requireInitiative,requireResource,usesElvenAccuracy,useResource,weaponAttackModi
 } from '../campaign.ts';
 import {
 activeEffectDefsFor,breakConcentration,collectHitRiders,computeAttackStateMods,computeCheckStateMods,computeDefenseStateMod,
-computeSaveStateMods,effectiveMaxHp,ensureTurnState,formatStateModSummary,hasCondition,movementSpeedInfo,normalizeCondition,recordTurnSpellCast
+computeSaveStateMods,effectiveMaxHp,ensureTurnState,formatStateModSummary,hasCondition,movementSpeedInfo,normalizeCondition,recordTurnSpellCast,type CollectedRider
 } from '../conditions.ts';
 import { buildFormulaContext,evalIntFormula } from '../formula.ts';
 import { ABILITY_NAMES,type Ability,type Skill,SKILLS,parseAbility,parseSkill,proficiencyBonus,skillLabel } from '../rules.ts';
@@ -35,8 +35,32 @@ rollAttackDamage,
 rollCollectedRiders,
 onHitArg,settleAttackDamage,str,
 int,
-strList,advantageOf,hpLine,combatLedgerSuffix,type ToolKit
+strList,advantageOf,hpLine,combatLedgerSuffix,critExpression,type Exec,type ToolKit
 } from './shared.ts';
+
+const MAX_BATCH_ATTACKS = 6;
+const MAX_BATCH_RIDERS = 3;
+const BATCH_ATTACK_KEYS = ['character', 'type', 'target', 'weapon', 'ability', 'damage_type', 'advantage', 'crit_on', 'bonus', 'declared_by', 'attacks'];
+
+type BatchStrike = {
+  damage?: string;
+  damageType?: string;
+  riders: CollectedRider[];
+  result?: { hit: boolean; damage: number; pending: boolean; stop?: string };
+};
+
+function batchObject(value: unknown, keys: string[], label: string): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} 必须是对象`);
+  if (Object.keys(value).some((key) => !keys.includes(key))) throw new Error(`${label} 只能给 ${keys.join('、')}`);
+  return value as Record<string, unknown>;
+}
+
+function validateBatchDamage(expression: string): void {
+  // 校验普通命中和重击，但绝不消耗真正的骰子。
+  for (const expr of [expression, critExpression(expression)]) {
+    if (!Number.isSafeInteger(rollExpression(expr, (sides) => sides).total)) throw new Error('伤害超出骰子数值范围');
+  }
+}
 
 export function registerDiceTools(kit: ToolKit): void {
   const { deps, service, recordOf, mutate, rollId, sendersOf, memberId, resolvePending, saveEffectText, register } = kit;
@@ -86,6 +110,25 @@ export function registerDiceTools(kit: ToolKit): void {
       },
       dc: { type: 'integer', description: 'Difficulty class for skill/ability/save. Secret.' },
       target: { type: 'string', description: 'For type=attack: the character being attacked.' },
+      attacks: {
+        type: 'array', minItems: 2, maxItems: MAX_BATCH_ATTACKS,
+        description: 'Same-turn attack sequence with one attacker, target and weapon, already legally declared. One independent attack roll per item; stops at reactions, concentration saves or a downed target. Only continue unrolled strikes after resolving the stop. Use single attacks for resource spends, manual reaction windows and player choices.',
+        items: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            damage: { type: 'string', description: 'This strike’s damage expression (extra dice if a weapon is set; omit to use the sheet).' },
+            damage_type: { type: 'string', description: 'This strike’s main damage type, overriding the shared damage_type.' },
+            riders: {
+              type: 'array', minItems: 1, maxItems: MAX_BATCH_RIDERS,
+              description: 'Unconditional extra damage on the same hit, with separate defenses. Do not repeat riders already on the sheet or spend resources here.',
+              items: {
+                type: 'object', additionalProperties: false, required: ['damage', 'damage_type'],
+                properties: { damage: { type: 'string' }, damage_type: { type: 'string' } },
+              },
+            },
+          },
+        },
+      },
       targets: {
         type: 'array',
         description: 'For type=save: creatures that make the save (then `character` is the caster or source, e.g. '
@@ -202,7 +245,90 @@ export function registerDiceTools(kit: ToolKit): void {
       },
     },
     ['character', 'type'],
-    (args, exec) => mutate(exec, (c) => {
+    (args, exec) => args.attacks === undefined ? checkOne(args, exec) : checkBatch(args, exec),
+  );
+
+  function checkBatch(args: Record<string, unknown>, exec: Exec): string {
+    if (args.type !== 'attack') throw new Error('attacks 只用于 type=attack');
+    batchObject(args, BATCH_ATTACK_KEYS, '批量攻击的参数（扣资源、手动挂反应或让玩家另选时请逐击调用）');
+    const raw = args.attacks;
+    if (!Array.isArray(raw) || raw.length < 2 || raw.length > MAX_BATCH_ATTACKS) {
+      throw new Error(`attacks 要填 2–${MAX_BATCH_ATTACKS} 项，每项是一次攻击`);
+    }
+    for (const key of ['weapon', 'ability', 'damage_type'] as const) {
+      if (args[key] !== undefined && str(args[key]) === undefined) throw new Error(`${key} 要填非空字符串`);
+    }
+    if (args.ability !== undefined && parseAbility(String(args.ability)) === undefined) throw new Error('攻击属性不认识');
+    const key = recordOf(exec).sessionKey;
+    const { campaign: c } = service.require(key);
+    requireInitiative(c);
+    assertNoPending(c, '批量攻击');
+    const actor = requireCharacter(c, String(args.character ?? ''));
+    const target = requireCharacter(c, String(args.target ?? ''));
+    if (!inInitiative(c, target.name)) throw new Error('批量攻击的目标须在当前先攻表内');
+    if (target.hp <= 0 || hasCondition(target, '死亡')) throw new Error('目标已经倒下，不能批量攻击');
+    const weaponName = str(args.weapon);
+    const weapon = weaponName === undefined || (actor.kind !== 'pc' && (actor.weapons?.length ?? 0) === 0)
+      ? undefined : findWeapon(actor, weaponName);
+    const strikes: BatchStrike[] = raw.map((value, i) => {
+      const label = `第 ${i + 1} 击`;
+      const entry = batchObject(value, ['damage', 'damage_type', 'riders'], label);
+      const damage = str(entry.damage), damageType = str(entry.damage_type);
+      if (entry.damage !== undefined && damage === undefined) throw new Error(`${label} damage 要填非空骰子表达式`);
+      if (entry.damage_type !== undefined && damageType === undefined) throw new Error(`${label} damage_type 要填非空字符串`);
+      const expression = attackExpression(actor, weapon, damage);
+      if (expression === undefined) throw new Error(`${label}缺伤害公式：传武器或 damage`);
+      validateBatchDamage(expression);
+      const extras = entry.riders;
+      if (extras !== undefined && (!Array.isArray(extras) || extras.length === 0 || extras.length > MAX_BATCH_RIDERS)) {
+        throw new Error(`${label} riders 要填 1–${MAX_BATCH_RIDERS} 项`);
+      }
+      const riders: CollectedRider[] = (Array.isArray(extras) ? extras : []).map((value) => {
+        const rider = batchObject(value, ['damage', 'damage_type'], `${label}附伤`);
+        const expression = str(rider.damage), damageType = str(rider.damage_type);
+        if (expression === undefined || damageType === undefined) throw new Error(`${label}附伤要同时给 damage、damage_type`);
+        validateBatchDamage(expression);
+        return { label: damageType, expression, damageType };
+      });
+      return { ...(damage === undefined ? {} : { damage }), ...(damageType === undefined ? {} : { damageType }), riders };
+    });
+
+    let rolled = 0, settled = 0, hits = 0, damage = 0;
+    let stop: string | undefined;
+    let failed = false;
+    const lines: string[] = [];
+    const total = strikes.length;
+    for (const [index, strike] of strikes.entries()) {
+      try {
+        // 独立落盘及骰号，让下一击读取新状态，也让 dnd_undo 能只退最后一击。
+        const result = checkOne({ ...args, damage: strike.damage, damage_type: strike.damageType ?? args.damage_type },
+          { ...exec, label: `${exec.label ?? 'dnd_check'}（第 ${index + 1}/${total} 击）`, rolls: [] }, strike);
+        lines.push(`【第 ${index + 1}/${total} 击】${result}`);
+      } catch (error) {
+        if (rolled === 0) throw error;
+        failed = true;
+        stop = `第 ${index + 1} 击异常：${error instanceof Error ? error.message : String(error)}。先核对账本，不要重掷已结算的攻击`;
+        break;
+      }
+      rolled++;
+      const result = strike.result!;
+      if (!result.pending) {
+        settled++;
+        if (result.hit) hits++;
+        damage += result.damage;
+      }
+      if (result.stop !== undefined) { stop = result.stop; break; }
+    }
+    const remaining = rolled === total ? '' : failed
+      ? `；还有 ${total - rolled} 击未确认，不会自动继续`
+      : `；后续 ${total - rolled} 击未掷，不会自动继续`;
+    const summary = `【连击${settled === total ? '完成' : '停止'}】已结 ${settled}/${total} 击，命中 ${hits} 击，伤害合计 ${damage}（抗性、免疫及易伤调整后，扣临时生命前）${stop === undefined ? '' : `；${stop}`}${remaining}。`;
+    const final = service.store.load(key);
+    return `${lines.join('\n')}\n${summary}\n${SECRET_NOTE}${final === undefined ? '' : combatLedgerSuffix(final)}`;
+  }
+
+  function checkOne(args: Record<string, unknown>, exec: Exec, batch?: BatchStrike): string {
+    return mutate(exec, (c) => {
       const type = String(args.type);
       if (args.on_hit !== undefined && type !== 'attack') throw new Error('on_hit 只用于攻击');
       if (args.dm_override === true && str(args.declared_by) === undefined) {
@@ -326,6 +452,9 @@ export function registerDiceTools(kit: ToolKit): void {
         const targetName = str(args.target);
         if (targetName === undefined) throw new Error('dnd_check: 攻击需要 target');
         const target = requireCharacter(c, targetName);
+        if (batch !== undefined && (c.initiative === undefined || !inInitiative(c, target.name) || target.hp <= 0 || hasCondition(target, '死亡'))) {
+          throw new Error('战斗或目标状态已变，不能继续批量攻击');
+        }
         const weaponName = str(args.weapon);
         // srd 建的怪只有卡面上的攻击加值和伤害，没有武器列表：「咬」报错后 DM 只能战斗中逐只补武器。
         // 没有武器列表的怪直接用卡面数值，武器名只当描述；PC 写错武器名仍然报错
@@ -438,6 +567,7 @@ export function registerDiceTools(kit: ToolKit): void {
           globalEffects,
         });
         for (const sn of collected.skippedNotes) lines.push(`【防重算】${sn}`);
+        const riders = batch === undefined ? collected.riders : [...collected.riders, ...batch.riders];
 
         let extra = rawExtra;
         let curseNote = '';
@@ -458,11 +588,13 @@ export function registerDiceTools(kit: ToolKit): void {
         const reactors = mergeReactors(auto, holdFor);
         // 能反应的人在场就先不落账；DM 手动挂起（hold / hold_for）时天然 1 也挂：重掷能改掉它
         const hold = c.initiative !== undefined && (wantHold || (expression !== undefined && roll.natural !== 1 && auto.length > 0));
+        let settledDamage = 0;
+        let needsConcentrationSave = false;
         if (hold) {
           const dmg = hit && expression !== undefined ? rollAttackDamage(ch, weapon, expression, effectiveCrit, service.roller) : undefined;
           const pendingRiders: PendingRider[] = hit
-            ? rollCollectedRiders(c, target, collected.riders, effectiveCrit, service.roller, args.ignore_state_mods === true, globalEffects)
-            : collected.riders.map((r) => {
+            ? rollCollectedRiders(c, target, riders, effectiveCrit, service.roller, args.ignore_state_mods === true, globalEffects)
+            : riders.map((r) => {
               const rDef = args.ignore_state_mods === true ? undefined : computeDefenseStateMod(target, r.damageType, undefined, c, globalEffects).defense;
               return {
                 label: r.label,
@@ -504,20 +636,31 @@ export function registerDiceTools(kit: ToolKit): void {
             lines.push('没有伤害表达式：传 weapon（角色卡上的武器），或用 dnd_roll 掷伤害（重击时骰子翻倍）再 dnd_apply 扣血。');
           } else {
             const dmg = rollAttackDamage(ch, weapon, expression, effectiveCrit, service.roller);
-            const rolledRiders = rollCollectedRiders(c, target, collected.riders, effectiveCrit, service.roller, args.ignore_state_mods === true, globalEffects);
+            const rolledRiders = rollCollectedRiders(c, target, riders, effectiveCrit, service.roller, args.ignore_state_mods === true, globalEffects);
             const amount = saveDamage(dmg.total, false, 'half', defense);
             const riderLedger = rolledRiders.length > 0
               ? ` + 附伤(${rolledRiders.map((r) => `${r.label} ${r.detail} ${r.damageType}`).join(' + ')})`
               : '';
             pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote}${stateSuffix} → ${verdictText}，伤害 ${dmg.detail}${curseNote}${riderLedger}`, id);
             lines.push(`伤害 ${dmg.detail}${curseNote}${defense !== undefined ? `，${DEFENSE_NAMES[defense]} → ${amount}` : ''}`);
-            lines.push(...settleAttackDamage(c, ch.name, target.name, dmg.total, effectiveCrit, damageType, defense, onHit, service.roller, rolledRiders));
+            const settlement = settleAttackDamage(c, ch.name, target.name, dmg.total, effectiveCrit, damageType, defense, onHit, service.roller, rolledRiders);
+            settledDamage = settlement.damage;
+            needsConcentrationSave = settlement.needsConcentrationSave;
+            lines.push(...settlement.lines);
           }
         } else {
           pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote}${stateSuffix} → ${verdictText}`, id);
         }
         const rangeNote = attackRangeNote(c, ch, target, { ...(weapon !== undefined ? { weapon } : {}), reaction: args.reaction === true, advantage: effectiveAdv });
         if (rangeNote !== undefined) lines.push(rangeNote);
+        if (batch !== undefined) {
+          const stop = hold ? `#R${id} 待结算，先处理反应窗口`
+            : target.hp <= 0 || hasCondition(target, '死亡') ? '目标已倒下'
+              : needsConcentrationSave ? '先结算本击触发的专注豁免'
+                : undefined;
+          batch.result = { hit, damage: settledDamage, pending: hold, ...(stop === undefined ? {} : { stop }) };
+          return lines.join('\n');
+        }
         lines.push(SECRET_NOTE);
         return `${lines.join('\n')}${combatLedgerSuffix(c)}`;
       }
@@ -638,8 +781,8 @@ export function registerDiceTools(kit: ToolKit): void {
         return `${head}\n${holdNotice(p)}\n${SECRET_NOTE}${combatLedgerSuffix(c)}`;
       }
       return `${head}\n${secret ? HIDDEN_ROLL_NOTE : SECRET_NOTE}${combatLedgerSuffix(c)}`;
-    }),
-  );
+    });
+  }
 
   register(
     'dnd_apply',

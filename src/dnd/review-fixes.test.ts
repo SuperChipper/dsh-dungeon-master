@@ -11,18 +11,28 @@ import {
   combatants,
   createCampaign,
   findCharacter,
+  isAbsent,
+  joinInitiative,
   moveParty,
+  partyPositions,
   playerStatus,
+  requireCharacter,
   rest,
+  roomOf,
   setResource,
   startInitiative,
+  summarize,
+  summarizeCombat,
   upsertCharacter,
   useResource,
   woundLabel,
 } from './campaign.ts';
 import { DndService } from './dnd-service.ts';
-import { srdMonsterInput } from './dnd-tools.ts';
+import { partySizeHint, registerDndTools, srdMonsterInput } from './dnd-tools.ts';
 import { ACK, DndTurnButtons, buildTurnKeyboard } from './turn-buttons.ts';
+import { combatPartyContext } from './combat-context.ts';
+import { addHook, hookPromptLines, matchHooks } from './hooks.ts';
+import { eligibleReactors } from './pending-attack.ts';
 import { SUNKEN_BELL } from './dungeons/sunken-bell.ts';
 import { AdventureLibrary, adventureFromDungeon } from './adventure.ts';
 import { mergeWithSenders } from '../gateway/middleware-setup.ts';
@@ -414,5 +424,238 @@ describe('开团签到', () => {
     expect(service.checkIns.has(key)).toBe(false);
     expect(press('in', 'P3')).toBe(ACK.ok);
     expect(service.checkIns.get(key)?.arrived.has('P3')).toBe(true);
+  });
+
+  it('点「开始」时未签到的绑定 PC 暂时移出队伍；已到与未绑定 PC 保留，/dnd end 后全部归队', async () => {
+    const { buttons, key, service, press, kickoffText } = setup();
+    await buttons.openCheckIn(key, TARGET, '', true);
+    expect(press('in', 'P3')).toBe(ACK.ok);
+    expect(press('go', 'P3')).toBe(ACK.ok);
+
+    const campaign = service.store.load(key)!;
+    expect(isAbsent(requireCharacter(campaign, '恩佐'))).toBe(true);
+    expect(isAbsent(requireCharacter(campaign, '卡厄斯'))).toBe(false);
+    expect(isAbsent(requireCharacter(campaign, '路人'))).toBe(false);
+    expect(kickoffText()).toContain('已暂时移出队伍');
+    expect(service.stateSnapshot(key)).toContain('暂离队伍（未签到，不参与探索/战斗）：恩佐');
+
+    service.stop(key);
+    expect(isAbsent(requireCharacter(service.store.load(key)!, '恩佐'))).toBe(false);
+  });
+
+  it('暂离 PC 全链路隔离：探索、先攻、反应、战斗上下文、团况、人数提示、休息与背景钩子', async () => {
+    const { buttons, key, service, press } = setup();
+    service.store.update(key, (c) => {
+      upsertCharacter(c, { name: '卡厄斯', player: '玩家丙', playerId: 'P3', maxHp: 20, notes: '护盾术' });
+      upsertCharacter(c, { name: '恩佐', player: '玩家乙', playerId: 'P4', maxHp: 20, notes: '护盾术' });
+      upsertCharacter(c, { name: '小四', player: '玩家戊', playerId: 'P5', maxHp: 18 });
+      upsertCharacter(c, { name: '小五', player: '玩家己', playerId: 'P6', maxHp: 18 });
+      upsertCharacter(c, { name: '地精1', kind: 'monster', maxHp: 7, room: c.currentRoom });
+      addHook(requireCharacter(c, '恩佐'), '在找失踪的姐姐', ['残殿']);
+      requireCharacter(c, '恩佐').hp = 5;
+      requireCharacter(c, '卡厄斯').hp = 5;
+    });
+    await buttons.openCheckIn(key, TARGET, '', true);
+    press('in', 'P3');
+    press('in', 'P5');
+    press('in', 'P6');
+    press('go', 'P3');
+
+    const { campaign, adventure } = service.require(key);
+    expect(isAbsent(requireCharacter(campaign, '恩佐'))).toBe(true);
+    expect(roomOf(campaign, requireCharacter(campaign, '恩佐'))).toBeUndefined();
+    expect(partyPositions(campaign).get(campaign.currentRoom)?.map((x) => x.name)).not.toContain('恩佐');
+    expect(partySizeHint(campaign, adventure)).toBeUndefined(); // 4 个 PC 暂离 1 个（加未绑定路人 4 人 ≤ 默认 4 人）
+
+    // 全队移动不带走暂离 PC，也不会触发其钩子或出口检定；显式移动暂离 PC 报错
+    moveParty(campaign, adventure, 'nave');
+    expect(requireCharacter(campaign, '恩佐').room).toBeUndefined();
+    expect(campaign.currentRoom).toBe('nave');
+    expect(() => moveParty(campaign, adventure, 'vestry', false, ['恩佐'])).toThrow(/暂时移出队伍/);
+
+    // 钩子与休息隔离
+    expect(matchHooks(campaign, '残殿的石头')).toEqual([]);
+    expect(hookPromptLines(campaign)).toEqual([]);
+    rest(campaign, 'long');
+    expect(requireCharacter(campaign, '卡厄斯').hp).toBe(20);
+    expect(requireCharacter(campaign, '恩佐').hp).toBe(5);
+    expect(() => rest(campaign, 'long', ['恩佐'])).toThrow(/暂时移出队伍/);
+
+    // 先攻、反应、战斗上下文与团况隔离
+    const summaryText = summarize(campaign, adventure);
+    expect(summaryText).toContain('暂离队伍');
+    expect(playerStatus(campaign, adventure)).toContain('💤 暂离（未签到）：恩佐');
+
+    upsertCharacter(campaign, { name: '伏兵', kind: 'monster', maxHp: 10, room: 'nave' });
+    const rolls = startInitiative(campaign, fixed(10));
+    expect(rolls.map((r) => r.name)).not.toContain('恩佐');
+    expect(() => startInitiative(campaign, fixed(10), ['恩佐'])).toThrow(/暂时移出队伍/);
+    expect(() => joinInitiative(campaign, ['恩佐'])).toThrow(/暂时移出队伍/);
+    expect(combatPartyContext(campaign)).not.toContain('恩佐');
+    expect(summarizeCombat(campaign, adventure)).not.toContain('恩佐');
+    const reactors = eligibleReactors(campaign, requireCharacter(campaign, '伏兵'), requireCharacter(campaign, '卡厄斯'), { hit: true, crit: false, natural: 15 });
+    expect(reactors.map((r) => r.character)).not.toContain('恩佐');
+  });
+
+  it('战斗未完续团后点「开始」：未签到 PC 从先攻、站位与待结算移出，turn 指针不越界', async () => {
+    const { buttons, key, service, press } = setup();
+    service.store.update(key, (c) => {
+      upsertCharacter(c, { name: '地精', kind: 'monster', maxHp: 7, room: c.currentRoom });
+      c.initiative = {
+        round: 1,
+        turn: 2,
+        order: [{ name: '卡厄斯', init: 18 }, { name: '地精', init: 12 }, { name: '恩佐', init: 8 }],
+        positions: { 卡厄斯: { x: 1, y: 1, room: c.currentRoom }, 恩佐: { x: 2, y: 1, room: c.currentRoom } },
+        pending: {
+          kind: 'attack', seq: 1, at: 10, attacker: '地精', target: '卡厄斯',
+          reactors: [{ character: '恩佐', reaction: '尖刻言语' }],
+          declined: [], claimed: [{ character: '恩佐', reaction: '尖刻言语', authorization: 'tok' }], used: [],
+          natural: 15, total: 19, rollDetail: 'd20=15+4=19', ac: 16, crit: false, attackMod: 0, acMod: 0, damageMod: 0,
+        },
+        turnState: { actor: '恩佐', attacks: 0 },
+      };
+    });
+    await buttons.openCheckIn(key, TARGET, '', true);
+    press('in', 'P3');
+    expect(press('go', 'P3')).toBe(ACK.ok);
+
+    const saved = service.store.load(key)!;
+    expect(isAbsent(requireCharacter(saved, '恩佐'))).toBe(true);
+    expect(saved.initiative!.order.map((e) => e.name)).toEqual(['卡厄斯', '地精']);
+    expect(saved.initiative!.turn).toBe(0);
+    expect(saved.initiative!.round).toBe(2);
+    expect(saved.initiative!.turnState?.actor).toBe('卡厄斯');
+    expect(saved.initiative!.positions?.['恩佐']).toBeUndefined();
+    expect(saved.initiative!.pending!.declined).toContain('恩佐');
+    expect(saved.initiative!.pending!.claimed).toEqual([]);
+  });
+
+  it('晚到玩家开场后点「签到」自动归队并同步当前房间；bot 重启后按团档恢复签到态', async () => {
+    const { buttons, key, service, sender, followup, press } = setup();
+    await buttons.openCheckIn(key, TARGET, '', true);
+    press('in', 'P3');
+    press('go', 'P3');
+    expect(followup).toHaveBeenCalledTimes(1);
+
+    // 队伍移动到了新房间
+    service.store.update(key, (c) => {
+      moveParty(c, service.require(key).adventure, 'nave');
+    });
+    sender.sendMarkdown.mockClear();
+
+    // 模拟 bot 重启：清空内存 checkIns 后重开 DndTurnButtons
+    service.checkIns.clear();
+    const restartedManager = { sessionKey: (_s: string, gid: string) => `group:${gid}`, getSessionRecord: () => ({ sessionKey: key, scope: 'group', replyTarget: { scope: 'group', targetId: 'G1' }, agent: { followup, whenIdle: () => Promise.resolve() } }) };
+    const restartedButtons = new DndTurnButtons(service, restartedManager as never, sender, { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as never);
+
+    // 重启后点「名单」先恢复 started=true 视图
+    expect(restartedButtons.handleInteraction({
+      id: 'e-r', type: 11, version: 1, group_openid: 'G1', group_member_openid: 'P3',
+      data: { type: 11, resolved: { button_data: encodeButtonData({ t: 'dnd', a: 'roster' }) } },
+    })).toBe(ACK.ok);
+    expect(service.checkIns.get(key)?.started).toBe(true);
+    expect(sender.sendMarkdown).toHaveBeenLastCalledWith(expect.anything(), expect.stringContaining('💤 暂离（未签到，已移出队伍）：恩佐'));
+
+    // 再次模拟内存空了（或直接点击），恩佐点击「签到」自动归队并同步到 nave，不重开 kickoff
+    service.checkIns.clear();
+    expect(restartedButtons.handleInteraction({
+      id: 'e-in', type: 11, version: 1, group_openid: 'G1', group_member_openid: 'P4',
+      data: { type: 11, resolved: { button_data: encodeButtonData({ t: 'dnd', a: 'in' }) } },
+    })).toBe(ACK.ok);
+
+    const updated = service.store.load(key)!;
+    expect(isAbsent(requireCharacter(updated, '恩佐'))).toBe(false);
+    expect(roomOf(updated, requireCharacter(updated, '恩佐'))).toBe('nave');
+    expect(requireCharacter(updated, '恩佐').room).toBe('nave');
+    expect(followup).toHaveBeenCalledTimes(1);
+    expect(sender.sendMarkdown).toHaveBeenLastCalledWith(expect.anything(), expect.stringContaining('恩佐 签到归队'));
+    // 已经归队再点一次签到算重复
+    expect(restartedButtons.handleInteraction({
+      id: 'e-in-dup', type: 11, version: 1, group_openid: 'G1', group_member_openid: 'P4',
+      data: { type: 11, resolved: { button_data: encodeButtonData({ t: 'dnd', a: 'in' }) } },
+    })).toBe(ACK.duplicate);
+  });
+
+  it('无缓存会话 record（重启后直接 /dnd start 未 @bot）时点名单/签到/开始不再失败', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dnd-norecord-'));
+    const service = new DndService({ store: new CampaignStore(join(root, 'campaigns')), library: new AdventureLibrary(), mapDir: root });
+    const key = 'group:G1';
+    service.start(key, 'sunken-bell', false);
+    service.store.update(key, (c) => {
+      upsertCharacter(c, { name: '卡厄斯', player: '玩家丙', playerId: 'P3' });
+      upsertCharacter(c, { name: '恩佐', player: '玩家丁', playerId: 'P4' });
+    });
+    const followup = vi.fn();
+    const createdRecord = { sessionKey: key, scope: 'group' as const, peerId: 'G1', replyTarget: { scope: 'group' as const, targetId: 'G1' }, agent: { followup, whenIdle: () => Promise.resolve() } };
+    const getOrCreate = vi.fn(async () => createdRecord);
+    const manager = { sessionKey: (_s: string, gid: string) => `group:${gid}`, getSessionRecord: () => undefined, getOrCreate };
+    const sender = { sendMarkdown: vi.fn(() => Promise.resolve()) };
+    const buttons = new DndTurnButtons(service, manager as never, sender, { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as never);
+    await buttons.openCheckIn(key, TARGET, '', true);
+    sender.sendMarkdown.mockClear();
+
+    const press = (a: 'in' | 'go' | 'roster', clicker: string) => buttons.handleInteraction({
+      id: `e-${a}-${clicker}`, type: 11, version: 1, group_openid: 'G1', group_member_openid: clicker,
+      data: { type: 11, resolved: { button_data: encodeButtonData({ t: 'dnd', a }) } },
+    });
+
+    expect(press('roster', 'P3')).toBe(ACK.ok);
+    expect(sender.sendMarkdown).toHaveBeenCalledWith({ scope: 'group', targetId: 'G1' }, expect.stringContaining('未到：卡厄斯'));
+    expect(press('in', 'P3')).toBe(ACK.ok);
+    expect(press('go', 'P3')).toBe(ACK.ok);
+    await vi.waitFor(() => expect(followup).toHaveBeenCalledTimes(1));
+    expect(getOrCreate).toHaveBeenCalledWith('group', 'G1', 'P3', { scope: 'group', targetId: 'G1' });
+    expect(isAbsent(requireCharacter(service.store.load(key)!, '恩佐'))).toBe(true);
+  });
+
+  it('dnd_undo 不回滚暂离/归队状态；dnd_character update absent 同步签到表与先攻，停团时拒绝', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dnd-absent-tools-'));
+    const service = new DndService({ store: new CampaignStore(join(root, 'campaigns')), library: new AdventureLibrary(), mapDir: root });
+    const key = 'group:G1';
+    service.start(key, 'sunken-bell', false);
+    service.store.update(key, (c) => {
+      upsertCharacter(c, { name: '卡厄斯', player: '玩家丙', playerId: 'P3', maxHp: 20 });
+      upsertCharacter(c, { name: '恩佐', player: '玩家丁', playerId: 'P4', maxHp: 20 });
+      upsertCharacter(c, { name: '地精', kind: 'monster', maxHp: 7, room: c.currentRoom });
+    });
+    const tools = new Map<string, { name: string; execute(args: unknown, exec: unknown): Promise<{ text: string }> }>();
+    registerDndTools({ get: () => ({ register: (t: never) => tools.set((t as { name: string }).name, t as never) }) } as never, {
+      service,
+      manager: { findByAgent: () => ({ sessionKey: key }), sessionKey: () => key } as never,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      sendImage: vi.fn(),
+    });
+    const call = async (name: string, args: object) => (await tools.get(name)!.execute(args, { agent: {} })).text;
+
+    const followup = vi.fn();
+    const record = { sessionKey: key, scope: 'group', replyTarget: { scope: 'group', targetId: 'G1' }, agent: { followup, whenIdle: () => Promise.resolve() } };
+    const buttons = new DndTurnButtons(service, { sessionKey: () => key, getSessionRecord: () => record } as never, { sendMarkdown: vi.fn(() => Promise.resolve()) }, { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as never);
+    await buttons.openCheckIn(key, TARGET, '', true);
+    buttons.handleInteraction({ id: 'e1', type: 11, version: 1, group_openid: 'G1', group_member_openid: 'P3', data: { type: 11, resolved: { button_data: encodeButtonData({ t: 'dnd', a: 'in' }) } } });
+    buttons.handleInteraction({ id: 'e2', type: 11, version: 1, group_openid: 'G1', group_member_openid: 'P3', data: { type: 11, resolved: { button_data: encodeButtonData({ t: 'dnd', a: 'go' }) } } });
+
+    // 在恩佐暂离期间做一次能进撤销栈的操作（移动或扣血）
+    await call('dnd_apply', { target: '卡厄斯', damage: 3 });
+    await call('dnd_undo', { action: 'undo', steps: 1 });
+    expect(isAbsent(requireCharacter(service.store.load(key)!, '恩佐'))).toBe(true);
+
+    // 之后用 dnd_character 让恩佐归队，并再做一次扣血然后撤销：归队不会被撤回暂离
+    const backMsg = await call('dnd_character', { action: 'update', name: '恩佐', absent: false });
+    expect(backMsg).toContain('已更新');
+    expect(service.checkIns.get(key)?.arrived.has('P4')).toBe(true);
+    await call('dnd_apply', { target: '卡厄斯', damage: 2 });
+    await call('dnd_undo', { action: 'undo', steps: 1 });
+    expect(isAbsent(requireCharacter(service.store.load(key)!, '恩佐'))).toBe(false);
+
+    // 战斗中把卡厄斯设成暂离：同步移出先攻表和签到表
+    await call('dnd_initiative', { action: 'start' });
+    const leaveMsg = await call('dnd_character', { action: 'update', name: '卡厄斯', absent: true });
+    expect(leaveMsg).toContain('已暂时移出队伍并移出先攻表');
+    expect(service.store.load(key)!.initiative!.order.map((e) => e.name)).not.toContain('卡厄斯');
+    expect(service.checkIns.get(key)?.arrived.has('P3')).toBe(false);
+
+    // 停团后拒绝传 absent
+    service.stop(key);
+    await expect(call('dnd_character', { action: 'update', name: '卡厄斯', absent: true })).rejects.toThrow('停团时不能设置暂离');
   });
 });
