@@ -19,7 +19,7 @@ import type { ImQQBotConfig } from '../config.ts';
 import type { DshAgent, SessionManager } from '../session/index.ts';
 import type { Logger, ReplyTarget } from '../types.ts';
 import { hasFullToolAccess, type ToolAccessGrants, type ToolGuardSession } from '../shared/tool-guard.ts';
-import { decodeButtonData, encodeButtonData } from './button-utils.ts';
+import { accessKeyboard, decodeButtonData } from './button-utils.ts';
 
 export const TOOL_ACCESS_TOOL_NAME = 'qqbot_tool_access';
 
@@ -112,20 +112,6 @@ const DESCRIPTION =
 
 function label(kind: Kind, id: string): string {
   return kind === 'group' ? `群 ${id.slice(0, 8)}` : `用户 ${id.slice(0, 8)}`;
-}
-
-function confirmKeyboard(pendingId: string): InlineKeyboard {
-  const button = (id: string, text: string, style: number, d: 'allow' | 'deny'): InlineKeyboard['content']['rows'][number]['buttons'][number] => ({
-    id,
-    render_data: { label: text, visited_label: text, style },
-    action: {
-      type: 1,
-      permission: { type: 2 },
-      data: encodeButtonData({ t: 'access', p: pendingId, d }),
-      unsupport_tips: '请升级 QQ 后再点',
-    } as InlineKeyboard['content']['rows'][number]['buttons'][number]['action'],
-  });
-  return { content: { rows: [{ buttons: [button('access-allow', '同意', 1, 'allow'), button('access-deny', '拒绝', 0, 'deny')] }] } };
 }
 
 /** 白名单服务：合并配置与运行时授予，提供工具注册和按钮处理 */
@@ -227,7 +213,7 @@ export class ToolAccess {
       ? '把**本群**加入终端白名单（bot 可在本群使用命令行、读写本机任意文件）'
       : '把**本群**移出终端白名单';
     await this.sender.sendMarkdown(record.replyTarget, `🔐 申请${what}。\n只有 bot 主人点「同意」才生效，10 分钟内有效。`, {
-      keyboard: confirmKeyboard(pendingId),
+      keyboard: accessKeyboard('access', pendingId),
     });
     return '已发出确认按钮，等主人点「同意」才生效。告诉用户等主人确认，不要说已经开通。';
   }

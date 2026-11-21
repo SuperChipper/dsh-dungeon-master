@@ -40,6 +40,7 @@ const PATH_TOOLS: Record<string, readonly string[]> = {
   grep: ['path', 'root', 'paths'],
   qqbot_send_file: ['file_path'],
   qqbot_video_frames: ['video'],
+  qqbot_image_gen: ['images', 'mask', 'out_dir'],
 };
 
 /** 不给 path 就会默认搜整个工作目录的工具 */
@@ -62,6 +63,12 @@ export interface ToolAccessGrants {
   readonly users: readonly string[];
 }
 
+/** 会改文件的工具 */
+const WRITE_TOOLS = new Set(['write', 'edit', 'str_replace_editor']);
+
+/** 纯只读文件工具：允许读取按会话动态放开的只读目录（如当前团模组目录） */
+const READ_ONLY_TOOLS = new Set(['read', 'read_image', 'grep', 'glob']);
+
 export interface ToolGuardDeps {
   config: ImQQBotConfig;
   /** 会话是否有完整工具权限（配置 + 运行时白名单） */
@@ -69,6 +76,8 @@ export interface ToolGuardDeps {
   findSession(agent: unknown): ToolGuardSession | undefined;
   /** 受限会话可读写的根目录（media、表情库、临时目录 + toolAccess.readRoots） */
   roots: readonly string[];
+  /** 受限会话按会话动态放开的只读目录（如当前团的模组目录，供 DM 备团查阅，禁止写入与外发） */
+  readOnlyRootsFor?(session: ToolGuardSession): readonly string[];
   /** 相对路径按它解析（agent 工作目录） */
   cwd: string;
   /**
@@ -77,9 +86,6 @@ export interface ToolGuardDeps {
    */
   noWriteRoots?: readonly string[];
 }
-
-/** 会改文件的工具 */
-const WRITE_TOOLS = new Set(['write', 'edit', 'str_replace_editor']);
 
 interface GuardedExecution {
   readonly name: string;
@@ -163,8 +169,9 @@ function escapesFilter(name: string, args: unknown): boolean {
 
 const DENY_SHELL = '本会话没有终端权限（只有白名单群和主人私聊能用命令行）。不要换别的工具绕过，直接告诉用户这里做不到。';
 const DENY_AGENT = '本会话不能派生子 agent 或后台流程（只有白名单群和主人私聊可以）。直接用现有工具完成，或告诉用户做不到。';
-const DENY_PATH = '本会话只能访问 bot 自己的媒体、表情和临时目录，这个路径不在允许范围内。不要再尝试别的路径，也别把路径告诉用户。';
-const DENY_NO_PATH = '本会话搜索文件时必须用 path 指定 bot 的媒体、表情或临时目录，不能搜整个工作目录。';
+const DENY_PATH = '这个路径不在允许范围内（默认仅允许 bot 的媒体、表情和临时目录；有跑团存档时允许只读查阅当前模组目录）。不要再尝试别的路径，也别把路径告诉用户。';
+const DENY_NO_PATH = '本会话搜索文件时必须用 path 指定允许的目录（bot 的媒体、表情、临时目录，或当前团的模组目录），不能搜整个工作目录。';
+const DENY_READ_ONLY = '当前目录仅允许只读查阅（例如当前团模组目录），不能修改或发送给玩家，该操作不在允许范围内。';
 const DENY_SENSITIVE = '这个路径在敏感路径名单里，禁止访问。不要再尝试，也别把路径告诉用户。';
 const DENY_NO_WRITE = '跑团存档只能通过 dnd_* 工具修改，不能直接改文件。工具做不到的，在回复里说明，让主人处理。';
 
@@ -187,7 +194,12 @@ export function createToolGuard(deps: ToolGuardDeps): (exec: GuardedExecution) =
       : pathArgs(exec.arguments, pathKeys).map((p) => canonical(resolve(deps.cwd, p)));
     const fullAccess = deps.isFullAccess(session);
     if (sensitivePathsApply(deps.config, fullAccess) && paths.some((p) => sensitive.some((root) => isWithin(p, root)))) return DENY_SENSITIVE;
-    if (WRITE_TOOLS.has(exec.name) && paths.some((p) => noWrite.some((root) => isWithin(p, root)))) return DENY_NO_WRITE;
+    const writeTargets = WRITE_TOOLS.has(exec.name)
+      ? paths
+      : exec.name === 'qqbot_image_gen'
+        ? pathArgs(exec.arguments, ['out_dir']).map((p) => canonical(resolve(deps.cwd, p)))
+        : [];
+    if (writeTargets.some((p) => noWrite.some((root) => isWithin(p, root)))) return DENY_NO_WRITE;
 
     if (fullAccess) return undefined;
 
@@ -197,7 +209,19 @@ export function createToolGuard(deps: ToolGuardDeps): (exec: GuardedExecution) =
 
     if (paths.length === 0 && NEEDS_EXPLICIT_PATH.has(exec.name)) return DENY_NO_PATH;
     if (escapesFilter(exec.name, exec.arguments)) return DENY_PATH;
-    if (paths.some((p) => !roots.some((root) => isWithin(p, root)))) return DENY_PATH;
+    const readOnlyRoots = (deps.readOnlyRootsFor?.(session) ?? [])
+      .filter((r) => r.trim() !== '')
+      .map((r) => canonical(resolve(deps.cwd, r)));
+    if (READ_ONLY_TOOLS.has(exec.name)) {
+      const allowed = (p: string) => roots.some((root) => isWithin(p, root)) || readOnlyRoots.some((root) => isWithin(p, root));
+      if (paths.some((p) => !allowed(p))) return DENY_PATH;
+      return undefined;
+    }
+    const denied = paths.filter((p) => !roots.some((root) => isWithin(p, root)));
+    if (denied.length > 0) {
+      if (denied.some((p) => readOnlyRoots.some((root) => isWithin(p, root)))) return DENY_READ_ONLY;
+      return DENY_PATH;
+    }
     return undefined;
   };
 }

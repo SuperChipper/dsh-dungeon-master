@@ -48,15 +48,9 @@ export interface DndButtonData {
   o?: string;
 }
 
-/** 终端白名单确认按钮：p=待确认申请 id，d=决策（只认主人点击） */
+/** 各权限使用独立的 t 和待审批队列；p=申请 id，d=主人决策。 */
 export interface AccessButtonData {
-  t: 'access';
-  p: string;
-  d: 'allow' | 'deny';
-}
-
-export interface BrowserAccessButtonData {
-  t: 'browser-access';
+  t: 'access' | 'browser-access' | 'image-gen-access';
   p: string;
   d: 'allow' | 'deny';
 }
@@ -69,7 +63,7 @@ export interface PersonaButtonData {
   n?: number;
 }
 
-export type ButtonData = QuestionButtonData | ApprovalButtonData | DndButtonData | AccessButtonData | BrowserAccessButtonData | PersonaButtonData;
+export type ButtonData = QuestionButtonData | ApprovalButtonData | DndButtonData | AccessButtonData | PersonaButtonData;
 
 /** 编码 button_data（JSON 字符串） */
 export function encodeButtonData(data: ButtonData): string {
@@ -80,13 +74,23 @@ export function encodeButtonData(data: ButtonData): string {
 export function decodeButtonData(raw: string): ButtonData | undefined {
   try {
     const parsed = JSON.parse(raw) as Partial<ButtonData>;
-    if (parsed !== null && typeof parsed === 'object' && (parsed.t === 'question' || parsed.t === 'approval' || parsed.t === 'dnd' || parsed.t === 'access' || parsed.t === 'browser-access' || parsed.t === 'persona')) {
+    if (parsed !== null && typeof parsed === 'object' && (parsed.t === 'question' || parsed.t === 'approval' || parsed.t === 'dnd' || parsed.t === 'access' || parsed.t === 'browser-access' || parsed.t === 'image-gen-access' || parsed.t === 'persona')) {
       return parsed as ButtonData;
     }
   } catch {
     // fall through
   }
   return undefined;
+}
+
+export function accessKeyboard(t: AccessButtonData['t'], p: string): InlineKeyboard {
+  return { content: { rows: [{ buttons: (['allow', 'deny'] as const).map((d) => {
+    const label = d === 'allow' ? '同意' : '拒绝';
+    return {
+      id: `${t}-${d}`, render_data: { label, visited_label: label, style: d === 'allow' ? 1 : 0 },
+      action: { type: 1, permission: { type: 2 }, data: encodeButtonData({ t, p, d }), unsupport_tips: '请升级 QQ 后再点' },
+    };
+  }) }] } };
 }
 
 /** 构建内联键盘的行数组（供 buildKeyboard/buildApprovalKeyboard 复用类型） */

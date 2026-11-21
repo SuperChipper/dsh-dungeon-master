@@ -5,30 +5,38 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import yaml from 'js-yaml';
 import type { Context } from '@deepseek-ai/cordis';
 import type { InteractionEvent, InlineKeyboard } from '@tencent-connect/qqbot-nodejs';
-import { BrowserSchema, type ImQQBotConfig } from '../config.ts';
+import { BrowserSchema, ImageGenSchema, type ImQQBotConfig } from '../config.ts';
 import type { SessionManager } from '../session/index.ts';
-import { updateProfileConfig } from '../setup/persist.ts';
-import { BrowserAccess } from './browser-access.ts';
-import { decodeButtonData } from '../features/button-utils.ts';
+import { updateProfileAllowedGroups } from '../setup/persist.ts';
+import { GroupAccess, type GroupAccessFeature } from './group-access.ts';
+import { decodeButtonData } from './button-utils.ts';
 import type { ReplyTarget } from '../types.ts';
+import { registerImageGenTool } from '../media/image-gen-tool.ts';
+import { dispatchInteraction } from '../gateway/bootstrap.ts';
+import type { ToolAccess } from './tool-access.ts';
+import type { MediaSenderLike } from '../media/send-file-tool.ts';
 
 interface Tool { execute(args: unknown, exec: { agent?: unknown }): Promise<{ message: string }> }
 const directories: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-function setup(allowedGroups: string[] = []) {
-  const config = { ownerOpenid: 'owner', browser: BrowserSchema({ enabled: true, allowedGroups }) } as ImQQBotConfig;
+function harness(feature: GroupAccessFeature, allowedGroups: string[] = [], ownerOpenid = 'owner', enabled = true) {
+  const config = { ownerOpenid, adminOpenids: ['admin'],
+    browser: BrowserSchema({ enabled, allowedGroups: feature === 'browser' ? allowedGroups : ['browser-only'] }),
+    imageGen: ImageGenSchema({ enabled, allowedGroups: feature === 'imageGen' ? allowedGroups : ['image-only'] }),
+  } as ImQQBotConfig;
   const group = { followup: vi.fn() }, owner = {}, other = {};
   const records = new Map<unknown, unknown>([
     [group, { scope: 'group', peerId: 'g1', senderId: 'member', agent: group, replyTarget: { scope: 'group', targetId: 'g1' } }],
     [owner, { scope: 'c2c', peerId: 'owner', senderId: 'owner' }],
     [other, { scope: 'c2c', peerId: 'other', senderId: 'other' }],
   ]);
-  const manager = { findByAgent: (a: unknown) => records.get(a) } as unknown as SessionManager;
+  const isFullAccess = vi.fn(() => false);
+  const manager = { findByAgent: (a: unknown) => records.get(a), toolAccess: { isFullAccess } } as unknown as SessionManager;
   const sender = { sendMarkdown: vi.fn(async (_target: ReplyTarget, _content: string, _opts?: { keyboard?: InlineKeyboard }) => {}) };
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const persist = vi.fn((_groups: string[]) => true);
-  const access = new BrowserAccess(config, manager, sender, logger, persist);
+  const access = new GroupAccess(feature, config, manager, sender, logger, persist);
   let tool!: Tool;
   let dispose!: () => void;
   const ctx = { get: () => ({ register: (t: Tool) => { tool = t; } }),
@@ -43,29 +51,51 @@ function setup(allowedGroups: string[] = []) {
     scene: 'group', group_openid: target, group_member_openid: user,
     data: { resolved: { button_data: raw } },
   } as InteractionEvent);
-  return { config, access, sender, persist, invoke, button, click, group, owner, other, dispose, tool, records, logger };
+  return { config, access, sender, persist, invoke, button, click, group, owner, other, dispose, tool, records, logger, isFullAccess, ctx, manager };
 }
 
-describe('qqbot_browser_access', () => {
+describe.each([
+  ['browser', '浏览', 'browser-access', 'qqbot_browser_access'],
+  ['imageGen', '生图', 'image-gen-access', 'qqbot_image_gen_access'],
+] as const)('%s 单群审批', (feature, label, tag, name) => {
+  const setup = (allowedGroups?: string[]) => harness(feature, allowedGroups);
   it('群里只申请，只有主人原群点击才授权，审批回执与后续通知到原群', async () => {
     const s = setup();
     expect((await s.invoke('grant')).message).toContain('当前权限尚未修改');
     expect(s.access.isAllowedGroup('g1')).toBe(false);
     expect(s.persist).not.toHaveBeenCalled();
     const data = s.button();
-    expect(decodeButtonData(data)).toMatchObject({ t: 'browser-access', d: 'allow' });
+    expect(decodeButtonData(data)).toMatchObject({ t: tag, d: 'allow' });
     expect(s.click(data, 'member')).toBe(4);
+    expect(s.click(data, 'admin')).toBe(4); // QQ bot 管理员也不是主人
+    const buttons = JSON.parse(data);
+    expect(s.click(JSON.stringify({ ...buttons, d: 'invalid' }))).toBe(3);
+    expect(s.click(JSON.stringify({ ...buttons, t: 'access' }))).toBeUndefined();
     expect(s.click(data, 'owner', 'g2')).toBe(4);
     expect(s.access.handleInteraction({ scene: 'c2c', user_openid: 'owner',
       data: { resolved: { button_data: data } } } as InteractionEvent)).toBe(4);
     expect(s.persist).not.toHaveBeenCalled();
     expect(s.click(data)).toBe(0);
     expect(s.persist).toHaveBeenCalledExactlyOnceWith(['g1']);
-    expect(s.config.browser?.allowedGroups).toEqual(['g1']);
+    expect(s.config[feature]?.allowedGroups).toEqual(['g1']);
     expect(s.access.isAllowedGroup('g1')).toBe(true);
     expect(s.group.followup).toHaveBeenCalledOnce();
     expect(s.sender.sendMarkdown.mock.calls[1]?.[0]).toMatchObject({ scope: 'group', targetId: 'g1' });
     expect(s.click(data)).toBe(3);
+  });
+
+  it('只注册启用且有主人的审批工具', () => {
+    expect(setup().tool).toMatchObject({ name });
+    expect(harness(feature, [], '   ').tool).toBeUndefined();
+    expect(harness(feature, [], 'owner', false).tool).toBeUndefined();
+  });
+
+  it('主人直接撤销（即使幂等）使旧的群申请失效', async () => {
+    const s = setup();
+    await s.invoke('grant');
+    await s.invoke('revoke', s.owner, 'g1');
+    expect(s.click(s.button())).toBe(3);
+    expect(s.persist).not.toHaveBeenCalled();
   });
 
   it('拒绝和过期均不授权；过期可重新申请', async () => {
@@ -108,8 +138,8 @@ describe('qqbot_browser_access', () => {
     expect(s.sender.sendMarkdown).not.toHaveBeenCalled();
     expect((await s.invoke('status', s.owner)).message).toContain('configured、g1');
     await s.invoke('revoke', s.owner, 'configured');
-    expect(s.config.browser?.allowedGroups).toEqual(['g1']);
-    expect((await s.invoke('status')).message).toBe('本群已在浏览白名单里。');
+    expect(s.config[feature]?.allowedGroups).toEqual(['g1']);
+    expect((await s.invoke('status')).message).toBe(`本群已在${label}白名单里。`);
   });
 
   it('群撤销也需审批，批准后立即拒绝该群权限', async () => {
@@ -157,14 +187,74 @@ describe('qqbot_browser_access', () => {
   });
 
   it('沿用 profile 持久化，设置页可读同一 allowedGroups，保留其他顶层配置', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'browser-access-')); directories.push(dir);
+    const dir = mkdtempSync(join(tmpdir(), 'group-access-')); directories.push(dir);
     const path = join(dir, 'cordis.patch.yml');
     writeFileSync(path, yaml.dump([{ id: 'im-qqbot', config: { appSecret: 'test-secret', historyLimit: 7 } }]));
     const s = setup();
-    s.persist.mockImplementation((groups) => updateProfileConfig({ browser: { ...s.config.browser, allowedGroups: groups } }, dir, s.logger));
+    s.persist.mockImplementation((groups) => updateProfileAllowedGroups(feature, groups, dir, s.logger, s.config[feature]?.allowedGroups));
     await s.invoke('grant', s.owner, 'g1');
     const stored = yaml.load(readFileSync(path, 'utf8')) as Array<{ config: Record<string, unknown> }>;
-    expect(stored[0]!.config).toMatchObject({ appSecret: 'test-secret', historyLimit: 7, browser: { allowedGroups: ['g1'] } });
-    expect(Object.keys(stored[0]!.config).sort()).toEqual(['appSecret', 'browser', 'historyLimit']);
+    expect(stored[0]!.config).toMatchObject({ appSecret: 'test-secret', historyLimit: 7, [feature]: { allowedGroups: ['g1'] } });
+    expect(Object.keys(stored[0]!.config).sort()).toEqual(['appSecret', feature, 'historyLimit'].sort());
+  });
+});
+
+describe('生图专用授权', () => {
+  it.each(['allowAllGroups', 'fullAccess'])('%s：区分实际可用与是否在名单，撤销不暗示单群封禁', async (source) => {
+    const s = harness('imageGen', ['g1']);
+    const reason = source === 'allowAllGroups' ? '全群生图' : '完全工具权限';
+    if (source === 'allowAllGroups') s.config.imageGen.allowAllGroups = true;
+    else s.isFullAccess.mockReturnValue(true);
+    expect((await s.invoke('status')).message).toContain(reason);
+    const removed = await s.invoke('revoke', s.owner, 'g1');
+    expect(removed.message).toContain('移出');
+    expect(removed.message).toContain(reason);
+    expect((await s.invoke('status', s.owner, 'g1')).message).toContain('不依赖此白名单也可生图');
+    expect((await s.invoke('grant')).message).toContain(reason);
+    expect(s.sender.sendMarkdown).not.toHaveBeenCalled();
+    expect(s.config.imageGen.allowedGroups).toEqual([]);
+  });
+
+  it('群审批只改变生图；同一工具实例不重载即可授权或撤销，不访问 Images API', async () => {
+    const s = harness('imageGen');
+    const register = vi.fn();
+    const ctx = { get: () => ({ register }) } as unknown as Context;
+    registerImageGenTool(ctx, {} as MediaSenderLike, s.manager, s.config, s.logger);
+    const [gen] = register.mock.calls[0]!;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unexpected network request'));
+    // 空提示词在通过授权后才执行校验，又一定早于凭证、网络与写文件。
+    const probe = (agent: unknown) => gen.execute({ prompt: '' }, { signal: new AbortController().signal, agent });
+    const otherGroup = {};
+    s.records.set(otherGroup, { scope: 'group', peerId: 'browser-only' });
+    await expect(probe(s.group)).rejects.toThrow('qqbot_image_gen_access');
+    await s.invoke('grant');
+    await expect(probe(s.group)).rejects.toThrow('未开通');
+    expect(s.click(s.button())).toBe(0);
+    expect(s.config.browser!.allowedGroups).toEqual(['browser-only']);
+    expect(s.isFullAccess()).toBe(false);
+    await expect(probe(s.group)).rejects.toThrow('`prompt` 不能为空');
+    await expect(probe(otherGroup)).rejects.toThrow('未开通');
+    await s.invoke('revoke', s.owner, 'g1');
+    await expect(probe(s.group)).rejects.toThrow('未开通');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('同时申请两种权限：按钮不能互换；点生图按钮不消耗待审的浏览申请', async () => {
+    const image = harness('imageGen'), browser = harness('browser');
+    await image.invoke('grant'); await browser.invoke('grant');
+    expect(browser.click(image.button())).toBeUndefined();
+    expect(image.click(browser.button())).toBeUndefined();
+    const reTagged = JSON.stringify({ ...JSON.parse(image.button()), t: 'browser-access' });
+    const terminal = { handleInteraction: vi.fn() };
+    const route = (data: string) => dispatchInteraction({
+      scene: 'group', group_openid: 'g1', group_member_openid: 'owner', data: { resolved: { button_data: data } },
+    } as InteractionEvent, image.manager, undefined, terminal as unknown as ToolAccess, { browser: browser.access, imageGen: image.access });
+    expect(route(reTagged)).toBe(3);
+    expect(route(image.button())).toBe(0);
+    expect(route(image.button())).toBe(3);
+    expect(browser.persist).not.toHaveBeenCalled();
+    expect(route(browser.button())).toBe(0);
+    expect(image.persist).toHaveBeenCalledTimes(1);
+    expect(terminal.handleInteraction).not.toHaveBeenCalled();
   });
 });

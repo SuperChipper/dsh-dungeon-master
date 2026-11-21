@@ -4,7 +4,7 @@ import type { ImQQBotConfig } from '../config.ts';
 import { BrowserSchema } from '../config.ts';
 import type { SessionManager } from '../session/index.ts';
 import { registerBrowserTool } from './browser-tool.ts';
-import { BrowserAccess } from './browser-access.ts';
+import { GroupAccess } from '../features/group-access.ts';
 
 const run = vi.hoisted(() => vi.fn(async () => ({ text: 'page' })));
 const construct = vi.hoisted(() => vi.fn());
@@ -29,11 +29,11 @@ describe('浏览器登录态权限', () => {
     const manager = { findByAgent: () => record } as unknown as SessionManager;
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
     const sender = { sendMarkdown: vi.fn(async () => {}) };
-    const access = new BrowserAccess(config, manager, sender, logger, () => true);
+    const access = new GroupAccess('browser', config, manager, sender, logger, () => true);
     const definitions = new Map<string, { execute(args: unknown, exec: { agent?: unknown }): Promise<unknown> }>();
     const ctx = { get: () => ({ register: (tool: { name: string; execute: (args: unknown, exec: { agent?: unknown }) => Promise<unknown> }) => definitions.set(tool.name, tool) }), effect: vi.fn() } as unknown as Context;
     access.register(ctx);
-    registerBrowserTool(ctx, config, manager, logger, access);
+    registerBrowserTool(ctx, config, manager, logger);
     const permissions = definitions.get('qqbot_browser_access')!;
     const browsing = definitions.get('qqbot_browser')!;
     await permissions.execute({ action: 'grant', group: 'g1' }, { agent: {} });

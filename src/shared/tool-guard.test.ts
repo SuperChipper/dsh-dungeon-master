@@ -83,6 +83,9 @@ describe('createToolGuard', () => {
     expect(guard({ name: 'qqbot_send_file', arguments: { file_path: join(cwd, '.env') }, agent })).toMatch(/不在允许范围/);
     expect(guard({ name: 'qqbot_video_frames', arguments: { video: join(media, 'clip.mp4'), timestamps: [0] }, agent })).toBeUndefined();
     expect(guard({ name: 'qqbot_video_frames', arguments: { video: join(cwd, 'private.mp4'), timestamps: [0] }, agent })).toMatch(/不在允许范围/);
+    expect(guard({ name: 'qqbot_image_gen', arguments: { prompt: 'hi', images: [join(media, 'a.png')] }, agent })).toBeUndefined();
+    expect(guard({ name: 'qqbot_image_gen', arguments: { prompt: 'hi', images: [join(cwd, '.env')] }, agent })).toMatch(/不在允许范围/);
+    expect(guard({ name: 'qqbot_image_gen', arguments: { prompt: 'hi', out_dir: cwd }, agent })).toMatch(/不在允许范围/);
   });
 
   it('非白名单群：grep/glob 必须给 path，通配不能跳出', () => {
@@ -128,8 +131,79 @@ describe('createToolGuard', () => {
     const save = join(campaigns, 'qqbot_group_x.json');
     expect(guard({ name: 'edit', arguments: { file_path: save, old_string: 'a', new_string: 'b' }, agent: white })).toMatch(/dnd_\* 工具/);
     expect(guard({ name: 'write', arguments: { file_path: save, content: '{}' }, agent: white })).toMatch(/dnd_\* 工具/);
+    expect(guard({ name: 'qqbot_image_gen', arguments: { prompt: 'map', out_dir: campaigns }, agent: white })).toMatch(/dnd_\* 工具/);
+    expect(guard({ name: 'qqbot_image_gen', arguments: { prompt: 'map', images: [join(campaigns, 'pc.png')] }, agent: white })).toBeUndefined();
     expect(guard({ name: 'read', arguments: { file_path: save }, agent: white })).toBeUndefined();
     // 本机会话不受影响
     expect(guard({ name: 'edit', arguments: { file_path: save, old_string: 'a', new_string: 'b' }, agent: {} })).toBeUndefined();
+  });
+
+  it('按会话动态只读目录：有团档可只读查阅当前模组，禁止写与外发、禁止跨模组/穿越/无团档读取', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'guard-adv-'));
+    const media = join(cwd, 'media');
+    const toa = join(cwd, 'dnd', 'adventures', 'toa');
+    const lmop = join(cwd, 'dnd', 'adventures', 'lmop');
+    const campaigns = join(cwd, 'dnd', 'campaigns');
+    mkdirSync(media, { recursive: true });
+    mkdirSync(join(toa, 'text-zh'), { recursive: true });
+    mkdirSync(join(toa, 'img'), { recursive: true });
+    mkdirSync(lmop, { recursive: true });
+    mkdirSync(campaigns, { recursive: true });
+    writeFileSync(join(toa, 'text-zh', 'ch1.md'), '# ch1');
+    writeFileSync(join(toa, 'img', 'map.png'), 'png');
+    writeFileSync(join(lmop, 'adventure.json'), '{}');
+    writeFileSync(join(campaigns, 'group_a.json'), '{}');
+
+    const config = makeConfig({}, [join(toa, 'secret.txt')]);
+    const agents = new Map<object, ToolGuardSession>();
+    const agentFor = (session: ToolGuardSession): object => {
+      const agent = {};
+      agents.set(agent, session);
+      return agent;
+    };
+    const guard = createToolGuard({
+      config,
+      isFullAccess: (s) => hasFullToolAccess(s, config),
+      findSession: (agent) => agents.get(agent as object),
+      roots: [media],
+      readOnlyRootsFor: (s) => (s.scope === 'group' && s.peerId === GROUP ? [toa] : []),
+      noWriteRoots: [campaigns],
+      cwd,
+    });
+
+    const withCampaign = agentFor({ scope: 'group', peerId: GROUP });
+    const withoutCampaign = agentFor({ scope: 'group', peerId: 'GROUP_B' });
+
+    // 允许 read / read_image / glob / grep 查阅当前模组
+    expect(guard({ name: 'read', arguments: { file_path: join(toa, 'text-zh', 'ch1.md') }, agent: withCampaign })).toBeUndefined();
+    expect(guard({ name: 'read_image', arguments: { file_path: join(toa, 'img', 'map.png') }, agent: withCampaign })).toBeUndefined();
+    expect(guard({ name: 'glob', arguments: { pattern: '**/*.md', path: toa }, agent: withCampaign })).toBeUndefined();
+    expect(guard({ name: 'grep', arguments: { pattern: 'ch1', path: toa }, agent: withCampaign })).toBeUndefined();
+
+    // 禁止写入、外发、生图输出与视频抽帧操作该只读目录
+    for (const call of [
+      { name: 'write', arguments: { file_path: join(toa, 'text-zh', 'ch1.md'), content: 'x' } },
+      { name: 'edit', arguments: { file_path: join(toa, 'text-zh', 'ch1.md'), old_string: 'a', new_string: 'b' } },
+      { name: 'str_replace_editor', arguments: { path: join(toa, 'text-zh', 'ch1.md') } },
+      { name: 'qqbot_send_file', arguments: { file_path: join(toa, 'text-zh', 'ch1.md') } },
+      { name: 'qqbot_image_gen', arguments: { prompt: 'x', images: [join(toa, 'img', 'map.png')] } },
+      { name: 'qqbot_image_gen', arguments: { prompt: 'x', out_dir: toa } },
+      { name: 'qqbot_video_frames', arguments: { video: join(toa, 'clip.mp4'), timestamps: [0] } },
+    ]) {
+      const denied = guard({ ...call, agent: withCampaign });
+      expect(denied).toMatch(/只读/);
+      expect(denied).toMatch(/不在允许范围/);
+    }
+
+    // 禁止穿越、无 path 搜索、读另一模组、读存档目录、读敏感路径
+    expect(guard({ name: 'read', arguments: { file_path: join(toa, '..', 'lmop', 'adventure.json') }, agent: withCampaign })).toMatch(/不在允许范围/);
+    expect(guard({ name: 'glob', arguments: { pattern: '../lmop/**', path: toa }, agent: withCampaign })).toMatch(/不在允许范围/);
+    expect(guard({ name: 'grep', arguments: { pattern: 'ch1' }, agent: withCampaign })).toMatch(/必须用 path/);
+    expect(guard({ name: 'read', arguments: { file_path: join(lmop, 'adventure.json') }, agent: withCampaign })).toMatch(/不在允许范围/);
+    expect(guard({ name: 'read', arguments: { file_path: join(campaigns, 'group_a.json') }, agent: withCampaign })).toMatch(/不在允许范围/);
+    expect(guard({ name: 'read', arguments: { file_path: join(toa, 'secret.txt') }, agent: withCampaign })).toMatch(/敏感路径/);
+
+    // 没有团档的群连当前模组也读不到
+    expect(guard({ name: 'read', arguments: { file_path: join(toa, 'text-zh', 'ch1.md') }, agent: withoutCampaign })).toMatch(/不在允许范围/);
   });
 });

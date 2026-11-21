@@ -7,9 +7,9 @@ import type { DshAgent, SessionManager } from '../session/index.ts';
 import type { Logger } from '../types.ts';
 import { resolveTmpDir } from '../media/tmp-dir.ts';
 import { BrowserService } from './browser-service.ts';
-import type { BrowserAccess } from './browser-access.ts';
+import { groupOnList } from '../features/group-access-policy.ts';
 
-export function registerBrowserTool(ctx: Context, config: ImQQBotConfig, manager: SessionManager, logger: Logger, access?: BrowserAccess): void {
+export function registerBrowserTool(ctx: Context, config: ImQQBotConfig, manager: SessionManager, logger: Logger): void {
   if (!config.browser?.enabled) return;
   const owner = config.ownerOpenid?.trim();
   if (!owner) {
@@ -20,7 +20,6 @@ export function registerBrowserTool(ctx: Context, config: ImQQBotConfig, manager
   if (!tools?.register) return;
   const browser = config.browser;
   const cwd = config.cwd || process.cwd();
-  const allowedGroups = new Set((browser.allowedGroups ?? []).map((id) => id.trim()).filter(Boolean));
   const services = new Map<string, BrowserService>();
   let disposed = false;
   ctx.effect(() => async () => {
@@ -54,7 +53,7 @@ export function registerBrowserTool(ctx: Context, config: ImQQBotConfig, manager
       // 权限不继承终端白名单；单独授权浏览不应同时授予文件或 shell 能力。
       const record = exec.agent ? manager.findByAgent(exec.agent as DshAgent) : undefined;
       const isOwner = record?.scope === 'c2c' && record.peerId === owner && record.senderId === owner;
-      const isAllowedGroup = record?.scope === 'group' && (access ? access.isAllowedGroup(record.peerId) : allowedGroups.has(record.peerId));
+      const isAllowedGroup = record?.scope === 'group' && groupOnList(record.peerId, config.browser?.allowedGroups);
       if (!record || (!isOwner && !isAllowedGroup)) {
         throw new Error('浏览工具仅限主人私聊或浏览群白名单内的群使用；可按用户要求调用 qqbot_browser_access(action="grant") 申请，等主人审批');
       }
@@ -72,5 +71,5 @@ export function registerBrowserTool(ctx: Context, config: ImQQBotConfig, manager
       return service.run(args, exec.signal);
     },
   });
-  logger.info(`im-qqbot: qqbot_browser 已注册（主人私聊 + ${allowedGroups.size} 个授权群，独立环境，按需启动）`);
+  logger.info(`im-qqbot: qqbot_browser 已注册（主人私聊 + ${browser.allowedGroups.length} 个授权群，独立环境，按需启动）`);
 }
