@@ -153,6 +153,10 @@ export class ApprovalChannel {
     this.logger.info('im-qqbot: QQ approval channel installed');
   }
 
+  public hasPending(sessionKey: string): boolean {
+    return this.pending.has(sessionKey);
+  }
+
   /** 会话回收时清理其 pending 审批，避免 Promise 悬挂 */
   public cancelPending(sessionKey: string): void {
     const entry = this.pending.get(sessionKey);

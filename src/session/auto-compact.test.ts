@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { ContextLockManager } from '../features/compact-policy.ts';
 import { SessionManager } from './session-manager.ts';
 import type { SessionRecord } from './types.ts';
 import type { CompactOutcome } from './types.ts';
@@ -186,5 +187,77 @@ describe('SessionManager.checkIdleCompact', () => {
     r.lastActivity = NOW + 2 * MIN;
     run(NOW + 40 * MIN);
     await vi.waitFor(() => expect(compact).toHaveBeenCalledTimes(2));
+  });
+
+  it('ContextLock / 待答问题 / 未结算后台任务 阻止 autoCompact 与 idleCompact，释放或到硬上限才压缩', async () => {
+    const contextLocks = new ContextLockManager();
+    const compact = vi.fn(async () => ({ ok: true, shadowed: 10, tokens: 50000 } as CompactOutcome));
+    const sessions = new Map<string, SessionRecord>();
+    const pendingQuestions = new Set<string>();
+    const self = {
+      config: {
+        appId: 'app',
+        autoCompactTokens: 120000,
+        autoCompactPrivateRatio: 0.5,
+        autoCompactDeferOnTools: false,
+        idleCompactMinutes: 20,
+        idleCompactTokens: 100000,
+        idleCompactProviders: 'google',
+      },
+      logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      sessions,
+      compact,
+      contextLocks,
+      questionChannel: { hasPending: (k: string) => pendingQuestions.has(k) },
+      contextWindowOf: vi.fn(async () => undefined),
+      routeOf: () => ({ provider: 'google', model: 'gemini' }),
+    };
+    Object.assign(self, {
+      autoCompact: (SessionManager.prototype as unknown as { autoCompact: unknown }).autoCompact,
+      getContextLockStatus: SessionManager.prototype.getContextLockStatus,
+      getPersonaSwitchState: SessionManager.prototype.getPersonaSwitchState,
+    });
+
+    // 1. 显式事务租约期间：130k 不压缩（< 180k 硬上限），idleCompact 也跳过且不记录 triedAt
+    const release = contextLocks.acquire('k', 'multi-step', 60_000);
+    const r = record({ contextTokens: 130000, lastActivity: NOW - 30 * MIN });
+    sessions.set('k', r);
+    SessionManager.prototype.maybeAutoCompact.call(self as never, r);
+    await vi.waitFor(() => expect(r.compacting).toBe(false));
+    expect(compact).not.toHaveBeenCalled();
+
+    SessionManager.prototype.checkIdleCompact.call(self as never, NOW);
+    expect(compact).not.toHaveBeenCalled();
+    expect(r.idleCompactTriedAt).toBeUndefined();
+
+    // 2. 释放租约后仍有未结算后台任务，继续拦截 idleCompact
+    release();
+    const jobRecord = record({
+      contextTokens: 130000,
+      lastActivity: NOW - 30 * MIN,
+      events: [...QUIET_TURN, { type: 'job/registered', data: { jobId: 'job-1' } }],
+    });
+    sessions.set('k', jobRecord);
+    SessionManager.prototype.checkIdleCompact.call(self as never, NOW);
+    expect(compact).not.toHaveBeenCalled();
+
+    // 3. 后台任务结算且待答问题关闭后，idleCompact 放行
+    (jobRecord.agent.session.events as unknown[]).push({ type: 'job/settled', data: { jobId: 'job-1' } });
+    pendingQuestions.add('k');
+    SessionManager.prototype.checkIdleCompact.call(self as never, NOW);
+    expect(compact).not.toHaveBeenCalled();
+    pendingQuestions.delete('k');
+    SessionManager.prototype.checkIdleCompact.call(self as never, NOW);
+    await vi.waitFor(() => expect(jobRecord.compacting).toBe(false));
+    expect(compact).toHaveBeenCalledTimes(1);
+
+    // 4. 上下文顶到 1.5x 硬上限（180k）即使持有租约仍强制 autoCompact
+    const keepLock = contextLocks.acquire('k', 'multi-step', 60_000);
+    const overflow = record({ contextTokens: 180000 });
+    sessions.set('k', overflow);
+    SessionManager.prototype.maybeAutoCompact.call(self as never, overflow);
+    await vi.waitFor(() => expect(overflow.compacting).toBe(false));
+    expect(compact).toHaveBeenCalledTimes(2);
+    keepLock();
   });
 });

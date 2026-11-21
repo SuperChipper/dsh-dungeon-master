@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -6,6 +6,7 @@ import { createUserMessage, type GenerateOptions, type StreamChunk } from '@deep
 import { Session, SessionId } from '@deepseek-ai/dsh-session';
 import { newCommand } from '../commands/session.ts';
 import { PersonaHandoffStore } from '../features/persona-handoff.ts';
+import { PersonaStore } from '../features/persona-store.ts';
 import { SessionManager } from './session-manager.ts';
 import type { SessionEventLike, SessionRecord } from './types.ts';
 import type { ChatScope } from '../types.ts';
@@ -268,5 +269,73 @@ describe('人格交接生命周期', () => {
     expect(h.select).not.toHaveBeenCalled();
     expect(h.handoffs.read(h.key).latest).toBeUndefined();
     expect(h.handoffs.read(h.key).pending?.error).toContain('历史发生变化');
+  });
+
+  it('Persona Switch FSM 崩溃恢复：handoff 阶段标失败回原人设，committing 阶段补齐目标 sessionId', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'persona-fsm-recovery-'));
+    dirs.push(base);
+    const personaDir = join(base, 'personas');
+    writeFileSync(join(base, 'init.txt'), '');
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(personaDir, { recursive: true });
+    writeFileSync(join(personaDir, 'dragon.md'), '肥龙正文');
+    const statePath = join(base, 'persona-state.json');
+
+    // Case 1: handoff 阶段崩溃（generating 未收尾）
+    const store1 = new PersonaStore({ dir: personaDir, statePath });
+    const key = 'qqbot:app:group:peer';
+    store1.handoffs.begin(key, 'default', { cursor: { sessionId: 's0', event: 1 }, transcript: '对话', recent: '对话' });
+    store1.beginTransition({
+      scope: 'group',
+      peerId: 'peer',
+      fromPersona: 'default',
+      toPersona: 'dragon',
+      sourceSessionId: 's0',
+      targetSessionId: 's1',
+    });
+
+    const reopened1 = new PersonaStore({ dir: personaDir, statePath });
+    let resolvedSessionId = 's0';
+    const mgr1 = Object.assign(Object.create(SessionManager.prototype) as SessionManager, {
+      personaStore: reopened1,
+      modelResolver: { setSessionId: (_k: string, id: string) => { resolvedSessionId = id; } },
+      retiredSessionIds: new Map<string, string>(),
+      captureScheduleMigrations: vi.fn(),
+      config: { appId: 'app' },
+      logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    });
+    expect(mgr1.getPersonaSwitchState('group', 'peer')).toBe('recovering');
+    await mgr1.waitForPersonaSwitch('group', 'peer');
+    expect(mgr1.getPersonaSwitchState('group', 'peer')).toBe('idle');
+    expect(reopened1.currentId('peer', 'group')).toBe('default');
+    expect(reopened1.handoffs.read(key).pending?.status).toBe('failed');
+    expect(resolvedSessionId).toBe('s0');
+
+    // Case 2: committing 阶段崩溃（selection 已指向 dragon，modelResolver 尚停留在 s0）
+    reopened1.beginTransition({
+      scope: 'group',
+      peerId: 'peer',
+      fromPersona: 'default',
+      toPersona: 'dragon',
+      sourceSessionId: 's0',
+      targetSessionId: 's1',
+    });
+    reopened1.commitTransition('peer', 'group');
+
+    const reopened2 = new PersonaStore({ dir: personaDir, statePath });
+    const setSessionId = vi.fn();
+    const mgr2 = Object.assign(Object.create(SessionManager.prototype) as SessionManager, {
+      personaStore: reopened2,
+      modelResolver: { setSessionId },
+      retiredSessionIds: new Map<string, string>(),
+      captureScheduleMigrations: vi.fn(),
+      config: { appId: 'app' },
+      logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    });
+    expect(mgr2.getPersonaSwitchState('group', 'peer')).toBe('recovering');
+    mgr2.recoverPersonaTransition('group', 'peer');
+    expect(mgr2.getPersonaSwitchState('group', 'peer')).toBe('idle');
+    expect(reopened2.currentId('peer', 'group')).toBe('dragon');
+    expect(setSessionId).toHaveBeenCalledWith(key, 's1');
   });
 });

@@ -32,6 +32,7 @@ import { QQBOT_MESSAGE_SOURCE } from '../shared/message-source.ts';
 import { deriveProjectsFromCwd } from '../notes/note-metadata.ts';
 import type { NoteMetricsStore } from '../notes/note-metrics.ts';
 import type { NoteJudge } from '../features/note-judge.ts';
+import { renderNoteStats, type NoteStatsView } from '../features/note-stats.ts';
 import { formatHandoffHint, latestCompactionSummary } from '../features/session-handoff.ts';
 import { collectHandoffInput, generatePersonaHandoff } from '../features/persona-handoff.ts';
 import type { JudgeLine, JudgeLlm } from '../features/reply-judge.ts';
@@ -59,9 +60,17 @@ import {
 import type { QuestionChannel } from '../features/question-channel.ts';
 import type { ApprovalChannel } from '../features/approval-channel.ts';
 import { GROUP_MESSAGE_FORMAT_PROMPT } from '../features/message-format.ts';
-import type { PersonaStore } from '../features/persona-store.ts';
+import type { PersonaStore, PersonaSwitchState } from '../features/persona-store.ts';
 import type { PersonaSwitch, SwitchPersonaOutcome } from '../features/persona-switch.ts';
-import { compactThreshold, decideAutoCompact, deferCeiling, lastTurnUsedTools, shouldIdleCompact } from '../features/compact-policy.ts';
+import {
+  ContextLockManager,
+  compactThreshold,
+  decideAutoCompact,
+  deferCeiling,
+  hasOpenBackgroundJobs,
+  lastTurnUsedTools,
+  shouldIdleCompact,
+} from '../features/compact-policy.ts';
 import { TurnSteerTracker } from '../transport/turn-steer.ts';
 import type {
   SessionEventLike,
@@ -298,12 +307,15 @@ function buildNoteQueryContextFromDeps(
   const scenes: NoteQueryContext['scenes'] = campaignRunning ? [scope, 'dnd'] : [scope];
 
   const activePersona = deps.personaStore?.current(peerId, scope);
-  const defaultPrompt = scope === 'group' ? deps.config.groupPrompt : deps.config.directPrompt;
+  const fallbackDefault = deps.personaStore?.defaultPersona?.(scope);
+  const defaultPrompt = fallbackDefault?.prompt
+    ?? (scope === 'group' ? deps.config.groupPrompt : deps.config.directPrompt);
   const personas = activePersona !== undefined
     ? [activePersona.id, activePersona.name, ...activePersona.names]
     : [
         'default',
         '默认',
+        ...(fallbackDefault?.names ?? []),
         ...(deps.config.replyDesire?.names ?? []),
         ...extractDefaultPersonaAliases(defaultPrompt),
       ];
@@ -379,6 +391,8 @@ export class SessionManager {
   /** 切换先完成落盘；期间到来的 QQ 消息等待，不得进入即将离开的人格历史。 */
   private personaTransitions = new Map<string, Promise<SwitchPersonaOutcome>>();
   private personaRoutes = new Map<string, ModelRoute>();
+  /** 多步关键事务/切换/待决交互期间阻止后台自动压缩与空闲压缩的锁表 */
+  public contextLocks = new ContextLockManager();
   private disposing = false;
   /** 由 bootstrap 注入的工具权限（终端白名单） */
   public toolAccess?: ToolAccess;
@@ -418,6 +432,7 @@ export class SessionManager {
         if (this.personaTransitions.has(key)) return;
         this.logger.info(`evicting idle session: key=${key}`);
         this.sessions.delete(key);
+        this.contextLocks?.clear(key);
         void this.combatAgents?.release(key);
         this.modelSelections.delete(record.agent);
         record.agent.cancel({ kind: 'user' });
@@ -490,6 +505,7 @@ export class SessionManager {
 
       const sections = [...(assembled.sections ?? [])];
       const prompt = this.personaStore?.current(record.peerId, record.scope)?.prompt
+        ?? this.personaStore?.defaultPersona?.(record.scope)?.prompt
         ?? (record.scope === 'group' ? this.config.groupPrompt : this.config.directPrompt);
       if (prompt) {
         sections.push({ name: 'qqbot:scope-prompt', order: 90, text: prompt });
@@ -536,7 +552,7 @@ export class SessionManager {
           order: 91,
           text: [
             '【工具权限】',
-            '本会话不在终端白名单里：没有 pwsh/bash/终端，不能派生子 agent；文件工具只能用在 bot 的媒体、表情和临时目录。被拦就直接告诉用户做不到，别换工具绕，也别说出本机路径。',
+            '本会话不在终端白名单里：没有 pwsh/bash/终端，不能派生子 agent；文件工具默认只能用在 bot 的媒体、表情和临时目录。若本群有跑团存档，可用 read/read_image/glob/grep 只读查阅当前模组目录用于 DM 备团（禁止修改、禁止用 qqbot_send_file 发给玩家）。被拦就直接告诉用户做不到，别换工具绕，也别说出本机路径。',
             '只有 bot 主人能把本群加入白名单：主人明确要求时调用 qqbot_tool_access(action="grant")，它会发确认按钮，主人点了才生效。',
           ].join('\n'),
         });
@@ -604,11 +620,31 @@ export class SessionManager {
           '【发图配文】',
           '用 qqbot_send_file 发图片/视频/文件并配文字时，整段配文放进 caption，但不超过两句、不换行、不放列表；要讲道理另发一条纯文字。caption 会和媒体同一条消息发出，不要再单独复述这段配文。',
           '发完没别的要说，就只回一个「。」收尾：只有标点的回复不会发出去。不要什么都不输出，完全空的回复会被当成出错。',
-          '没有媒体要发时正常文字回复。语音不支持 caption，按下面的语音发送规则处理。',
+          '不发媒体也不发语音时正常文字回复。语音不支持 caption，按下面的语音规则处理。',
           '【语音单独发送】',
           '通过 qqbot_speak 或 qqbot_send_file 发送语音时：' + VOICE_REPLY_REMINDER,
         ].join('\n'),
       });
+
+      if (this.config.speak?.enabled !== false) {
+        sections.push({
+          name: 'qqbot:voice-routing',
+          order: 93,
+          text: [
+            '【语音出声（qqbot_speak）】',
+            '你有自己的嗓子（qqbot_speak，自动匹配当前人设音色）。遇到下面这些要你「真出声」的话，调用 qqbot_speak 发语音条，别只打一行拟声词或把原文打字抄一遍交差：',
+            '1. 点名听语音/开麦：「发语音」「来条语音」「语音回我」「说句话听听」「想听你声音」「用你的声音说」「开麦」「出个声」。',
+            '2. 声音动作与情绪发声：「大喊一声…」「喊一句…」「吼一声…」「叫一声…（如叫姐姐/喵一声/汪一声）」「叹口气听听」「笑一声」「撒个娇/哄我一句/骂我两句听听」「学…说话」「给这句配音」。',
+            '3. 朗读与口头念白：「念一下…」「把这段念出来」「读出来」「朗读…」「背一段…听听」「用语音讲个故事/念段台词」。',
+            '4. 语音闲聊互动：对方发语音条（`[Voice message]`）闲聊且内容简短时，也可视气氛用 qqbot_speak 语音回接。',
+            '参数与边界：',
+            '- `text` 只放要亲口念出口的词句和语气词（大喊可用感叹号、破折号拖长音，如「喂——！听见没有！」）；绝不要在 `text` 里写「（大声喊）」「*深吸一口气*」「[大喊]」等括号/星号动作描写，否则 TTS 会把动作说明当台词念出来。语气提示可填进单行的 `style`（不带括号与特殊符号）。',
+            '- QQ 会话里省略 `role`（系统按当前人设自动选音色）。代码、命令、链接、报错或需要复制的文本不要塞进语音，留给文字发。',
+            '- 区分点歌：说话、喊叫、念白、朗读、清口念词都走 `qqbot_speak`；只有用户明确点歌翻唱整首曲子（提供歌曲文件或链接走 RVC）才用 `qqbot_sing`。',
+            '- 用户没让你出声/念/喊时，日常问答、查资料、写代码默认打字，偶尔气氛特别合适再随口发一句短语音，别每轮刷屏。发完语音若没别的话要补充，只回一个「。」收尾，不要把语音里的词再原样打字复读一遍。',
+          ].join('\n'),
+        });
+      }
 
       sections.push({
         name: 'qqbot:image-routing',
@@ -1090,8 +1126,21 @@ export class SessionManager {
     (this.ctx as unknown as { on(event: 'tools/post-execute', listener: typeof handler, options?: { global: boolean }): void }).on('tools/post-execute', handler, { global: true });
   }
 
-  /** 这段笔记是否被静音（相关性打分长期偏低）。笔记文件在静音之后改过就解除：旧分数评的不是现在的内容 */
-  private noteMuted(file: string, heading: string): boolean {
+  /** 账本概览保留历史；只让低分清单跟随当前索引和静音策略。 */
+  public noteStats(view: NoteStatsView, limit: number): string | undefined {
+    if (this.noteMetrics === undefined) return undefined;
+    const rows = this.noteMetrics.summary(Number.POSITIVE_INFINITY);
+    const notes = this.config.notes;
+    const canInject = notes?.autoInject === true && notes.injectTopK > 0
+      && (notes.injectMaxChars > 0 || (notes.groupInjectMaxChars ?? 0) > 0);
+    const lowRows = view === 'low' && canInject
+      ? (this.notesStore?.filterAutoInjectableSections(rows) ?? []).filter((row) => !this.noteMuted(row.file, row.heading, false))
+      : [];
+    return renderNoteStats(rows, view, limit, notes?.judge?.enabled === true, lowRows);
+  }
+
+  /** 笔记文件改过后旧自动静音失效；只在真正召回时更新账本，查看榜单不修改历史。 */
+  private noteMuted(file: string, heading: string, clearExpired = true): boolean {
     if (this.noteMetrics === undefined || this.notesStore === undefined) return false;
     // 主人手动静音的不看打分开关，也不因为文件改过就自动恢复：那是明确说过「别再注入」
     if (this.noteMetrics.mutedManually(file, heading)) return true;
@@ -1102,7 +1151,7 @@ export class SessionManager {
     if (mutedAt === undefined) return false;
     try {
       if (statSync(join(this.notesStore.root, file)).mtimeMs > mutedAt) {
-        this.noteMetrics.unmute(file, heading);
+        if (clearExpired) this.noteMetrics.unmute(file, heading);
         return false;
       }
     } catch {
@@ -1410,7 +1459,40 @@ export class SessionManager {
   }
 
   async waitForPersonaSwitch(scope: ChatScope, peerId: string): Promise<void> {
-    await this.personaTransitions?.get(this.sessionKey(scope, peerId));
+    const key = this.sessionKey?.(scope, peerId) ?? `qqbot:${this.config?.appId ?? ''}:${scope}:${peerId}`;
+    await this.personaTransitions?.get(key);
+    (this.recoverPersonaTransition ?? SessionManager.prototype.recoverPersonaTransition).call(this, scope, peerId);
+  }
+
+  getPersonaSwitchState(scope: ChatScope, peerId: string): PersonaSwitchState {
+    const key = this.sessionKey?.(scope, peerId) ?? `qqbot:${this.config?.appId ?? ''}:${scope}:${peerId}`;
+    if (this.personaTransitions?.has(key)) return 'transitioning';
+    if (this.personaStore?.getTransition?.(peerId, scope) !== undefined) return 'recovering';
+    return 'idle';
+  }
+
+  /** 启动/重连检测到上次人设切换中途崩溃的事务标记时，按阶段清理悬挂或补齐会话指向。 */
+  recoverPersonaTransition(scope: ChatScope, peerId: string): void {
+    const tr = this.personaStore?.getTransition?.(peerId, scope);
+    if (tr === undefined) return;
+    const key = this.sessionKey?.(scope, peerId) ?? `qqbot:${this.config?.appId ?? ''}:${scope}:${peerId}`;
+    const releaseLock = (this.contextLocks ??= new ContextLockManager()).acquire(key, 'persona-recovery', 60_000);
+    try {
+      this.logger.warn(`persona transition recovery: key=${key} phase=${tr.phase} ${tr.fromPersona}->${tr.toPersona}`);
+      if (tr.phase === 'handoff') {
+        this.personaStore?.handoffs?.recoverInterrupted?.(key, '人设切换中途中断，保留原人设');
+        this.personaStore?.finishTransition?.(peerId, scope);
+      } else if (tr.phase === 'committing') {
+        if (tr.sourceSessionId !== tr.targetSessionId) {
+          this.captureScheduleMigrations?.(key, tr.sourceSessionId);
+          this.retiredSessionIds?.set(tr.sourceSessionId, key);
+        }
+        this.modelResolver?.setSessionId?.(key, tr.targetSessionId);
+        this.personaStore?.finishTransition?.(peerId, scope);
+      }
+    } finally {
+      releaseLock();
+    }
   }
 
   private async openSession(
@@ -1572,6 +1654,7 @@ export class SessionManager {
 
   private async performPersonaSwitch(peerId: string, personaId: string, scope: ChatScope): Promise<SwitchPersonaOutcome> {
     if (this.disposing) return 'busy';
+    (this.recoverPersonaTransition ?? SessionManager.prototype.recoverPersonaTransition).call(this, scope, peerId);
     const store = this.personaStore;
     const currentId = store?.currentId(peerId, scope);
     if (store === undefined || currentId === personaId) return 'same';
@@ -1580,69 +1663,125 @@ export class SessionManager {
     if (this.dndService?.active(key) !== undefined) return 'dnd';
     let record = this.sessions.get(key);
     if (record !== undefined && (record.agent.status !== 'idle' || record.compacting)) return 'busy';
-    let incomplete = false;
-    let sourceRoute: ModelRoute | undefined;
-    if (store.handoffs !== undefined) {
+
+    const releaseLock = (this.contextLocks ??= new ContextLockManager()).acquire(key, 'persona-switch', 5 * 60_000);
+    let transitionStarted = false;
+    const abortTransition = (): void => {
+      if (!transitionStarted) return;
+      transitionStarted = false;
       try {
-        // 空闲回收或进程重启后，也要先恢复来源历史；不能把“不在内存”当成没有对话。
-        record ??= await this.openSession(scope, peerId, peerId, { scope, targetId: peerId });
-        if (record.agent.status !== 'idle' || record.compacting) return 'busy';
-        sourceRoute = this.personaModelRoute(record);
-        const events = [...(record.agent.session.snapshotEvents?.() ?? record.agent.session.events ?? [])];
-        const previous = store.handoffs.read(key);
-        const input = collectHandoffInput(record.sessionId, events, record.agent.session.surface?.nodes, previous.covered[record.sessionId]);
-        input.schedules = readScheduleMigrations(scheduleStorageHome(), record.sessionId);
-        if (input.transcript || previous.pending) {
-          const attempt = store.handoffs.begin(key, currentId!, input);
-          try {
-            const llm = this.ctx.get('llm') as JudgeLlm | undefined;
-            const provider = sourceRoute?.provider;
-            const model = sourceRoute?.model;
-            if (!llm || !provider || !model) throw new Error('交接模型不可用');
-            const summary = await record.agent.runMaintenance((signal) => generatePersonaHandoff(
-              llm, { provider, model }, previous.latest ? `版本 ${previous.latest.version}；时间 ${previous.latest.at}\n${previous.latest.summary}` : '', attempt.transcript,
-              signal,
-              { resume: attempt.progress, source: { fromPersona: attempt.fromPersona, at: attempt.at, cursor: attempt.cursor }, save: (chars, draft) => store.handoffs.checkpoint(key, attempt.id, chars, draft) },
-            ));
-            const after = record.agent.session.snapshotEvents?.() ?? record.agent.session.events ?? [];
-            if (after.length !== events.length || after.at(-1)?.seq !== events.at(-1)?.seq || record.agent.status !== 'idle') {
-              store.handoffs.fail(key, attempt.id, '生成期间历史发生变化，请重新切换');
-              return 'busy';
+        store.finishTransition?.(peerId, scope);
+      } catch (err) {
+        this.logger.warn(`persona transition cleanup failed: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+
+    try {
+      let incomplete = false;
+      let sourceRoute: ModelRoute | undefined;
+      let sourceSessionId = record?.sessionId ?? this.currentSessionId(key);
+      const targetSessionId = store.sessionFor(peerId, personaId, scope) ?? randomUUID();
+
+      const ensureTransitionBegun = (): boolean => {
+        if (transitionStarted) return true;
+        try {
+          store.beginTransition?.({
+            scope,
+            peerId,
+            fromPersona: currentId!,
+            toPersona: personaId,
+            sourceSessionId,
+            targetSessionId,
+          });
+          transitionStarted = true;
+          return true;
+        } catch (err) {
+          this.logger.warn(`persona transition persistence failed: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
+          return false;
+        }
+      };
+
+      if (store.handoffs !== undefined) {
+        try {
+          // 空闲回收或进程重启后，也要先恢复来源历史；不能把“不在内存”当成没有对话。
+          record ??= await this.openSession(scope, peerId, peerId, { scope, targetId: peerId });
+          if (record.agent.status !== 'idle' || record.compacting) return 'busy';
+          sourceSessionId = record.sessionId;
+          if (!ensureTransitionBegun()) return 'failed';
+          sourceRoute = this.personaModelRoute(record);
+          const events = [...(record.agent.session.snapshotEvents?.() ?? record.agent.session.events ?? [])];
+          const previous = store.handoffs.read(key);
+          const input = collectHandoffInput(record.sessionId, events, record.agent.session.surface?.nodes, previous.covered[record.sessionId]);
+          input.schedules = readScheduleMigrations(scheduleStorageHome(), record.sessionId);
+          if (input.transcript || previous.pending) {
+            const attempt = store.handoffs.begin(key, currentId!, input);
+            try {
+              const llm = this.ctx.get('llm') as JudgeLlm | undefined;
+              const provider = sourceRoute?.provider;
+              const model = sourceRoute?.model;
+              if (!llm || !provider || !model) throw new Error('交接模型不可用');
+              const summary = await record.agent.runMaintenance((signal) => generatePersonaHandoff(
+                llm, { provider, model }, previous.latest ? `版本 ${previous.latest.version}；时间 ${previous.latest.at}\n${previous.latest.summary}` : '', attempt.transcript,
+                signal,
+                { resume: attempt.progress, source: { fromPersona: attempt.fromPersona, at: attempt.at, cursor: attempt.cursor }, save: (chars, draft) => store.handoffs.checkpoint(key, attempt.id, chars, draft) },
+              ));
+              const after = record.agent.session.snapshotEvents?.() ?? record.agent.session.events ?? [];
+              if (after.length !== events.length || after.at(-1)?.seq !== events.at(-1)?.seq || record.agent.status !== 'idle') {
+                store.handoffs.fail(key, attempt.id, '生成期间历史发生变化，请重新切换');
+                abortTransition();
+                return 'busy';
+              }
+              store.handoffs.complete(key, attempt.id, summary);
+            } catch (err) {
+              incomplete = true;
+              store.handoffs.fail(key, attempt.id, err instanceof Error ? err.message : String(err));
+              this.logger.warn(`persona handoff incomplete: key=${key} attempt=${attempt.id} err=${err instanceof Error ? err.message : String(err)}`);
             }
-            store.handoffs.complete(key, attempt.id, summary);
-          } catch (err) {
-            incomplete = true;
-            store.handoffs.fail(key, attempt.id, err instanceof Error ? err.message : String(err));
-            this.logger.warn(`persona handoff incomplete: key=${key} attempt=${attempt.id} err=${err instanceof Error ? err.message : String(err)}`);
           }
+        } catch (err) {
+          // 落盘失败不能继续切换，否则连“哪些没覆盖”也无法保证。
+          abortTransition();
+          this.logger.warn(`persona handoff persistence failed: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
+          return 'failed';
+        }
+      }
+      if (!ensureTransitionBegun()) return 'failed';
+      if (sourceRoute && record) {
+        const current = this.personaModelRoute(record);
+        if (record.agent.status !== 'idle' || this.sessions.get(key) !== record
+          || current?.provider !== sourceRoute.provider || current.model !== sourceRoute.model) {
+          abortTransition();
+          return 'busy';
+        }
+      }
+      if (this.disposing) {
+        abortTransition();
+        return 'busy';
+      }
+      try {
+        // 人格只改变设定和历史，不应把 Web 实际选用的模型悄悄换回聊天默认。
+        if (sourceRoute) this.modelResolver.setOverride(key, sourceRoute);
+        if (typeof store.commitTransition === 'function') {
+          store.commitTransition(peerId, scope);
+        } else {
+          store.rememberSession(peerId, currentId!, sourceSessionId, scope);
+          store.select(peerId, personaId, scope);
         }
       } catch (err) {
-        // 落盘失败不能继续切换，否则连“哪些没覆盖”也无法保证。
-        this.logger.warn(`persona handoff persistence failed: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
+        abortTransition();
+        this.logger.warn(`persona selection persistence failed: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
         return 'failed';
       }
+      if (sourceRoute) {
+        this.personaRoutes ??= new Map();
+        this.personaRoutes.set(key, sourceRoute);
+      }
+      await this.remove(scope, peerId, targetSessionId);
+      store.finishTransition?.(peerId, scope);
+      return incomplete ? 'handoff-incomplete' : 'ok';
+    } finally {
+      releaseLock();
     }
-    if (sourceRoute && record) {
-      const current = this.personaModelRoute(record);
-      if (record.agent.status !== 'idle' || this.sessions.get(key) !== record
-        || current?.provider !== sourceRoute.provider || current.model !== sourceRoute.model) return 'busy';
-    }
-    if (this.disposing) return 'busy';
-    try {
-      // 人格只改变设定和历史，不应把 Web 实际选用的模型悄悄换回聊天默认。
-      if (sourceRoute) this.modelResolver.setOverride(key, sourceRoute);
-      store.rememberSession(peerId, currentId!, record?.sessionId ?? this.currentSessionId(key), scope);
-      store.select(peerId, personaId, scope);
-    } catch (err) {
-      this.logger.warn(`persona selection persistence failed: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
-      return 'failed';
-    }
-    if (sourceRoute) {
-      this.personaRoutes ??= new Map();
-      this.personaRoutes.set(key, sourceRoute);
-    }
-    await this.remove(scope, peerId, store.sessionFor(peerId, personaId, scope) ?? randomUUID());
-    return incomplete ? 'handoff-incomplete' : 'ok';
   }
 
   /**
@@ -1784,6 +1923,7 @@ export class SessionManager {
     else this.pendingScheduleMigrations.delete(key);
     this.retiredSessionIds.delete(nextSessionId);
     this.modelResolver.setSessionId(key, nextSessionId);
+    this.contextLocks?.clear(key);
 
     if (!record) { await releaseCombat; return; }
     this.sessions.delete(key);
@@ -1876,6 +2016,25 @@ export class SessionManager {
       });
   }
 
+  /** 汇总当前会话阻塞后台压缩的原因（显式事务租约、人设切换、待答问题/审批、未结算后台任务）。 */
+  getContextLockStatus(record: SessionRecord, now: number = Date.now()): { locked: boolean; reasons: string[] } {
+    const reasons = [...(this.contextLocks?.status?.(record.sessionKey, now).reasons ?? [])];
+    const switchState = this.getPersonaSwitchState?.(record.scope, record.peerId)
+      ?? SessionManager.prototype.getPersonaSwitchState.call(this, record.scope, record.peerId);
+    if (switchState !== 'idle' && !reasons.includes('persona-switch')) reasons.push('persona-switch');
+    if (this.questionChannel?.hasPending?.(record.sessionKey) && !reasons.includes('pending-question')) {
+      reasons.push('pending-question');
+    }
+    if (this.approvalChannel?.hasPending?.(record.sessionKey) && !reasons.includes('pending-approval')) {
+      reasons.push('pending-approval');
+    }
+    const events = record.agent?.session?.snapshotEvents?.() ?? record.agent?.session?.events;
+    if (hasOpenBackgroundJobs(events) && !reasons.includes('background-job')) {
+      reasons.push('background-job');
+    }
+    return { locked: reasons.length > 0, reasons };
+  }
+
   private async autoCompact(record: SessionRecord): Promise<void> {
     const before = record.contextTokens;
     const contextWindow = await this.contextWindowOf(record);
@@ -1885,16 +2044,22 @@ export class SessionManager {
       autoCompactDeferOnTools: this.config.autoCompactDeferOnTools ?? false,
     });
     const usedTools = lastTurnUsedTools(record.agent.session.events);
+    const lock = this.getContextLockStatus?.(record)
+      ?? SessionManager.prototype.getContextLockStatus.call(this, record);
     const decision = decideAutoCompact({
       contextTokens: before,
       threshold,
       contextWindow,
       lastTurnUsedTools: usedTools,
       deferOnTools: this.config.autoCompactDeferOnTools ?? false,
+      contextLocked: lock.locked,
     });
     if (decision === 'defer') {
+      const reasonText = lock.locked
+        ? `事务锁持有中（${lock.reasons.join('、')}）`
+        : '上一轮还在调工具';
       this.logger.info(
-        `im-qqbot: 自动压缩推迟 key=${record.sessionKey} 上下文≈${before} tokens ≥ 阈值 ${threshold}，上一轮还在调工具，等收尾轮或到 ${deferCeiling(threshold, contextWindow)} 再压`,
+        `im-qqbot: 自动压缩推迟 key=${record.sessionKey} 上下文≈${before} tokens ≥ 阈值 ${threshold}，${reasonText}，等收尾轮或到 ${deferCeiling(threshold, contextWindow)} 再压`,
       );
       return;
     }
@@ -1927,6 +2092,8 @@ export class SessionManager {
       if (this.combatAgents?.current(record.sessionKey) !== undefined) continue;
       if (record.compacting || record.idleCompactTriedAt === record.lastActivity) continue;
       if (record.agent.status !== 'idle') continue;
+      const lock = this.getContextLockStatus?.(record, now)
+        ?? SessionManager.prototype.getContextLockStatus.call(this, record, now);
       const eligible = shouldIdleCompact({
         contextTokens: record.contextTokens,
         minTokens,
@@ -1934,6 +2101,7 @@ export class SessionManager {
         minIdleMs,
         provider: this.routeOf(record)?.provider,
         providers: this.config.idleCompactProviders ?? '',
+        contextLocked: lock.locked,
       });
       if (!eligible) continue;
 
@@ -1993,6 +2161,7 @@ export class SessionManager {
     this.disposing = true;
     this.evictor.dispose();
     clearInterval(this.idleCompactTimer);
+    this.contextLocks?.clearAll();
     const records = [...this.sessions.values()];
     this.sessions.clear();
     for (const record of records) {

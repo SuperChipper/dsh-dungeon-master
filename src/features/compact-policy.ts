@@ -10,6 +10,7 @@
  * 更大的上下文还会碰到宿主自己的 pressure 压缩（轮内 step 边界触发、保留近期尾部），
  * 那条路不受这里控制。
  */
+import { randomUUID } from 'node:crypto';
 import type { ChatScope } from '../types.ts';
 
 export interface CompactPolicyConfig {
@@ -57,6 +58,8 @@ export interface IdleCompactInput {
   provider: string | undefined;
   /** 逗号分隔的 provider 名；空 = 所有 provider */
   providers: string;
+  /** 关键事务窗口 locked 时禁止空闲压缩，避免等待用户或后台任务途中截断上下文 */
+  contextLocked?: boolean;
 }
 
 export function parseProviderList(raw: string): string[] {
@@ -64,6 +67,7 @@ export function parseProviderList(raw: string): string[] {
 }
 
 export function shouldIdleCompact(input: IdleCompactInput): boolean {
+  if (input.contextLocked === true) return false;
   if (input.minIdleMs <= 0 || input.minTokens <= 0) return false;
   if (input.idleMs < input.minIdleMs) return false;
   if (input.contextTokens === undefined || input.contextTokens < input.minTokens) return false;
@@ -80,15 +84,94 @@ export interface CompactInput {
   contextWindow: number | undefined;
   lastTurnUsedTools: boolean;
   deferOnTools: boolean;
+  /** 多步关键事务/交接/待决状态持有锁时，同样推迟到紧急硬上限前 */
+  contextLocked?: boolean;
 }
 
 export function decideAutoCompact(input: CompactInput): CompactDecision {
   const { contextTokens, threshold } = input;
   if (threshold <= 0 || contextTokens === undefined || contextTokens < threshold) return 'skip';
-  if (input.deferOnTools && input.lastTurnUsedTools && contextTokens < deferCeiling(threshold, input.contextWindow)) {
+  const busy = input.contextLocked === true || (input.deferOnTools && input.lastTurnUsedTools);
+  if (busy && contextTokens < deferCeiling(threshold, input.contextWindow)) {
     return 'defer';
   }
   return 'compact';
+}
+
+/**
+ * 扫描最近一次压缩摘要之后的事件，检查是否仍有未结算的后台任务（job/registered 且未 job/settled）。
+ */
+export function hasOpenBackgroundJobs(
+  events: readonly { type: string; data?: unknown; [key: string]: unknown }[] | undefined,
+): boolean {
+  if (!events || events.length === 0) return false;
+  let start = 0;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    if (events[i]!.type === 'compaction/summary') {
+      start = i + 1;
+      break;
+    }
+  }
+  const open = new Set<string>();
+  for (let i = start; i < events.length; i += 1) {
+    const ev = events[i]!;
+    if (ev.type !== 'job/registered' && ev.type !== 'job/settled') continue;
+    const body = (ev.data ?? ev) as { jobId?: unknown };
+    const id = typeof body.jobId === 'string' ? body.jobId.trim() : '';
+    if (!id) continue;
+    if (ev.type === 'job/registered') open.add(id);
+    else open.delete(id);
+  }
+  return open.size > 0;
+}
+
+/** 会话级关键事务租约管理器（TTL 兜底防止异常分支泄漏永久锁死压缩）。 */
+export class ContextLockManager {
+  private readonly leases = new Map<string, Map<string, { reason: string; expiresAt: number }>>();
+
+  public acquire(
+    sessionKey: string,
+    reason: string,
+    ttlMs = 10 * 60_000,
+    now = Date.now(),
+  ): () => void {
+    const id = randomUUID();
+    let perSession = this.leases.get(sessionKey);
+    if (perSession === undefined) {
+      perSession = new Map();
+      this.leases.set(sessionKey, perSession);
+    }
+    perSession.set(id, { reason, expiresAt: now + Math.max(1, ttlMs) });
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const bag = this.leases.get(sessionKey);
+      if (bag === undefined) return;
+      bag.delete(id);
+      if (bag.size === 0) this.leases.delete(sessionKey);
+    };
+  }
+
+  public status(sessionKey: string, now = Date.now()): { locked: boolean; reasons: string[] } {
+    const bag = this.leases.get(sessionKey);
+    if (bag === undefined || bag.size === 0) return { locked: false, reasons: [] };
+    const reasons: string[] = [];
+    for (const [id, entry] of bag) {
+      if (entry.expiresAt <= now) bag.delete(id);
+      else if (!reasons.includes(entry.reason)) reasons.push(entry.reason);
+    }
+    if (bag.size === 0) this.leases.delete(sessionKey);
+    return { locked: reasons.length > 0, reasons };
+  }
+
+  public clear(sessionKey: string): void {
+    this.leases.delete(sessionKey);
+  }
+
+  public clearAll(): void {
+    this.leases.clear();
+  }
 }
 
 /**

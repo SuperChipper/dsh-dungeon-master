@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { Logger } from '../types.ts';
-import { DEFAULT_PERSONA_ID, parsePersona, PersonaStore } from './persona-store.ts';
+import { DEFAULT_PERSONA_ID, parsePersona, PersonaStore, resolvePersonasDir } from './persona-store.ts';
 
 function setup() {
   const base = mkdtempSync(join(tmpdir(), 'qqbot-persona-'));
@@ -16,9 +16,16 @@ function setup() {
 }
 
 describe('parsePersona', () => {
-  it('读文件头的 name、names，正文作为 prompt', () => {
+  it('读文件头的 name、names，正文作为 prompt；支持可选 voiceId 且空值不挂载属性', () => {
     const persona = parsePersona('maid', '---\nname: 冷面女仆\nnames: [女仆, 小女仆]\n---\n【身份】女仆\n');
     expect(persona).toEqual({ id: 'maid', name: '冷面女仆', names: ['女仆', '小女仆'], prompt: '【身份】女仆' });
+    expect('voiceId' in persona).toBe(false);
+
+    const voiced = parsePersona('maid', '---\nname: 冷面女仆\nvoiceId: "  voice_abc123  "\n---\n【身份】女仆\n');
+    expect(voiced.voiceId).toBe('voice_abc123');
+
+    const emptyVoice = parsePersona('maid', '---\nname: 冷面女仆\nvoiceId: "   "\n---\n【身份】女仆\n');
+    expect('voiceId' in emptyVoice).toBe(false);
   });
 
   it('没有文件头时用文件名，CRLF 也能解析', () => {
@@ -128,5 +135,102 @@ describe('PersonaStore', () => {
     store.select('u1', 'maid', 'c2c');
     expect(open().currentId('u1', 'c2c')).toBe('maid');
     expect(open().sessionFor('g1', 'maid')).toBe('old-session');
+  });
+
+  it('支持 .group.md / .direct.md 按群聊和私聊分别加载，并在列表中按规范 id 去重', () => {
+    const { dir, open } = setup();
+    writeFileSync(join(dir, 'Gemini.group.md'), '---\nname: 哈基米\nnames: [吉米]\n---\n群聊版猫猫');
+    writeFileSync(join(dir, 'Gemini.direct.md'), '---\nname: 哈基米\nnames: [吉米]\n---\n私聊版深度猫猫');
+    writeFileSync(join(dir, 'fallback.md'), '---\nname: 通用\n---\n通用正文');
+    const store = open();
+    expect(store.list().map((p) => p.id)).toEqual(['Gemini', 'fallback']);
+    expect(store.find('哈基米')?.id).toBe('Gemini');
+    expect(store.find('Gemini.group')).toBeUndefined();
+    store.select('g1', 'Gemini', 'group');
+    store.select('u1', 'Gemini', 'c2c');
+    store.select('u2', 'fallback', 'c2c');
+    expect(store.current('g1', 'group')?.prompt).toBe('群聊版猫猫');
+    expect(store.current('u1', 'c2c')?.prompt).toBe('私聊版深度猫猫');
+    expect(store.current('u2', 'c2c')?.prompt).toBe('通用正文');
+  });
+
+  it('defaultPersona 读取并解析 default.{group,direct}.md 且不进 list()', () => {
+    const { dir, open } = setup();
+    writeFileSync(join(dir, 'default.group.md'), '---\nname: 默认\nnames: [大肥鱼, 小肥鱼]\n---\n默认群聊正文');
+    writeFileSync(join(dir, 'default.direct.md'), '---\nname: 默认\nnames: [大肥鱼]\n---\n默认私聊正文');
+    const store = open();
+    expect(store.list('group').map((p) => p.id)).toEqual([]);
+    expect(store.list('c2c').map((p) => p.id)).toEqual([]);
+    expect(store.current('g1', 'group')).toBeUndefined();
+    expect(store.defaultPersona('group')).toEqual({
+      id: DEFAULT_PERSONA_ID,
+      name: '默认',
+      names: ['大肥鱼', '小肥鱼'],
+      prompt: '默认群聊正文',
+    });
+    expect(store.defaultPersona('c2c')).toEqual({
+      id: DEFAULT_PERSONA_ID,
+      name: '默认',
+      names: ['大肥鱼'],
+      prompt: '默认私聊正文',
+    });
+  });
+
+  it('持久化人设切换事务支持 beginTransition → commitTransition → finishTransition 及崩溃持久化恢复', () => {
+    const { dir, open } = setup();
+    writeFileSync(join(dir, 'maid.md'), '女仆正文');
+    const store = open();
+    const begun = store.beginTransition({
+      scope: 'group',
+      peerId: 'g1',
+      fromPersona: DEFAULT_PERSONA_ID,
+      toPersona: 'maid',
+      sourceSessionId: 's-default',
+      targetSessionId: 's-maid',
+    });
+    expect(begun.phase).toBe('handoff');
+    expect(open().getTransition('g1', 'group')).toEqual(begun);
+
+    const committed = store.commitTransition('g1', 'group');
+    expect(committed?.phase).toBe('committing');
+    const reloaded = open();
+    expect(reloaded.currentId('g1', 'group')).toBe('maid');
+    expect(reloaded.sessionFor('g1', DEFAULT_PERSONA_ID, 'group')).toBe('s-default');
+    expect(reloaded.sessionFor('g1', 'maid', 'group')).toBe('s-maid');
+    expect(reloaded.getTransition('g1', 'group')?.phase).toBe('committing');
+
+    reloaded.finishTransition('g1', 'group');
+    expect(open().getTransition('g1', 'group')).toBeUndefined();
+    expect(open().currentId('g1', 'group')).toBe('maid');
+  });
+});
+
+describe('resolvePersonasDir', () => {
+  it('显式 root 支持绝对路径和按 cwd 解析相对路径，留空时优先插件根目录再回退 ~/.dsh-qqbot/personas', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qqbot-persona-dir-'));
+    const pluginWithPersonas = join(root, 'plugin-with');
+    const pluginEmpty = join(root, 'plugin-empty');
+    const pluginOnlyHelper = join(root, 'plugin-helper');
+    mkdirSync(join(pluginWithPersonas, 'personas'), { recursive: true });
+    mkdirSync(join(pluginEmpty, 'personas'), { recursive: true });
+    mkdirSync(join(pluginOnlyHelper, 'personas'), { recursive: true });
+    writeFileSync(join(pluginWithPersonas, 'personas', 'default.group.md'), '群聊默认');
+    writeFileSync(join(pluginOnlyHelper, 'personas', '_shared.md'), '共用片段');
+
+    const absTarget = join(root, 'custom-personas');
+    expect(resolvePersonasDir({ root: `  ${absTarget}  `, cwd: root, pluginRoot: pluginWithPersonas, homeDir: root }))
+      .toBe(absTarget);
+
+    expect(resolvePersonasDir({ root: 'my-personas', cwd: root, pluginRoot: pluginWithPersonas, homeDir: root }))
+      .toBe(join(root, 'my-personas'));
+
+    expect(resolvePersonasDir({ root: '', cwd: root, pluginRoot: pluginWithPersonas, homeDir: root }))
+      .toBe(join(pluginWithPersonas, 'personas'));
+
+    expect(resolvePersonasDir({ root: '', cwd: root, pluginRoot: pluginEmpty, homeDir: root }))
+      .toBe(join(root, '.dsh-qqbot', 'personas'));
+
+    expect(resolvePersonasDir({ root: '', cwd: root, pluginRoot: pluginOnlyHelper, homeDir: root }))
+      .toBe(join(root, '.dsh-qqbot', 'personas'));
   });
 });

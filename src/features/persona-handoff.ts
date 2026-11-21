@@ -274,6 +274,15 @@ export class PersonaHandoffStore {
     this.save(state);
   }
 
+  /** 启动/恢复检测到遗留的 generating 交接时将其标为失败，避免后续切换永久悬挂。 */
+  public recoverInterrupted(chatKey: string, error = '切换中途中断，未完成交接'): boolean {
+    const state = this.read(chatKey);
+    if (state.pending?.status !== 'generating') return false;
+    state.pending = { ...state.pending, status: 'failed', error };
+    this.save(state);
+    return true;
+  }
+
   public delivery(chatKey: string, persona: string, sessionId: string, force = false): { text: string; version: number; attemptId?: string } | undefined {
     const state = this.read(chatKey);
     const receipt = state.received[persona];

@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest';
-import { compactThreshold, decideAutoCompact, deferCeiling, lastTurnUsedTools, type CompactPolicyConfig } from './compact-policy.ts';
+import {
+  ContextLockManager,
+  compactThreshold,
+  decideAutoCompact,
+  deferCeiling,
+  hasOpenBackgroundJobs,
+  lastTurnUsedTools,
+  shouldIdleCompact,
+  type CompactPolicyConfig,
+} from './compact-policy.ts';
 
 const cfg: CompactPolicyConfig = { autoCompactTokens: 120000, autoCompactPrivateRatio: 0.5, autoCompactDeferOnTools: true };
 
@@ -82,5 +91,56 @@ describe('lastTurnUsedTools', () => {
   it('没有事件 / 还没结束过一轮 → false', () => {
     expect(lastTurnUsedTools(undefined)).toBe(false);
     expect(lastTurnUsedTools(ev('turn/start', 'tool/call'))).toBe(false);
+  });
+});
+
+describe('ContextLock 与后台任务保护', () => {
+  it('contextLocked 在阈值与硬上限之间推迟 autoCompact，超硬上限仍强制压缩', () => {
+    const base = { threshold: 500000, contextWindow: 1_000_000, lastTurnUsedTools: false, deferOnTools: false };
+    expect(decideAutoCompact({ ...base, contextTokens: 600000, contextLocked: true })).toBe('defer');
+    expect(decideAutoCompact({ ...base, contextTokens: 749999, contextLocked: true })).toBe('defer');
+    expect(decideAutoCompact({ ...base, contextTokens: 750000, contextLocked: true })).toBe('compact');
+  });
+
+  it('contextLocked 时禁止空闲压缩', () => {
+    expect(shouldIdleCompact({
+      contextTokens: 200000,
+      minTokens: 100000,
+      idleMs: 30 * 60_000,
+      minIdleMs: 20 * 60_000,
+      provider: 'google',
+      providers: 'google',
+      contextLocked: true,
+    })).toBe(false);
+  });
+
+  it('ContextLockManager 支持多租约叠加、幂等释放与 TTL 自动过期', () => {
+    const locks = new ContextLockManager();
+    const t0 = 1_000_000;
+    const releaseA = locks.acquire('s1', 'multi-step', 10_000, t0);
+    const releaseB = locks.acquire('s1', 'persona-switch', 5_000, t0);
+    expect(locks.status('s1', t0 + 100)).toEqual({ locked: true, reasons: ['multi-step', 'persona-switch'] });
+
+    releaseB();
+    releaseB();
+    expect(locks.status('s1', t0 + 100)).toEqual({ locked: true, reasons: ['multi-step'] });
+
+    expect(locks.status('s1', t0 + 10_001)).toEqual({ locked: false, reasons: [] });
+    releaseA();
+  });
+
+  it('hasOpenBackgroundJobs 仅在最近摘要后存在未 settled 的 job 时返回 true', () => {
+    expect(hasOpenBackgroundJobs([
+      { type: 'job/registered', data: { jobId: 'old-job' } },
+      { type: 'compaction/summary', data: {} },
+      { type: 'job/registered', data: { jobId: 'j1' } },
+      { type: 'job/settled', data: { jobId: 'j1' } },
+    ])).toBe(false);
+
+    expect(hasOpenBackgroundJobs([
+      { type: 'job/registered', data: { jobId: 'j1' } },
+      { type: 'job/registered', data: { jobId: 'j2' } },
+      { type: 'job/settled', data: { jobId: 'j1' } },
+    ])).toBe(true);
   });
 });

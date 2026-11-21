@@ -91,4 +91,41 @@ describe('SessionManager voice reply delivery', () => {
     expect(next).toHaveBeenCalledTimes(1);
     expect(nextExec.concludeTurn).not.toHaveBeenCalled();
   });
+
+  it('注入 qqbot:voice-routing 触发指引，并在 speak.enabled=false 时跳过', async () => {
+    type AssembleHandler = (
+      assembly: unknown,
+      context: { agent?: unknown },
+      next: () => Promise<{ sections?: Array<{ name: string; order?: number; text: string }> }>,
+    ) => Promise<{ sections?: Array<{ name: string; order?: number; text: string }> }>;
+
+    const runAssemble = async (speakEnabled: boolean) => {
+      const agent = { session: { id: 's1' } };
+      const record = { sessionKey: 'qqbot:group:g', scope: 'group', peerId: 'g', agent };
+      let assemble!: AssembleHandler;
+      const manager = {
+        ctx: { on: (event: string, callback: AssembleHandler) => { expect(event).toBe('system-prompt/assemble'); assemble = callback; } },
+        logger: { info: vi.fn(), warn: vi.fn() },
+        config: { cwd: '/tmp', speak: { enabled: speakEnabled } },
+        findByAgent: (value: unknown) => (value === agent ? record : undefined),
+      };
+      (SessionManager.prototype as unknown as { registerScopePromptInjection(): void }).registerScopePromptInjection.call(manager);
+      return assemble({}, { agent }, async () => ({ sections: [] }));
+    };
+
+    const enabled = await runAssemble(true);
+    const voiceSection = enabled.sections?.find((s) => s.name === 'qqbot:voice-routing');
+    expect(voiceSection).toBeDefined();
+    expect(voiceSection?.text).toContain('大喊一声');
+    expect(voiceSection?.text).toContain('念一下');
+    expect(voiceSection?.text).toContain('qqbot_speak');
+    expect(voiceSection?.text).toContain('（大声喊）');
+    expect(voiceSection?.text).toContain('qqbot_sing');
+
+    const captionSection = enabled.sections?.find((s) => s.name === 'qqbot:media-caption');
+    expect(captionSection?.text).toContain('不发媒体也不发语音时正常文字回复');
+
+    const disabled = await runAssemble(false);
+    expect(disabled.sections?.find((s) => s.name === 'qqbot:voice-routing')).toBeUndefined();
+  });
 });
