@@ -18,6 +18,7 @@ import { personaCommand } from './persona.ts';
 import { dndCommand } from './dnd.ts';
 import { cleanupCommand } from './cleanup.ts';
 import { notesCommand } from './notes.ts';
+import { doctorCommand } from './doctor.ts';
 
 /**
  * 构建标准命令列表
@@ -39,6 +40,7 @@ export function buildCommandList(deps: CommandDeps): CategorizedCommand[] {
     dndCommand(deps),
     cleanupCommand(deps),
     notesCommand(deps),
+    doctorCommand(deps),
   ];
 
   // help 需要访问完整列表（含自身），通过闭包惰性引用
