@@ -98,4 +98,19 @@ describe('qqbot_tool_access', () => {
     const message = (await tool.execute({ action: 'status' }, { agent: groupAgent })).message;
     expect(message).toBe('本会话不在终端白名单里。');
   });
+
+  it('onChange 仅在实际变更白名单时触发（幂等操作不触发）', async () => {
+    const { access, tool, ownerAgent } = setup();
+    const changes: Array<{ kind: string; id: string }> = [];
+    access.onChange = (kind, id) => changes.push({ kind, id });
+
+    await tool.execute({ action: 'grant', group: GROUP }, { agent: ownerAgent });
+    await tool.execute({ action: 'grant', group: GROUP }, { agent: ownerAgent }); // 幂等
+    await tool.execute({ action: 'revoke', group: GROUP }, { agent: ownerAgent });
+    await tool.execute({ action: 'revoke', group: GROUP }, { agent: ownerAgent }); // 幂等
+    expect(changes).toEqual([
+      { kind: 'group', id: GROUP },
+      { kind: 'group', id: GROUP },
+    ]);
+  });
 });

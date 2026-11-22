@@ -6,9 +6,9 @@
  * 解析失败或结构异常时拒绝写入、保留原文件（避免覆盖用户其他配置）。
  */
 import { resolve } from 'node:path';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { readFileSync, existsSync } from 'node:fs';
 import yaml from 'js-yaml';
+import { writeTextAtomic } from '../shared/atomic-fs.ts';
 
 /** 凭据结果 */
 export interface SetupCredentials {
@@ -76,8 +76,7 @@ export function persistCredentialsToProfile(
     // 3. dump 写回（保证合法 YAML）
     //    先确保 profile 目录存在（文件不存在时也能正常创建，而非误入 ENOENT）
     const output = `# QQ 机器人凭据（扫码绑定自动生成）\n${yaml.dump(entries)}`;
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(patchPath, output, 'utf8');
+    writeTextAtomic(patchPath, output);
     log.info(`✔ 凭据已写入: ${patchPath}`);
     log.info(`  下次启动将自动使用保存的凭据`);
     return true;
@@ -119,8 +118,7 @@ export function removeCredentialsFromProfile(
     // 无条件写回：幂等场景（凭据字段已不存在）也更新 mtime——
     // 宿主 HMR 靠文件变化触发重载，不写则 bound fiber 永不卸载，
     // 解绑后状态会一直停留在 bound
-    mkdirSync(profileDir, { recursive: true });
-    writeFileSync(patchPath, yaml.dump(entries), 'utf8');
+    writeTextAtomic(patchPath, yaml.dump(entries));
     log.info(`✔ 凭据已移除: ${patchPath}`);
     log.info(`  插件将重新进入绑定流程`);
     return true;
@@ -173,8 +171,7 @@ export function updateProfileConfig(
       entries.push({ id: 'im-qqbot', config: rest });
     }
 
-    mkdirSync(profileDir, { recursive: true });
-    writeFileSync(patchPath, yaml.dump(entries), 'utf8');
+    writeTextAtomic(patchPath, yaml.dump(entries));
     log.info(`✔ 配置已保存: ${patchPath}`);
     log.info(`  插件将自动重载`);
     return true;
@@ -197,7 +194,6 @@ export function updateProfileAllowedGroups(
   const validIds = (value: unknown): value is string[] => Array.isArray(value) && value.every((id) => typeof id === 'string' && id.trim() !== '');
   const normalize = (ids: readonly string[]) => [...new Set(ids.map((id) => id.trim()))].sort();
   const path = resolve(profileDir, 'cordis.patch.yml');
-  const tmp = `${path}.${randomUUID()}.tmp`;
   try {
     if (!validIds(groups)) throw new Error('invalid groups');
     const original = existsSync(path) ? readFileSync(path, 'utf8') : '';
@@ -219,16 +215,12 @@ export function updateProfileAllowedGroups(
     // approval rather than overwriting that edit with the old in-memory list.
     if (expectedGroups && stored !== undefined && JSON.stringify(normalize(stored)) !== JSON.stringify(normalize(expectedGroups))) throw new Error('stale groups');
     rows[index] = { ...row, config: { ...config, [section]: { ...part, allowedGroups: [...new Set(groups.map((id) => id.trim()))] } } };
-    mkdirSync(profileDir, { recursive: true });
-    writeFileSync(tmp, yaml.dump(rows), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-    renameSync(tmp, path);
+    writeTextAtomic(path, yaml.dump(rows), { mode: 0o600, exclusive: true });
     return true;
   } catch {
     // YAML errors may quote the surrounding lines, which can contain credentials.
     logger.warn(`im-qqbot: ${section}.allowedGroups 保存失败，配置未替换；请检查 profile 结构或是否有并发修改`);
     return false;
-  } finally {
-    try { rmSync(tmp, { force: true }); } catch { /* leave the active profile untouched */ }
   }
 }
 

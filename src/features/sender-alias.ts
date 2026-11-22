@@ -6,9 +6,9 @@
  * 由代码用这张表换回去，模型永远不需要写 openid。
  * 路径：~/.dsh/qqbot-memory/<appId>-<groupId>.aliases.json（和群记忆放一起）
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { existsSync, readFileSync } from 'node:fs';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
+import { qqbotMemoryDir, senderAliasesPath } from '../shared/paths.ts';
 
 const ALIAS_PATTERN = /^#?\s*u(\d+)$/i;
 
@@ -17,10 +17,6 @@ interface GroupTable {
   byAlias: Map<string, string>;
   /** openid → 别名 */
   byOpenid: Map<string, string>;
-}
-
-function sanitize(s: string): string {
-  return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
 /** 是不是别名的写法（U3 / #U3 / u3），是的话返回规范形式 U3 */
@@ -32,10 +28,10 @@ export function normalizeAlias(value: string): string | undefined {
 export class SenderAliasStore {
   private readonly tables = new Map<string, GroupTable>();
 
-  constructor(private readonly dir: string = resolve(homedir(), '.dsh', 'qqbot-memory')) {}
+  constructor(private readonly dir?: string) {}
 
   private path(appId: string, groupId: string): string {
-    return resolve(this.dir, `${sanitize(appId)}-${sanitize(groupId)}.aliases.json`);
+    return senderAliasesPath(appId, groupId, this.dir ?? qqbotMemoryDir());
   }
 
   private table(appId: string, groupId: string): GroupTable {
@@ -63,9 +59,7 @@ export class SenderAliasStore {
 
   private save(appId: string, groupId: string, table: GroupTable): void {
     try {
-      const p = this.path(appId, groupId);
-      mkdirSync(dirname(p), { recursive: true });
-      writeFileSync(p, JSON.stringify({ aliases: Object.fromEntries(table.byAlias) }, null, 2), 'utf8');
+      writeJsonAtomic(this.path(appId, groupId), { aliases: Object.fromEntries(table.byAlias) }, { indent: 2 });
     } catch {
       /* 写失败时内存里的表照常用，本进程内别名仍然稳定 */
     }

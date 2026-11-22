@@ -4,9 +4,9 @@
  * 隔离文件 I/O 操作，便于单元测试时 mock。
  * 存储路径：~/.dsh-qqbot/model-prefs.json
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
-import { homedir } from 'node:os';
+import { readFileSync, existsSync } from 'node:fs';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
+import { qqbotModelPrefsPath } from '../shared/paths.ts';
 import type { ModelRoute } from './types.ts';
 
 /** 日志回调（可选） */
@@ -37,7 +37,7 @@ export class PrefsStore {
   private readonly debugLog?: DebugFn;
 
   constructor(debugLog?: DebugFn) {
-    this.prefsPath = resolve(homedir(), '.dsh-qqbot', 'model-prefs.json');
+    this.prefsPath = qqbotModelPrefsPath();
     this.debugLog = debugLog;
     this.load();
   }
@@ -154,14 +154,13 @@ export class PrefsStore {
 
   private write(): void {
     try {
-      mkdirSync(dirname(this.prefsPath), { recursive: true });
       const data: PrefsFile = {
         overrides: Object.fromEntries(this.overrides.entries()),
         ...(this.failover === undefined ? {} : { failover: this.failover }),
         sessionIds: Object.fromEntries(this.sessionIds.entries()),
         presets: Object.fromEntries(this.presets.entries()),
       };
-      writeFileSync(this.prefsPath, JSON.stringify(data, null, 2), 'utf8');
+      writeJsonAtomic(this.prefsPath, data, { indent: 2 });
     } catch (err) {
       this.debugLog?.(`writePrefs failed: ${err instanceof Error ? err.message : String(err)}`);
     }

@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -13,6 +13,7 @@ vi.mock('node:os', async (importOriginal) => {
 const {
   appendGroupMessage,
   appendBotGroupMessage,
+  clearGroupMemoryCache,
   extractSentMessageId,
   isBotMemoryEntry,
   readAllGroupMessages,
@@ -31,6 +32,7 @@ function seed(n: number): void {
 
 describe('group memory history cursor', () => {
   beforeEach(() => {
+    clearGroupMemoryCache();
     fakeHome.dir = mkdtempSync(join(tmpdir(), 'gm-home-'));
   });
 
@@ -149,5 +151,33 @@ describe('group memory history cursor', () => {
       .toEqual(['u1', 'u2', 'u3']);
     expect(readGroupMessagesAfter('app', 'g1', 3, 'u1', 'u4', { includeSelf: false }).map((e) => e.messageId))
       .toEqual(['u2', 'u3']);
+  });
+
+  it('内存缓存与追加写一致、返回副本防篡改，且外部修改或删除时自动失效', () => {
+    seed(2);
+    const first = readAllGroupMessages('app', 'g1');
+    expect(first.map((e) => e.messageId)).toEqual(['m1', 'm2']);
+
+    // 返回值应是独立副本，调用方改动不影响缓存
+    first.pop();
+    expect(readAllGroupMessages('app', 'g1').map((e) => e.messageId)).toEqual(['m1', 'm2']);
+
+    // 热缓存期间 appendGroupMessage 同步更新缓存
+    appendGroupMessage('app', 'g1', { messageId: 'm3', senderId: 'u', content: 'msg 3', timestamp: 3 });
+    expect(readAllGroupMessages('app', 'g1').map((e) => e.messageId)).toEqual(['m1', 'm2', 'm3']);
+
+    // 外部覆盖文件内容时（大小改变），下次读取失效并重新解析
+    const memFile = join(fakeHome.dir, '.dsh', 'qqbot-memory', 'app-g1.jsonl');
+    writeFileSync(memFile, `${JSON.stringify({ messageId: 'ext-1', senderId: 'u', content: 'external replacement line', timestamp: 10 })}\n`, 'utf8');
+    expect(readAllGroupMessages('app', 'g1').map((e) => e.messageId)).toEqual(['ext-1']);
+
+    // 游标原子写入不残留临时文件
+    writeHistoryCursor('app', 'g1', { sessionId: 's1', messageId: 'ext-1' });
+    const files = readdirSync(join(fakeHome.dir, '.dsh', 'qqbot-memory'));
+    expect(files.filter((f) => f.includes('.tmp'))).toEqual([]);
+
+    // 删除底层文件后读取返回空
+    rmSync(memFile);
+    expect(readAllGroupMessages('app', 'g1')).toEqual([]);
   });
 });

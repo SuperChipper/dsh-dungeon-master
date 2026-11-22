@@ -10,10 +10,9 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { ContentBlock } from '@deepseek-ai/dsh-llm';
 import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { resolve } from 'node:path';
 import type { Logger } from '../types.ts';
 import type { SessionManager } from '../session/session-manager.ts';
+import { senderAliasesPath } from '../shared/paths.ts';
 import { isBotMemoryEntry, listMemoryChats, readAllGroupMessages } from './group-memory.ts';
 
 export const HISTORY_SEARCH_TOOL_NAME = 'qqbot_history_search';
@@ -108,7 +107,7 @@ function entryTime(entry: RawEntry): number {
 function aliasMap(appId: string, chat: string): Map<string, string> {
   const map = new Map<string, string>();
   try {
-    const p = resolve(homedir(), '.dsh', 'qqbot-memory', `${appId}-${chat}.aliases.json`);
+    const p = senderAliasesPath(appId, chat);
     if (!existsSync(p)) return map;
     const raw = JSON.parse(readFileSync(p, 'utf8')) as { aliases?: Record<string, string> };
     for (const [alias, openid] of Object.entries(raw.aliases ?? {})) {

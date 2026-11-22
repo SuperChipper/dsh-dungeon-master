@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { QUOTE_MISSING_NOTE } from '../features/chat-record.ts';
 import type { ResolvedQuote } from '@tencent-connect/qqbot-nodejs';
-import { buildAgentBody, buildQuotePart, buildUserMessage, sanitizeNotesQuery } from './inbound.ts';
+import { buildAgentBody, buildQuotePart, buildUserMessage, renderMediaLine, sanitizeNotesQuery } from './inbound.ts';
+import { resolveMediaRef } from '../media/media-ref-store.ts';
 import { extractExactTerms, EXACT_STRONG_SCORE } from '../features/exact-match.ts';
 import { quoteSenderFill } from '../gateway/middleware-setup.ts';
 import { makeSenderLabeler } from '../features/message-format.ts';
@@ -38,6 +39,32 @@ describe('buildUserMessage', () => {
     expect(missing).toBe(`[Platform context begins]\n1. 我写的是十条\n[Platform context ends]\n[Quoted message from 未知发送者]\n${QUOTE_MISSING_NOTE}\n[Quoted message ends]\n`);
     const known = buildQuotePart({ refKey: 'r', source: 'msg_elements', text, entry: { messageId: 'm', senderId: 'u2', senderName: '乙', content: '原话', timestamp: '' } }, label);
     expect(known).toContain('[Quoted message from [乙 #U2]]\n原话\n[Quoted message ends]');
+  });
+
+  it('引用内容或 entry.content 里残留的 QQ CDN 图片长 URL 自动折叠为 qqref，普通链接保留', () => {
+    const qqUrl = 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=QUOTED&rkey=secret_key';
+    const normalUrl = 'https://example.com/docs';
+    const fromText = buildQuotePart(
+      { refKey: 'r1', source: 'store', text: `看这张 ${qqUrl} 和 ${normalUrl}`, entry: { messageId: 'm1', senderId: 'u2', senderName: '乙', content: `看这张 ${qqUrl}`, timestamp: '' } },
+      label,
+    );
+    expect(fromText).not.toContain('multimedia.nt.qq.com.cn');
+    expect(fromText).toContain(normalUrl);
+    const matched = /qqref:[0-9a-f]{10}/.exec(fromText);
+    expect(matched).not.toBeNull();
+    expect(resolveMediaRef(matched![0])?.url).toBe(qqUrl);
+
+    const fromEntryFallback = buildQuotePart(
+      {
+        refKey: 'r2',
+        source: 'msg_elements',
+        text: '=== 消息 1 ===\n[消息类型] 引用消息\n',
+        entry: { messageId: 'm2', senderId: 'u2', senderName: '乙', content: `原图 ${qqUrl}`, timestamp: '' },
+      },
+      label,
+    );
+    expect(fromEntryFallback).not.toContain('multimedia.nt.qq.com.cn');
+    expect(fromEntryFallback).toMatch(/qqref:[0-9a-f]{10}/);
   });
 
   it('私聊不加发送者标签，只在有引用时分隔', () => {
@@ -136,7 +163,20 @@ describe('sanitizeNotesQuery', () => {
     expect(cleaned).not.toContain('Voice message');
   });
 
-  it('纯图片/表情占位清洗后为空串，不拿「图片」去搜笔记', () => {
-    expect(sanitizeNotesQuery('[图片] 【表情: 捂脸】 [表情包]')).toBe('');
+  it('纯图片/表情占位与 qqref 短引用清洗后为空串，不拿无意义占位去搜笔记', () => {
+    expect(sanitizeNotesQuery('[图片] 【表情: 捂脸】 [表情包] qqref:0123abcd89')).toBe('');
+  });
+});
+
+describe('renderMediaLine', () => {
+  it('已下载图片输出本地路径；未下载图片映射为 qqref 短引用而不是原 URL', () => {
+    expect(renderMediaLine('image', 'a.png', 'C:/media/a.png', 'https://q/a.png', undefined)).toBe('Image: C:/media/a.png');
+
+    const longUrl = 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=XYZ&rkey=r_secret';
+    const line = renderMediaLine('image', 'pic.png', undefined, longUrl, undefined);
+    expect(line).toMatch(/^Image: qqref:[0-9a-f]{10} \(pic\.png, 未下载\)$/);
+    expect(line).not.toContain('multimedia.nt.qq.com.cn');
+    const ref = /^Image: (qqref:[0-9a-f]{10})/.exec(line)![1]!;
+    expect(resolveMediaRef(ref)?.url).toBe(longUrl);
   });
 });

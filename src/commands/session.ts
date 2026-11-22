@@ -44,7 +44,7 @@ export function compactCommand({ manager }: CommandDeps): CategorizedCommand {
         case 'no-session':
           return '当前无活跃会话';
         case 'busy':
-          return '正在生成中，无法压缩';
+          return '正在生成或压缩中，无法重复压缩';
         case 'unavailable':
           return '压缩能力不可用（当前会话的 agent preset 未加载 compaction 服务）';
         default:

@@ -1,5 +1,3 @@
-import { isAutoSteerTurnEnd } from '../transport/turn-steer.ts';
-import { MediaReviewCoordinator } from '../features/media-review-coordinator.ts';
 /**
  * 网关组装 — 创建 bot、编排中间件、注册事件、出站、生命周期
  *
@@ -7,184 +5,46 @@ import { MediaReviewCoordinator } from '../features/media-review-coordinator.ts'
  * dsh session/event → createOutboundHandler → QQ 出站。
  */
 import type { Context } from '@deepseek-ai/cordis';
-import { existsSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { QQBot } from '@tencent-connect/qqbot-nodejs';
-import type { GatewayDisconnect, InteractionEvent, MiddlewareContext } from '@tencent-connect/qqbot-nodejs';
+import type { GatewayDisconnect, MiddlewareContext } from '@tencent-connect/qqbot-nodejs';
 import { SessionManager, type DshAgent, type DshAgentRegistry } from '../session/index.ts';
 import { handleInbound, createOutboundHandler } from '../transport/index.ts';
-import { SelfSentIndex, mediaQuoteText, mediaRefIdx } from '../transport/self-sent.ts';
-import { renderOutboundMentions } from '../features/member-mention.ts';
+import { SelfSentIndex } from '../transport/self-sent.ts';
 import { parseStreamFrame } from '../transport/events.ts';
-import { ReplyLimiter } from '../transport/reply-limiter.ts';
-import { PeerSendQueue } from '../transport/peer-send-queue.ts';
-import { cacheMsgId, cacheEventId } from '../transport/msgid-cache.ts';
-import { resolveReplyTarget, sendResolvedMarkdown } from '../transport/reply-target.ts';
+import { isAutoSteerTurnEnd } from '../transport/turn-steer.ts';
+import { cacheMsgId } from '../transport/msgid-cache.ts';
 import type { ToolsRegistryLike } from '../transport/tool-presenter.ts';
-import type { QQBotSender } from '../transport/outbound-buffer.ts';
 import { QuestionChannel } from '../features/question-channel.ts';
 import { ApprovalChannel, type ApprovalChannelContext } from '../features/approval-channel.ts';
 import { singingWaitGuard } from '../features/singing-wait-guard.ts';
-import { BiliClient } from '../bili/client.ts';
-import { registerBiliTools } from '../bili/tools.ts';
-import { biliPermission } from '../bili/permissions.ts';
-import { decodeButtonData } from '../features/button-utils.ts';
-import { PLUGIN_ROOT, buildUserAgent, isPrivilegedSender, privilegedOpenids } from '../shared/index.ts';
-import { NOTE_JUDGE_DEFAULTS, type ImQQBotConfig } from '../config.ts';
-import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
-import { appendBotGroupMessage, resolveBotSenderName } from '../features/group-memory.ts';
-import { setupMiddlewares } from './middleware-setup.ts';
-import { MEDIA_ROOT } from '../media/media-cleaner.ts';
-import { startCleanup } from '../media/cleanup.ts';
-import { ensureVisionInputModal, registerDescribeImageTool } from '../media/vision-tool.ts';
-import { locateFfmpeg, registerDescribeVideoTool } from '../media/video-tool.ts';
-import { registerTranscribeTool } from '../media/transcribe-tool.ts';
-import { registerSendFileTool, withFreshReplyTarget, type MediaSenderLike } from '../media/send-file-tool.ts';
-import { registerImageGenTool } from '../media/image-gen-tool.ts';
-import { registerVideoFetchTool } from '../media/video-fetch-tool.ts';
-import { registerSingTool } from '../media/sing-tool.ts';
-import { ModelWatch, isWatchedProvider } from '../model/status-watch.ts';
-import { registerSpeakTool } from '../media/speak-tool.ts';
-import { StickerStore } from '../media/sticker-store.ts';
-import { registerSaveStickerTool } from '../media/save-sticker-tool.ts';
-import { registerMatchStickerTool } from '../media/match-sticker-tool.ts';
-import { registerReverseImageTool } from '../media/reverse-image-tool.ts';
-import { registerHistorySearchTool } from '../features/history-tool.ts';
-import { registerPetNativeBalance } from '../pet/native-balance.ts';
-import { NotesStore } from '../notes/notes-store.ts';
-import { NoteMetricsStore } from '../notes/note-metrics.ts';
-import { EmbeddingCache, createOpenAIEmbedder, resolveEmbeddingApiKey } from '../notes/embedding.ts';
-import { ensureTmpDir, resolveTmpDir } from '../media/tmp-dir.ts';
-import { registerNotesTools } from '../notes/notes-tools.ts';
-import { registerFanartPickTool } from '../fanart/fanart-tool.ts';
-import { registerBooruFetchTool } from '../fanart/booru-tool.ts';
-import { createHttpGet } from '../fanart/http.ts';
-import { FanartSeenStore, markSentCandidate } from '../fanart/seen.ts';
-import { CampaignStore } from '../dnd/campaign.ts';
-import { AdventureLibrary } from '../dnd/adventure.ts';
-import { DndService } from '../dnd/dnd-service.ts';
-import { registerDndTools } from '../dnd/dnd-tools.ts';
-import { DndCombatAgents } from '../dnd/combat-agent.ts';
-import { DndToolScope } from '../dnd/tool-scope.ts';
-import { ACK, DndTurnButtons } from '../dnd/turn-buttons.ts';
+import { MediaReviewCoordinator } from '../features/media-review-coordinator.ts';
 import { PersonaStore, resolvePersonasDir } from '../features/persona-store.ts';
 import { PersonaSwitch } from '../features/persona-switch.ts';
 import { ToolAccess, ToolAccessStore } from '../features/tool-access.ts';
-import { getSenderAliases, memberIdsFor } from '../features/sender-alias.ts';
-import { createToolGuard } from '../shared/tool-guard.ts';
-import { registerBrowserTool } from '../browser/browser-tool.ts';
 import { GroupAccess, type GroupAccessFeature } from '../features/group-access.ts';
-import { resolveProfileDir } from '../shared/utils.ts';
-import { updateProfileAllowedGroups } from '../setup/persist.ts';
+import { registerAccessTool } from '../features/access-tool.ts';
+import { SessionToolScope } from '../features/session-tool-scope.ts';
 import type { JudgeLlm } from '../features/reply-judge.ts';
 import { NoteJudge } from '../features/note-judge.ts';
+import { NoteMetricsStore } from '../notes/note-metrics.ts';
+import { DndTurnButtons } from '../dnd/turn-buttons.ts';
+import { MEDIA_ROOT } from '../media/media-cleaner.ts';
+import { startCleanup } from '../media/cleanup.ts';
+import { ensureTmpDir, resolveTmpDir } from '../media/tmp-dir.ts';
+import { PLUGIN_ROOT, buildUserAgent, isPrivilegedSender, privilegedOpenids, resolveProfileDir } from '../shared/index.ts';
+import { createToolGuard } from '../shared/tool-guard.ts';
+import { updateProfileAllowedGroups } from '../setup/persist.ts';
+import { NOTE_JUDGE_DEFAULTS, type ImQQBotConfig } from '../config.ts';
+import type { Logger } from '../types.ts';
+import { setupMiddlewares } from './middleware-setup.ts';
+import { bindInteractionHandler, dispatchInteraction } from './interaction.ts';
+import { createDndService, createNotesStore, createStickerStore } from './stores.ts';
+import { createGatewaySenders } from './senders.ts';
+import { registerGatewayTools } from './media-tools.ts';
+import { startModelWatch } from './model-watch.ts';
+import { wireDndTools } from './dnd-wiring.ts';
 
-/**
- * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
- * channel（question / approval）。QQ 只有一个 interaction 入口，集中路由
- * 避免多通道各自 try 导致误判。
- */
-export function dispatchInteraction(
-  event: InteractionEvent,
-  manager: SessionManager,
-  dndButtons?: DndTurnButtons,
-  toolAccess?: ToolAccess,
-  groupAccess?: Partial<Record<GroupAccessFeature, GroupAccess>>,
-  personaSwitch?: PersonaSwitch,
-): number {
-  const raw = event.data?.resolved?.button_data;
-  if (!raw) return ACK.duplicate;
-  const button = decodeButtonData(raw);
-  if (!button) return ACK.duplicate;
-  // 跑团按钮自己决定返回码：不是本人点「结束回合」时回 denied，QQ 会弹无权限提示
-  if (button.t === 'dnd') return dndButtons?.handleInteraction(event) ?? ACK.duplicate;
-  // 终端白名单确认：只认主人点击，别人点回 denied
-  if (button.t === 'access') return toolAccess?.handleInteraction(event) ?? ACK.duplicate;
-  if (button.t === 'browser-access') return groupAccess?.browser?.handleInteraction(event) ?? ACK.duplicate;
-  if (button.t === 'image-gen-access') return groupAccess?.imageGen?.handleInteraction(event) ?? ACK.duplicate;
-  if (button.t === 'persona') return personaSwitch?.handleInteraction(event) ?? ACK.duplicate;
-  const matched = button.t === 'question'
-    ? manager.questionChannel?.handleInteraction(event) ?? false
-    : manager.approvalChannel?.handleInteraction(event) ?? false;
-  return matched ? ACK.ok : ACK.duplicate;
-}
-
-/** 解析表情包目录与允许来源，构建 StickerStore（关闭时返回 undefined） */
-function createStickerStore(config: ImQQBotConfig, logger: Logger): StickerStore | undefined {
-  const stickers = config.stickers ?? {
-    enabled: true,
-    root: '',
-    extraRoots: [],
-    maxBytes: 8 * 1024 * 1024,
-    maxAutoEntries: 200,
-  };
-  if (!stickers.enabled) return undefined;
-
-  const configuredRoot = stickers.root.trim();
-  const root = configuredRoot === ''
-    ? resolve(PLUGIN_ROOT, 'stickers')
-    : (isAbsolute(configuredRoot) ? configuredRoot : resolve(PLUGIN_ROOT, configuredRoot));
-
-  const allowedRoots = [MEDIA_ROOT];
-  // 兼容旧版 media 根目录（升级前下载的图片仍可被收藏）
-  const legacyMediaRoot = resolve(homedir(), '.dsh-qqbot', 'media');
-  if (existsSync(legacyMediaRoot)) allowedRoots.push(legacyMediaRoot);
-  for (const extra of stickers.extraRoots) {
-    if (extra.trim() === '') continue;
-    allowedRoots.push(isAbsolute(extra) ? extra : resolve(PLUGIN_ROOT, extra));
-  }
-
-  const store = new StickerStore({
-    root,
-    allowedRoots,
-    sensitivePaths: config.fileAccess?.sensitivePaths ?? [],
-    maxBytes: stickers.maxBytes,
-    maxAutoEntries: stickers.maxAutoEntries,
-    logger,
-  });
-  logger.info(`im-qqbot: 表情收藏已启用 root=${store.root}`);
-  return store;
-}
-
-/** 解析笔记目录，构建共享笔记库（关闭时返回 undefined）；默认放在 agent 工作目录下，不进插件仓库 */
-function createNotesStore(config: ImQQBotConfig, logger: Logger): NotesStore | undefined {
-  const notes = config.notes;
-  if (notes === undefined || !notes.enabled) return undefined;
-  const cwd = config.cwd || process.cwd();
-  const configuredRoot = notes.root.trim();
-  const root = configuredRoot === ''
-    ? resolve(cwd, 'notes')
-    : (isAbsolute(configuredRoot) ? configuredRoot : resolve(cwd, configuredRoot));
-  logger.info(`im-qqbot: 共享笔记库已启用 root=${root}`);
-  const store = new NotesStore(root, logger);
-  const semantic = notes.semantic;
-  if (semantic?.enabled) {
-    // 没密钥也照样挂上：baseUrl 可能指向不需要鉴权的本地服务（Ollama 等）；鉴权失败会进冷却、退回 BM25
-    if (resolveEmbeddingApiKey(semantic) === '') logger.warn('im-qqbot: 笔记语义检索已启用但没有密钥（QQBOT_EMBEDDING_API_KEY），远程接口会拒绝请求');
-    store.setSemantic(new EmbeddingCache(createOpenAIEmbedder(semantic), semantic.timeoutMs, logger), semantic);
-    logger.info(`im-qqbot: 笔记语义检索已启用 model=${semantic.model} minSimilarity=${semantic.minSimilarity} minMargin=${semantic.minMargin}`);
-  }
-  return store;
-}
-
-/** 解析跑团目录，构建 DndService（关闭时返回 undefined）；数据放在 agent 工作目录下，不进插件仓库 */
-function createDndService(config: ImQQBotConfig, logger: Logger): DndService | undefined {
-  const dnd = config.dnd;
-  if (dnd === undefined || !dnd.enabled) return undefined;
-  const cwd = config.cwd || process.cwd();
-  const configuredRoot = dnd.root.trim();
-  const root = configuredRoot === ''
-    ? resolve(cwd, 'dnd')
-    : (isAbsolute(configuredRoot) ? configuredRoot : resolve(cwd, configuredRoot));
-  logger.info(`im-qqbot: 跑团已启用 root=${root}`);
-  return new DndService({
-    store: new CampaignStore(join(root, 'campaigns')),
-    library: new AdventureLibrary({ dungeons: join(root, 'dungeons'), adventures: join(root, 'adventures') }, logger),
-    mapDir: join(resolveTmpDir(config), 'dnd-maps'),
-    cwd,
-  });
-}
+export { dispatchInteraction };
 
 export async function bootstrapGateway(
   ctx: Context,
@@ -199,17 +59,15 @@ export async function bootstrapGateway(
     logger.warn('im-qqbot: 未配置 ownerOpenid/adminOpenids，配置命令与审批对所有通过访问控制的用户开放');
   }
 
-  // ── 表情收藏存储（工具 + 动态 prompt 清单共用） ──
+  // ── 核心存储（表情收藏 / 共享笔记 / 跑团） ──
   const stickerStore = createStickerStore(config, logger);
   manager.stickerStore = stickerStore;
 
-  // ── 共享笔记库（工具 + 自动召回共用） ──
   const notesStore = createNotesStore(config, logger);
   manager.notesStore = notesStore;
-
   // 注入账本：只观察「哪几段真的进了提示词」，先跑一周看分布再谈调权
   if (notesStore !== undefined) manager.noteMetrics = new NoteMetricsStore(undefined, logger);
-  // ── 跑团（/dnd 命令、DM prompt 注入、dnd_* 工具共用） ──
+
   const dndService = createDndService(config, logger);
   manager.dndService = dndService;
 
@@ -257,7 +115,6 @@ export async function bootstrapGateway(
   });
 
   // ── 出站：dsh session/event → QQ 消息 ──
-  // 获取 tools 服务（工具结果结构化展示），可选
   let toolsRegistry: ToolsRegistryLike | undefined;
   try {
     toolsRegistry = ctx.get('tools') as ToolsRegistryLike | undefined;
@@ -265,41 +122,11 @@ export async function bootstrapGateway(
     toolsRegistry = undefined;
   }
 
-  // 发送适配器：将 QQBot 实例适配为 QQBotSender（openStream 参数形态不同）。
-  // sendMarkdown 统一做被动回复限额管控：同一 msgId 超限/过期时降级主动推送。
-  const replyLimiter = new ReplyLimiter({ limit: 4 });
-  const sendQueue = new PeerSendQueue();
-  // 群里模型写的 @#U3 在这里换成真正的 @（编号 → openid 用同一张别名表）
-  const withMentions = (target: { scope: string; targetId: string }, content: string): string =>
-    target.scope === 'group'
-      ? renderOutboundMentions(content, (alias) => getSenderAliases().resolve(config.appId, target.targetId, alias))
-      : content;
-  const archiveBotMessage = (target: ReplyTarget, content: string, result: unknown): void => {
-    if (target.scope !== 'group' || !target.targetId) return;
-    appendBotGroupMessage(config.appId, target.targetId, {
-      content,
-      senderName: resolveBotSenderName(target.targetId, config.replyDesire?.names, manager.personaStore),
-      result,
-    });
-  };
-  const sender: QQBotSender = {
-    sendMarkdown: (target, content, opts) => sendQueue.run(target,
-      () => sendResolvedMarkdown(bot, resolveReplyTarget(target, replyLimiter, true), withMentions(target, content), opts))
-      .then((result) => {
-        archiveBotMessage(target, content, result);
-        return result;
-      }),
-    openStream: (target) => sendQueue.stream(target, () => bot.openStream({
-      target: {
-        scope: target.scope,
-        targetId: target.targetId,
-        msgId: target.msgId as string,
-      },
-    })),
-  };
+  const senders = createGatewaySenders({ bot, config, manager, selfSent });
+  const { sender, mediaSender } = senders;
 
   const outbound = createOutboundHandler(manager, sender, config, logger, toolsRegistry, stickerStore);
-  const mediaReview = new MediaReviewCoordinator(outbound, message => logger.warn(message));
+  const mediaReview = new MediaReviewCoordinator(outbound, (message) => logger.warn(message));
   manager.mediaReview = mediaReview;
   (ctx as unknown as { on(event: string, handler: (...args: unknown[]) => void): void })
     .on('session/event', ((session: Parameters<typeof outbound.routeSessionEvent>[0], event: Parameters<typeof outbound.routeSessionEvent>[1]) => {
@@ -313,21 +140,17 @@ export async function bootstrapGateway(
     }, { global: true });
 
   // ── 出站流式：agent/assistant-stream → 流式帧路由 ──
-  // 实时流式走瞬态 agent/assistant-stream（chunk 不进 session log）。
-  // 该事件按 agent 作用域派发，根作用域监听器不带 global 会被过滤（同
-  // approval/request），帧到达后自行按 agent.id 路由，非 QQ 会话在 router 内忽略。
   (ctx as unknown as { on(event: string, handler: (...args: unknown[]) => void, options?: { global?: boolean }): void })
     .on('agent/assistant-stream', (payload: unknown) => {
       const parsed = parseStreamFrame(payload);
       if (parsed !== undefined) outbound.routeStreamFrame(parsed.agentId, parsed.delta);
     }, { global: true });
 
-  // ── 问答通道（ask_user_question → QQ 文本 + 按钮） ──
+  // ── 互动通道（问答 / 审批 / 跑团回合 / 人设 / 权限授权） ──
   const questionChannel = new QuestionChannel(manager, sender, config, logger);
   manager.questionChannel = questionChannel;
   questionChannel.install(ctx);
 
-  // ── 审批通道（approval/request → QQ 两按钮审批） ──
   const approvalChannel = new ApprovalChannel(
     manager,
     sender,
@@ -337,14 +160,11 @@ export async function bootstrapGateway(
   manager.approvalChannel = approvalChannel;
   approvalChannel.install(ctx as unknown as ApprovalChannelContext);
 
-  // ── 按钮点击回调（interaction）：统一分发到问答/审批通道 ──
-  // ── 跑团回合按钮（轮到 PC 时发「结束回合 / 查看状态」，点击者身份由 QQ 回调决定） ──
   const dndButtons = dndService !== undefined && config.dnd?.turnButtons !== false
     ? new DndTurnButtons(dndService, manager, sender, logger)
     : undefined;
   manager.dndButtons = dndButtons;
 
-  // ── 聊天人设（/persona 卡片；选择按群或私聊持久化，目录可在 personas.root 指向仓库） ──
   const personasDir = resolvePersonasDir({ root: config.personas?.root, cwd: config.cwd, pluginRoot: PLUGIN_ROOT });
   const personaStore = new PersonaStore({ dir: personasDir, logger });
   logger.info(`im-qqbot: 聊天人设已就绪 dir=${personaStore.dir}`);
@@ -352,9 +172,9 @@ export async function bootstrapGateway(
   manager.personaStore = personaStore;
   manager.personaSwitch = personaSwitch;
 
-  // ── 工具权限：非白名单会话不给终端、文件工具只能碰 bot 自己的目录；主人可在聊天里确认加白名单 ──
   const toolAccess = new ToolAccess(config, new ToolAccessStore(), manager, sender, logger);
   manager.toolAccess = toolAccess;
+  toolAccess.onChange = (kind, id) => manager.syncSessionTools(kind === 'group' ? 'group' : 'c2c', id);
   try {
     const guardTools = ctx.get('tools') as { guard?: (guard: unknown) => unknown } | undefined;
     if (guardTools?.guard === undefined) {
@@ -380,27 +200,18 @@ export async function bootstrapGateway(
   } catch (err) {
     logger.warn(`im-qqbot: 工具权限拦截注册失败: ${err instanceof Error ? err.message : String(err)}`);
   }
-  toolAccess.register(ctx);
   const registerGroupAccess = (feature: GroupAccessFeature): GroupAccess | undefined => {
     if (!config[feature]?.enabled || !config.ownerOpenid?.trim()) return undefined;
     const access = new GroupAccess(feature, config, manager, sender, logger, (groups) => updateProfileAllowedGroups(
       feature, groups, resolveProfileDir(ctx.baseUrl) ?? undefined, logger, config[feature]?.allowedGroups,
     ));
-    access.register(ctx);
+    access.onChange = (group) => manager.syncSessionTools('group', group);
     return access;
   };
   const groupAccess = { browser: registerGroupAccess('browser'), imageGen: registerGroupAccess('imageGen') };
+  registerAccessTool(ctx, { terminal: toolAccess, browser: groupAccess.browser, imageGen: groupAccess.imageGen }, logger);
 
-  bot.on('interaction', async (_iCtx: unknown, event: InteractionEvent) => {
-    // scope/targetId 推导对齐消息事件（inbound.ts）：按 scene 判定类型，群用 group_openid，私聊用 user_openid
-    const scope: ChatScope = event.scene === 'group' ? 'group' : 'c2c';
-    const targetId = scope === 'group' ? (event.group_openid ?? event.user_openid) : event.user_openid;
-    // 记录互动事件 id，作为后续被动回复候选（event_id）
-    cacheEventId(scope, targetId, event.id);
-
-    const code = dispatchInteraction(event, manager, dndButtons, toolAccess, groupAccess, personaSwitch);
-    await bot.acknowledgeInteraction(event.id, code).catch(() => {});
-  });
+  bindInteractionHandler(bot, manager, dndButtons, toolAccess, groupAccess, personaSwitch);
 
   bot.on('error', (err: unknown) => {
     logger.error(`bot error: ${err instanceof Error ? err.message : String(err)}`);
@@ -426,283 +237,33 @@ export async function bootstrapGateway(
     console.log(`[im-qqbot] Bot ready! appId=${config.appId}`);
   });
 
-  // ── Agent 临时目录（cwd/tmp）：prompt 里要求模型把中间文件都放这里 ──
+  // ── 临时目录、定期清理、工具集、上游健康监测、跑团装配 ──
   ensureTmpDir(resolveTmpDir(config), logger);
-
-  // ── 定期清理：media / tmp / 视频工作目录 + cleanup.rules（启动时一次，之后每小时） ──
   startCleanup(ctx, config, logger);
-
-  // ── 视觉工具注册（qqbot_describe_image，复用 dsh llm + attachments） ──
-  ensureVisionInputModal(config.vision, logger);
-  registerDescribeImageTool(ctx, config.vision, logger);
-  registerBrowserTool(ctx, config, manager, logger);
-
-  // ── 视频理解工具（qqbot_describe_video：抽帧宫格 + 音轨 ASR；ffmpeg 不可用时跳过） ──
-  // 先找 ffmpeg：winget 装的不在 PATH 里时，把它的目录补进本进程 PATH（终端工具会继承），并在 prompt 里点名路径
-  const ffmpegBins = await locateFfmpeg(config.video.ffmpegPath);
-  if (ffmpegBins !== undefined && isAbsolute(ffmpegBins.ffmpeg)) {
-    const binDir = dirname(ffmpegBins.ffmpeg);
-    const pathKey = Object.keys(process.env).find(k => k.toUpperCase() === 'PATH') ?? 'PATH';
-    const entries = (process.env[pathKey] ?? '').split(delimiter);
-    if (!entries.some(e => e.toLowerCase() === binDir.toLowerCase())) {
-      process.env[pathKey] = [binDir, ...entries].filter(Boolean).join(delimiter);
-    }
-    manager.ffmpegPath = ffmpegBins.ffmpeg;
-    logger.info(`im-qqbot: 使用 ffmpeg ${ffmpegBins.ffmpeg}（目录已补进 PATH）`);
-  }
-  await registerDescribeVideoTool(
-    ctx,
-    ffmpegBins !== undefined ? { ...config.video, ffmpegPath: ffmpegBins.ffmpeg === 'ffmpeg' ? '' : ffmpegBins.ffmpeg } : config.video,
-    config.vision,
-    config.asr,
-    logger,
-    resolveTmpDir(config),
-  );
-
-  // ── 听音频（qqbot_transcribe）：跟随 config.asr 协议/网关与 ffmpeg 路径 ──
-  registerTranscribeTool(ctx, logger, config.asr, ffmpegBins);
-
-  // ── 附件发送工具注册（qqbot_send_file） ──
-  // 包装 bot：让文件发送也走 msgId 兜底 + 被动回复限额管控。
-  // 注意：SDK 文件发送暂不支持 event_id，故 allowEvent=false，跳过 event 候选。
-  // 媒体发送不走 onMessageSent，结果里的 ref_idx 自己记，群友引用表情/配图时才认得出是 bot 发的；群聊同时写入归档
-  const rememberMedia = <T,>(
-    target: ReplyTarget,
-    kind: Parameters<typeof mediaQuoteText>[0],
-    caption: string | undefined,
-  ) => (result: T): T => {
-    const text = mediaQuoteText(kind, caption);
-    selfSent.record(mediaRefIdx(result), text);
-    archiveBotMessage(target, text, result);
-    return result;
-  };
-  const rawSendVoice = (target: ReplyTarget, source: { localPath?: string }) =>
-    sendQueue.run(target, () => bot.sendVoice(resolveReplyTarget(target, replyLimiter, false), source), true);
-  const mediaSender: MediaSenderLike = {
-    sendImage: (target, source, opts) => sendQueue.run(target, () => bot.sendImage(resolveReplyTarget(target, replyLimiter, false), source, opts))
-      .then(rememberMedia(target, '图片', opts?.content)),
-    sendVideo: (target, source, opts) => sendQueue.run(target, () => bot.sendVideo(resolveReplyTarget(target, replyLimiter, false), source, opts))
-      .then(rememberMedia(target, '视频', opts?.content)),
-    sendVoice: (target, source) => rawSendVoice(target, source)
-      .then(rememberMedia(target, '语音', undefined)),
-    sendFile: (target, source, opts) => sendQueue.run(target, () => bot.sendFile(resolveReplyTarget(target, replyLimiter, false), source, opts))
-      .then(rememberMedia(target, '文件', opts?.content?.trim() ? opts.content : opts?.fileName)),
-  };
-  // ── 搜图工具（qqbot_fanart_pick）：候选落在 tmp/fanart，发出去的那张才记进 media/fanart 的 seen ──
-  const fanartCandidatesDir = join(resolveTmpDir(config), 'fanart');
-  const fanartSeen = new FanartSeenStore(join(MEDIA_ROOT, 'fanart'));
-  if (config.fanart.enabled) {
-    const poolDir = config.fanart.poolDir.trim();
-    // 两个工具共用一个 HttpGet：代理探测只做一次，免得每轮都读注册表
-    const fanartGet = createHttpGet(config.fanart.proxy);
-    registerFanartPickTool(ctx, config, {
-      get: fanartGet,
-      seen: fanartSeen,
-      poolDir: poolDir === '' ? resolve(PLUGIN_ROOT, 'scripts') : (isAbsolute(poolDir) ? poolDir : resolve(PLUGIN_ROOT, poolDir)),
-      candidatesDir: fanartCandidatesDir,
-    }, logger);
-    // 单角色定时推送用：按 tag 直接取一张落地，候选图命名与上面一致，发送后自动记为已发
-    registerBooruFetchTool(ctx, config, {
-      get: fanartGet,
-      seen: fanartSeen,
-      candidatesDir: fanartCandidatesDir,
-    }, logger);
-  }
-  registerSendFileTool(ctx, mediaSender, manager, config, logger, (absPath) => {
-    if (config.fanart.enabled && markSentCandidate(fanartSeen, fanartCandidatesDir, absPath)) {
-      logger.info(`im-qqbot: 搜图候选已发，记为已发: ${absPath}`);
-    }
-  });
-
-  // ── 语音合成工具注册（qqbot_speak） ──
-  // 放在插件里而不是让模型自己跑命令：沙箱里联网要人审批，开一次口弹一次确认太出戏。
-  if (config.speak.enabled) {
-    registerSpeakTool(ctx, { sendVoice: rawSendVoice }, manager, config, logger, {
-      onSent: (target, spoken, result) => rememberMedia(target, '语音', spoken)(result),
-    });
-  }
-
-  // ── 生图与参考图编辑工具（qqbot_image_gen） ──
-  if (config.imageGen?.enabled === true) {
-    registerImageGenTool(ctx, mediaSender, manager, config, logger);
-  }
-
-  // ── Bilibili 只读工具（搜索/视频/评论/字幕/扫码登录） ──
-  const biliTools = ctx.get('tools') as { register(definition: unknown): unknown } | undefined;
-  if (biliTools !== undefined) {
-    const biliClient = new BiliClient();
-    registerBiliTools(biliTools, {
-      client: biliClient,
-      logger,
-      permission: (agent, kind = 'login') => biliPermission(
-        manager.findByAgent(agent as never), kind, config,
-      ),
-      sendQr: async (agent, qrPath, caption) => {
-        const record = manager.findByAgent(agent as never);
-        if (record === undefined) return false;
-        await mediaSender.sendImage(record.replyTarget, { localPath: qrPath }, { content: caption });
-        return true;
-      },
-    });
-    // 群聊没有终端之后，取片这一步只能靠固定动作：给 bvid，拿回本地 mp4
-    registerVideoFetchTool(biliTools, {
-      client: biliClient,
-      logger,
-      ffmpegPath: ffmpegBins !== undefined && isAbsolute(ffmpegBins.ffmpeg) ? ffmpegBins.ffmpeg : undefined,
-    });
-  }
-
-  // ── 点歌（qqbot_sing）：走本地唱歌服务的 HTTP，不再需要命令行 ──
-  registerSingTool(ctx, mediaSender, manager, logger);
-  // ── 上游健康监测：opencode 与 commandcode 互为主备，降级就换边 ──
-  const failover = config.modelFailover;
-  let modelWatch: ModelWatch | undefined;
-  if (failover?.enabled === true) {
-    const primary = {
-      provider: failover.primaryProvider.trim() === "" ? (config.provider ?? "") : failover.primaryProvider.trim(),
-      model: failover.primaryModel.trim() === "" ? (config.model ?? "") : failover.primaryModel.trim(),
-      apiKeyEnv: failover.primaryApiKeyEnv.trim() || undefined,
-    };
-    const backup = {
-      provider: failover.backupProvider.trim(),
-      model: failover.backupModel.trim(),
-      apiKeyEnv: failover.backupApiKeyEnv.trim() || undefined,
-    };
-    const ready = primary.provider !== "" && primary.model !== "" && backup.provider !== "" && backup.model !== "";
-    if (ready && isWatchedProvider(primary.provider) && isWatchedProvider(backup.provider)) {
-      const notify = async (line: string): Promise<void> => {
-        if (!failover.notify) return;
-        const owner = config.ownerOpenid?.trim();
-        if (owner === undefined || owner === "") return;
-        try {
-          await bot.sendMarkdown({ scope: "c2c", targetId: owner }, line);
-        } catch (err) {
-          logger.warn(`model-watch: 通知失败 ${err instanceof Error ? err.message : String(err)}`);
-        }
-      };
-      modelWatch = new ModelWatch({
-        primary,
-        backup,
-        intervalMs: Math.max(1, failover.intervalMinutes) * 60_000,
-        failThreshold: Math.max(1, failover.failThreshold),
-        recoverThreshold: Math.max(1, failover.recoverThreshold),
-        ttftThresholdMs: Math.max(1000, failover.ttftThresholdMs),
-        initialUsingBackup: manager.getFailoverRoute() !== undefined,
-        immediate: true,
-        switchTo: async (target, health) => {
-          const count = await manager.switchAllSessions(target);
-          await notify(`⚠️ ${health.detail}\n已把 ${count} 个会话切到 ${target.provider}/${target.model}`);
-        },
-        switchBack: async (_target, health) => {
-          // 切回默认：清掉全局故障转移那一格，而不是再写一遍 override。
-          // 写 override 的问题是它会永久压住配置默认，下次再切又要追平一次。
-          const count = await manager.clearFailoverRoute();
-          await notify(`✅ ${health.detail}\n已把 ${count} 个会话切回配置默认`);
-        },
-        log: (message) => logger.info(`im-qqbot: ${message}`),
-      });
-      modelWatch.start();
-    } else if (ready) {
-      logger.warn(`model-watch: ${primary.provider} 或 ${backup.provider} 不在可监测名单（opencode / commandcode），跳过`);
-    } else {
-      logger.warn("model-watch: 主用或备用的 provider/model 没配全，跳过");
-    }
-  }
-  if (modelWatch === undefined && manager.getFailoverRoute() !== undefined) {
-    void manager.clearFailoverRoute()
-      .then((count) => logger.info(`im-qqbot: model-watch 未运行，已自动清理磁盘残留故障转移路由（切回默认会话=${count}）`))
-      .catch((err: unknown) => logger.warn(`im-qqbot: 清理残留故障转移路由失败: ${String(err)}`));
-  }
-  // ── 表情收藏工具注册（qqbot_save_sticker） ──
-  if (stickerStore !== undefined) {
-    registerSaveStickerTool(ctx, stickerStore, logger);
-    registerMatchStickerTool(ctx, stickerStore, logger);
-  }
-
-  // ── 以图搜图（trace.moe + SauceNAO）：本地库没命中时查出处 ──
-  registerReverseImageTool(ctx, logger);
-
-  // ── 共享笔记工具注册（qqbot_notes_search / qqbot_notes_save） ──
-  if (notesStore !== undefined) {
-    registerNotesTools(ctx, notesStore, manager, logger, { ownerOpenid: config.ownerOpenid });
-  }
-
-  // ── 历史归档检索（qqbot_history_search）：归档写得多、读得少，这里补一个查询口 ──
-  registerHistorySearchTool(ctx, config.appId, manager, logger);
-
-  // ── 跑团工具注册（dnd_*） ──
+  await registerGatewayTools({ ctx, config, manager, senders, stickerStore, notesStore, logger });
+  const modelWatch = startModelWatch({ bot, config, manager, logger });
   if (dndService !== undefined) {
-    // /dnd map 发的是被动回复：target 就是那条 /dnd 消息，不用换新的 msgId
-    dndService.sendImage = async (target, path, caption) => {
-      await mediaSender.sendImage(target, { localPath: path }, caption !== undefined ? { content: caption } : undefined);
-    };
-    const dndToolNames = registerDndTools(ctx, {
-      service: dndService,
-      manager,
-      logger,
-      sendImage: async (record, path, caption) => {
-        await mediaSender.sendImage(
-          withFreshReplyTarget(record.replyTarget),
-          { localPath: path },
-          caption !== undefined ? { content: caption } : undefined,
-        );
-      },
-      onTurnChange: (record) => dndButtons?.schedule(record),
-      onCombatStart: (record, field) => {
-        const starting = manager.combatAgents?.startAfterReply(record, field);
-        if (starting === undefined) return false;
-        void starting.then((child) => { if (child !== undefined) dndButtons?.schedule(child); })
-          .catch((err: unknown) => logger.warn(`im-qqbot: 自动战斗交接失败: ${String(err)}`));
-        return true;
-      },
-      onPendingAttack: (record) => dndButtons?.scheduleReaction(record),
-      members: memberIdsFor(getSenderAliases(), config.appId),
-    });
-    // 没开团的会话不带跑团工具：开团、停团时跟着换
-    if (dndToolNames.length > 0) {
-      const toolScope = new DndToolScope(dndService, dndToolNames, logger, (record) => manager.combatAgents?.toolView(record) ?? 'full');
-      manager.dndToolScope = toolScope;
-      manager.combatAgents = new DndCombatAgents(
-        agents, dndService, () => config.dnd?.combatAgent,
-        (record) => toolScope.sync(record), logger, undefined,
-        (main) => {
-          const mainRoute = manager.getEffectiveSessionRoute(main);
-          const fo = config.modelFailover;
-          if (!fo?.enabled) return mainRoute ? { mainRoute } : undefined;
-          const cur = config.dnd?.combatAgent;
-          const pProv = fo.primaryProvider.trim() || (config.provider ?? '').trim();
-          const pMod = fo.primaryModel.trim() || (config.model ?? '').trim();
-          const bProv = fo.backupProvider.trim();
-          const bMod = fo.backupModel.trim();
-          const activeFailover = cur?.provider.trim() === pProv ? manager.getFailoverRoute() : undefined;
-          const isBackupConfiguredAsPrimary = cur?.provider.trim() === bProv && cur?.model.trim() === bMod;
-          const cand = isBackupConfiguredAsPrimary
-            ? (pProv && pMod ? { provider: pProv, model: pMod } : undefined)
-            : (bProv && bMod ? { provider: bProv, model: bMod } : undefined);
-          const backup = cand && (cand.provider !== cur?.provider.trim() || cand.model !== cur?.model.trim())
-            ? cand
-            : undefined;
-          return { activeFailover, backup, mainRoute };
-        },
-      );
-      manager.combatAgents.installCompactionGuard(ctx);
-      dndService.onStateChange = (key) => manager.syncDndTools(key);
-      // 不是 QQ 会话的 agent 也不带跑团工具：每个 agent 出现时先全藏，QQ 会话建好记录后再按团的状态放开。
-      // 这两个事件按 agent 作用域派发，根作用域监听要带 global（同 agent/assistant-stream）
-      const events = ctx as unknown as { on(event: string, handler: (payload: { agent?: DshAgent }) => void, options?: { global?: boolean }): void };
-      events.on('agent/created', ({ agent }) => { if (agent !== undefined) toolScope.hideAll(agent); }, { global: true });
-      events.on('agent/disposed', ({ agent }) => { if (agent !== undefined) toolScope.release(agent); }, { global: true });
-      // 插件加载前就活着的 agent 收不到 created
-      try {
-        for (const agent of (agents as { list?(): DshAgent[] }).list?.() ?? []) toolScope.hideAll(agent);
-      } catch (err) {
-        logger.debug(`im-qqbot: 列不出现有 agent，跑团工具只对之后新建的隐藏: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    wireDndTools({ ctx, agents, config, manager, dndService, dndButtons, mediaSender, logger });
   }
 
-  // ── 桌宠余额：自定义 deepseek-native 不在 dsh-pet 内置表里，补一个同接口 provider ──
-  registerPetNativeBalance(ctx, logger);
+  // L0 按会话/宿主作用域隐藏确定不可用的非跑团工具（须在全部工具与 combatAgents 就绪后挂接）
+  const sessionToolScope = new SessionToolScope({
+    config,
+    isFullAccess: (session) => toolAccess.isFullAccess(session),
+    isCombatAgent: (agent) => manager.combatAgents?.isCombatAgent(agent as DshAgent) === true,
+    logger,
+  });
+  manager.sessionToolScope = sessionToolScope;
+  const scopeEvents = ctx as unknown as {
+    on(event: string, handler: (payload: { agent?: DshAgent }) => void, options?: { global?: boolean }): void;
+  };
+  scopeEvents.on('agent/created', ({ agent }) => { if (agent !== undefined) sessionToolScope.hideForNonQq(agent); }, { global: true });
+  scopeEvents.on('agent/disposed', ({ agent }) => { if (agent !== undefined) sessionToolScope.release(agent); }, { global: true });
+  try {
+    for (const agent of (agents as { list?(): DshAgent[] }).list?.() ?? []) sessionToolScope.hideForNonQq(agent);
+  } catch (err) {
+    logger.debug(`im-qqbot: 列不出现有 agent，会话工具仅对之后新建的隐藏: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // ── 生命周期 ──
   (ctx as unknown as { effect(fn: () => (() => Promise<void>) | void, name?: string): void })
@@ -714,10 +275,11 @@ export async function bootstrapGateway(
 
       return async () => {
         logger.info('Shutting down');
-        sendQueue.dispose();
+        senders.dispose();
         modelWatch?.stop();
         // 待答问题挂在旧实例上，重载后没人能答：先让它们以 ASK_ABORTED 结束
         questionChannel.uninstall();
+        manager.sessionToolScope?.disposeAll();
         manager.dndToolScope?.disposeAll();
         await manager.disposeAll();
         // 停掉账本的定时器并把最后一分钟刷盘，否则每次重组都留下一个还在写同一个文件的旧实例

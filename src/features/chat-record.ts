@@ -82,7 +82,7 @@ export function parseRecord(text: string): ParsedRecord | undefined {
     } else if (line === '[关联消息]') {
       inContent = false;
     } else if (ATTACHMENT_RE.test(line)) {
-      current.attachments.push(line);
+      current.attachments.push(sanitizeAttachmentLine(line));
       inContent = false;
     } else {
       const field = FIELD_RE.exec(line);
@@ -106,6 +106,10 @@ export function parseRecord(text: string): ParsedRecord | undefined {
     for (const related of each.related) related.content = cleanContent(related.content);
   }
   return { titled, items };
+}
+
+function sanitizeAttachmentLine(line: string): string {
+  return line.replace(/[ \t]+URL:https?:\/\/\S+/gi, '').replace(/\bURL:https?:\/\/\S+/gi, '').trim();
 }
 
 function cleanContent(content: string): string {

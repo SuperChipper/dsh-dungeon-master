@@ -21,6 +21,26 @@ export function beginMovement(c: Campaign, name: string, request: MoveRequest, o
       reactors: result.opportunity.reactors, declined: [], claimed: [], used: [], resume: result.opportunity.resume,
     };
     requireInitiative(c).movement = p;
+  } else if (result.swapConsent !== undefined) {
+    const allyCh = requireCharacter(c, result.swapConsent.ally);
+    const p: PendingMovement = {
+      kind: 'move',
+      seq: nextRollId(c),
+      at: Date.now(),
+      attacker: result.name,
+      target: result.name,
+      swapWith: allyCh.name,
+      reactors: [{
+        character: allyCh.name,
+        reaction: '同意换位',
+        ...(allyCh.kind !== 'pc' || allyCh.playerId === undefined ? { npc: true } : {}),
+      }],
+      declined: [],
+      claimed: [],
+      used: [],
+      resume: result.swapConsent.resume,
+    };
+    requireInitiative(c).movement = p;
   }
   return moveResultText(result);
 }
@@ -40,18 +60,34 @@ export function resolveMovement(
       ? '（尚未进入冲刺阶段，冲刺动作未消耗）'
       : '';
     delete state.movement;
-    pushLog(c, `${p.target} 取消剩余移动`);
-    return `${p.target} 取消剩余移动，停在当前格；已经花掉的移动力和反应不退${dashRefundNote}。`;
+    pushLog(c, `${p.target} 取消${p.swapWith !== undefined ? `与 ${p.swapWith} 的换位请求` : '剩余移动'}`);
+    return `${p.target} 取消${p.swapWith !== undefined ? `与 ${p.swapWith} 的换位请求` : '剩余移动'}，停在当前格；已经花掉的移动力和反应不退${dashRefundNote}。`;
   }
   if (Array.isArray(args.decline)) for (const name of args.decline) declineReaction(p, requireCharacter(c, String(name)).name);
-  if (args.settle !== true) return `${p.target} 仍停在借机触发处；全部答复且借机落账后 dnd_apply target=${p.target} settle=true 继续移动。`;
+  if (args.settle !== true) {
+    return p.swapWith !== undefined
+      ? `还在等 ${p.swapWith} 确认是否同意与 ${p.target} 交换站位；答复后 dnd_apply target=${p.target} settle=true 结算。`
+      : `${p.target} 仍停在借机触发处；全部答复且借机落账后 dnd_apply target=${p.target} settle=true 继续移动。`;
+  }
   assertWindowClosed(p);
   delete state.movement;
+  if (p.swapWith !== undefined) {
+    const dashRefundNote = p.resume.dash === true && state.dashed?.includes(p.target) !== true
+      ? '（尚未进入冲刺阶段，冲刺动作未消耗）'
+      : '';
+    if (p.declined.includes(p.swapWith)) {
+      pushLog(c, `${p.swapWith} 未同意与 ${p.target} 交换站位`);
+      return `${p.swapWith} 未同意交换站位，${p.target} 停留在当前格${dashRefundNote}。`;
+    }
+    if (!p.used.some((u) => u.by === p.swapWith)) {
+      throw new Error(`尚未收到 ${p.swapWith} 玩家本人同意换位的确认，不能执行换位`);
+    }
+  }
   if (stopped(c, p.target, p.resume.ignoreStateMods === true)) {
     const dashRefundNote = p.resume.dash === true && state.dashed?.includes(p.target) !== true
       ? '（尚未进入冲刺阶段，冲刺动作未消耗）'
       : '';
-    return `${p.target} 在借机后无法继续移动，停在当前格${dashRefundNote}。`;
+    return `${p.target} 在${p.swapWith !== undefined ? '换位前' : '借机后'}无法继续移动，停在当前格${dashRefundNote}。`;
   }
   return beginMovement(c, p.target, p.resume, options);
 }

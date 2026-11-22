@@ -6,8 +6,8 @@
  * - 支持 campaign 级（仅当前团档生效，如个人专武、本桌房规）与 global 级（dnd/custom-effects.json 跨团复用，如魔兽 5e 职业扩展）；
  * - 纯数据结构 + 安全公式求值（formula.ts），无需 eval、无需改源码重启，主 DM 与战斗子代理共享同一确定性引擎。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
 import { rollExpression } from './dice.ts';
 import { validateFormula } from './formula.ts';
 import { ABILITIES, parseAbility, type Ability } from './rules.ts';
@@ -23,12 +23,28 @@ export interface AttackModHook {
   weaponOnly?: boolean;
   meleeOnly?: boolean;
   rangedOnly?: boolean;
+  /** 目标当前 HP 低于有效上限时触发（如血腥狂乱） */
+  targetBelowMaxHp?: boolean;
+  /** 目标当前 HP 不高于有效上限一半时触发 */
+  targetHalfHp?: boolean;
+  /** 目标身上存在指定状态之一时触发 */
+  targetConditions?: string[];
+  /** 目标 5 尺内有除自身外未失能的盟友时触发（如集群战术） */
+  allyAdjacentToTarget?: boolean;
+  /** 仅第 1 轮触发（如幽域踪者恐袭伏击） */
+  firstRoundOnly?: boolean;
+  /** 攻击者自身须处于指定状态之一（如狂暴） */
+  requiresStates?: string[];
 }
 
 export interface HitRiderHook {
   /** 额外伤害骰表达式，如 "1d6"、"2d8"（重击时自动翻倍骰数） */
   damageDice?: string;
-  /** 额外固定加值公式，如 "prof"、"cha_mod"（重击不翻倍常数） */
+  /** 按公式动态计算骰数的同面骰（如偷袭 ceil(class_level / 2) 个 d6） */
+  scalingDice?: { countFormula: string; sides: number };
+  /** 追加 1 颗当前武器主伤害骰（不随重击再翻倍，配合 critOnly 实现半兽人凶蛮攻击等效果） */
+  weaponDie?: boolean;
+  /** 额外固定加值公式，如 "prof"、"cha_mod"、"floor(class_level / 2)"（重击不翻倍常数） */
   bonusFormula?: string;
   /** 伤害类型，如 "黯蚀"、"光耀"、"闪电"；填 "武器同型" 则继承主伤害类型 */
   damageType: string;
@@ -36,10 +52,33 @@ export interface HitRiderHook {
   markedTargetOnly?: boolean;
   weaponOnly?: boolean;
   meleeOnly?: boolean;
+  rangedOnly?: boolean;
+  /** 仅限灵巧武器或远程武器（如游荡者偷袭） */
+  finesseOrRangedOnly?: boolean;
   strAttackOnly?: boolean;
   /** 仅在本次攻击具有优势时触发（如重锻太刀「段云」优势命中 +1d6 雷鸣） */
   advantageOnly?: boolean;
-  /** 每回合至多触发 1 次（如巨像屠夫、神圣打击） */
+  /** 攻击具劣势时不触发（如游荡者偷袭） */
+  noDisadvantage?: boolean;
+  /** 目标在本次攻击扣血前 HP 已低于有效上限时触发（如巨兽杀手/巨像屠夫） */
+  targetBelowMaxHp?: boolean;
+  /** 目标在本次攻击扣血前 HP 不高于有效上限一半时触发 */
+  targetHalfHp?: boolean;
+  /** 目标身上存在指定状态之一时触发 */
+  targetConditions?: string[];
+  /** 目标 5 尺内有除自身外未失能的盟友时触发 */
+  allyAdjacentToTarget?: boolean;
+  /** 具有优势，或目标 5 尺内有除自身外未失能的盟友时触发（如游荡者偷袭） */
+  advantageOrAllyAdjacent?: boolean;
+  /** 仅战斗第 1 轮触发 */
+  firstRoundOnly?: boolean;
+  /** 仅重击时触发（且该附伤骰不再二次翻倍） */
+  critOnly?: boolean;
+  /** 仅在攻击者自己回合触发（如狂热者神圣狂怒、牧师祝福打击，借机不触发） */
+  ownTurnOnly?: boolean;
+  /** 攻击者自身须处于指定状态之一（如神圣狂怒需「狂暴」） */
+  requiresStates?: string[];
+  /** 每回合至多触发 1 次（如巨像屠夫、偷袭、神圣打击） */
   oncePerTurn?: boolean;
 }
 
@@ -112,7 +151,13 @@ export interface CustomEffectDef {
   name: string;
   aliases?: string[];
   description?: string;
+  /** 常驻被动特性：除 traits 外，还可从卡面被动能力与非否定备注中安全识别（仅对本特性生效，绝不误开可施放法术） */
+  passive?: boolean;
+  /** 从备注识别常驻被动及提取 class_level 时匹配的职业正则，如 "游荡者|盗贼|rogue" */
+  classFilter?: string;
   concentration?: boolean;
+  /** 目标倒下或战斗结束后专注保留在施法者身上，后续可用附赠动作免费转移给新目标（如脆弱诅咒、猎人印记） */
+  transferable?: boolean;
   defaultRounds?: number;
   attackMod?: AttackModHook;
   hitRider?: HitRiderHook;
@@ -126,18 +171,28 @@ export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
   脆弱诅咒: {
     name: '脆弱诅咒',
     aliases: ['hex', '邪咒', '诅咒术'],
-    description: '附赠动作专注法术：施法者每次攻击命中受诅咒目标额外造成 1d6 黯蚀伤害。',
+    description: '附赠动作专注法术（1环1小时=600轮，3-4环8小时=4800轮，5+环24小时）：施法者每次攻击命中受诅咒目标额外造成 1d6 黯蚀伤害；目标倒下后专注保留，后续可用附赠动作免费转移。',
     concentration: true,
-    defaultRounds: 10,
+    transferable: true,
+    defaultRounds: 600,
     hitRider: { damageDice: '1d6', damageType: '黯蚀', markedTargetOnly: true },
   },
   猎人印记: {
     name: '猎人印记',
     aliases: ["hunter's mark", 'hunters mark', '猎手印记'],
-    description: '附赠动作专注法术：施法者每次武器攻击命中受印记目标额外造成 1d6 武器同型伤害。',
+    description: '附赠动作专注法术（1环1小时=600轮，3-4环8小时=4800轮，5+环24小时）：施法者每次武器攻击命中受印记目标额外造成 1d6 武器同型伤害；目标倒下后专注保留，后续可用附赠动作免费转移。',
+    concentration: true,
+    transferable: true,
+    defaultRounds: 600,
+    hitRider: { damageDice: '1d6', damageType: '武器同型', markedTargetOnly: true, weaponOnly: true },
+  },
+  朦胧术: {
+    name: '朦胧术',
+    aliases: ['blur', '模糊术'],
+    description: '2 环专注法术（1分钟=10轮）：不依赖非视觉感官的攻击者对你进行的攻击检定具有劣势。',
     concentration: true,
     defaultRounds: 10,
-    hitRider: { damageDice: '1d6', damageType: '武器同型', markedTargetOnly: true, weaponOnly: true },
+    defenseMod: { attackerAdvantage: 'disadvantage' },
   },
   神恩: {
     name: '神恩',
@@ -167,6 +222,7 @@ export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
   守护灵光: {
     name: '守护灵光',
     aliases: ['aura of protection', '保护灵光', '守护光环'],
+    passive: true,
     description: '圣武士 6 级特性：自身未失能时，10 尺内（18 级起 30 尺）自己与友军所有豁免检定自动加 max(1, 魅力调整值)。',
     aura: {
       radius: 10,
@@ -199,12 +255,14 @@ export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
   生命门徒: {
     name: '生命门徒',
     aliases: ['disciple of life', '生命信徒'],
+    passive: true,
     description: '生命领域 1 级特性：使用 1 环及以上法术恢复生命值时，受术者额外恢复 2 + 法术环阶 HP。',
     healMod: { bonusFormula: '2 + slot_level' },
   },
   神佑医者: {
     name: '神佑医者',
     aliases: ['blessed healer', '受祝医者'],
+    passive: true,
     description: '生命领域 6 级特性：对自身以外生物施放 1 环及以上治疗法术时，自身同步恢复 2 + 法术环阶 HP。',
     healMod: { selfHealOnOtherFormula: '2 + slot_level' },
   },
@@ -213,6 +271,141 @@ export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
     aliases: ['preserve life', '保留生命'],
     description: '生命领域引导神力：动作分配 5×牧师等级 点治疗池给 30 尺内生物，最多恢复至其有效生命上限的一半。',
     healMod: { poolFormula: '5 * level', capAtHalfMaxHp: true },
+  },
+  巨兽杀手: {
+    name: '巨兽杀手',
+    aliases: ['巨像屠夫', '巨象屠夫', 'colossus slayer', 'colossus_slayer'],
+    passive: true,
+    description: '游侠（猎人）3 级特性：每回合一次，用武器攻击命中当前 HP 低于生命上限的生物时，额外造成 1d8 武器同型伤害。',
+    hitRider: {
+      damageDice: '1d8',
+      damageType: '武器同型',
+      weaponOnly: true,
+      targetBelowMaxHp: true,
+      oncePerTurn: true,
+    },
+  },
+  偷袭: {
+    name: '偷袭',
+    aliases: ['sneak attack', 'sneak_attack'],
+    passive: true,
+    classFilter: '游荡者|盗贼|rogue',
+    description: '游荡者特性：每回合一次，用灵巧或远程武器攻击命中且无劣势，同时具有优势或目标 5 尺内有未失能盟友时，额外造成 ceil(游荡者等级/2)d6 武器同型伤害。',
+    hitRider: {
+      scalingDice: { countFormula: 'ceil(class_level / 2)', sides: 6 },
+      damageType: '武器同型',
+      weaponOnly: true,
+      finesseOrRangedOnly: true,
+      noDisadvantage: true,
+      advantageOrAllyAdjacent: true,
+      oncePerTurn: true,
+    },
+  },
+  精通至圣斩: {
+    name: '精通至圣斩',
+    aliases: ['improved divine smite', '强化至圣斩', '高等至圣斩'],
+    passive: true,
+    description: '圣武士 11 级特性：近战武器攻击命中目标时自动额外造成 1d8 光耀伤害。',
+    hitRider: {
+      damageDice: '1d8',
+      damageType: '光耀',
+      weaponOnly: true,
+      meleeOnly: true,
+    },
+  },
+  祝福打击: {
+    name: '祝福打击',
+    aliases: ['blessed strikes', '受祝打击'],
+    passive: true,
+    description: '牧师 8 级特性（Tasha）：自己回合内武器攻击命中（每回合一次）额外造成 1d8 光耀伤害；若由戏法触发则以伤害公式/damage 传入。',
+    hitRider: {
+      damageDice: '1d8',
+      damageType: '光耀',
+      weaponOnly: true,
+      ownTurnOnly: true,
+      oncePerTurn: true,
+    },
+  },
+  神圣狂怒: {
+    name: '神圣狂怒',
+    aliases: ['divine fury'],
+    passive: true,
+    classFilter: '野蛮人|barbarian',
+    description: '狂热者道途 3 级特性：狂暴期间在自己回合内首次武器攻击命中时，额外造成 1d6 + floor(野蛮人等级/2) 光耀伤害。',
+    hitRider: {
+      damageDice: '1d6',
+      bonusFormula: 'floor(class_level / 2)',
+      damageType: '光耀',
+      weaponOnly: true,
+      requiresStates: ['狂暴'],
+      ownTurnOnly: true,
+      oncePerTurn: true,
+    },
+  },
+  凶蛮攻击: {
+    name: '凶蛮攻击',
+    aliases: ['savage attacks', '野蛮攻击'],
+    passive: true,
+    description: '半兽人种族特性：使用近战武器攻击打出重击时，额外多掷 1 颗该武器的伤害骰（不翻倍）。',
+    hitRider: {
+      weaponDie: true,
+      damageType: '武器同型',
+      weaponOnly: true,
+      meleeOnly: true,
+      critOnly: true,
+    },
+  },
+  精通重击: {
+    name: '精通重击',
+    aliases: ['improved critical'],
+    passive: true,
+    description: '勇士战士 3 级特性：武器攻击天然 19-20 即视为重击。',
+    attackMod: {
+      critOn: 19,
+      weaponOnly: true,
+    },
+  },
+  卓越重击: {
+    name: '卓越重击',
+    aliases: ['superior critical'],
+    passive: true,
+    description: '勇士战士 15 级特性：武器攻击天然 18-20 即视为重击。',
+    attackMod: {
+      critOn: 18,
+      weaponOnly: true,
+    },
+  },
+  战地施法者: {
+    name: '战地施法者',
+    aliases: ['war caster', '战争施法者'],
+    passive: true,
+    description: '专长：因受伤害而进行的体质专注豁免检定具有优势。',
+    saveMod: {
+      abilities: ['con'],
+      advantage: 'advantage',
+      vsTags: ['concentration'],
+    },
+  },
+  集群战术: {
+    name: '集群战术',
+    aliases: ['pack tactics'],
+    passive: true,
+    description: '当目标 5 尺内至少有一名除自己外未失能的盟友时，对目标进行的攻击检定具有优势。',
+    attackMod: {
+      advantage: 'advantage',
+      allyAdjacentToTarget: true,
+    },
+  },
+  血腥狂乱: {
+    name: '血腥狂乱',
+    aliases: ['blood frenzy', '嗜血狂乱'],
+    passive: true,
+    description: '对生命值低于其生命值上限的生物进行的近战攻击检定具有优势。',
+    attackMod: {
+      advantage: 'advantage',
+      meleeOnly: true,
+      targetBelowMaxHp: true,
+    },
   },
 };
 
@@ -243,16 +436,38 @@ export function parseCustomEffectDef(raw: unknown): CustomEffectDef {
     ? o.aliases.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim())
     : undefined;
   const description = typeof o.description === 'string' && o.description.trim().length > 0 ? o.description.trim() : undefined;
+  const passive = typeof o.passive === 'boolean' ? o.passive : undefined;
+  const classFilterRaw = typeof (o.classFilter ?? o.class_filter) === 'string'
+    ? String(o.classFilter ?? o.class_filter).trim()
+    : undefined;
+  const classFilter = classFilterRaw && classFilterRaw.length > 0 ? classFilterRaw : undefined;
+  if (classFilter !== undefined) {
+    try {
+      new RegExp(classFilter, 'i');
+    } catch (err) {
+      throw new Error(`class_filter 正则不合法：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   const concentration = typeof o.concentration === 'boolean' ? o.concentration : undefined;
+  const transferable = typeof o.transferable === 'boolean' ? o.transferable : undefined;
   const defaultRounds = typeof o.defaultRounds === 'number' && Number.isInteger(o.defaultRounds) && o.defaultRounds > 0
     ? o.defaultRounds
     : (typeof o.default_rounds === 'number' && Number.isInteger(o.default_rounds) && o.default_rounds > 0 ? o.default_rounds : undefined);
+
+  const strArr = (v: unknown): string[] | undefined => {
+    if (!Array.isArray(v)) return undefined;
+    const list = v.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim());
+    return list.length > 0 ? list : undefined;
+  };
 
   const def: CustomEffectDef = {
     name,
     ...(aliases && aliases.length > 0 ? { aliases } : {}),
     ...(description !== undefined ? { description } : {}),
+    ...(passive !== undefined ? { passive } : {}),
+    ...(classFilter !== undefined ? { classFilter } : {}),
     ...(concentration !== undefined ? { concentration } : {}),
+    ...(transferable !== undefined ? { transferable } : {}),
     ...(defaultRounds !== undefined ? { defaultRounds } : {}),
   };
 
@@ -269,6 +484,8 @@ export function parseCustomEffectDef(raw: unknown): CustomEffectDef {
     const advantage = rawAtk.advantage === 'advantage' || rawAtk.advantage === 'disadvantage' ? rawAtk.advantage : undefined;
     const critRaw = rawAtk.critOn ?? rawAtk.crit_on;
     const critOn = typeof critRaw === 'number' && Number.isInteger(critRaw) && critRaw >= 18 && critRaw <= 20 ? critRaw : undefined;
+    const targetConditions = strArr(rawAtk.targetConditions ?? rawAtk.target_conditions);
+    const requiresStates = strArr(rawAtk.requiresStates ?? rawAtk.requires_states);
     def.attackMod = {
       ...(toHitFormula ? { toHitFormula } : {}),
       ...(bonusDice ? { bonusDice } : {}),
@@ -277,6 +494,12 @@ export function parseCustomEffectDef(raw: unknown): CustomEffectDef {
       ...((rawAtk.weaponOnly ?? rawAtk.weapon_only) === true ? { weaponOnly: true } : {}),
       ...((rawAtk.meleeOnly ?? rawAtk.melee_only) === true ? { meleeOnly: true } : {}),
       ...((rawAtk.rangedOnly ?? rawAtk.ranged_only) === true ? { rangedOnly: true } : {}),
+      ...((rawAtk.targetBelowMaxHp ?? rawAtk.target_below_max_hp) === true ? { targetBelowMaxHp: true } : {}),
+      ...((rawAtk.targetHalfHp ?? rawAtk.target_half_hp) === true ? { targetHalfHp: true } : {}),
+      ...(targetConditions ? { targetConditions } : {}),
+      ...((rawAtk.allyAdjacentToTarget ?? rawAtk.ally_adjacent_to_target) === true ? { allyAdjacentToTarget: true } : {}),
+      ...((rawAtk.firstRoundOnly ?? rawAtk.first_round_only) === true ? { firstRoundOnly: true } : {}),
+      ...(requiresStates ? { requiresStates } : {}),
     };
   }
 
@@ -285,25 +508,60 @@ export function parseCustomEffectDef(raw: unknown): CustomEffectDef {
     const damageDice = typeof (rawRider.damageDice ?? rawRider.damage_dice) === 'string'
       ? String(rawRider.damageDice ?? rawRider.damage_dice).trim()
       : undefined;
+    const rawScaling = (rawRider.scalingDice ?? rawRider.scaling_dice) as Record<string, unknown> | undefined;
+    let scalingDice: HitRiderHook['scalingDice'];
+    if (rawScaling !== undefined && rawScaling !== null && typeof rawScaling === 'object') {
+      const countFormula = typeof (rawScaling.countFormula ?? rawScaling.count_formula) === 'string'
+        ? String(rawScaling.countFormula ?? rawScaling.count_formula).trim()
+        : '';
+      const sidesRaw = rawScaling.sides;
+      const sides = typeof sidesRaw === 'number' && Number.isInteger(sidesRaw) && sidesRaw >= 2 && sidesRaw <= 100
+        ? sidesRaw
+        : undefined;
+      if (!countFormula || sides === undefined) {
+        throw new Error('hit_rider.scaling_dice 需要合法的 count_formula 与 sides (2-100 整数)');
+      }
+      checkFormula(countFormula, 'hit_rider.scaling_dice.count_formula');
+      scalingDice = { countFormula, sides };
+    }
+    const weaponDie = (rawRider.weaponDie ?? rawRider.weapon_die) === true;
     const bonusFormula = typeof (rawRider.bonusFormula ?? rawRider.bonus_formula) === 'string'
       ? String(rawRider.bonusFormula ?? rawRider.bonus_formula).trim()
       : undefined;
     const damageType = typeof (rawRider.damageType ?? rawRider.damage_type) === 'string'
       ? String(rawRider.damageType ?? rawRider.damage_type).trim()
       : '';
-    if (!damageDice && !bonusFormula) throw new Error('hit_rider 至少需要 damage_dice 或 bonus_formula 之一');
+    if (!damageDice && !bonusFormula && !scalingDice && !weaponDie) {
+      throw new Error('hit_rider 至少需要 damage_dice、scaling_dice、weapon_die 或 bonus_formula 之一');
+    }
     if (!damageType) throw new Error('hit_rider 需要 damage_type（如 "闪电"、"光耀" 或 "武器同型"）');
     checkDice(damageDice, 'hit_rider.damage_dice');
     checkFormula(bonusFormula, 'hit_rider.bonus_formula');
+    const targetConditions = strArr(rawRider.targetConditions ?? rawRider.target_conditions);
+    const requiresStates = strArr(rawRider.requiresStates ?? rawRider.requires_states);
     def.hitRider = {
       ...(damageDice ? { damageDice } : {}),
+      ...(scalingDice ? { scalingDice } : {}),
+      ...(weaponDie ? { weaponDie: true } : {}),
       ...(bonusFormula ? { bonusFormula } : {}),
       damageType,
       ...((rawRider.markedTargetOnly ?? rawRider.marked_target_only) === true ? { markedTargetOnly: true } : {}),
       ...((rawRider.weaponOnly ?? rawRider.weapon_only) === true ? { weaponOnly: true } : {}),
       ...((rawRider.meleeOnly ?? rawRider.melee_only) === true ? { meleeOnly: true } : {}),
+      ...((rawRider.rangedOnly ?? rawRider.ranged_only) === true ? { rangedOnly: true } : {}),
+      ...((rawRider.finesseOrRangedOnly ?? rawRider.finesse_or_ranged_only) === true ? { finesseOrRangedOnly: true } : {}),
       ...((rawRider.strAttackOnly ?? rawRider.str_attack_only) === true ? { strAttackOnly: true } : {}),
       ...((rawRider.advantageOnly ?? rawRider.advantage_only) === true ? { advantageOnly: true } : {}),
+      ...((rawRider.noDisadvantage ?? rawRider.no_disadvantage) === true ? { noDisadvantage: true } : {}),
+      ...((rawRider.targetBelowMaxHp ?? rawRider.target_below_max_hp) === true ? { targetBelowMaxHp: true } : {}),
+      ...((rawRider.targetHalfHp ?? rawRider.target_half_hp) === true ? { targetHalfHp: true } : {}),
+      ...(targetConditions ? { targetConditions } : {}),
+      ...((rawRider.allyAdjacentToTarget ?? rawRider.ally_adjacent_to_target) === true ? { allyAdjacentToTarget: true } : {}),
+      ...((rawRider.advantageOrAllyAdjacent ?? rawRider.advantage_or_ally_adjacent) === true ? { advantageOrAllyAdjacent: true } : {}),
+      ...((rawRider.firstRoundOnly ?? rawRider.first_round_only) === true ? { firstRoundOnly: true } : {}),
+      ...((rawRider.critOnly ?? rawRider.crit_only) === true ? { critOnly: true } : {}),
+      ...((rawRider.ownTurnOnly ?? rawRider.own_turn_only) === true ? { ownTurnOnly: true } : {}),
+      ...(requiresStates ? { requiresStates } : {}),
       ...((rawRider.oncePerTurn ?? rawRider.once_per_turn) === true ? { oncePerTurn: true } : {}),
     };
   }
@@ -317,11 +575,6 @@ export function parseCustomEffectDef(raw: unknown): CustomEffectDef {
       acBonus = acRaw.trim();
       checkFormula(acBonus, 'defense_mod.ac_bonus');
     }
-    const strArr = (v: unknown): string[] | undefined => {
-      if (!Array.isArray(v)) return undefined;
-      const list = v.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim());
-      return list.length > 0 ? list : undefined;
-    };
     const resistant = strArr(rawDef.resistant);
     const immune = strArr(rawDef.immune);
     const vulnerable = strArr(rawDef.vulnerable);
@@ -443,9 +696,10 @@ export function parseCustomEffectDef(raw: unknown): CustomEffectDef {
   }
 
   const hasAnyHook = def.attackMod !== undefined || def.hitRider !== undefined || def.defenseMod !== undefined
-    || def.saveMod !== undefined || def.aura !== undefined || def.healMod !== undefined;
+    || def.saveMod !== undefined || def.aura !== undefined || def.healMod !== undefined
+    || def.concentration === true || def.transferable === true;
   if (!hasAnyHook) {
-    throw new Error('规则定义至少需要包含一个效果钩子（attack_mod / hit_rider / defense_mod / save_mod / aura / heal_mod）');
+    throw new Error('规则定义至少需要包含一个效果钩子（attack_mod / hit_rider / defense_mod / save_mod / aura / heal_mod / concentration / transferable）');
   }
   return def;
 }
@@ -474,10 +728,7 @@ export class CustomEffectStore {
   }
 
   public saveAll(defs: Record<string, CustomEffectDef>): void {
-    mkdirSync(dirname(this.filePath), { recursive: true });
-    const tmp = `${this.filePath}.tmp`;
-    writeFileSync(tmp, JSON.stringify(defs, null, 2), 'utf8');
-    renameSync(tmp, this.filePath);
+    writeJsonAtomic(this.filePath, defs, { indent: 2 });
   }
 
   public upsert(def: CustomEffectDef): void {
@@ -519,9 +770,54 @@ export function resolveEffectDef(
   campaignEffects?: Record<string, CustomEffectDef>,
   globalEffects?: Record<string, CustomEffectDef>,
 ): CustomEffectDef | undefined {
-  const q = rawName.trim().toLowerCase();
+  const trimmed = rawName.trim();
+  const q = trimmed.toLowerCase();
   if (!q) return undefined;
-  return mergedEffectMap(campaignEffects, globalEffects).get(q);
+  const map = mergedEffectMap(campaignEffects, globalEffects);
+  const direct = map.get(q);
+  if (direct !== undefined) return direct;
+
+  const stripped = trimmed.replace(/（[^）]*）|\([^)]*\)/g, '').trim();
+  if (stripped.length > 0 && stripped.toLowerCase() !== q) {
+    const byStripped = map.get(stripped.toLowerCase());
+    if (byStripped !== undefined) return byStripped;
+  }
+
+  const baseForSplit = stripped.length > 0 ? stripped : trimmed;
+  for (const part of baseForSplit.split(/[:：·—]+/)) {
+    const p = part.trim().toLowerCase();
+    if (p.length > 0) {
+      const hit = map.get(p);
+      if (hit !== undefined) return hit;
+    }
+  }
+  return undefined;
+}
+
+/** 安全识别 notes 中的正面/肯定式被动提及（排除「未选」「失去」「被偷袭」等否定/被动语态） */
+export function hasPositivePassiveMention(notes: string, terms: readonly string[]): boolean {
+  if (!notes.trim() || terms.length === 0) return false;
+  const clauses = notes.split(/[，,。\n；;！!]+/);
+  for (const term of terms) {
+    const clean = term.trim();
+    if (!clean) continue;
+    const escaped = clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const isAscii = /^[\x00-\x7F]+$/.test(clean);
+    const re = isAscii
+      ? new RegExp(`(?<![a-z0-9_])${escaped}(?![a-z0-9_])`, 'i')
+      : new RegExp(escaped, 'i');
+    for (const sub of clauses) {
+      const m = re.exec(sub);
+      if (m === null) continue;
+      const pre = sub.slice(0, m.index);
+      const post = sub.slice(m.index + m[0].length);
+      if (/(?:移除|取消|失去|没有|不含|未学|未选|作废|放弃|删去|防备|警惕|怕|躲避|免疫|抵抗|被|遭)|(?:^|[^不])无\s*$/.test(pre)) continue;
+      if (/^原/.test(pre.trim()) && /(?:移除|取消|失去|作废|洗点|重修|改为)/.test(sub)) continue;
+      if (/^[^（(]*?(?:已移除|被移除|移除|已取消|取消|已失去|失去|作废|已删)/.test(post)) continue;
+      return true;
+    }
+  }
+  return false;
 }
 
 /** 判断伤害类型是否命中抗性/免疫/易伤列表 */

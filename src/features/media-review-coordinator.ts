@@ -1,12 +1,12 @@
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import type { DshAgent } from '../session/types.ts';
 import type { OutboundHandlers } from '../transport/outbound.ts';
 import type { OperationEvidence } from '../notes/operation-recall.ts';
 import { QQBOT_MESSAGE_SOURCE } from '../shared/message-source.ts';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
+import { qqbotMediaReviewDir } from '../shared/paths.ts';
 
 interface Evidence { operations: string[]; results: OperationEvidence[] }
 export class MediaReviewCoordinator {
@@ -14,7 +14,7 @@ export class MediaReviewCoordinator {
   retainedAudit(sessionId: string): unknown { return this.failedAudits.get(sessionId); }
   constructor(private readonly outbound: OutboundHandlers,
     private readonly warn: (message: string) => void,
-    private readonly auditRoot = join(homedir(), '.dsh', 'qqbot-media-review')) {}
+    private readonly auditRoot = qqbotMediaReviewDir()) {}
 
   arm(agent: DshAgent, operations: readonly string[]): void {
     if (!operations.some(op => op.startsWith('media.'))) return;
@@ -70,15 +70,18 @@ export class MediaReviewCoordinator {
     const state = this.outbound.getMediaReviewState(sessionId);
     if (!state) return;
     try {
-      mkdirSync(this.auditRoot, { recursive: true });
       const name = createHash('sha256').update(sessionId).digest('hex');
       const path = join(this.auditRoot, `${name}.json`);
-      const temp = `${path}.${process.pid}.tmp`;
-      writeFileSync(temp, JSON.stringify({ ...state, at: new Date().toISOString(),
-        note: 'Buffered drafts are not evidence of QQ delivery; only transport delivery events confirm it.' }), { mode: 0o600 });
-      renameSync(temp, path);
-      writeFileSync(join(this.auditRoot, `${name}-${Date.now()}-${randomUUID()}.json`),
-        JSON.stringify({ ...state, at: new Date().toISOString(), deliveryConfirmed: false }), { mode: 0o600 });
+      writeJsonAtomic(path, {
+        ...state,
+        at: new Date().toISOString(),
+        note: 'Buffered drafts are not evidence of QQ delivery; only transport delivery events confirm it.',
+      }, { mode: 0o600 });
+      writeJsonAtomic(join(this.auditRoot, `${name}-${Date.now()}-${randomUUID()}.json`), {
+        ...state,
+        at: new Date().toISOString(),
+        deliveryConfirmed: false,
+      }, { mode: 0o600 });
       this.outbound.clearMediaReview(sessionId);
       this.failedAudits.delete(sessionId);
     } catch {

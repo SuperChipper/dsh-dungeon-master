@@ -18,6 +18,7 @@ import {
   type ReactionDef,
   type ReactionWindow,
   type ReactorOption,
+  armorClass,
   describePending,
   findCharacter,
   inInitiative,
@@ -33,11 +34,75 @@ import { canReact, cellOf, distanceFeet } from './battlefield.ts';
 
 export { reactionsOf };
 
-function hasResource(ch: Character, key: string | undefined, cost = 1): boolean {
-  if (key === undefined) return true;
-  const resource = ch.resources?.[key];
-  // 卡上没记这项资源就不拦：只是没登记，不等于用完了
-  return resource === undefined || resource.current >= Math.max(1, cost);
+export function parseSlotLevel(key: string): number | undefined {
+  const m = /([1-9])\s*环/.exec(key);
+  return m !== null ? Number(m[1]) : undefined;
+}
+
+export function isCounterspellReaction(name: string): boolean {
+  return /^(法术反制|反制法术|Counterspell)$/i.test(name.trim());
+}
+
+export function isShieldReaction(name: string): boolean {
+  return /^(护盾术|Shield)$/i.test(name.trim());
+}
+
+export function minReactionSpellSlot(name: string): number | undefined {
+  const clean = name.trim();
+  if (isCounterspellReaction(clean)) return 3;
+  if (/^(护盾术|Shield|吸收元素|Absorb Elements|炼狱叱喝|Hellish Rebuke)$/i.test(clean)) return 1;
+  return undefined;
+}
+
+export function availableSpellSlots(
+  ch: Character,
+  minLevel = 1,
+): Array<{ key: string; level: number; current: number; max: number }> {
+  const out: Array<{ key: string; level: number; current: number; max: number }> = [];
+  for (const [key, res] of Object.entries(ch.resources ?? {})) {
+    const level = parseSlotLevel(key);
+    if (level !== undefined && level >= minLevel && res.current > 0) {
+      out.push({ key, level, current: res.current, max: res.max });
+    }
+  }
+  out.sort((a, b) => a.level - b.level);
+  return out;
+}
+
+function tracksSpellSlots(ch: Character): boolean {
+  return Object.keys(ch.resources ?? {}).some((k) => parseSlotLevel(k) !== undefined);
+}
+
+export function isSpellcasterCharacter(ch: Character): boolean {
+  if (tracksSpellSlots(ch)) return true;
+  if ((ch.spells ?? []).some((s) => s.kind !== 'feature' && s.kind !== 'item')) return true;
+  return /施法|法师|术士|邪术师|牧师|德鲁伊|吟游诗人|诗人|圣武士|游侠|wizard|sorcerer|warlock|cleric|druid|bard|paladin|ranger|mage|archmage|priest|acolyte|cult fanatic/i
+    .test(`${ch.className ?? ''} ${ch.notes ?? ''}`);
+}
+
+export function hasReactionResource(ch: Character, r: Pick<ReactionDef, 'name' | 'resource' | 'cost'>): boolean {
+  const cost = Math.max(1, r.cost ?? 1);
+  const minSlot = minReactionSpellSlot(r.name);
+  if (r.resource !== undefined) {
+    const resource = ch.resources?.[r.resource];
+    const reqSlot = parseSlotLevel(r.resource);
+    if (resource === undefined) {
+      if (reqSlot !== undefined && tracksSpellSlots(ch)) {
+        return availableSpellSlots(ch, Math.max(reqSlot, minSlot ?? reqSlot)).length > 0;
+      }
+      // 卡上没记这项非环位资源就不拦：只是没登记，不等于用完了
+      return true;
+    }
+    if (resource.current >= cost) return true;
+    if (reqSlot !== undefined && minSlot !== undefined) {
+      return availableSpellSlots(ch, Math.max(reqSlot, minSlot)).length > 0;
+    }
+    return false;
+  }
+  if (minSlot !== undefined && tracksSpellSlots(ch)) {
+    return availableSpellSlots(ch, minSlot).length > 0;
+  }
+  return true;
 }
 
 /** 确认受到伤害后才触发的反应（兼容旧存档里把迷雾逃生/炼狱叱喝写成 when=attacked 的角色卡） */
@@ -76,8 +141,8 @@ export function eligibleReactors(
     // 用过反应或受惊：反手一击、挡攻击这类都不行（天赋类「自己攻击时」的不占反应，不受影响）
     const free = reactionBlocked(c, ch.name) === undefined;
     for (const r of reactionsOf(ch)) {
-      if (r.enter === true) continue;
-      if (!hasResource(ch, r.resource, r.cost)) continue;
+      if (r.enter === true || r.when === 'foe_casts' || isCounterspellReaction(r.name)) continue;
+      if (!hasReactionResource(ch, r)) continue;
       if (r.range !== undefined) {
         // 没摆位就不按距离筛：宁可多问一句，也别把够得着的人漏掉
         const mine = cellOf(c, ch);
@@ -105,6 +170,105 @@ export function eligibleReactors(
   }
   if (stage === 'damaged') return postDamage;
   return preDamage.length > 0 ? preDamage : postDamage;
+}
+
+/**
+ * 敌方施法时能用「法术反制」或「护盾术（挡魔法飞弹）」的在场 PC。
+ */
+export function eligibleSpellReactors(
+  c: Campaign,
+  caster: Character,
+  options: { spellName?: string; targets?: readonly string[] } = {},
+): ReactorOption[] {
+  if (c.initiative === undefined || caster.kind !== 'monster') return [];
+  const room = roomOf(c, caster);
+  const casterCell = cellOf(c, caster);
+  const isMagicMissile = options.spellName !== undefined && /^(?:魔法飞弹|Magic Missile)$/i.test(options.spellName.trim());
+  const out: ReactorOption[] = [];
+  const seen = new Set<string>();
+  const pushOption = (character: string, reaction: string): void => {
+    const k = `${character}·${reaction}`;
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push({ character, reaction });
+    }
+  };
+  for (const ch of c.characters) {
+    if (ch.kind !== 'pc' || isAbsent(ch) || !canReact(ch) || roomOf(c, ch) !== room) continue;
+    if (!inInitiative(c, ch.name)) continue;
+    if (reactionBlocked(c, ch.name) !== undefined) continue;
+    for (const r of reactionsOf(ch)) {
+      if (!hasReactionResource(ch, r)) continue;
+      if (r.when === 'foe_casts' || isCounterspellReaction(r.name)) {
+        const range = r.range ?? 60;
+        const mine = cellOf(c, ch);
+        if (mine !== undefined && casterCell !== undefined && distanceFeet(mine, casterCell) > range) continue;
+        pushOption(ch.name, r.name);
+      } else if (isMagicMissile && isShieldReaction(r.name) && options.targets?.includes(ch.name)) {
+        pushOption(ch.name, r.name);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * DM 内部战术提醒：当 PC 施法或攻击命中敌方施法者时，检查敌方是否仍有可用的「法术反制 / 护盾术」反应。
+ * 绝不向玩家发反应按钮，仅在工具结果末尾提醒 DM 决策。
+ */
+export function hostileSpellcasterHints(
+  c: Campaign,
+  actor: Character,
+  context: {
+    kind: 'spell' | 'attack';
+    spellName?: string;
+    target?: Character;
+    attackTotal?: number;
+    targetAc?: number;
+    crit?: boolean;
+  },
+): string[] {
+  if (c.initiative === undefined || actor.kind === 'monster') return [];
+  const room = roomOf(c, actor);
+  const actorCell = cellOf(c, actor);
+  const hints: string[] = [];
+
+  if (context.kind === 'spell') {
+    for (const m of c.characters) {
+      if (m.kind !== 'monster' || isOut(m) || !canReact(m) || roomOf(c, m) !== room) continue;
+      if (!inInitiative(c, m.name) || reactionBlocked(c, m.name) !== undefined) continue;
+      const counter = reactionsOf(m).find((r) => (r.when === 'foe_casts' || isCounterspellReaction(r.name)) && hasReactionResource(m, r));
+      if (counter === undefined) continue;
+      const mCell = cellOf(c, m);
+      const dist = mCell !== undefined && actorCell !== undefined ? distanceFeet(mCell, actorCell) : undefined;
+      if (dist !== undefined && dist > (counter.range ?? 60)) continue;
+      const slots = availableSpellSlots(m, 3);
+      const slotDesc = slots.length > 0 ? slots.map((s) => `${s.key} ${s.current}/${s.max}`).join('、') : '按角色卡施法能力';
+      const distDesc = dist !== undefined ? `距 ${dist} 尺、` : '';
+      hints.push(
+        `【DM战术提醒】敌方「${m.name}」（${distDesc}反应 1/1）持有「${counter.name}」（${slotDesc}）`
+        + `${context.spellName ? `，可反制「${context.spellName}」` : '，可反制本次施法'}（若决定反制，请用 dnd_undo 回滚或扣减反应与 3+ 环位后重写结算）。`,
+      );
+    }
+    return hints;
+  }
+
+  const target = context.target;
+  if (target === undefined || target.kind !== 'monster' || isOut(target) || !canReact(target)) return [];
+  if (!inInitiative(c, target.name) || reactionBlocked(c, target.name) !== undefined || context.crit === true) return [];
+  const shield = reactionsOf(target).find((r) => isShieldReaction(r.name) && hasReactionResource(target, r));
+  if (shield === undefined) return [];
+  const slots = availableSpellSlots(target, 1);
+  const slotDesc = slots.length > 0 ? slots.map((s) => `${s.key} ${s.current}/${s.max}`).join('、') : '按角色卡施法能力';
+  const ac = context.targetAc ?? armorClass(c, target);
+  const blocksThis = context.attackTotal !== undefined ? context.attackTotal < ac + 5 : undefined;
+  const blockText = blocksThis === undefined
+    ? '可提供 +5 AC 至下回合开始'
+    : blocksThis
+      ? '施放「护盾术」（+5 AC）可直接挡下本击（要使用可用 dnd_undo 回滚后改传 hold=true 并按护盾术反应结算）'
+      : '单靠「护盾术」（+5 AC）挡不下本击，但仍可挡本轮后续攻击';
+  hints.push(`【DM战术提醒】敌方「${target.name}」（反应 1/1）持有「${shield.name}」（${slotDesc}）：${blockText}。`);
+  return hints;
 }
 
 /**
@@ -160,8 +324,9 @@ export function requirePending(c: Campaign): PendingRoll {
   return p;
 }
 
-/** 还要等谁：点了要用但效果还没结算的也算在等 */
+/** 还要等谁：点了要用但效果还没结算的也算在等；法术已被反制时无需再等其他人 */
 export function waitingOn(p: ReactionWindow): string[] {
+  if (p.kind !== 'move' && p.countered === true) return [];
   const done = new Set([...p.declined, ...p.used.map((u) => u.by)]);
   return [...new Set(p.reactors.map((r) => r.character))].filter((name) => !done.has(name));
 }
@@ -178,7 +343,19 @@ function rollLine(p: PendingCheck, r: PendingD20): string {
 
 /** 这笔现在的局面，给模型看：只给成败，DC/AC 的数字不给（会被照抄进群里） */
 export function pendingState(p: ReactionWindow): string {
-  if (p.kind === 'move') return `${p.target} 暂停在借机触发处，剩余移动还没执行`;
+  if (p.kind === 'move') {
+    return p.swapWith !== undefined
+      ? `${p.target} 请求与 ${p.swapWith} 交换站位（不消耗反应），等待 ${p.swapWith} 确认`
+      : `${p.target} 暂停在借机触发处，剩余移动还没执行`;
+  }
+  if (p.countered === true) {
+    return `${describePending(p)}已被 ${p.counteredBy} 反制失效，落账时不产生任何效果`;
+  }
+  if (p.kind === 'spell') {
+    if (p.effect.kind === 'zone') return `${p.attacker} 正在放置持续区域「${p.spellName}」，等待反应确认`;
+    if (p.effect.kind === 'state') return `${p.attacker} 正在施放「${p.spellName}」挂载状态给 ${p.effect.targets.join('、')}，等待反应确认`;
+    return `${p.attacker} 施放「${p.spellName}」造成力场伤害${p.shieldedTargets?.length ? `（${p.shieldedTargets.join('、')} 已开护盾术免疫）` : ''}，等待反应确认`;
+  }
   if (p.kind === 'roll') {
     const damage = p.damage === undefined
       ? ''
@@ -213,15 +390,20 @@ export function pendingSummaryLine(p: ReactionWindow): string {
  * 成败要告诉玩家：重掷类反应按规则就是看到成败才决定，这里只能泄露一次，DC/AC 的数字仍然不报。
  */
 export function holdNotice(p: PendingRoll): string {
+  const hasCounter = p.reactors.some((r) => isCounterspellReaction(r.reaction));
   const unsettled = p.kind === 'attack'
     ? '血没扣'
-    : p.damage !== undefined || (p.onFail?.length ?? 0) > 0 ? '伤害和状态都还没落' : '后果先别演';
+    : p.kind === 'spell'
+      ? (p.effect.kind === 'zone' ? '区域还没落地' : (p.effect.kind === 'state' ? '状态还没生效' : '飞弹伤害还没扣'))
+      : p.damage !== undefined || (p.onFail?.length ?? 0) > 0 ? '伤害和状态都还没落' : '后果先别演';
   const fix = p.kind === 'attack'
     ? 'reaction 改数值（attack_mod/ac_mod/damage_mod，或 reroll="d20" 重掷）'
-    : `reaction 改数值（attack_mod 加减这一骰，或 reroll="d20" 重掷；target 填被改的那个掷骰人）`;
+    : p.kind === 'spell'
+      ? 'reaction 结算法术反制/护盾术（例如 {by, name:"法术反制", slot_level:3} 或挡魔法飞弹 {by, name:"护盾术"}）'
+      : `reaction 改数值（attack_mod 加减这一骰，或 reroll="d20" 重掷；target 填被改的那个掷骰人${hasCounter ? '；法术反制直接传 reaction={by, name:"法术反制", slot_level}' : ''}）`;
   const shieldWarn = p.kind === 'attack'
     && !p.crit
-    && p.reactors.some((r) => /^(护盾术|Shield)$/i.test(r.reaction))
+    && p.reactors.some((r) => isShieldReaction(r.reaction))
     && p.total + p.attackMod >= p.ac + p.acMod + 5
     ? '【算账核对】本次攻击总值不低于护盾术 +5 后的防御等级，单靠「护盾术」挡不下这一击（只能为本轮后续攻击提供 +5 AC，或配合减命中反应）；严禁在回复中误导玩家说护盾术能把这一击挡下！'
     : '';
@@ -266,6 +448,9 @@ export function chooseReaction(c: Campaign, p: ReactionWindow, senderId: string,
   }
   const grant = { ...option, authorization: randomUUID() };
   p.claimed.push(grant);
+  if (p.kind === 'move' && p.swapWith === ch.name) {
+    p.used.push({ by: ch.name, name: option.reaction, effect: '本人同意交换站位', consumedReaction: false });
+  }
   return grant;
 }
 
@@ -294,7 +479,7 @@ function stripCharacterPrefix(text: string, characterName: string): string {
 }
 
 const DECLINE_REPLY = /^(不用|不用了|不反应|这次不用|跳过反应|pass|no)[。.!！~～]*$/i;
-const GENERIC_REACTION = /反应|借机|尖刻言语|护盾术|导引打击|招架|反制法术|幸运点|重掷|重骰|时间变幻/;
+const GENERIC_REACTION = /反应|借机|尖刻言语|护盾术|法术反制|反制法术|反制|导引打击|招架|幸运点|重掷|重骰|时间变幻/;
 
 export interface ReactionReply {
   kind: 'use' | 'decline' | 'question';
@@ -318,16 +503,31 @@ export function classifyReactionReply(c: Campaign, senderId: string, text: strin
   const mine = charactersOf(c, senderId);
   if (mine.length === 0) return undefined;
   const listed = [...new Set(p.reactors.map((r) => r.character))].filter((name) => mine.some((ch) => ch.name === name));
+  const hasQuestionMark = /[?？]|(吗|呢)[。.!！~～]*$|能不能|可以吗|要不要|是不是/.test(clean);
+  if (p.kind === 'move' && p.swapWith !== undefined && listed.includes(p.swapWith)) {
+    const body = stripCharacterPrefix(clean, p.swapWith);
+    if (!hasQuestionMark) {
+      if (/^(我)?(不同意|不换|不交换|别换|拒绝|不用|算了|no|pass)[!！。.~～]*$/i.test(body)) {
+        return { kind: 'decline', characters: [p.swapWith], windowId: p.seq };
+      }
+      if (/^(我)?(同意|同意换位|同意交换|换位|换吧|换|可以换|可以|好|好的|行|没问题|来吧|ok|yes)[!！。.~～]*$/i.test(body)) {
+        return { kind: 'use', characters: [p.swapWith], windowId: p.seq, choices: p.reactors.filter((r) => r.character === p.swapWith) };
+      }
+    }
+    if (/换位|交换|位置/.test(clean)) {
+      return { kind: 'question', characters: [p.swapWith], windowId: p.seq };
+    }
+    return undefined;
+  }
   if (listed.length > 0 && DECLINE_REPLY.test(clean)) return { kind: 'decline', characters: listed, windowId: p.seq };
   // DM 点名问的反应（时间变幻）不在角色卡的 reactions 里，名字从名单上认
   const named = mine.some((ch) => reactionsOf(ch).some((r) => clean.includes(r.name)))
     || p.reactors.some((r) => listed.includes(r.character) && clean.includes(r.reaction));
   const movementUse = p.kind === 'move' && listed.length > 0 && /^(打|攻击|借机攻击)[。.!！]*$/.test(clean);
-  const hasQuestionMark = /[?？]|(吗|呢)[。.!！~～]*$|能不能|可以吗|要不要|是不是/.test(clean);
   const myOptions = p.reactors.filter((r) => listed.includes(r.character));
   const singleOptionBody = myOptions.length === 1 ? stripCharacterPrefix(clean, myOptions[0]!.character) : '';
   const singleOptionUse = !hasQuestionMark && myOptions.length === 1
-    && /^(我)?(这次|这下)?(要|想|决定)?(用|使用|开|交|放|施放|发动)(?=[!！。.，,、：:\s~～]|$)/.test(singleOptionBody);
+    && /^(我)?(这次|这下)?(要|想|决定)?(用|使用|开|交|放|施放|发动)(?=[!！。.，,、：:\s~～\d]|$)/.test(singleOptionBody);
   const multiOptionBareUse = !hasQuestionMark && myOptions.length > 1
     && /^(我)?(这次|这下)?(要|想|决定)?(用|使用|开|交|放|施放|发动)(?=[!！。.，,、：:\s~～]|$)/.test(clean);
   if (!named && !GENERIC_REACTION.test(clean) && !movementUse && !singleOptionUse && !multiOptionBareUse) return undefined;
@@ -346,15 +546,15 @@ export function classifyReactionReply(c: Campaign, senderId: string, text: strin
     }
   }
   const choices = myOptions.filter((r) => clean.includes(r.reaction) || movementUse);
-  // 技能名出现在规则提问/纠正里不是宣告；接收明确短宣告及附带修饰目标说明（如「用尖刻言语，直接放在伤害骰上」）。
+  // 技能名出现在规则提问/纠正里不是宣告；接收明确短宣告及附带修饰目标说明（如「用尖刻言语，直接放在伤害骰上」「用3环法术反制」）。
   const explicit = hasQuestionMark ? [] : choices.filter((r) => {
     if (movementUse) return true;
     const nameAt = clean.indexOf(r.reaction);
     const before = stripCharacterPrefix(clean.slice(0, nameAt).trim(), r.character);
     const after = clean.slice(nameAt + r.reaction.length).trim();
-    const validBefore = /^(我)?(这次|这下)?(要|想|决定)?(用|使用|开|交|放|施放|发动)?$/.test(before);
-    const shortAfter = /^(吧|了|呗|挡一下|挡|减他|减命中|减伤害|减一下|重掷|重骰)?[。.!！~～]*$/.test(after);
-    const directiveAfter = /^[，,、：:\s]*(直接)?(放|加|减|用|改|算|扣|压)?[^\n?？吗呢不没别持续]*(伤害|命中|攻击|检定|鉴定|豁免|骰|d20)[上里]?[。.!！~～]*$/i.test(after);
+    const validBefore = /^(我)?(这次|这下)?(要|想|决定)?(用|使用|开|交|放|施放|发动)?(?:\s*[（(]?\d\s*环[)）]?)?$/.test(before);
+    const shortAfter = /^(吧|了|呗|挡一下|挡|挡飞弹|挡魔法飞弹|减他|减命中|减伤害|减一下|重掷|重骰|\s*[（(]?\d\s*环[)）]?)*[。.!！~～]*$/.test(after);
+    const directiveAfter = /^[，,、：:\s]*(直接)?(放|加|减|用|改|算|扣|压)?[^\n?？吗呢不没别持续]*(伤害|命中|攻击|检定|鉴定|豁免|骰|d20|环|反制|飞弹)[上里]?[。.!！~～]*$/i.test(after);
     return validBefore && (shortAfter || directiveAfter);
   });
   return explicit.length === 1
@@ -394,14 +594,24 @@ export function reactionReplyNote(c: Campaign, reply: ReactionReply): string {
     return `[系统 · 反应讨论] 这条涉及「${what}」，但没有新的使用授权。回答规则/澄清选择，不能凭这条扣资源或跳过反应。`;
   }
   if (reply.kind === 'decline') {
+    if (p.kind === 'move' && p.swapWith !== undefined) {
+      return `[系统 · 换位确认] ${who} 本人明确不同意交换站位；已由服务器记下。调用 dnd_apply target=${p.target} settle=true 结束本次换位请求（停在原位）。`;
+    }
     return `[系统 · 待结算] ${who} 本人明确选择不用；已由服务器记下并撤销旧授权。这是「${what}」的答复，不是回合行动；都答复了再 dnd_apply target=${p.target} settle=true。`;
   }
   if (p.kind === 'move') {
+    if (p.swapWith !== undefined) {
+      return `[系统 · 换位确认] ${who} 本人已同意与 ${p.target} 交换站位（不消耗反应）；直接调用 dnd_apply target=${p.target} settle=true 完成换位结算。`;
+    }
     const grant = reply.grants![0]!;
     return `[系统 · 借机] 本人已授权「${grant.reaction}」：用 dnd_check character=${grant.character} type=attack target=${p.target} reaction=true authorization="${grant.authorization}" 结算；所有人答复并结算完后 dnd_apply target=${p.target} settle=true 继续移动。`;
   }
   return `[系统 · 待结算] 这条按对「${what}」那笔的反应处理（没带 @ 也算），不是新的回合行动，也不要 next：`
-    + reply.grants!.map((g) => `用 dnd_apply target=${p.target} reaction={by:"${g.character}", name:"${g.reaction}", authorization:"${g.authorization}", attack_mod/ac_mod/damage_mod 或 reroll:"d20", spend} 改数值。`).join(' ');
+    + reply.grants!.map((g) => (isCounterspellReaction(g.reaction)
+      ? `用 dnd_apply target=${p.target} reaction={by:"${g.character}", name:"${g.reaction}", authorization:"${g.authorization}", slot_level, spend} 结算法术反制。`
+      : p.kind === 'spell' && isShieldReaction(g.reaction)
+        ? `用 dnd_apply target=${p.target} reaction={by:"${g.character}", name:"${g.reaction}", authorization:"${g.authorization}", spend} 挡下魔法飞弹。`
+        : `用 dnd_apply target=${p.target} reaction={by:"${g.character}", name:"${g.reaction}", authorization:"${g.authorization}", attack_mod/ac_mod/damage_mod 或 reroll:"d20", spend} 改数值。`)).join(' ');
 }
 
 /** 这个反应会不会占掉角色本轮的反应：导引打击这类是自己攻击时用的，不算 */
@@ -442,7 +652,7 @@ export function refreshReactors(c: Campaign, p: PendingAttack): ReactorOption[] 
  * 改命中阶段全部答复后，若最终仍命中且造成伤害，解锁目标的「受伤后反应」（迷雾逃生、炼狱叱喝等）。
  */
 export function unlockDamagedReactors(c: Campaign, p: PendingAttack): ReactorOption[] {
-  if (!pendingHit(p) || (p.rawDamage !== undefined && Math.max(0, p.rawDamage + p.damageMod) <= 0)) return [];
+  if (p.countered === true || !pendingHit(p) || (p.rawDamage !== undefined && Math.max(0, p.rawDamage + p.damageMod) <= 0)) return [];
   const attacker = findCharacter(c, p.attacker);
   const target = findCharacter(c, p.target);
   if (attacker === undefined || target === undefined) return [];

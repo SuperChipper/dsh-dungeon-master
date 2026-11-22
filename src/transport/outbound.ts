@@ -481,6 +481,7 @@ class OutboundRouter {
         const result = this.stickerStore.save({
           source: call.image,
           emotion: call.emotion,
+          ...(call.look !== undefined ? { look: call.look } : {}),
           ...(call.note !== undefined ? { note: call.note } : {}),
           ...(call.file !== undefined ? { file: call.file } : {}),
         });

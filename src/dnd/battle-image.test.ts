@@ -49,6 +49,44 @@ describe('战斗图：标签和站位', () => {
     const tokens = roomTokens(c, 'hall', (ch) => ch.name !== '影魔');
     expect(tokens.map((t) => [t.name, t.x, t.y, t.down, t.current])).toEqual([['艾琳', 1, 1, false, true], ['卡厄斯', 2, 1, true, false]]);
   });
+
+  it('人物状态可视化：正面 buff 画蓝圈、负面/控制（失能/倒地/邪咒）画红圈、正负并存画双色半环，并绘制底部状态角标', () => {
+    const pBuff = person('卡厄斯', 'pc', 20);
+    pBuff.conditions = ['祝福术', '护盾信仰', '专注:祝福术'];
+    const pDebuff = person('蛇人纯血3', 'monster', 25);
+    pDebuff.conditions = ['倒地', '脆弱诅咒'];
+    const pMixed = person('丛云', 'pc', 30);
+    pMixed.conditions = ['狂暴', '失能'];
+
+    const c = fight([[pBuff, 1, 1], [pDebuff, 3, 1], [pMixed, 2, 2]], '卡厄斯');
+    const tokens = roomTokens(c, 'hall', () => true);
+
+    const tBuff = tokens.find((t) => t.name === '卡厄斯')!;
+    expect(tBuff.buffs).toEqual(['祝福术', '护盾信仰']);
+    expect(tBuff.debuffs).toBeUndefined();
+    expect(tBuff.badge).toBe('祝·盾');
+
+    const tDebuff = tokens.find((t) => t.name === '蛇人纯血3')!;
+    expect(tDebuff.debuffs).toEqual(['倒地', '脆弱诅咒']);
+    expect(tDebuff.buffs).toBeUndefined();
+    expect(tDebuff.badge).toBe('倒·咒');
+
+    const tMixed = tokens.find((t) => t.name === '丛云')!;
+    expect(tMixed.buffs).toEqual(['狂暴']);
+    expect(tMixed.debuffs).toEqual(['失能']);
+    expect(tMixed.badge).toBe('失·狂');
+
+    const map = parseBattleMap({ width: 5, height: 4 });
+    const svg = buildBattleSvg(map, tokens, '状态圈测试', false);
+    // 蓝圈（正面增益）、红圈（负面控制）、双色半圆弧 path 与状态角标文字均在 SVG 中渲染
+    expect(svg).toContain('stroke="#38bdf8"');
+    expect(svg).toContain('stroke="#ff3b5c"');
+    expect(svg).toContain('A 21.14 21.14 0 0 0');
+    expect(svg).toContain('A 21.14 21.14 0 0 1');
+    expect(svg).toContain('祝·盾');
+    expect(svg).toContain('倒·咒');
+    expect(svg).toContain('失·狂');
+  });
 });
 
 describe('战斗图：底图和规则', () => {

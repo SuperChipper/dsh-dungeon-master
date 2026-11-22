@@ -85,16 +85,16 @@ describe('停团兜底摘要', () => {
 describe('开团时写笔记的 DM 机密拦截', () => {
   it('怪物数值、DC 被拒并提示用 dnd_progress；玩家角色数值照常写', async () => {
     const { call, notesRoot } = setup();
-    await expect(call('qqbot_notes_save', { title: '地窖', content: '巨鼠2 HP 7 AC 12' })).rejects.toThrow(/巨鼠.*dnd_progress/);
-    await expect(call('qqbot_notes_save', { title: '地窖', content: '门锁 DC 15' })).rejects.toThrow('DC');
-    await call('qqbot_notes_save', { title: '队伍', content: '卡厄斯 HP 12 AC 18', scope: 'chat' });
+    await expect(call('qqbot_notes', { action: 'save', title: '地窖', content: '巨鼠2 HP 7 AC 12' })).rejects.toThrow(/巨鼠.*dnd_progress/);
+    await expect(call('qqbot_notes', { action: 'save', title: '地窖', content: '门锁 DC 15' })).rejects.toThrow('DC');
+    await call('qqbot_notes', { action: 'save', title: '队伍', content: '卡厄斯 HP 12 AC 18', scope: 'chat' });
     expect(readdirSync(join(notesRoot, 'chats', 'group_G1'))).toContain('队伍.md');
   });
 
   it('没开团时不拦', async () => {
     const { service, key, call } = setup();
     service.stop(key);
-    await expect(call('qqbot_notes_save', { title: '规则备忘', content: '开锁一般 DC 15', scope: 'chat' })).resolves.toBeDefined();
+    await expect(call('qqbot_notes', { action: 'save', title: '规则备忘', content: '开锁一般 DC 15', scope: 'chat' })).resolves.toBeDefined();
   });
 });
 

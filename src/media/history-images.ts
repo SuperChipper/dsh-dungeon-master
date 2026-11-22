@@ -11,6 +11,7 @@ import type { MediaConfig } from '../config.ts';
 import type { GroupMemoryImage } from '../features/group-memory.ts';
 import type { Logger, RawAttachment } from '../types.ts';
 import { downloadMediaAttachments, type DownloadedFile } from '../transport/attachment.ts';
+import { bindMediaRefLocalPath, mediaRefStore, type MediaRefStore } from './media-ref-store.ts';
 
 /** 每次触发最多下载/注入的历史图片张数（越新越优先） */
 export const MAX_HISTORY_IMAGES = 4;
@@ -68,6 +69,7 @@ export async function downloadRecentHistoryImages(
     const cached = downloadedByUrl.get(image.url);
     if (cached !== undefined && existsSync(cached)) {
       image.localPath = cached;
+      bindMediaRefLocalPath(image.url, cached);
       continue;
     }
 
@@ -80,6 +82,7 @@ export async function downloadRecentHistoryImages(
     if (file === undefined) continue;
 
     image.localPath = file.localPath;
+    bindMediaRefLocalPath(image.url, file.localPath);
     downloadedByUrl.delete(image.url);
     downloadedByUrl.set(image.url, file.localPath);
     if (downloadedByUrl.size > CACHE_LIMIT) {
@@ -89,7 +92,8 @@ export async function downloadRecentHistoryImages(
   }
 }
 
-/** 历史文本里的图片标记：有本地文件给路径，否则给 URL（可能已过期） */
-export function historyImageTag(image: HistoryImage): string {
-  return `[图片#${image.index}: ${image.localPath ?? image.url}]`;
+/** 历史文本里的图片标记：有本地文件给路径，否则给短引用 qqref:<id>（可能已过期） */
+export function historyImageTag(image: HistoryImage, refs: MediaRefStore = mediaRefStore): string {
+  const refOrPath = image.localPath ?? refs.register(image.url, { filename: image.filename });
+  return `[图片#${image.index}: ${refOrPath}]`;
 }

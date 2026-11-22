@@ -9,11 +9,12 @@
  * 所以每个人设有自己的会话，切回来接着聊。
  */
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import yaml from 'js-yaml';
 import type { ChatScope, Logger } from '../types.ts';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
+import { qqbotLegacyHomeDir, qqbotPersonaHandoffsDir, qqbotPersonasDir, qqbotPersonaStatePath } from '../shared/paths.ts';
 import { PersonaHandoffStore } from './persona-handoff.ts';
 
 export const DEFAULT_PERSONA_ID = 'default';
@@ -85,7 +86,7 @@ export function resolvePersonasDir(options: {
       // 目录不存在或不可读时回退默认目录
     }
   }
-  const home = resolve(options.homeDir ?? homedir(), '.dsh-qqbot');
+  const home = qqbotLegacyHomeDir(options.homeDir);
   return join(home, 'personas');
 }
 
@@ -118,10 +119,10 @@ export class PersonaStore {
   private readonly warned = new Set<string>();
 
   public constructor(options: { dir?: string; statePath?: string; logger?: Logger } = {}) {
-    const home = resolve(homedir(), '.dsh-qqbot');
-    this.dir = options.dir ?? join(home, 'personas');
-    this.statePath = options.statePath ?? join(home, 'persona-state.json');
-    this.handoffs = new PersonaHandoffStore(join(dirname(this.statePath), 'persona-handoffs'));
+    this.dir = options.dir ?? qqbotPersonasDir();
+    this.statePath = options.statePath ?? qqbotPersonaStatePath();
+    const handoffsDir = options.statePath !== undefined ? join(dirname(this.statePath), 'persona-handoffs') : qqbotPersonaHandoffsDir();
+    this.handoffs = new PersonaHandoffStore(handoffsDir);
     this.logger = options.logger;
     try {
       if (existsSync(this.statePath)) {
@@ -330,9 +331,6 @@ export class PersonaStore {
   }
 
   private save(): void {
-    mkdirSync(dirname(this.statePath), { recursive: true });
-    const tmp = `${this.statePath}.tmp-${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(this.state, null, 2), 'utf8');
-    renameSync(tmp, this.statePath);
+    writeJsonAtomic(this.statePath, this.state, { indent: 2 });
   }
 }

@@ -7,11 +7,13 @@
 import type { BattleCell, Campaign, Character, Weapon } from './campaign.ts';
 import {
   type CustomEffectDef,
+  hasPositivePassiveMention,
   matchesDamageType,
+  mergedEffectMap,
   resolveEffectDef,
 } from './custom-effects.ts';
 import type { Advantage } from './dice.ts';
-import { buildFormulaContext, evalIntFormula } from './formula.ts';
+import { buildFormulaContext, evalIntFormula, extractClassLevel } from './formula.ts';
 import type { Ability } from './rules.ts';
 import type { Defense } from './save-effect.ts';
 import { isCellHeavilyObscured } from './zones.ts';
@@ -45,6 +47,21 @@ export interface ActiveState {
   saveDc?: number;
   /** 随状态挂载的额外命中附伤 */
   riders?: StateRiderSpec[];
+}
+
+export interface ConcentrationRecord {
+  /** 正在维持专注的标准状态/法术名（如 "脆弱诅咒"、"猎人印记"、"无痕步"） */
+  name: string;
+  /** 施法使用的法术位环阶 */
+  slotLevel?: number;
+  /** 剩余持续轮数（1 分钟 = 10 轮，10 分钟 = 100 轮，1 小时 = 600 轮，8 小时 = 4800 轮，24 小时 = 14400 轮） */
+  roundsLeft?: number;
+  /** 原目标倒下或战斗结束后专注保留在施法者身上，后续可用附赠动作免费转移给新目标 */
+  transferable?: boolean;
+  /** 当前锁定的受术目标名（单目标标记类专注） */
+  currentTarget?: string;
+  /** 原目标已降至 0 HP 或离场，当前处于待转移状态 */
+  canTransfer?: boolean;
 }
 
 export interface TurnActionState {
@@ -277,6 +294,47 @@ const CONDITION_ALIASES: Record<string, string> = {
   雨夹雪: '雪雨暴',
   雨雪暴: '雪雨暴',
   雪雨暴: '雪雨暴',
+
+  'pass without trace': '无痕步',
+  pass_without_trace: '无痕步',
+  无踪步: '无痕步',
+  行动无踪: '无痕步',
+  无痕步: '无痕步',
+
+  'detect magic': '侦测魔法',
+  detect_magic: '侦测魔法',
+  侦测魔法: '侦测魔法',
+
+  blur: '朦胧术',
+  模糊术: '朦胧术',
+  朦胧术: '朦胧术',
+
+  suggestion: '暗示术',
+  暗示术: '暗示术',
+
+  'call lightning': '召雷术',
+  召雷术: '召雷术',
+
+  'flaming sphere': '炽焰法球',
+  炽焰法球: '炽焰法球',
+
+  barkskin: '树肤术',
+  树肤术: '树肤术',
+
+  stoneskin: '石肤术',
+  石肤术: '石肤术',
+
+  'magic weapon': '魔化武器',
+  魔化武器: '魔化武器',
+
+  'elemental weapon': '元素武器',
+  元素武器: '元素武器',
+
+  'expeditious retreat': '脚底抹油',
+  脚底抹油: '脚底抹油',
+
+  'spider climb': '蛛行术',
+  蛛行术: '蛛行术',
 };
 
 /** 含失能效果的状态：禁止动作/附赠动作/反应，且施加时自动打断专注 */
@@ -292,6 +350,8 @@ export const DEFAULT_CONCENTRATION_STATES = new Set([
   '云雾术', '黑暗术', '力场墙', '防护善恶', '蛛网术', '纠缠术',
   '月华之光', '催眠图纹', '恐惧术', '迟缓术', '变形术', '隐形术', '高等隐形',
   '荆棘丛生', '匕首之云', '火墙术', '沉默术', '臭云术', '死云术', '雪雨暴',
+  '无痕步', '侦测魔法', '朦胧术', '暗示术', '召雷术', '炽焰法球',
+  '树肤术', '石肤术', '魔化武器', '元素武器', '脚底抹油', '蛛行术',
 ]);
 
 /** 把英文或中文同义词归一成标准状态名；未知自定义状态原样保留（仅去首尾空白） */
@@ -340,29 +400,56 @@ export function effectiveStates(ch: Character): ActiveState[] {
   return [...map.values()];
 }
 
-/** 列出角色身上激活的所有自定义/内置规则定义（含 traits 常驻被动与 activeStates 限时状态） */
+/** 列出角色身上激活的所有自定义/内置规则定义（含 traits 常驻被动、spells 被动特性/物品、activeStates 限时状态与安全备注兜底） */
 export function activeEffectDefsFor(
   ch: Character,
   campaignEffects?: Record<string, CustomEffectDef>,
   globalEffects?: Record<string, CustomEffectDef>,
 ): Array<{ def: CustomEffectDef; state?: ActiveState }> {
-  const seen = new Set<string>();
-  const out: Array<{ def: CustomEffectDef; state?: ActiveState }> = [];
+  const byName = new Map<string, { def: CustomEffectDef; state?: ActiveState }>();
   for (const trait of ch.traits ?? []) {
     const def = resolveEffectDef(trait, campaignEffects, globalEffects);
-    if (def !== undefined && !seen.has(def.name)) {
-      seen.add(def.name);
-      out.push({ def });
+    if (def !== undefined && !byName.has(def.name)) {
+      byName.set(def.name, { def });
+    }
+  }
+  for (const s of ch.spells ?? []) {
+    if (s.kind !== 'feature' && s.kind !== 'item') continue;
+    const def = resolveEffectDef(s.name, campaignEffects, globalEffects);
+    if (def === undefined || byName.has(def.name)) continue;
+    if (def.passive === true || (s.action === 'passive' && def.concentration !== true && def.defaultRounds === undefined)) {
+      byName.set(def.name, { def });
     }
   }
   for (const s of effectiveStates(ch)) {
     const def = resolveEffectDef(s.name, campaignEffects, globalEffects);
-    if (def !== undefined && !seen.has(def.name)) {
-      seen.add(def.name);
-      out.push({ def, state: s });
+    if (def === undefined) continue;
+    const existing = byName.get(def.name);
+    if (existing === undefined) {
+      byName.set(def.name, { def, state: s });
+    } else if (existing.state === undefined) {
+      existing.state = s;
     }
   }
-  return out;
+  if (ch.notes !== undefined && ch.notes.trim().length > 0) {
+    const checkedDefs = new Set<string>();
+    for (const def of mergedEffectMap(campaignEffects, globalEffects).values()) {
+      if (checkedDefs.has(def.name) || byName.has(def.name)) continue;
+      checkedDefs.add(def.name);
+      if (def.passive !== true) continue;
+      if (def.classFilter !== undefined) {
+        try {
+          if (!new RegExp(def.classFilter, 'i').test(ch.className ?? '')) continue;
+        } catch {
+          continue;
+        }
+      }
+      if (hasPositivePassiveMention(ch.notes, [def.name, ...(def.aliases ?? [])])) {
+        byName.set(def.name, { def });
+      }
+    }
+  }
+  return [...byName.values()];
 }
 
 export function hasCondition(ch: Character, canonicalName: string): boolean {
@@ -472,6 +559,58 @@ function charRoom(c: Campaign, ch: Character): string | undefined {
   return ch.kind === 'monster' ? ch.room : (ch.room ?? c.currentRoom);
 }
 
+/** 判断某状态是否为目标倒下后可保留并免费转移的专注效果（如脆弱诅咒、猎人印记，或自定义 transferable 规则） */
+export function isTransferableState(
+  c: Campaign | undefined,
+  rawName: string,
+  globalEffects?: Record<string, CustomEffectDef>,
+): boolean {
+  const norm = normalizeCondition(rawName);
+  return resolveEffectDef(norm, c?.customEffects, globalEffects)?.transferable === true;
+}
+
+/** 判断某状态是否默认需要维持专注 */
+export function isDefaultConcentrationState(
+  c: Campaign | undefined,
+  rawName: string,
+  globalEffects?: Record<string, CustomEffectDef>,
+): boolean {
+  const norm = normalizeCondition(rawName);
+  const def = resolveEffectDef(norm, c?.customEffects, globalEffects);
+  if (def?.concentration !== undefined) return def.concentration;
+  return DEFAULT_CONCENTRATION_STATES.has(norm);
+}
+
+/** 按 5e 标准规则推导法术/状态的默认持续轮数（1 分钟=10，10 分钟=100，1 小时=600，8 小时=4800，24 小时=14400） */
+export function defaultStateRounds(
+  rawName: string,
+  slotLevel?: number,
+  c?: Campaign,
+  globalEffects?: Record<string, CustomEffectDef>,
+): number {
+  const norm = normalizeCondition(rawName);
+  if (norm === '脆弱诅咒' || norm === '猎人印记') {
+    if (slotLevel !== undefined && slotLevel >= 5) return 14400;
+    if (slotLevel !== undefined && slotLevel >= 3) return 4800;
+    return 600;
+  }
+  if (
+    norm === '无痕步' || norm === '隐形术' || norm === '变形术'
+    || norm === '树肤术' || norm === '石肤术' || norm === '魔化武器'
+    || norm === '元素武器' || norm === '蛛行术'
+  ) {
+    return 600;
+  }
+  if (
+    norm === '护盾信仰' || norm === '侦测魔法' || norm === '脚底抹油'
+    || norm === '召雷术' || norm === '飞行术' || norm === '防护善恶'
+    || norm === '黑暗术' || norm === '力场墙' || norm === '沉默术' || norm === '死云术'
+  ) {
+    return 100;
+  }
+  return resolveEffectDef(norm, c?.customEffects, globalEffects)?.defaultRounds ?? 10;
+}
+
 /** 查询某施法者当前维持专注的所有状态描述 */
 export function concentratingOn(c: Campaign, casterName: string): Array<{ owner: Character; state: ActiveState }> {
   const out: Array<{ owner: Character; state: ActiveState }> = [];
@@ -490,11 +629,61 @@ export function concentratingZoneNames(c: Campaign, casterName: string): string[
   return [...new Set((c.initiative?.zones ?? []).filter((z) => z.source === casterName && z.concentration === true).map((z) => z.name))];
 }
 
+/** 查询某施法者当前维持专注的全部法术/状态名（包含目标状态、战场区域与待转移的施法者专注记录） */
+export function concentratingSpellNames(c: Campaign, casterName: string): string[] {
+  const caster = c.characters.find((x) => x.name === casterName);
+  const fromStates = concentratingOn(c, casterName).map((x) => x.state.name);
+  const fromZones = concentratingZoneNames(c, casterName);
+  const fromRecord = caster?.concentrationState !== undefined ? [caster.concentrationState.name] : [];
+  return [...new Set([...fromStates, ...fromZones, ...fromRecord])];
+}
+
+/** 生成角色维持在外部目标、战场区域或待转移状态上的紧凑专注标签（避免摘要遗漏外部专注） */
+export function externalConcentrationTags(c: Campaign, ch: Character): string[] {
+  const selfConds = new Set(ch.conditions.map(normalizeCondition));
+  const concOwned = concentratingOn(c, ch.name);
+  const concZones = concentratingZoneNames(c, ch.name);
+  const tags: string[] = [];
+  const covered = new Set<string>();
+
+  const bySpell = new Map<string, string[]>();
+  for (const { owner, state } of concOwned) {
+    const sName = normalizeCondition(state.name);
+    bySpell.set(sName, [...(bySpell.get(sName) ?? []), owner.name]);
+  }
+  for (const [spell, owners] of bySpell) {
+    covered.add(spell);
+    if (selfConds.has(spell) && owners.length === 1 && owners[0] === ch.name) continue;
+    const others = owners.filter((n) => n !== ch.name);
+    if (others.length === 1 && !selfConds.has(spell)) {
+      tags.push(`专注:${spell}→${others[0]}`);
+    } else if (!selfConds.has(spell)) {
+      tags.push(`专注:${spell}×${owners.length}`);
+    }
+  }
+  for (const zName of concZones) {
+    const norm = normalizeCondition(zName);
+    covered.add(norm);
+    if (!selfConds.has(norm)) tags.push(`专注:${norm}`);
+  }
+  const cs = ch.concentrationState;
+  if (cs !== undefined) {
+    const norm = normalizeCondition(cs.name);
+    if (!covered.has(norm) && !selfConds.has(norm)) {
+      tags.push(cs.transferable || cs.canTransfer ? `专注:${norm}(可转移)` : `专注:${norm}`);
+    }
+  }
+  return tags;
+}
+
 /** 打断某施法者维持的全部专注状态与专注区域效果，同步移除受术者身上的对应状态 */
 export function breakConcentration(c: Campaign, casterName: string, reason?: string): string[] {
+  const caster = c.characters.find((x) => x.name === casterName);
+  const cs = caster?.concentrationState;
   const active = concentratingOn(c, casterName);
   const concZones = (c.initiative?.zones ?? []).filter((z) => z.source === casterName && z.concentration === true);
-  if (active.length === 0 && concZones.length === 0) return [];
+  if (active.length === 0 && concZones.length === 0 && cs === undefined) return [];
+  if (caster !== undefined) delete caster.concentrationState;
   const grouped = new Map<string, string[]>();
   for (const { owner, state } of active) {
     grouped.set(state.name, [...(grouped.get(state.name) ?? []), owner.name]);
@@ -517,6 +706,9 @@ export function breakConcentration(c: Campaign, casterName: string, reason?: str
       }
     }
   }
+  if (cs !== undefined && !grouped.has(cs.name) && !concZones.some((z) => z.name === cs.name)) {
+    lines.push(`${casterName} 对「${cs.name}」的专注中断${reason ? `（${reason}）` : ''}`);
+  }
   return lines;
 }
 
@@ -528,18 +720,25 @@ export function upsertActiveState(
   c: Campaign,
   ch: Character,
   input: ActiveState,
-  options: { replaceConcentration?: boolean } = {},
+  options: { replaceConcentration?: boolean; globalEffects?: Record<string, CustomEffectDef> } = {},
 ): { broken: string[] } {
   const rawTrimmed = input.name.trim();
   const name = normalizeCondition(rawTrimmed);
   if (name.length === 0) throw new Error('状态名不能为空');
   const displayCond = rawTrimmed === '祝福' || rawTrimmed === '灾祸' ? rawTrimmed : name;
   const broken: string[] = [];
+  const transferable = isTransferableState(c, name, options.globalEffects);
   if (input.concentration === true && input.source !== undefined && options.replaceConcentration !== false) {
-    const prevStates = concentratingOn(c, input.source).filter((x) => x.state.name !== name);
-    const prevZones = concentratingZoneNames(c, input.source).filter((zName) => zName !== name);
-    if (prevStates.length > 0 || prevZones.length > 0) {
+    const prevSpells = concentratingSpellNames(c, input.source).filter((sName) => sName !== name);
+    if (prevSpells.length > 0) {
       broken.push(...breakConcentration(c, input.source, `改换专注为「${name}」`));
+    }
+  }
+  // 单目标可转移标记（如脆弱诅咒、猎人印记）：同一施法者只能同时标记一个目标，自动清掉旧目标上的本人同名标记
+  if (input.concentration === true && input.source !== undefined && transferable) {
+    for (const other of c.characters) {
+      if (other === ch) continue;
+      removeActiveState(other, name, input.source);
     }
   }
   // 力竭等级互斥：新力竭等级替换旧力竭等级；力竭:6 直接转死亡
@@ -567,13 +766,34 @@ export function upsertActiveState(
     || clean.acBonus !== undefined || clean.slotLevel !== undefined || clean.saveDc !== undefined || clean.riders !== undefined;
 
   if (hasMetadata || ch.activeStates !== undefined) {
-    const list = (ch.activeStates ?? []).filter((s) => normalizeCondition(s.name) !== name);
+    // 不同施法者对同一目标施加的专注状态（如双术士同时对首领挂脆弱诅咒）按 (name, source) 独立共存，互不覆盖
+    const list = (ch.activeStates ?? []).filter((s) => {
+      if (normalizeCondition(s.name) !== name) return true;
+      if (clean.concentration === true && clean.source !== undefined && s.concentration === true && s.source !== undefined) {
+        return s.source !== clean.source;
+      }
+      return false;
+    });
     list.push(clean);
     ch.activeStates = list;
   }
   // 统一把归一后的中文名写入 conditions（兼容保留“祝福/灾祸”字面简称，避免破坏旧列表断言）
   ch.conditions = ch.conditions.filter((cond) => normalizeCondition(cond) !== name);
   ch.conditions.push(displayCond);
+
+  if (clean.concentration === true && clean.source !== undefined) {
+    const caster = c.characters.find((x) => x.name === clean.source);
+    if (caster !== undefined) {
+      caster.concentrationState = {
+        name,
+        ...(clean.slotLevel !== undefined ? { slotLevel: clean.slotLevel } : {}),
+        ...(clean.roundsLeft !== undefined ? { roundsLeft: clean.roundsLeft } : {}),
+        ...(transferable
+          ? { transferable: true, currentTarget: ch.name, canTransfer: false }
+          : (ch.name !== caster.name ? { currentTarget: ch.name } : {})),
+      };
+    }
+  }
 
   if (name === '力竭:4' || name === '力竭:5') {
     ch.hp = Math.min(ch.hp, effectiveMaxHp(ch));
@@ -589,8 +809,8 @@ export function upsertActiveState(
   return { broken };
 }
 
-/** 移除角色身上的某状态（兼容移除裸 `"力竭"` 清除任意等级力竭），同步清理 `activeStates` 与 `conditions` */
-export function removeActiveState(ch: Character, rawName: string): string[] {
+/** 移除角色身上的某状态（兼容移除裸 `"力竭"` 清除任意等级力竭；可选按 source 仅移除某施法者的标记），同步清理 `activeStates` 与 `conditions` */
+export function removeActiveState(ch: Character, rawName: string, bySource?: string): string[] {
   const trimmed = rawName.trim();
   const isBareExhaustion = /^(?:exhaustion|力竭)$/i.test(trimmed);
   const norm = normalizeCondition(trimmed);
@@ -599,6 +819,23 @@ export function removeActiveState(ch: Character, rawName: string): string[] {
     return isBareExhaustion ? /^力竭:[1-6]$/.test(n) : n === norm;
   };
   const removed = new Set<string>();
+  if (bySource !== undefined) {
+    for (const s of ch.activeStates ?? []) {
+      if (matches(s.name) && s.source === bySource) removed.add(normalizeCondition(s.name));
+    }
+    if (removed.size === 0) return [];
+    if (ch.activeStates !== undefined) {
+      ch.activeStates = ch.activeStates.filter((s) => !(matches(s.name) && s.source === bySource));
+      if (ch.activeStates.length === 0) delete ch.activeStates;
+    }
+    for (const rName of removed) {
+      const stillHas = ch.activeStates?.some((s) => normalizeCondition(s.name) === rName) === true;
+      if (!stillHas) {
+        ch.conditions = ch.conditions.filter((cond) => normalizeCondition(cond) !== rName);
+      }
+    }
+    return [...removed];
+  }
   for (const cond of ch.conditions) {
     if (matches(cond)) removed.add(normalizeCondition(cond));
   }
@@ -612,6 +849,186 @@ export function removeActiveState(ch: Character, rawName: string): string[] {
     if (ch.activeStates.length === 0) delete ch.activeStates;
   }
   return [...removed];
+}
+
+/** 受术目标身上的状态被手动移除后，同步核对施法者 concentrationState（可转移专注在受术者移除后保留待转移） */
+export function syncConcentrationAfterRemoval(
+  c: Campaign,
+  removedFrom: Character,
+  removedNames: readonly string[],
+): void {
+  if (removedNames.length === 0) return;
+  const set = new Set(removedNames.map(normalizeCondition));
+  for (const caster of c.characters) {
+    const cs = caster.concentrationState;
+    if (cs === undefined || !set.has(normalizeCondition(cs.name))) continue;
+    const stillOnTarget = concentratingOn(c, caster.name).some((x) => normalizeCondition(x.state.name) === normalizeCondition(cs.name));
+    const stillOnZone = concentratingZoneNames(c, caster.name).some((z) => normalizeCondition(z) === normalizeCondition(cs.name));
+    if (stillOnTarget || stillOnZone) continue;
+    if (cs.transferable === true && removedFrom.name !== caster.name) {
+      caster.concentrationState = {
+        name: cs.name,
+        ...(cs.slotLevel !== undefined ? { slotLevel: cs.slotLevel } : {}),
+        ...(cs.roundsLeft !== undefined ? { roundsLeft: cs.roundsLeft } : {}),
+        transferable: true,
+        canTransfer: true,
+      };
+    } else {
+      delete caster.concentrationState;
+    }
+  }
+}
+
+/** 当目标降至 0 HP 或离场时，将锁定该目标的可转移专注（脆弱诅咒、猎人印记等）保留在施法者身上并标记为可免费转移 */
+export function notifyConcentrationTargetDown(
+  c: Campaign,
+  fallen: Character,
+  globalEffects?: Record<string, CustomEffectDef>,
+): string[] {
+  const notes: string[] = [];
+  const handled = new Set<string>();
+  for (const s of fallen.activeStates ?? []) {
+    if (s.concentration !== true || s.source === undefined) continue;
+    const spell = normalizeCondition(s.name);
+    if (!isTransferableState(c, spell, globalEffects)) continue;
+    const caster = c.characters.find((x) => x.name === s.source);
+    if (caster === undefined || caster.hp <= 0 || caster.conditions.includes('死亡')) continue;
+    caster.concentrationState = {
+      name: spell,
+      ...(s.slotLevel !== undefined ? { slotLevel: s.slotLevel } : (caster.concentrationState?.slotLevel !== undefined ? { slotLevel: caster.concentrationState.slotLevel } : {})),
+      ...(s.roundsLeft !== undefined ? { roundsLeft: s.roundsLeft } : (caster.concentrationState?.roundsLeft !== undefined ? { roundsLeft: caster.concentrationState.roundsLeft } : {})),
+      transferable: true,
+      canTransfer: true,
+    };
+    handled.add(`${caster.name}:${spell}`);
+    notes.push(`${caster.name} 维持的「${spell}」保留专注（后续可用附赠动作免费转移给新目标）`);
+  }
+  for (const caster of c.characters) {
+    const cs = caster.concentrationState;
+    if (cs === undefined || cs.transferable !== true || cs.currentTarget !== fallen.name) continue;
+    const key = `${caster.name}:${cs.name}`;
+    if (handled.has(key) || caster.hp <= 0 || caster.conditions.includes('死亡')) continue;
+    caster.concentrationState = {
+      name: cs.name,
+      ...(cs.slotLevel !== undefined ? { slotLevel: cs.slotLevel } : {}),
+      ...(cs.roundsLeft !== undefined ? { roundsLeft: cs.roundsLeft } : {}),
+      transferable: true,
+      canTransfer: true,
+    };
+    notes.push(`${caster.name} 维持的「${cs.name}」保留专注（后续可用附赠动作免费转移给新目标）`);
+  }
+  return notes;
+}
+
+/** 将施法者正在维持的可转移专注（如脆弱诅咒、猎人印记）零法术位消耗地转移到新目标身上 */
+export function transferConcentration(
+  c: Campaign,
+  caster: Character,
+  newTarget: Character,
+  options: { spellName?: string; force?: boolean; globalEffects?: Record<string, CustomEffectDef> } = {},
+): { spellName: string; previousTarget?: string; roundsLeft: number; slotLevel?: number } {
+  const requested = options.spellName !== undefined && options.spellName.trim().length > 0
+    ? normalizeCondition(options.spellName)
+    : undefined;
+
+  let cs = caster.concentrationState;
+  // 兼容旧存档：尚无 concentrationState 但目标怪物身上有 source === caster.name 的可转移专注
+  if (cs === undefined) {
+    const legacy = concentratingOn(c, caster.name).find(({ state }) =>
+      isTransferableState(c, state.name, options.globalEffects)
+      && (requested === undefined || normalizeCondition(state.name) === requested),
+    );
+    if (legacy !== undefined) {
+      cs = {
+        name: normalizeCondition(legacy.state.name),
+        ...(legacy.state.slotLevel !== undefined ? { slotLevel: legacy.state.slotLevel } : {}),
+        ...(legacy.state.roundsLeft !== undefined ? { roundsLeft: legacy.state.roundsLeft } : {}),
+        transferable: true,
+        currentTarget: legacy.owner.name,
+        canTransfer: legacy.owner.hp <= 0 || legacy.owner.conditions.includes('死亡'),
+      };
+      caster.concentrationState = cs;
+    }
+  }
+
+  if (cs === undefined || (requested !== undefined && normalizeCondition(cs.name) !== requested)) {
+    const active = concentratingSpellNames(c, caster.name);
+    if (active.length > 0) {
+      throw new Error(`${caster.name} 当前维持的专注是「${active.join('、')}」${requested !== undefined ? `，并非「${requested}」` : '，该效果不支持免费转移目标'}`);
+    }
+    throw new Error(`${caster.name} 当前没有维持${requested !== undefined ? `「${requested}」` : '可转移的'}专注效果，需先消耗法术位施放`);
+  }
+
+  const spellName = normalizeCondition(cs.name);
+  if (cs.transferable !== true && !isTransferableState(c, spellName, options.globalEffects)) {
+    throw new Error(`「${spellName}」不是可转移目标的专注法术`);
+  }
+  if (newTarget.name === caster.name && !options.force) {
+    throw new Error(`不能将「${spellName}」转移到施法者自己身上`);
+  }
+
+  const marked = concentratingOn(c, caster.name).filter((x) => normalizeCondition(x.state.name) === spellName);
+  const prevOwner = marked.find((x) => x.owner.name !== newTarget.name)?.owner;
+  if (prevOwner !== undefined && prevOwner.hp > 0 && !prevOwner.conditions.includes('死亡') && cs.canTransfer !== true && !options.force) {
+    const inCurrentFight = c.initiative !== undefined
+      ? c.initiative.order.some((e) => e.name === prevOwner.name)
+      : charRoom(c, prevOwner) === charRoom(c, caster);
+    if (inCurrentFight) {
+      throw new Error(`原目标「${prevOwner.name}」尚未倒下（HP > 0）；按 5e 规则，「${spellName}」只有在原目标降至 0 HP 后才能免费转移（若有特殊能力允许提前转移，请传 ignore_state_mods=true）`);
+    }
+  }
+
+  const previousTarget = prevOwner?.name ?? cs.currentTarget;
+  const slotLevel = cs.slotLevel ?? marked[0]?.state.slotLevel;
+  const roundsLeft = cs.roundsLeft ?? marked[0]?.state.roundsLeft ?? defaultStateRounds(spellName, slotLevel, c, options.globalEffects);
+
+  for (const { owner } of marked) {
+    removeActiveState(owner, spellName, caster.name);
+  }
+  upsertActiveState(
+    c,
+    newTarget,
+    {
+      name: spellName,
+      source: caster.name,
+      concentration: true,
+      roundsLeft,
+      ...(slotLevel !== undefined ? { slotLevel } : {}),
+    },
+    { replaceConcentration: false, globalEffects: options.globalEffects },
+  );
+
+  return {
+    spellName,
+    ...(previousTarget !== undefined ? { previousTarget } : {}),
+    roundsLeft,
+    ...(slotLevel !== undefined ? { slotLevel } : {}),
+  };
+}
+
+/** 生成并校验本回合 oncePerTurn 消耗记录（支持自身回合与他人回合借机触发） */
+export function oncePerTurnKey(attackerName: string, ruleName: string): string {
+  return `${attackerName}:${ruleName}`;
+}
+
+export function hasUsedOncePerTurn(
+  ts: TurnActionState | undefined,
+  attackerName: string,
+  ruleName: string,
+): boolean {
+  const used = ts?.oncePerTurnUsed;
+  if (used === undefined || used.length === 0) return false;
+  return used.includes(oncePerTurnKey(attackerName, ruleName))
+    || (ts?.actor === attackerName && used.includes(ruleName));
+}
+
+export function markOncePerTurnUsed(c: Campaign, attackerName: string, ruleName: string): void {
+  const ts = ensureTurnState(c);
+  if (ts === undefined) return;
+  const key = oncePerTurnKey(attackerName, ruleName);
+  if (!ts.oncePerTurnUsed?.includes(key)) {
+    ts.oncePerTurnUsed = [...(ts.oncePerTurnUsed ?? []), key];
+  }
 }
 
 /** 获取或初始化当前行动者的回合动作槽记录 */
@@ -657,6 +1074,7 @@ export function recordTurnSpellCast(
  */
 export function tickActiveStatesOnTurnChange(c: Campaign, prevActor: string | undefined, nextActor: string): string[] {
   const logs: string[] = [];
+  const expiredConcKeys = new Set<string>();
   for (const ch of c.characters) {
     if (ch.activeStates === undefined || ch.activeStates.length === 0) continue;
     const kept: ActiveState[] = [];
@@ -678,6 +1096,9 @@ export function tickActiveStatesOnTurnChange(c: Campaign, prevActor: string | un
         changed = true;
       } else {
         changed = true;
+        if (s.concentration === true && s.source !== undefined) {
+          expiredConcKeys.add(`${s.source}:${normalizeCondition(s.name)}`);
+        }
         logs.push(`${ch.name} 的状态「${s.name}」持续时间结束`);
       }
     }
@@ -716,11 +1137,42 @@ export function tickActiveStatesOnTurnChange(c: Campaign, prevActor: string | un
       if (z.roundsLeft > 1) {
         keptZones.push({ ...z, roundsLeft: z.roundsLeft - 1 });
       } else {
+        if (z.concentration === true && z.source !== undefined) {
+          expiredConcKeys.add(`${z.source}:${normalizeCondition(z.name)}`);
+        }
         logs.push(`战场区域「${z.name}」持续时间结束，已消散`);
       }
     }
     if (keptZones.length > 0) c.initiative.zones = keptZones;
     else delete c.initiative.zones;
+  }
+  // 同步施法者自身的 concentrationState（包含原目标倒下后处于待转移状态的专注轮数递减）
+  for (const caster of c.characters) {
+    const cs = caster.concentrationState;
+    if (cs === undefined) continue;
+    const norm = normalizeCondition(cs.name);
+    const activeTarget = concentratingOn(c, caster.name).find((x) => normalizeCondition(x.state.name) === norm);
+    const activeZone = (c.initiative?.zones ?? []).find((z) => z.source === caster.name && z.concentration === true && normalizeCondition(z.name) === norm);
+    if (activeTarget !== undefined) {
+      if (activeTarget.state.roundsLeft !== undefined) cs.roundsLeft = activeTarget.state.roundsLeft;
+      continue;
+    }
+    if (activeZone !== undefined) {
+      if (activeZone.roundsLeft !== undefined) cs.roundsLeft = activeZone.roundsLeft;
+      continue;
+    }
+    if (expiredConcKeys.has(`${caster.name}:${norm}`)) {
+      delete caster.concentrationState;
+      continue;
+    }
+    if (caster.name === nextActor && cs.roundsLeft !== undefined) {
+      if (cs.roundsLeft > 1) {
+        cs.roundsLeft -= 1;
+      } else {
+        delete caster.concentrationState;
+        logs.push(`${caster.name} 的专注「${cs.name}」持续时间结束`);
+      }
+    }
   }
   if (c.initiative !== undefined) {
     c.initiative.turnState = { actor: nextActor, attacks: 0 };
@@ -761,6 +1213,95 @@ function cellOfInCampaign(c: Campaign | undefined, ch: Character): BattleCell | 
 
 function chebyshev3dFeet(a: BattleCell, b: BattleCell): number {
   return Math.max(Math.abs(a.x - b.x) * 5, Math.abs(a.y - b.y) * 5, Math.abs((a.z ?? 0) - (b.z ?? 0)));
+}
+
+function hasConditionMatch(states: readonly ActiveState[], required: readonly string[]): boolean {
+  const present = new Set(states.map((s) => normalizeCondition(s.name)));
+  return required.some((req) => present.has(normalizeCondition(req)));
+}
+
+function hasNonIncapacitatedAllyAdjacentTo(
+  c: Campaign,
+  attacker: Character,
+  target: Character,
+): 'yes' | 'no' | 'unknown' {
+  if (c.initiative === undefined) return 'unknown';
+  const tgtCell = cellOfInCampaign(c, target);
+  if (tgtCell === undefined) return 'unknown';
+  const targetRoom = charRoom(c, target);
+  for (const other of c.characters) {
+    if (other.name === attacker.name || other.name === target.name) continue;
+    if (!isAlly(attacker, other)) continue;
+    if (other.absent === true || other.hp <= 0 || other.conditions.includes('死亡') || isIncapacitated(other)) continue;
+    if (!c.initiative.order.some((e) => e.name === other.name)) continue;
+    if (charRoom(c, other) !== targetRoom) continue;
+    const otherCell = cellOfInCampaign(c, other);
+    if (otherCell !== undefined && chebyshev3dFeet(otherCell, tgtCell) <= 5) return 'yes';
+  }
+  return 'no';
+}
+
+export function isFinesseWeapon(weapon: Weapon | undefined): boolean {
+  if (weapon === undefined) return false;
+  return weapon.ability === 'dex'
+    || /灵巧|finesse/i.test(weapon.notes ?? '')
+    || /匕首|细剑|短剑|弯刀|鞭|飞镖|太刀|dagger|rapier|shortsword|scimitar|whip|dart/i.test(weapon.name);
+}
+
+export function primaryWeaponDie(weapon: Weapon | undefined): string | undefined {
+  if (weapon === undefined) return undefined;
+  const m = /\d*d(\d+)/i.exec(weapon.damage);
+  return m !== null ? `1d${m[1]}` : undefined;
+}
+
+interface SharedPredicateContext {
+  c: Campaign;
+  attacker: Character;
+  target: Character;
+  atkStates: readonly ActiveState[];
+  tgtStates: readonly ActiveState[];
+  hasWeapon: boolean;
+  isMelee: boolean;
+  isRanged: boolean;
+}
+
+function evaluateSharedPredicates(
+  hook: {
+    weaponOnly?: boolean;
+    meleeOnly?: boolean;
+    rangedOnly?: boolean;
+    targetBelowMaxHp?: boolean;
+    targetHalfHp?: boolean;
+    targetConditions?: string[];
+    allyAdjacentToTarget?: boolean;
+    firstRoundOnly?: boolean;
+    requiresStates?: string[];
+  },
+  ctx: SharedPredicateContext,
+  allyAdjacent: () => 'yes' | 'no' | 'unknown',
+): { ok: boolean; failedTargetBelowMaxHp?: boolean; unknownAllyAdjacent?: boolean } {
+  if (hook.weaponOnly && !ctx.hasWeapon) return { ok: false };
+  if (hook.meleeOnly && !ctx.isMelee) return { ok: false };
+  if (hook.rangedOnly && !ctx.isRanged) return { ok: false };
+  if (hook.firstRoundOnly && ctx.c.initiative?.round !== 1) return { ok: false };
+  if (hook.requiresStates !== undefined && hook.requiresStates.length > 0 && !hasConditionMatch(ctx.atkStates, hook.requiresStates)) {
+    return { ok: false };
+  }
+  if (hook.targetConditions !== undefined && hook.targetConditions.length > 0 && !hasConditionMatch(ctx.tgtStates, hook.targetConditions)) {
+    return { ok: false };
+  }
+  const tgtMaxHp = effectiveMaxHp(ctx.target);
+  if (hook.targetBelowMaxHp && ctx.target.hp >= tgtMaxHp) {
+    return { ok: false, failedTargetBelowMaxHp: true };
+  }
+  if (hook.targetHalfHp && ctx.target.hp > Math.floor(tgtMaxHp / 2)) {
+    return { ok: false };
+  }
+  if (hook.allyAdjacentToTarget) {
+    const adj = allyAdjacent();
+    if (adj !== 'yes') return { ok: false, ...(adj === 'unknown' ? { unknownAllyAdjacent: true } : {}) };
+  }
+  return { ok: true };
 }
 
 /** 计算攻击检定双方全部结构化状态、扩展规则与战场遮蔽区域的优劣势、命中加值、自动重击与加减骰 */
@@ -856,7 +1397,7 @@ export function computeAttackStateMods(
   }
 
   // 4c. 扩展规则钩子（attackMod & 目标 defenseMod.attackerAdvantage）
-  const atkCtx = buildFormulaContext(attacker);
+  const tgtMaxHp = effectiveMaxHp(target);
   let hitBonus = 0;
   const hitBonusReasons: string[] = [];
   const autoDice: string[] = [];
@@ -864,6 +1405,8 @@ export function computeAttackStateMods(
   const isMelee = options.isRanged !== true;
   const isRanged = options.isRanged === true;
   const hasWeapon = options.hasWeapon !== false;
+  let cachedAllyAdj: 'yes' | 'no' | 'unknown' | undefined;
+  const allyAdjacent = (): 'yes' | 'no' | 'unknown' => (cachedAllyAdj ??= hasNonIncapacitatedAllyAdjacentTo(c, attacker, target));
 
   for (const s of atkStates) {
     if (s.hitBonus !== undefined && s.hitBonus !== 0) {
@@ -878,12 +1421,16 @@ export function computeAttackStateMods(
     autoDice.push('-1d4');
   }
 
+  const predCtx: SharedPredicateContext = { c, attacker, target, atkStates, tgtStates, hasWeapon, isMelee, isRanged };
   for (const { def, state } of activeEffectDefsFor(attacker, c.customEffects, options.globalEffects)) {
     const am = def.attackMod;
     if (am === undefined) continue;
-    if (am.weaponOnly && !hasWeapon) continue;
-    if (am.meleeOnly && !isMelee) continue;
-    if (am.rangedOnly && !isRanged) continue;
+    if (!evaluateSharedPredicates(am, predCtx, allyAdjacent).ok) continue;
+    const atkCtx = buildFormulaContext(attacker, {
+      classLevel: extractClassLevel(attacker, def.classFilter),
+      targetHp: target.hp,
+      targetMaxHp: tgtMaxHp,
+    });
     if (am.advantage === 'advantage') advReasons.push(`${def.name}(优)`);
     if (am.advantage === 'disadvantage') disadvReasons.push(`${def.name}(劣)`);
     if (am.critOn !== undefined) critThreshold = Math.min(critThreshold ?? 20, am.critOn);
@@ -941,16 +1488,34 @@ export interface CollectedRider {
   expression: string;
   damageType: string;
   oncePerTurnRule?: string;
+  critOnly?: boolean;
 }
 
-function expressionContainsSameDice(explicitExtra: string | undefined, dice: string): boolean {
-  if (!explicitExtra) return false;
-  const cleanExtra = explicitExtra.replace(/\s+/g, '').replace(/^\+/, '').toLowerCase();
-  return cleanExtra === dice.replace(/\s+/g, '').toLowerCase();
+function parseExplicitPositiveTerms(explicitExtra: string | undefined): { compact: string; terms: string[] } {
+  if (!explicitExtra) return { compact: '', terms: [] };
+  const compact = explicitExtra.replace(/\s+/g, '').replace(/^\+/, '').toLowerCase();
+  if (!compact) return { compact: '', terms: [] };
+  if (/[-()]/.test(compact)) return { compact, terms: [compact] };
+  return { compact, terms: compact.split('+').filter(Boolean) };
+}
+
+function consumeExplicitTerm(terms: string[], compactFull: string, candidate: string): boolean {
+  const norm = candidate.replace(/\s+/g, '').replace(/^\+/, '').toLowerCase();
+  if (!norm) return false;
+  const idx = terms.indexOf(norm);
+  if (idx >= 0) {
+    terms.splice(idx, 1);
+    return true;
+  }
+  if (norm.includes('+') && compactFull === norm && terms.length > 0) {
+    terms.length = 0;
+    return true;
+  }
+  return false;
 }
 
 /**
- * 自动收集本次攻击命中时触发的全部结构化附伤（脆弱诅咒、猎人印记、神恩、狂暴、武器附伤与 dnd_rule 自定义 hitRider）。
+ * 自动收集本次攻击命中时触发的全部结构化附伤（脆弱诅咒、猎人印记、神恩、狂暴、巨兽杀手/偷袭等条件被动、武器附伤与 dnd_rule 自定义 hitRider）。
  */
 export function collectHitRiders(
   c: Campaign,
@@ -966,36 +1531,40 @@ export function collectHitRiders(
     ignoreStateMods?: boolean;
     globalEffects?: Record<string, CustomEffectDef>;
   } = {},
-): { riders: CollectedRider[]; skippedNotes: string[] } {
+): { riders: CollectedRider[]; skippedNotes: string[]; conditionalNotes: string[] } {
   const riders: CollectedRider[] = [];
   const skippedNotes: string[] = [];
-  let extraConsumed = false;
+  const conditionalNotes: string[] = [];
+  const { compact: explicitCompact, terms: remainingTerms } = parseExplicitPositiveTerms(options.explicitExtraDamage);
   const hasWeapon = options.weapon !== undefined || (attacker.kind !== 'pc' && options.ability === undefined);
   const isMelee = options.isRanged !== true;
+  const isRanged = options.isRanged === true;
   const usedStr = (options.ability ?? options.weapon?.ability ?? 'str') === 'str';
   const weaponDmgType = options.mainDamageType ?? '物理';
 
   // 1. 武器自身多段附伤（如绿龙撕裂 +2d6 毒素、魔法武器额外 +1d6 闪电）
   for (const wr of options.weapon?.riders ?? []) {
-    if (!extraConsumed && expressionContainsSameDice(options.explicitExtraDamage, wr.damage)) {
-      extraConsumed = true;
+    if (consumeExplicitTerm(remainingTerms, explicitCompact, wr.damage)) {
       skippedNotes.push(`参数 damage 已含 ${wr.damage}，跳过武器「${options.weapon!.name}」同名附伤防双算`);
       continue;
     }
     riders.push({ label: options.weapon!.name, expression: wr.damage, damageType: wr.damageType });
   }
 
-  if (options.ignoreStateMods === true) return { riders, skippedNotes };
+  if (options.ignoreStateMods === true) return { riders, skippedNotes, conditionalNotes };
 
   const atkStates = effectiveStates(attacker);
   const tgtStates = effectiveStates(target);
-  const atkCtx = buildFormulaContext(attacker);
-  const ts = c.initiative?.turnState?.actor === attacker.name ? c.initiative.turnState : undefined;
+  const tgtMaxHp = effectiveMaxHp(target);
+  const ts = c.initiative?.turnState;
+  const isOwnTurn = c.initiative === undefined || c.initiative.order[c.initiative.turn]?.name === attacker.name;
+  let cachedAllyAdj: 'yes' | 'no' | 'unknown' | undefined;
+  const allyAdjacent = (): 'yes' | 'no' | 'unknown' => (cachedAllyAdj ??= hasNonIncapacitatedAllyAdjacentTo(c, attacker, target));
 
   // 2. 野蛮人「狂暴」近战力量武器伤害加值（+2 / 9级+3 / 16级+4）
   if (atkStates.some((s) => s.name === '狂暴') && hasWeapon && isMelee && usedStr) {
     const rageBonus = attacker.level >= 16 ? 4 : attacker.level >= 9 ? 3 : 2;
-    if (options.explicitExtraDamage?.trim() !== String(rageBonus) && options.explicitExtraDamage?.trim() !== `+${rageBonus}`) {
+    if (!consumeExplicitTerm(remainingTerms, explicitCompact, String(rageBonus))) {
       riders.push({ label: '狂暴', expression: String(rageBonus), damageType: weaponDmgType });
     }
   }
@@ -1008,24 +1577,59 @@ export function collectHitRiders(
     }
   }
 
+  const predCtx: SharedPredicateContext = { c, attacker, target, atkStates, tgtStates, hasWeapon, isMelee, isRanged };
   const pushHookRider = (def: CustomEffectDef): void => {
     const hr = def.hitRider;
     if (hr === undefined) return;
-    if (hr.weaponOnly && !hasWeapon) return;
-    if (hr.meleeOnly && !isMelee) return;
+    if (hr.oncePerTurn && hasUsedOncePerTurn(ts, attacker.name, def.name)) return;
+    if (hr.ownTurnOnly && !isOwnTurn) return;
     if (hr.strAttackOnly && !usedStr) return;
+    if (hr.finesseOrRangedOnly && !(isRanged || isFinesseWeapon(options.weapon))) return;
     if (hr.advantageOnly && options.effectiveAdvantage !== 'advantage') return;
-    if (hr.oncePerTurn && ts?.oncePerTurnUsed?.includes(def.name)) return;
+    if (hr.noDisadvantage && options.effectiveAdvantage === 'disadvantage') return;
 
+    const shared = evaluateSharedPredicates(hr, predCtx, allyAdjacent);
+    if (!shared.ok) {
+      if (shared.failedTargetBelowMaxHp) {
+        conditionalNotes.push(`「${def.name}」未触发（本击前目标尚属毫发无伤；若受伤后再次命中将自动结算）`);
+      } else if (shared.unknownAllyAdjacent) {
+        conditionalNotes.push(`「${def.name}」未自动触发（当前未摆战位，无法确认目标 5 尺内是否有未失能盟友；满足条件请传 damage 或先摆位）`);
+      }
+      return;
+    }
+
+    if (hr.advantageOrAllyAdjacent && options.effectiveAdvantage !== 'advantage') {
+      const adj = allyAdjacent();
+      if (adj !== 'yes') {
+        if (adj === 'unknown') {
+          conditionalNotes.push(`「${def.name}」未自动触发（当前未摆战位，无法确认目标 5 尺内是否有未失能盟友；满足条件请传 damage 或先摆位）`);
+        }
+        return;
+      }
+    }
+
+    const atkCtx = buildFormulaContext(attacker, {
+      classLevel: extractClassLevel(attacker, def.classFilter),
+      targetHp: target.hp,
+      targetMaxHp: tgtMaxHp,
+    });
     const bonusVal = hr.bonusFormula !== undefined ? evalIntFormula(hr.bonusFormula, atkCtx) : 0;
     const exprParts: string[] = [];
     if (hr.damageDice) exprParts.push(hr.damageDice);
+    if (hr.scalingDice !== undefined) {
+      const count = evalIntFormula(hr.scalingDice.countFormula, atkCtx);
+      if (count > 0) exprParts.push(`${count}d${hr.scalingDice.sides}`);
+    }
+    if (hr.weaponDie) {
+      const die = primaryWeaponDie(options.weapon);
+      if (die === undefined) return;
+      exprParts.push(die);
+    }
     if (bonusVal !== 0) exprParts.push(bonusVal > 0 && exprParts.length > 0 ? `+${bonusVal}` : String(bonusVal));
-    const expr = exprParts.join('');
+    const expr = exprParts.join('+').replace(/\+\+/g, '+').replace(/\+-/g, '-');
     if (!expr) return;
-    if (!extraConsumed && hr.damageDice && bonusVal === 0 && expressionContainsSameDice(options.explicitExtraDamage, hr.damageDice)) {
-      extraConsumed = true;
-      skippedNotes.push(`参数 damage 已含 ${hr.damageDice}，跳过「${def.name}」自动附伤防双算`);
+    if (!hr.weaponDie && consumeExplicitTerm(remainingTerms, explicitCompact, expr)) {
+      skippedNotes.push(`参数 damage 已含 ${expr}，跳过「${def.name}」自动附伤防双算`);
       return;
     }
     const resolvedType = hr.damageType === '武器同型' ? weaponDmgType : hr.damageType;
@@ -1034,10 +1638,11 @@ export function collectHitRiders(
       expression: expr,
       damageType: resolvedType,
       ...(hr.oncePerTurn ? { oncePerTurnRule: def.name } : {}),
+      ...(hr.critOnly ? { critOnly: true } : {}),
     });
   };
 
-  // 4. 攻击者身上的常驻被动与状态（神恩、变巨术、段云等；若 markedTargetOnly 则需锁定当前 target）
+  // 4. 攻击者身上的常驻被动与状态（神恩、变巨术、巨兽杀手、偷袭、段云等；若 markedTargetOnly 则需锁定当前 target）
   const handledRules = new Set<string>();
   for (const { def, state } of activeEffectDefsFor(attacker, c.customEffects, options.globalEffects)) {
     if (def.hitRider === undefined) continue;
@@ -1048,16 +1653,55 @@ export function collectHitRiders(
     pushHookRider(def);
   }
 
-  // 5. 受击目标身上由当前攻击者施加的标记状态（脆弱诅咒、猎人印记等）
-  for (const s of tgtStates) {
+  // 5. 受击目标身上由当前攻击者本人施加的标记状态（脆弱诅咒、猎人印记等；严格要求 source === attacker.name，且多施法者对同一首领标记时各自独立触发）
+  for (const s of target.activeStates ?? []) {
     const def = resolveEffectDef(s.name, c.customEffects, options.globalEffects);
     if (def?.hitRider?.markedTargetOnly !== true || handledRules.has(def.name)) continue;
-    if (s.source !== undefined && s.source !== attacker.name) continue;
+    if (s.source === undefined || s.source !== attacker.name) continue;
     handledRules.add(def.name);
     pushHookRider(def);
   }
 
-  return { riders, skippedNotes };
+  return { riders, skippedNotes, conditionalNotes };
+}
+
+const BUILTIN_CAMPAIGN_HANDLED_TRAITS = new Set([
+  '巨武器战斗', 'great weapon fighting', '大武器战斗', '巨武器战斗风格', '巨武器',
+  '箭术', 'archery', '箭术战斗风格', '弓术', '射击', '射术',
+  '精灵精准', 'elven accuracy', '精灵准', '精灵精准专长',
+  '不死坚韧', 'undead fortitude',
+]);
+
+const COMBAT_PASSIVE_HINT_RE = /攻击|命中|伤害|重击|暴击|附伤|每回合一次|杀手|屠夫|打击|斩|猛击|偷袭|破阵|伏击|射手|大师|额外\s*\d+d\d+|未满血|受伤|半血/i;
+
+/** 列出角色卡上尚未录入规则引擎、但字面上像战斗被动的特性/被动能力，供攻击结算时提醒核对 */
+export function unhandledCombatPassives(
+  ch: Character,
+  c: Campaign,
+  globalEffects?: Record<string, CustomEffectDef>,
+): string[] {
+  const candidates: Array<{ name: string; text: string }> = [];
+  for (const t of ch.traits ?? []) {
+    candidates.push({ name: t, text: t });
+  }
+  for (const s of ch.spells ?? []) {
+    if ((s.kind === 'feature' || s.kind === 'item') && s.action === 'passive') {
+      candidates.push({ name: s.name, text: `${s.name} ${s.summary ?? ''}` });
+    }
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of candidates) {
+    const clean = item.name.trim();
+    if (!clean || seen.has(clean)) continue;
+    if (BUILTIN_CAMPAIGN_HANDLED_TRAITS.has(clean.toLowerCase())) continue;
+    if (resolveEffectDef(clean, c.customEffects, globalEffects) !== undefined) continue;
+    if (!COMBAT_PASSIVE_HINT_RE.test(item.text)) continue;
+    seen.add(clean);
+    out.push(clean);
+    if (out.length >= 5) break;
+  }
+  return out;
 }
 
 export interface SaveStateMods {
@@ -1335,16 +1979,38 @@ export function formatCharacterStates(c: Campaign, ch: Character): string {
     if (s.concentration === true) meta.push(s.source !== undefined && s.source !== ch.name ? `由${s.source}专注` : '专注');
     return `${s.name}${meta.length > 0 ? `(${meta.join(',')})` : ''}`;
   });
-  // 若该角色专注维持在队友/敌人身上或战场区域但自身不在受术列表中，也提示出来
-  const externalConc = [
-    ...new Set([
-      ...concOwned.filter((x) => x.owner.name !== ch.name).map((x) => x.state.name),
-      ...concZones,
-    ]),
-  ];
-  for (const spell of externalConc) {
-    if (!states.some((s) => s.name === spell && s.concentration === true)) {
-      items.push(`维持专注:${spell}`);
+  // 若该角色专注维持在队友/敌人身上、战场区域或处于原目标倒下后的待转移状态，也明确提示出来
+  const coveredSelf = new Set(states.filter((s) => s.concentration === true).map((s) => normalizeCondition(s.name)));
+  const shownExt = new Set<string>();
+  for (const { owner, state } of concOwned) {
+    if (owner.name === ch.name) continue;
+    const norm = normalizeCondition(state.name);
+    if (coveredSelf.has(norm) || shownExt.has(norm)) continue;
+    shownExt.add(norm);
+    const sameSpellTargets = concOwned.filter((x) => x.owner.name !== ch.name && normalizeCondition(x.state.name) === norm).map((x) => x.owner.name);
+    const meta = [
+      sameSpellTargets.length > 0 ? `→${sameSpellTargets.join('/')}` : '',
+      state.slotLevel !== undefined ? `${state.slotLevel}环` : '',
+      state.roundsLeft !== undefined ? `剩${state.roundsLeft}轮` : '',
+    ].filter(Boolean).join(',');
+    items.push(`维持专注:${norm}${meta ? `(${meta})` : ''}`);
+  }
+  for (const zName of concZones) {
+    const norm = normalizeCondition(zName);
+    if (coveredSelf.has(norm) || shownExt.has(norm)) continue;
+    shownExt.add(norm);
+    items.push(`维持专注:${norm}`);
+  }
+  const cs = ch.concentrationState;
+  if (cs !== undefined) {
+    const norm = normalizeCondition(cs.name);
+    if (!coveredSelf.has(norm) && !shownExt.has(norm)) {
+      const meta = [
+        cs.transferable || cs.canTransfer ? '可转移' : '',
+        cs.slotLevel !== undefined ? `${cs.slotLevel}环` : '',
+        cs.roundsLeft !== undefined ? `剩${cs.roundsLeft}轮` : '',
+      ].filter(Boolean).join(',');
+      items.push(`维持专注:${norm}${meta ? `(${meta})` : ''}`);
     }
   }
   return items.length > 0 ? items.join('、') : '无';

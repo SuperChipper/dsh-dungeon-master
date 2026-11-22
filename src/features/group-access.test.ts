@@ -226,7 +226,7 @@ describe('生图专用授权', () => {
     const probe = (agent: unknown) => gen.execute({ prompt: '' }, { signal: new AbortController().signal, agent });
     const otherGroup = {};
     s.records.set(otherGroup, { scope: 'group', peerId: 'browser-only' });
-    await expect(probe(s.group)).rejects.toThrow('qqbot_image_gen_access');
+    await expect(probe(s.group)).rejects.toThrow('qqbot_access');
     await s.invoke('grant');
     await expect(probe(s.group)).rejects.toThrow('未开通');
     expect(s.click(s.button())).toBe(0);
@@ -256,5 +256,22 @@ describe('生图专用授权', () => {
     expect(route(browser.button())).toBe(0);
     expect(image.persist).toHaveBeenCalledTimes(1);
     expect(terminal.handleInteraction).not.toHaveBeenCalled();
+  });
+
+  it('onChange 仅在实际保存并变更白名单时触发', async () => {
+    const s = harness('browser');
+    const changed: string[] = [];
+    s.access.onChange = (group) => changed.push(group);
+
+    // 保存失败不触发
+    s.persist.mockReturnValueOnce(false);
+    await expect(s.invoke('grant', s.owner, 'g1')).rejects.toThrow('保存失败');
+    expect(changed).toEqual([]);
+
+    // 正常 grant/revoke 触发，幂等操作不触发
+    await s.invoke('grant', s.owner, 'g1');
+    await s.invoke('grant', s.owner, 'g1');
+    await s.invoke('revoke', s.owner, 'g1');
+    expect(changed).toEqual(['g1', 'g1']);
   });
 });

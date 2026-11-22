@@ -11,10 +11,10 @@
  * 落盘策略：内存聚合，定时（默认 60s）和进程退出时刷一次。一轮注入至多两段，
  * 每轮都写盘会让磁盘成为瓶颈，而账本丢最后一分钟不影响统计。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import type { Logger } from '../types.ts';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
+import { qqbotNotesMetricsPath } from '../shared/paths.ts';
 import { shouldMute } from '../features/note-judge.ts';
 
 interface EntryStats {
@@ -48,7 +48,7 @@ export interface MetricsFile {
 const FLUSH_INTERVAL_MS = 60_000;
 
 export function metricsPath(): string {
-  return resolve(homedir(), '.dsh', 'qqbot-notes', 'metrics.json');
+  return qqbotNotesMetricsPath();
 }
 
 function dayKey(now: number): string {
@@ -202,10 +202,7 @@ export class NoteMetricsStore {
   public flush(): void {
     if (!this.dirty) return;
     try {
-      mkdirSync(dirname(this.path), { recursive: true });
-      const temporary = `${this.path}.${process.pid}.tmp`;
-      writeFileSync(temporary, JSON.stringify(this.data, null, 2), 'utf8');
-      renameSync(temporary, this.path);
+      writeJsonAtomic(this.path, this.data, { indent: 2 });
       this.dirty = false;
     } catch (err) {
       this.logger?.warn(`im-qqbot: 笔记账本写入失败: ${err instanceof Error ? err.message : String(err)}`);

@@ -29,6 +29,7 @@ export function combatParticipantCard(campaign: Campaign, ch: Character) {
     resources: ch.resources, hitDie: ch.hitDie, hitDiceUsed: ch.hitDiceUsed,
     conditions: ch.conditions,
     ...(ch.activeStates !== undefined ? { activeStates: ch.activeStates } : {}),
+    ...(ch.concentrationState !== undefined ? { concentrationState: ch.concentrationState } : {}),
     deathSaves: ch.deathSaves, notes: ch.notes,
     inventory: ch.inventory, room: ch.room,
   };
@@ -65,7 +66,7 @@ export function combatPartyContext(campaign: Campaign): string {
   const customNames = Object.keys(campaign.customEffects ?? {});
   return [
     '【角色能力与被动 · 开战时快照】',
-    '下列基础命中、伤害和固定先攻只按结构化字段计算；备注里的职业被动、专长与临时效果不会被程序自动识别（已由工具自动结算的效果包括：14种PHB状态与力竭、巨武器战斗、箭术、精灵精准、不死坚韧、守护灵光、灵体卫士、脆弱诅咒、猎人印记、神恩、变巨术、狂暴近战加伤、防护毒素、生命门徒/神佑医者/保全生命、武器多段 riders，以及 dnd_rule 已登记扩展规则；上述自动项切勿再手掷或重复填进 damage）。',
+    '下列基础命中、伤害和固定先攻只按结构化字段计算；备注里的职业被动、专长与临时效果不会被程序自动识别（已由工具自动结算的包括：14种PHB状态与力竭、巨武器战斗、箭术、精灵精准、战地施法者、不死坚韧、守护灵光、灵体卫士、脆弱诅咒、猎人印记、神恩、变巨术、狂暴、巨兽杀手/偷袭/精通至圣斩/祝福打击/神圣狂怒/凶蛮攻击/精通重击/集群战术/血腥狂乱、防护毒素、生命门徒/神佑医者/保全生命、武器 riders 及 dnd_rule 扩展规则；上述自动项切勿手掷或重复填进 damage）。',
     ...(customNames.length > 0 ? [`本团已登记扩展规则（可用 dnd_rule show 查看详情）：${customNames.join('、')}`] : []),
     'participating=false 的角色未参战，不进入反应与借机名单；若中途入战须先 dnd_initiative join（返回结果会自动附上新参战我方的完整能力卡）。',
     '核对参战者的 notes、traits、reactions、装备和本桌约定；先攻已掷出的 rolled 与最新先攻表为准，不重掷。',

@@ -9,6 +9,7 @@ import {
   downloadForwardImages,
   extractForwardImages,
 } from './forward-images.ts';
+import { registerMediaRef, resolveMediaRef } from './media-ref-store.ts';
 import { buildForwardHint } from '../transport/inbound.ts';
 
 const logger: Logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
@@ -92,7 +93,7 @@ describe('downloadForwardImages', () => {
 });
 
 describe('createForwardTagger', () => {
-  it('把图片附件行改写成 [图片#n: 路径]，编号接在历史图片后面', () => {
+  it('把图片附件行改写成 [图片#n: 路径或 qqref]，编号接在历史图片后面', () => {
     const images = [
       { url: URL_A, filename: '3424958F.jpg', localPath: '/m/a.jpg' },
       { url: URL_B, filename: '65AD2C81.png' },
@@ -100,12 +101,15 @@ describe('createForwardTagger', () => {
     ];
     const tagger = createForwardTagger(images, 3);
     const text = tagger.rewrite(FORWARD);
+    const refB = registerMediaRef(URL_B, { filename: '65AD2C81.png' });
 
     expect(text).toContain('[附件1] [图片#4: /m/a.jpg] 尺寸:240x240');
-    expect(text).toContain(`[附件1] [图片#5: ${URL_B}] 尺寸:1200x2608\r`);
+    expect(text).toContain(`[附件1] [图片#5: ${refB}] 尺寸:1200x2608\r`);
     expect(text).toContain('    [附件1] [图片#6: /m/c.jpg] 尺寸:10x10');
     expect(text).toContain('[附件2] 类型:文件 文件名:a.zip');
     expect(text).not.toContain(URL_A);
+    expect(text).not.toContain(URL_B);
+    expect(resolveMediaRef(refB)?.url).toBe(URL_B);
     expect(tagger.tagged.map((i) => [i.index, i.localPath])).toEqual([
       [4, '/m/a.jpg'],
       [5, undefined],
@@ -129,13 +133,14 @@ describe('createForwardTagger', () => {
 });
 
 describe('buildForwardHint', () => {
-  it('区分已下载和只有 URL 的图片', () => {
+  it('区分已下载和使用 qqref 短引用的图片', () => {
     const hint = buildForwardHint([
       { index: 2, url: URL_A, localPath: '/m/a.jpg' },
       { index: 3, url: URL_B },
     ]);
     expect(hint).toContain('#2 已下载到本地');
     expect(hint).toContain('#3 未下载');
+    expect(hint).toContain('qqref:');
     expect(hint).toContain('qqbot_describe_image');
     expect(buildForwardHint([])).toBe('');
   });

@@ -23,26 +23,17 @@ import { deriveProjectsFromCwd } from './note-metadata.ts';
 import { findDmSecret } from '../features/campaign-secrets.ts';
 import { NOTE_STATS_VIEWS, type NoteStatsView } from '../features/note-stats.ts';
 
-export const NOTES_SEARCH_TOOL_NAME = 'qqbot_notes_search';
-export const NOTES_SAVE_TOOL_NAME = 'qqbot_notes_save';
+export const NOTES_TOOL_NAME = 'qqbot_notes';
 export const NOTES_MANAGE_TOOL_NAME = 'qqbot_notes_manage';
 
 /** 检索结果里每段正文的最大字数 */
 const SEARCH_SNIPPET_CHARS = 800;
 
-const SEARCH_DESCRIPTION =
-  'Search the shared notes library with scope awareness (general, project, persona/scene, and chat-private notes). '
-  + 'Returns matching sections along with why each hit matched, its applicable scope, date/source provenance, and any '
-  + 'conflicts with newer notes. Use optional `project` / `persona` filters when looking up a specific project or character; '
-  + '`all_scopes=true` inspects across project/persona scopes in owner private chat or local sessions.';
-
-const SAVE_DESCRIPTION =
-  'Save distilled long-term knowledge into the shared notes library with explicit scope and lifecycle metadata. '
-  + 'General engineering lessons and writing preferences leave `projects`/`personas` empty so they work everywhere. '
-  + 'Project-specific experiment conditions or code conventions must set `projects`; roleplay settings must set `personas` '
-  + 'and/or `scenes`; chat-only affairs (TRPG campaigns, this group\'s plans/facts) set scope="chat". '
-  + 'Use `triggers` for explicit keywords, `inject="search-only"` or `budget_chars` to control auto-injection budget, '
-  + 'and `supersedes` to link old notes replaced by this new conclusion. Never save private secrets or DM-only stats.';
+const NOTES_DESCRIPTION =
+  'Shared notes library (long-term memory with scope isolation and lifecycle metadata). Choose action: '
+  + '"search" — look up relevant sections by query (optional `project` / `persona`, or `all_scopes=true` in owner private chat / local sessions); '
+  + '"save" — record distilled long-term knowledge. General lessons leave `projects`/`personas` empty; project lessons set `projects`; '
+  + 'roleplay notes set `personas`/`scenes`; chat-private affairs (TRPG/group plans) set scope="chat". Never save DM-only stats or secrets.';
 
 const MANAGE_DESCRIPTION =
   'Owner-only housekeeping for the shared notes library; works only in a private chat with the owner or local sessions. '
@@ -77,17 +68,15 @@ interface ToolsRegistryLike {
   register(definition: unknown): unknown;
 }
 
-interface SearchArgs {
-  query: string;
+interface NotesArgs {
+  action: 'search' | 'save';
+  query?: string;
   limit?: number;
   project?: string;
   persona?: string;
   all_scopes?: boolean;
-}
-
-interface SaveArgs {
-  title: string;
-  content: string;
+  title?: string;
+  content?: string;
   file?: string;
   scope?: 'shared' | 'chat';
   projects?: string[];
@@ -158,203 +147,156 @@ export function registerNotesTools(
   }
 
   tools.register({
-    name: NOTES_SEARCH_TOOL_NAME,
-    description: SEARCH_DESCRIPTION,
+    name: NOTES_TOOL_NAME,
+    description: NOTES_DESCRIPTION,
     parameters: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'What to look for, e.g. "大肥鱼小课堂 第四集" or "voice-lab 破音".' },
-        limit: { type: 'integer', description: 'Max sections to return (1-8, default 4).' },
-        project: { type: 'string', description: 'Optional project name filter, e.g. "voice-lab" or "dsh-qqbot".' },
-        persona: { type: 'string', description: 'Optional persona name/id filter, e.g. "哈基米" or "大肥鱼".' },
-        all_scopes: { type: 'boolean', description: 'Owner private chat / local session only: search across project/persona/scene scopes.' },
-      },
-      required: ['query'],
-      additionalProperties: false,
-    },
-    output: {
-      schema: {
-        type: 'object',
-        properties: {
-          query: { type: 'string' },
-          hits: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                file: { type: 'string' },
-                heading: { type: 'string' },
-                text: { type: 'string' },
-                score: { type: 'number' },
-                exact: { type: 'array', items: { type: 'string' } },
-                similarity: { type: 'number' },
-                scope: { type: 'string' },
-                why: { type: 'string' },
-                date: { type: 'string' },
-                source: { type: 'string' },
-                status: { type: 'string', enum: ['active', 'superseded'] },
-                conflicts: { type: 'array', items: { type: 'string' } },
-              },
-              required: ['file', 'heading', 'text', 'score'],
-              additionalProperties: false,
-            },
-          },
-        },
-        required: ['query', 'hits'],
-        additionalProperties: false,
-      },
-      render: (_args: unknown, value: unknown): ContentBlock[] => {
-        const v = value as { query: string; hits: SearchOutputHit[] };
-        return [{ type: 'text', text: renderHits(v.query, v.hits) }];
-      },
-    },
-    async execute(args: unknown, exec: { agent?: unknown }): Promise<Record<string, unknown>> {
-      const { query, limit, project, persona, all_scopes } = args as SearchArgs;
-      if (typeof query !== 'string' || query.trim().length === 0) {
-        throw new Error('qqbot_notes_search: `query` 不能为空');
-      }
-      const n = typeof limit === 'number' && Number.isFinite(limit) ? Math.min(8, Math.max(1, Math.floor(limit))) : 4;
-      const agent = exec.agent as DshAgent | undefined;
-      const record = agent !== undefined ? manager.findByAgent(agent) : undefined;
-      const owner = options.ownerOpenid?.trim() ?? '';
-      const ownerOrLocal = record === undefined || (owner !== '' && record.scope === 'c2c' && record.peerId === owner);
-
-      let queryCtx: Omit<NoteQueryContext, 'chatKey'>;
-      let chatKey: string | undefined;
-      if (record !== undefined && typeof manager.buildNoteQueryContext === 'function') {
-        const built = manager.buildNoteQueryContext(record.scope, record.peerId, { record, agent });
-        chatKey = built.chatKey;
-        const { chatKey: _c, ...rest } = built;
-        queryCtx = rest;
-      } else if (record !== undefined) {
-        chatKey = chatKeyOf(record.scope, record.peerId);
-        const projects = deriveProjectsFromCwd(agent?.session?.header?.cwd, dirname(store.root));
-        queryCtx = {
-          scenes: [record.scope],
-          ...(projects.length > 0 ? { projects } : {}),
-          allowQueryProjectMatch: ownerOrLocal,
-        };
-      } else {
-        chatKey = undefined;
-        const projects = deriveProjectsFromCwd(agent?.session?.header?.cwd, dirname(store.root));
-        queryCtx = {
-          scenes: ['local'],
-          ...(projects.length > 0 ? { projects } : {}),
-          allowQueryProjectMatch: true,
-        };
-      }
-
-      if (ownerOrLocal && typeof project === 'string' && project.trim() !== '') {
-        queryCtx = { ...queryCtx, projects: [project.trim()] };
-      }
-      if (ownerOrLocal && typeof persona === 'string' && persona.trim() !== '') {
-        queryCtx = { ...queryCtx, personas: [persona.trim()] };
-      }
-      if (all_scopes === true && ownerOrLocal) {
-        queryCtx = { ...queryCtx, unscoped: true };
-      }
-
-      if (record === undefined) queryCtx = { ...queryCtx, sharedOnly: true };
-      const rawHits = await store.searchHybrid(query, n, chatKey, queryCtx);
-      const hits: SearchOutputHit[] = rawHits.map((hit) => {
-        const conflictStrings = hit.conflicts?.map((c) => formatConflictsSummary([c])).filter(Boolean);
-        return {
-          file: hit.file,
-          heading: hit.heading,
-          text: hit.text,
-          score: Math.round(hit.score * 100) / 100,
-          ...(hit.exact === undefined ? {} : { exact: hit.exact.matched }),
-          ...(hit.similarity === undefined ? {} : { similarity: Math.round(hit.similarity * 100) / 100 }),
-          ...(hit.scopeLabel === undefined ? {} : { scope: hit.scopeLabel }),
-          ...(hit.why === undefined ? {} : { why: hit.why }),
-          ...(hit.meta?.date === undefined ? {} : { date: hit.meta.date }),
-          ...(hit.meta?.source === undefined ? {} : { source: hit.meta.source }),
-          ...(hit.meta?.status === undefined ? {} : { status: hit.meta.status }),
-          ...(conflictStrings === undefined || conflictStrings.length === 0 ? {} : { conflicts: conflictStrings }),
-        };
-      });
-      return { query, hits };
-    },
-  });
-
-  tools.register({
-    name: NOTES_SAVE_TOOL_NAME,
-    description: SAVE_DESCRIPTION,
-    parameters: {
-      type: 'object',
-      properties: {
-        title: { type: 'string', description: 'Short title of the note or section.' },
-        content: { type: 'string', description: 'Markdown body. Keep it distilled; lists are fine.' },
-        file: { type: 'string', description: 'Optional existing note file name to append to (e.g. 大肥鱼小课堂-课堂笔记.md).' },
+        action: { type: 'string', enum: ['search', 'save'], description: '"search" to query notes; "save" to store a note.' },
+        query: { type: 'string', description: 'action="search" required: what to look for, e.g. "大肥鱼小课堂 第四集" or "voice-lab 破音".' },
+        limit: { type: 'integer', description: 'action="search": max sections to return (1-8, default 4).' },
+        project: { type: 'string', description: 'action="search": optional project name filter, e.g. "voice-lab" or "dsh-qqbot".' },
+        persona: { type: 'string', description: 'action="search": optional persona name/id filter, e.g. "哈基米" or "大肥鱼".' },
+        all_scopes: { type: 'boolean', description: 'action="search" (owner private chat / local session only): search across project/persona/scene scopes.' },
+        title: { type: 'string', description: 'action="save" required: short title of the note or section.' },
+        content: { type: 'string', description: 'action="save" required: markdown body (distilled; lists are fine).' },
+        file: { type: 'string', description: 'action="save": optional existing note file name to append to (e.g. 大肥鱼小课堂-课堂笔记.md).' },
         scope: {
           type: 'string',
           enum: ['shared', 'chat'],
-          description: '"shared" = cross-chat eligible (subject to projects/personas/scenes); "chat" = only this group/private chat.',
+          description: 'action="save": "shared" = cross-chat eligible (subject to projects/personas/scenes); "chat" = only this group/private chat.',
         },
         projects: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Restrict this note to specific project(s) (e.g. ["voice-lab"], ["dsh-qqbot"]). Omit for general lessons.',
+          description: 'action="save": restrict to specific project(s) (e.g. ["voice-lab"], ["dsh-qqbot"]). Omit for general lessons.',
         },
         personas: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Restrict roleplay/character notes to specific persona(s) (e.g. ["哈基米"], ["大肥鱼"]).',
+          description: 'action="save": restrict roleplay notes to specific persona(s) (e.g. ["哈基米"], ["大肥鱼"]).',
         },
         scenes: {
           type: 'array',
           items: { type: 'string', enum: ['group', 'c2c', 'dnd', 'local'] },
-          description: 'Restrict to specific scene(s): group, c2c, dnd, local.',
+          description: 'action="save": restrict to specific scene(s): group, c2c, dnd, local.',
         },
-        operations: { type: 'array', items: { type: 'string' }, description: 'Optional operation tags, e.g. ["notes.search"]. Adds a recall route without restricting ordinary recall.' },
+        operations: { type: 'array', items: { type: 'string' }, description: 'action="save": optional operation tags, e.g. ["notes.search"].' },
         triggers: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Explicit trigger words/phrases that should activate this note reliably.',
+          description: 'action="save": explicit trigger words/phrases that activate this note reliably.',
         },
         inject: {
           type: 'string',
           enum: ['auto', 'search-only'],
-          description: '"auto" (default) = eligible for prompt injection; "search-only" = only retrieved by explicit search.',
+          description: 'action="save": "auto" (default) = eligible for prompt injection; "search-only" = only retrieved by explicit search.',
         },
         budget_chars: {
           type: 'integer',
-          description: 'Optional max characters allocated to this note when auto-injected (60-2000).',
+          description: 'action="save": optional max characters allocated when auto-injected (60-2000).',
         },
         supersedes: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Older note file(s) or "file.md › heading" sections replaced by this new conclusion.',
+          description: 'action="save": older note file(s) or "file.md › heading" sections replaced by this new conclusion.',
         },
       },
-      required: ['title', 'content'],
+      required: ['action'],
       additionalProperties: false,
     },
     output: {
-      schema: {
-        type: 'object',
-        properties: {
-          file: { type: 'string' },
-          created: { type: 'boolean' },
-          chars: { type: 'integer' },
-          message: { type: 'string' },
-        },
-        required: ['file', 'created', 'chars', 'message'],
-        additionalProperties: false,
+      schema: { type: 'object', additionalProperties: true },
+      render: (_args: unknown, value: unknown): ContentBlock[] => {
+        const v = value as Record<string, unknown>;
+        if (v.action === 'search') {
+          return [{ type: 'text', text: renderHits(String(v.query ?? ''), (v.hits as SearchOutputHit[]) ?? []) }];
+        }
+        return [{ type: 'text', text: String(v.message ?? '') }];
       },
-      render: (_args: unknown, value: unknown): ContentBlock[] => [
-        { type: 'text', text: (value as SaveNoteResult).message },
-      ],
     },
-    async execute(args: unknown, exec: { agent?: unknown }): Promise<SaveNoteResult> {
-      const { title, content, file, scope, projects, personas, scenes, operations, triggers, inject, budget_chars, supersedes } = args as SaveArgs;
+    async execute(args: unknown, exec: { agent?: unknown }): Promise<Record<string, unknown>> {
+      const input = (args ?? {}) as Partial<NotesArgs>;
+      if (input.action === 'search') {
+        const { query, limit, project, persona, all_scopes } = input;
+        if (typeof query !== 'string' || query.trim().length === 0) {
+          throw new Error('qqbot_notes: action="search" 时 `query` 不能为空');
+        }
+        const n = typeof limit === 'number' && Number.isFinite(limit) ? Math.min(8, Math.max(1, Math.floor(limit))) : 4;
+        const agent = exec.agent as DshAgent | undefined;
+        const record = agent !== undefined ? manager.findByAgent(agent) : undefined;
+        const owner = options.ownerOpenid?.trim() ?? '';
+        const ownerOrLocal = record === undefined || (owner !== '' && record.scope === 'c2c' && record.peerId === owner);
+
+        let queryCtx: Omit<NoteQueryContext, 'chatKey'>;
+        let chatKey: string | undefined;
+        if (record !== undefined && typeof manager.buildNoteQueryContext === 'function') {
+          const built = manager.buildNoteQueryContext(record.scope, record.peerId, { record, agent });
+          chatKey = built.chatKey;
+          const { chatKey: _c, ...rest } = built;
+          queryCtx = rest;
+        } else if (record !== undefined) {
+          chatKey = chatKeyOf(record.scope, record.peerId);
+          const projects = deriveProjectsFromCwd(agent?.session?.header?.cwd, dirname(store.root));
+          queryCtx = {
+            scenes: [record.scope],
+            ...(projects.length > 0 ? { projects } : {}),
+            allowQueryProjectMatch: ownerOrLocal,
+          };
+        } else {
+          chatKey = undefined;
+          const projects = deriveProjectsFromCwd(agent?.session?.header?.cwd, dirname(store.root));
+          queryCtx = {
+            scenes: ['local'],
+            ...(projects.length > 0 ? { projects } : {}),
+            allowQueryProjectMatch: true,
+          };
+        }
+
+        if (ownerOrLocal && typeof project === 'string' && project.trim() !== '') {
+          queryCtx = { ...queryCtx, projects: [project.trim()] };
+        }
+        if (ownerOrLocal && typeof persona === 'string' && persona.trim() !== '') {
+          queryCtx = { ...queryCtx, personas: [persona.trim()] };
+        }
+        if (all_scopes === true && ownerOrLocal) {
+          queryCtx = { ...queryCtx, unscoped: true };
+        }
+
+        if (record === undefined) queryCtx = { ...queryCtx, sharedOnly: true };
+        const rawHits = await store.searchHybrid(query, n, chatKey, queryCtx);
+        const hits: SearchOutputHit[] = rawHits.map((hit) => {
+          const conflictStrings = hit.conflicts?.map((c) => formatConflictsSummary([c])).filter(Boolean);
+          return {
+            file: hit.file,
+            heading: hit.heading,
+            text: hit.text,
+            score: Math.round(hit.score * 100) / 100,
+            ...(hit.exact === undefined ? {} : { exact: hit.exact.matched }),
+            ...(hit.similarity === undefined ? {} : { similarity: Math.round(hit.similarity * 100) / 100 }),
+            ...(hit.scopeLabel === undefined ? {} : { scope: hit.scopeLabel }),
+            ...(hit.why === undefined ? {} : { why: hit.why }),
+            ...(hit.meta?.date === undefined ? {} : { date: hit.meta.date }),
+            ...(hit.meta?.source === undefined ? {} : { source: hit.meta.source }),
+            ...(hit.meta?.status === undefined ? {} : { status: hit.meta.status }),
+            ...(conflictStrings === undefined || conflictStrings.length === 0 ? {} : { conflicts: conflictStrings }),
+          };
+        });
+        return { action: 'search', query, hits };
+      }
+
+      if (input.action !== 'save') {
+        throw new Error(`qqbot_notes: 不支持的 action="${String(input.action)}"`);
+      }
+
+      const { title, content, file, scope, projects, personas, scenes, operations, triggers, inject, budget_chars, supersedes } = input;
       if (typeof title !== 'string' || typeof content !== 'string') {
-        throw new Error('qqbot_notes_save: `title` 和 `content` 必须是字符串');
+        throw new Error('qqbot_notes: action="save" 时 `title` 和 `content` 必须是字符串');
       }
       let budgetChars: number | undefined;
       if (budget_chars !== undefined) {
         if (typeof budget_chars !== 'number' || !Number.isFinite(budget_chars) || budget_chars < 60 || budget_chars > 2000) {
-          throw new Error('qqbot_notes_save: `budget_chars` 必须是 60-2000 的整数（仅检索请传 inject="search-only"）');
+          throw new Error('qqbot_notes: `budget_chars` 必须是 60-2000 的整数（仅检索请传 inject="search-only"）');
         }
         budgetChars = Math.floor(budget_chars);
       }
@@ -369,7 +311,7 @@ export function registerNotesTools(
         const pcs = campaign.characters.filter((ch) => ch.kind === 'pc').flatMap((ch) => ch.name.split(/\s+/));
         const secret = findDmSecret(`${title}\n${content}`, monsters, pcs);
         if (secret !== undefined) {
-          throw new Error(`qqbot_notes_save: 跑团进行中，笔记${secret}。DM 机密（DC、怪物数值、DM 笔记）不写进笔记，去掉后再记；跑团进度用 dnd_progress 写进团档。`);
+          throw new Error(`qqbot_notes: 跑团进行中，笔记${secret}。DM 机密（DC、怪物数值、DM 笔记）不写进笔记，去掉后再记；跑团进度用 dnd_progress 写进团档。`);
         }
       }
       // 本机会话没有「本会话」可言，一律记到共享区
@@ -384,7 +326,7 @@ export function registerNotesTools(
       const cleanTriggers = cleanStringArray(triggers);
       const cleanSupersedes = cleanStringArray(supersedes);
 
-      return store.save({
+      const saved: SaveNoteResult = store.save({
         title,
         content,
         source,
@@ -399,6 +341,7 @@ export function registerNotesTools(
         ...(budgetChars === undefined ? {} : { budgetChars }),
         ...(cleanSupersedes === undefined ? {} : { supersedes: cleanSupersedes }),
       });
+      return { action: 'save', ...saved } as unknown as Record<string, unknown>;
     },
   });
 
@@ -477,9 +420,9 @@ export function registerNotesTools(
           return { message: `已恢复自动注入：${path} › ${section}（之前的相关性分数已清零，重新累计）。` };
         }
         // 标题路径写错的话静音会落到一个不存在的键上，什么也不会发生还以为生效了
-        if (!store.hasSection(path, section)) throw new Error(`qqbot_notes_manage: 笔记库里没有 ${path} › ${section}，先用 stats 或 qqbot_notes_search 确认路径`);
+        if (!store.hasSection(path, section)) throw new Error(`qqbot_notes_manage: 笔记库里没有 ${path} › ${section}，先用 stats 或 qqbot_notes(action="search") 确认路径`);
         metrics.mute(path, section);
-        return { message: `已静音：${path} › ${section}。之后不再自动注入，qqbot_notes_search 仍然查得到；要恢复用 unmute。` };
+        return { message: `已静音：${path} › ${section}。之后不再自动注入，qqbot_notes(action="search") 仍然查得到；要恢复用 unmute。` };
       }
       throw new Error(`qqbot_notes_manage: 不认识的 action「${String(action)}」`);
     },

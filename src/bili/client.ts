@@ -8,9 +8,9 @@
  * 端点与签名思路参考 dsh-bili-scroll 内置的 bilibili-mcp（MIT），这里只保留只读部分。
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
+import { biliCredentialPath } from '../shared/paths.ts';
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -27,7 +27,6 @@ const MIXIN_KEY_ENC_TAB = [
 ];
 const GUEST_COOKIE_TTL_MS = 6 * 60 * 60 * 1000;
 const WBI_TTL_MS = 60 * 60 * 1000;
-const CREDENTIAL_PATH = join(homedir(), '.dsh', 'bili-read', 'credential.json');
 
 export interface BiliCredential {
   cookie: string;
@@ -175,7 +174,7 @@ export class BiliClient {
   private wbi: { mixin: string; expiresAt: number } | undefined;
   private credential: BiliCredential | undefined;
 
-  public constructor(private readonly credentialPath: string = CREDENTIAL_PATH) {
+  public constructor(private readonly credentialPath: string = biliCredentialPath()) {
     this.loadCredential();
   }
 
@@ -356,7 +355,7 @@ export class BiliClient {
     const subtitles = data.subtitle?.subtitles ?? [];
     if (subtitles.length === 0) {
       if (data.need_login_subtitle === true && !this.hasCredential()) {
-        throw new Error('这个视频的字幕需要登录 B 站：请先调用 bili_login 扫码登录，再重试');
+        throw new Error('这个视频的字幕需要登录 B 站：请先调用 qqbot_bili_auth(action="login") 扫码登录，再重试');
       }
       return undefined;
     }
@@ -411,7 +410,7 @@ export class BiliClient {
       return { state: 'success', message: 'B 站登录成功，凭证已保存到本机', cookieSaved: true };
     }
     if (code === 86090) return { state: 'scanned', message: '已扫码，等待手机确认' };
-    if (code === 86038) return { state: 'expired', message: '二维码已失效，请重新调用 bili_login' };
+    if (code === 86038) return { state: 'expired', message: '二维码已失效，请重新调用 qqbot_bili_auth(action="login")' };
     return { state: 'waiting', message: data.message ?? '等待扫码' };
   }
 
@@ -434,7 +433,6 @@ export class BiliClient {
 
   private saveCredential(credential: BiliCredential): void {
     this.credential = credential;
-    mkdirSync(dirname(this.credentialPath), { recursive: true });
-    writeFileSync(this.credentialPath, `${JSON.stringify(credential, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    writeJsonAtomic(this.credentialPath, credential, { indent: 2, trailingNewline: true, mode: 0o600 });
   }
 }

@@ -1,12 +1,14 @@
 /** 战斗：dnd_initiative（先攻）、dnd_position（站位与场地图）。 */
 import { roomGraph } from '../adventure.ts';
 import {
+type PendingSpell,
 assertCanAct,assertDeclaredByOwner,assertNoPending,
 assertCanEndTurn,endInitiative,findCharacter,gotoTurn,fightRooms,
 joinInitiative,nextTurn,skipSurprised,requireCharacter,
-requireInitiative,startInitiative,spendReaction
+requireInitiative,startInitiative,spendReaction,useResource
 } from '../campaign.ts';
 import { combatParticipantCard } from '../combat-context.ts';
+import { ensureTurnState, recordTurnSpellCast } from '../conditions.ts';
 import { findRoom,resolveRoom } from '../dungeon.ts';
 import {
 type AreaRequest,
@@ -24,9 +26,12 @@ setBattleMap,
 setPositions,unplaced,upsertBattleZone
 } from '../battlefield.ts';
 import { beginMovement } from '../movement.ts';
+import { eligibleSpellReactors, holdNotice, hostileSpellcasterHints } from '../pending-attack.ts';
 import { terrainLine } from '../terrain.ts';
-import { formatZoneSummary,inferSpellSaveDc,type ZoneTrigger } from '../zones.ts';
+import { type BattleZoneInput, formatZoneSummary, inferSpellSaveDc, type ZoneTrigger } from '../zones.ts';
 import {
+SECRET_NOTE,
+parseFormationInput,
 parsePlacements,
 str,
 int,
@@ -38,7 +43,7 @@ orderLine,combatTurnPrompt,combatLedgerSuffix,type ToolKit
 } from './shared.ts';
 
 export function registerCombatTools(kit: ToolKit): void {
-  const { deps, service, recordOf, mutate, sendersOf, memberId, register } = kit;
+  const { deps, service, recordOf, mutate, rollId, sendersOf, memberId, register } = kit;
 
   register(
     'dnd_initiative',
@@ -126,7 +131,7 @@ export function registerCombatTools(kit: ToolKit): void {
         if (!delegated) turnChanged();
         const unused = Object.keys(initiativeBonusArg(args.bonus)).filter((n) => !rolls.some((r) => r.name === n));
         const warn = unused.length > 0 ? `\n【DM】bonus 里这几个名字不在参战者里，没算进去：${unused.join('、')}` : '';
-        return `先攻：\n${rolls.map((r, i) => `${i + 1}. ${r.name} ${r.detail}`).join('\n')}\n${delegated ? '【战斗委派】回复只叙述开场并停下。回复结束后战斗代理自动接手场地图、摆位和当前回合；不要再用主 DM 结算攻击或 next。' : field}${rehearsalNote}${surpriseNote}\n第 ${state.round} 轮，${delegated ? `当前 ${state.order[state.turn]!.name}` : combatTurnPrompt(c, state.order[state.turn]!.name, { recentSenders: sendersOf(exec) })}${away}${warn}`;
+        return `先攻：\n${rolls.map((r, i) => `${i + 1}. ${r.name} ${r.detail}`).join('\n')}\n${delegated ? '【战斗委派】回复只叙述开场并停下。回复结束后战斗代理自动接手场地图、摆位和当前回合；不要再用主 DM 结算攻击或 next。' : field}${rehearsalNote}${surpriseNote}\n第 ${state.round} 轮，${delegated ? `当前 ${state.order[state.turn]!.name}` : combatTurnPrompt(c, state.order[state.turn]!.name, { recentSenders: sendersOf(exec), globalEffects: service.globalEffects() })}${away}${warn}`;
       }
       if (action === 'join') {
         assertNoPending(c, '加入战斗');
@@ -180,12 +185,12 @@ export function registerCombatTools(kit: ToolKit): void {
         const expiredNote = expired.length > 0 ? `【状态/区域到期】${expired.join('；')}\n` : '';
         const hazardBlock = hazardNotes.length > 0 ? `【回合切换自动结算（回复里照实播报掷骰过程）】\n${hazardNotes.map((h) => `- ${h}`).join('\n')}\n` : '';
         // 新一轮把顺序带上，DM 照着列给玩家，不用守则里再交代
-        return `${skippedNote}${expiredNote}${hazardBlock}${newRound ? `进入第 ${round} 轮（回复里把这一轮的顺序列一遍）：${orderLine(c)}\n` : ''}${combatTurnPrompt(c, current.name, { recentSenders: sendersOf(exec) })}`;
+        return `${skippedNote}${expiredNote}${hazardBlock}${newRound ? `进入第 ${round} 轮（回复里把这一轮的顺序列一遍）：${orderLine(c)}\n` : ''}${combatTurnPrompt(c, current.name, { recentSenders: sendersOf(exec), globalEffects: service.globalEffects() })}`;
       }
       if (action === 'goto') {
         const entry = gotoTurn(c, String(args.name ?? ''), int(args.round));
         turnChanged();
-        return `已调整：第 ${requireInitiative(c).round} 轮，${combatTurnPrompt(c, entry.name, { recentSenders: sendersOf(exec), force: true })}`;
+        return `已调整：第 ${requireInitiative(c).round} 轮，${combatTurnPrompt(c, entry.name, { recentSenders: sendersOf(exec), force: true, globalEffects: service.globalEffects() })}`;
       }
       if (action === 'end') {
         assertNoPending(c, '结束战斗');
@@ -216,12 +221,13 @@ export function registerCombatTools(kit: ToolKit): void {
     + 'terrain: draw the room\'s battle map once (walls, doors, the corridor outside each door, obstacles, difficult '
     + 'ground); it is kept for the room and reused next time. Moves then route around walls and enemies, and the '
     + 'players\' map shows the scene. '
-    + 'set: place combatants at the start of a fight, when someone joins or enters the room, for forced movement (shove, '
-    + 'teleport: no movement cost, no opportunity attack); `near` places someone next to a door, landmark or creature '
-    + 'without counting cells. mark=true places a landmark or an uncarded creature (captive). '
-    + 'move: one creature moves on its own turn. Prefer intent over coordinates: `to` a creature (ends adjacent), a '
-    + 'door, the corridor outside, an obstacle; `away_from` a creature; `feet` caps the distance; `keep_adjacent` '
-    + 'when the player says to stay next to someone; dash / drag / disengage as declared. Use x/y only when the '
+    + 'set: place combatants at the start of a fight, when someone joins or enters the room, or for forced movement (shove, '
+    + 'teleport: no movement cost, no opportunity attack). For fast opening setup, pass `formation` ({ entry?, front:[...], mid:[...], back:[...], auto_rest?, enemies? }) '
+    + 'together with enemy `placements` (x/y or `near`) — the engine automatically arranges front/mid/back ranks facing the enemies around walls & doors without manual coordinate math! '
+    + '`near` places someone next to a door, landmark or creature without counting cells; `rank` ("front"/"mid"/"back") on a placement item also auto-ranks it; mark=true places a landmark or an uncarded creature (captive). '
+    + 'move / swap: one creature moves on its own turn (or swaps cells with a consenting ally via swap="队友名" or action="swap"). Prefer intent over coordinates: `to` a creature (ends adjacent), a '
+    + 'door, the corridor outside, an obstacle; `away_from` a creature; `swap` an ally (approaches an adjacent free cell if >5 ft away, then swaps cells once the ally\'s player consents — pass `ally_declared_by` if the ally\'s player already agreed in chat, otherwise the tool pauses and opens a 0-reaction consent button window); `feet` caps the distance; `keep_adjacent` '
+    + 'when the player says to stay next to someone; dash / drag / disengage as declared. Moves automatically detour around damaging/restraining zones & hostile auras (火墙术, 荆棘丛生, 蛛网术, 毒雾, 灵体卫士) when reachable within available speed, and emit a split-move (拆分移动) reminder whenever passing through a domain/zone; pass `enter_hazards=true` only when the creature intentionally charges straight through a hazard. NEVER eyeball coordinates to claim someone cannot reach or bypass a zone — always call `move` (`to="目标"`) and let the pathfinder check! Use x/y only when the '
     + 'player named a cell. Movement pauses at an opportunity-attack trigger BEFORE the remaining route is applied; '
     + 'ask the listed players, resolve dnd_check attack reaction=true (spends their reaction), then dnd_apply target=mover settle=true. '
     + 'Never bypass this with set; set is only for initial placement, correction or actual forced movement. '
@@ -229,10 +235,10 @@ export function registerCombatTools(kit: ToolKit): void {
     + 'shape covers so the placement is checked on the grid instead of guessed; tell the players honestly if an ally is in it. '
     + 'show: everyone\'s positions; with `from`, distances from that creature. remove: drop a mark '
     + 'or placement (never remove someone who just stepped outside: move them `to` the corridor outside). '
-    + 'zone / remove_zone: place or clear persistent battlefield zones (黑暗术, 毒雾, 云雾术, 蛛网术, 荆棘丛生, 月华之光, 火墙术 or custom ground hazards); rendered on /dnd status map, integrated with move/nextTurn saves & obscurement, and auto-cleared on round expiry, concentration break or combat end. '
+    + 'zone / remove_zone: place or clear persistent battlefield zones (黑暗术, 毒雾, 云雾术, 蛛网术, 荆棘丛生, 月华之光, 火墙术 or custom ground hazards); pass `spend` (e.g. "4环法术位") to spend the spell slot atomically; rendered on /dnd status map, integrated with move/nextTurn saves & obscurement, and auto-cleared on round expiry, concentration break or combat end. '
     + 'clear_terrain: clear an improvised/temporary arena map for the room, restoring the module\'s authored map if one exists.',
     {
-      action: { type: 'string', enum: ['terrain', 'clear_terrain', 'set', 'move', 'area', 'zone', 'remove_zone', 'show', 'remove'] },
+      action: { type: 'string', enum: ['terrain', 'clear_terrain', 'set', 'move', 'swap', 'area', 'zone', 'remove_zone', 'show', 'remove'] },
       shape: {
         type: 'string',
         enum: ['sphere', 'cube', 'line', 'rect'],
@@ -271,7 +277,7 @@ export function registerCombatTools(kit: ToolKit): void {
       },
       placements: {
         type: 'array',
-        description: 'For set.',
+        description: 'For set: explicit placements (e.g. enemies by x/y or `near`, landmarks with mark=true, or individual rank="front"/"mid"/"back"). Can be combined with `formation` in one call.',
         items: {
           type: 'object',
           properties: {
@@ -280,11 +286,39 @@ export function registerCombatTools(kit: ToolKit): void {
             y: { type: 'integer' },
             z: { type: 'integer', description: 'Altitude in feet (multiple of 5, default 0 ground).' },
             near: { type: 'string', description: 'Instead of x/y: nearest free cell to this door / landmark / creature, in list order.' },
+            rank: { type: 'string', enum: ['front', 'mid', 'back', '前排', '中排', '后排'], description: 'Instead of x/y: auto-place in front / mid / back rank relative to opposing forces.' },
             mark: { type: 'boolean', description: 'Not a character sheet: landmark or uncarded captive (needs x/y).' },
           },
           required: ['name'],
           additionalProperties: false,
         },
+      },
+      formation: {
+        type: 'object',
+        description: 'For set: automatic rank-priority formation! Pass party `front` / `mid` / `back` character lists (plus optional `entry` door/landmark or x/y, `auto_rest:true`, and optional `enemies` rank lists) alongside enemy `placements`. Automatically arranges frontline closest to enemies and backline safely behind without manual coordinate counting.',
+        properties: {
+          entry: { type: 'string', description: 'Optional party entry door / landmark name (auto-inferred from room entrance if omitted).' },
+          x: { type: 'integer', description: 'Optional party anchor x cell.' },
+          y: { type: 'integer', description: 'Optional party anchor y cell.' },
+          front: { type: 'array', items: { type: 'string' }, description: 'Frontline party members (e.g. fighters, paladins, barbarians).' },
+          mid: { type: 'array', items: { type: 'string' }, description: 'Midline party members (e.g. bards, clerics, rogues, monks).' },
+          back: { type: 'array', items: { type: 'string' }, description: 'Backline party members (e.g. wizards, sorcerers, warlocks, archers).' },
+          auto_rest: { type: 'boolean', description: 'If true, any unplaced participating allies in the room omitted from front/mid/back are auto-assigned a default rank by class/weapons.' },
+          enemies: {
+            type: 'object',
+            description: 'Optional enemy formation by rank (alternatively pass enemy coordinates or `near` in `placements`).',
+            properties: {
+              entry: { type: 'string', description: 'Optional enemy anchor landmark / door name.' },
+              x: { type: 'integer' },
+              y: { type: 'integer' },
+              front: { type: 'array', items: { type: 'string' } },
+              mid: { type: 'array', items: { type: 'string' } },
+              back: { type: 'array', items: { type: 'string' } },
+            },
+            additionalProperties: false,
+          },
+        },
+        additionalProperties: false,
       },
       name: { type: 'string', description: 'For move / remove: creature or mark name. For zone / remove_zone: zone name (e.g. "黑暗术", "毒雾", "蛛网术", "荆棘丛生", "月华之光").' },
       x: { type: 'integer', description: 'For move / area / zone: grid x cell.' },
@@ -306,19 +340,26 @@ export function registerCombatTools(kit: ToolKit): void {
       per_step: { type: 'boolean', description: 'For zone: true to deal damage for every 5 ft moved inside the zone (e.g. 荆棘丛生).' },
       rounds: { type: 'integer', description: 'For zone: duration in rounds (auto-ticks and clears on expiry or combat end).' },
       concentration: { type: 'boolean', description: 'For zone: bind to `caster`\'s concentration.' },
+      spend: { type: 'string', description: 'For zone: optional resource key to spend atomically when casting this zone spell (e.g. "4环法术位").' },
+      is_spell: { type: 'boolean', description: 'For zone: set false for non-spell environmental zones so Counterspell does not trigger.' },
+      spell_level: { type: 'integer', description: 'For zone: optional spell level (1-9) used for Counterspell checks.' },
       target_side: { type: 'string', enum: ['all', 'enemies', 'allies'], description: 'For zone: which side is affected (default "all").' },
-      to: { type: 'string', description: 'For move: a creature (ends adjacent), a door, the corridor outside, an obstacle or a landmark, by name.' },
+      to: { type: 'string', description: 'For move: a creature (ends adjacent), a door, the corridor outside, an obstacle or a landmark, by name. For action="swap": alias for `swap`.' },
       adjacent_to: { type: 'string', description: 'For move: same as `to` with a creature.' },
       away_from: { type: 'string', description: 'For move: get as far from this creature as the movement allows (or `feet`).' },
+      swap: { type: 'string', description: 'For move / swap: friendly creature name to swap positions with (approaches if >5 ft away, checks movement cost & opportunity attacks, and requires teammate consent without spending their reaction).' },
       feet: { type: 'integer', description: 'For move with to/away_from: walk at most this many feet ("往门口挪 10 尺").' },
       keep_adjacent: { type: 'string', description: 'For move: the mover must still be next to this creature afterwards.' },
       dash: { type: 'boolean', description: 'For move: the mover took the Dash action; movement doubles for this turn.' },
       drag: { type: 'string', description: 'For move: drag this adjacent creature along (costs double, ends right behind).' },
       disengage: { type: 'boolean', description: 'For move: the mover took Disengage; no opportunity attacks.' },
       crawl: { type: 'boolean', description: 'For move while 倒地 (prone): crawl along the ground (costs double movement, keeps 倒地) instead of automatically spending half speed to stand up first.' },
+      enter_hazards: { type: 'boolean', description: 'For move: allow taking a direct path straight through damaging/restraining zones or hostile auras instead of automatically detouring around them within available movement.' },
       ignore_state_mods: { type: 'boolean', description: 'For move: bypass automatic condition restrictions (speed=0, prone auto-stand, fear source block) when a special feature/immunity overrides standard 5e rules.' },
       from: { type: 'string', description: 'For show: list distances from this creature.' },
-      declared_by: { type: 'string', description: 'For move of a PC: member id of the player who declared it (the #U number, pass "U3").' },
+      declared_by: { type: 'string', description: 'For move / swap of a PC: member id of the player who declared it (the #U number, pass "U3").' },
+      ally_declared_by: { type: 'string', description: 'For move with `swap` (or action="swap") when swapping with another player\'s PC: member id (#U) of that teammate\'s player IF they already explicitly agreed to swap in recent chat. Omit to pause and open an interactive swap-consent button window.' },
+      ally_dm_override: { type: 'boolean', description: 'For swap: true ONLY when the swapped teammate\'s player explicitly delegated control of their PC (must also pass `ally_declared_by` of the delegating player).' },
       reaction: { type: 'boolean', description: 'For move: movement off-turn (a reaction, a feature); not counted against this turn\'s speed.' },
       use_reaction: { type: 'boolean', description: 'For move: this feature actually spends the mover\'s reaction (e.g. a readied move). Records 0/1 until their next turn. Off-turn movement alone need not cost a reaction.' },
       dm_override: { type: 'boolean', description: 'For move: a player explicitly delegated this PC\'s move. Say so in the reply.' },
@@ -390,13 +431,34 @@ export function registerCombatTools(kit: ToolKit): void {
         if (zx === undefined || zy === undefined) {
           throw new Error('dnd_position zone 需要给 x/y 坐标，或传 at="角色/标记名"');
         }
+        const spendKey = str(args.spend);
+        if (spendKey !== undefined && casterCh === undefined) {
+          throw new Error('dnd_position zone 传 spend 扣减法术位时必须同时指定 caster="施法者角色名"');
+        }
+        const spent = spendKey !== undefined && casterCh !== undefined ? useResource(c, casterCh.name, spendKey) : undefined;
+        let spellWarn: string | undefined;
+        let inferredSlotLevel: number | undefined;
+        if (spent !== undefined && casterCh !== undefined) {
+          const slotMatch = /([1-9])\s*环/.exec(spent.key);
+          if (slotMatch !== null) inferredSlotLevel = Number(slotMatch[1]);
+          if (c.initiative?.order[c.initiative.turn]?.name === casterCh.name) {
+            const ts = ensureTurnState(c);
+            if (ts !== undefined) {
+              ts.actionUsed ??= zoneName;
+              if (inferredSlotLevel !== undefined) {
+                spellWarn = recordTurnSpellCast(ts, casterCh.name, zoneName, inferredSlotLevel, 'action');
+              }
+            }
+          }
+        }
+        const spellLevel = int(args.spell_level) ?? inferredSlotLevel;
         const shapeRaw = str(args.shape);
         const shape = shapeRaw === 'rect' || shapeRaw === 'cube' ? 'rect' as const : (shapeRaw === 'sphere' ? 'sphere' as const : undefined);
         const cubeCells = shapeRaw === 'cube' && int(args.size) !== undefined ? Math.max(1, Math.round(int(args.size)! / 5)) : undefined;
         const explicitDc = int(args.save_dc);
         const inferredDc = explicitDc ?? (casterCh !== undefined ? inferSpellSaveDc(casterCh) : undefined);
         const rawTriggers = strList(args.triggers)?.filter((t): t is ZoneTrigger => t === 'enter' || t === 'turn_start' || t === 'turn_end');
-        const { zone, broken, affected } = upsertBattleZone(c, {
+        const zoneInput: BattleZoneInput = {
           name: zoneName,
           ...(zRoom !== undefined ? { room: zRoom } : {}),
           ...(shape !== undefined ? { shape } : {}),
@@ -420,10 +482,50 @@ export function registerCombatTools(kit: ToolKit): void {
           ...(rawTriggers !== undefined && rawTriggers.length > 0 ? { triggers: rawTriggers } : {}),
           ...(typeof args.per_step === 'boolean' ? { perStep: args.per_step } : {}),
           ...(args.target_side === 'all' || args.target_side === 'enemies' || args.target_side === 'allies' ? { targetSide: args.target_side } : {}),
-        });
-        const out = [`已放置持续区域：${formatZoneSummary(zone)}`];
+        };
+        if (c.initiative !== undefined && casterCh?.kind === 'monster' && args.is_spell !== false) {
+          const spellReactors = eligibleSpellReactors(c, casterCh, { spellName: zoneName });
+          if (spellReactors.length > 0) {
+            const id = rollId(c, exec);
+            const p: PendingSpell = {
+              kind: 'spell',
+              seq: id,
+              at: Date.now(),
+              attacker: casterCh.name,
+              target: casterCh.name,
+              reactors: spellReactors,
+              declined: [],
+              claimed: [],
+              used: [],
+              spellName: zoneName,
+              ...(spellLevel !== undefined ? { spellLevel } : {}),
+              effect: {
+                kind: 'zone',
+                zoneInput,
+                ...(spellWarn !== undefined ? { spellWarn } : {}),
+              },
+            };
+            requireInitiative(c).pending = p;
+            deps.onPendingAttack?.(recordOf(exec));
+            return [
+              ...(spent !== undefined ? [`${casterCh.name}「${spent.key}」${spent.before}→${spent.resource.current}/${spent.resource.max}`] : []),
+              `${casterCh.name} 正在施放持续区域法术「${zoneName}」（还没落地） #R${id}`,
+              holdNotice(p),
+              SECRET_NOTE,
+            ].join('\n');
+          }
+        }
+        const { zone, broken, affected } = upsertBattleZone(c, zoneInput);
+        const out = [
+          ...(spent !== undefined && casterCh !== undefined ? [`${casterCh.name}「${spent.key}」${spent.before}→${spent.resource.current}/${spent.resource.max}`] : []),
+          `已放置持续区域：${formatZoneSummary(zone)}`,
+        ];
         if (affected.length > 0) out.push(`当前处于区域内的单位：${affected.join('、')}`);
         if (broken.length > 0) out.push(...broken);
+        if (spellWarn !== undefined) out.push(spellWarn);
+        if (c.initiative !== undefined && casterCh !== undefined && casterCh.kind !== 'monster' && args.is_spell !== false) {
+          out.push(...hostileSpellcasterHints(c, casterCh, { kind: 'spell', spellName: zoneName }));
+        }
         return `${out.join('\n')}${combatLedgerSuffix(c)}`;
       }
       if (action === 'remove_zone') {
@@ -434,12 +536,13 @@ export function registerCombatTools(kit: ToolKit): void {
       }
       if (action === 'set') {
         assertNoPending(c, '重新摆位');
-        const notes = setPositions(c, parsePlacements(args.placements));
+        const formation = parseFormationInput(args.formation);
+        const notes = setPositions(c, parsePlacements(args.placements, formation !== undefined), formation);
         return [...battleLines(c, roomName), ...notes].join('\n');
       }
-      if (action === 'move') {
+      if (action === 'move' || action === 'swap') {
         const ch = requireCharacter(c, String(args.name ?? ''));
-        assertNoPending(c, '移动');
+        assertNoPending(c, action === 'swap' ? '交换站位' : '移动');
         if (args.dm_override === true && str(args.declared_by) === undefined) {
           throw new Error('dnd_position: dm_override 还要给 declared_by（委托的玩家编号，如 U4），并在回复里写明是谁委托的');
         }
@@ -455,14 +558,39 @@ export function registerCombatTools(kit: ToolKit): void {
           assertDeclaredByOwner(ch, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec) }, '反应移动');
           spendReaction(c, ch.name);
         }
+        const swapTargetRaw = str(args.swap) ?? (action === 'swap' ? (str(args.to) ?? str(args.adjacent_to)) : undefined);
+        if (action === 'swap' && swapTargetRaw === undefined) {
+          throw new Error('dnd_position action="swap" 需要传 swap="队友角色名"（或 to="队友角色名"）');
+        }
         const request: MoveRequest = { reaction: args.reaction === true };
         const text = (key: keyof MoveRequest, value: unknown): void => {
           const v = str(value);
           if (v !== undefined) (request as Record<string, unknown>)[key] = v;
         };
-        text('adjacentTo', args.adjacent_to);
-        text('to', args.to);
-        text('awayFrom', args.away_from);
+        if (swapTargetRaw !== undefined) {
+          const ally = requireCharacter(c, swapTargetRaw);
+          request.swap = ally.name;
+          if (ally.kind !== 'pc' || ally.playerId === undefined || ally.playerId === ch.playerId) {
+            request.swapApproved = true;
+          } else if (str(args.ally_declared_by) !== undefined) {
+            assertDeclaredByOwner(
+              ally,
+              {
+                declaredBy: memberId(exec, args.ally_declared_by, 'ally_declared_by'),
+                recentSenders: sendersOf(exec),
+                dmOverride: args.ally_dm_override === true,
+              },
+              '同意交换站位',
+            );
+            request.swapApproved = true;
+          } else if (args.ally_dm_override === true) {
+            throw new Error('dnd_position: ally_dm_override 需要同时提供 ally_declared_by（授权委托的玩家编号，如 U4），并在回复里写明是谁委托的');
+          }
+        } else {
+          text('adjacentTo', args.adjacent_to);
+          text('to', args.to);
+          text('awayFrom', args.away_from);
+        }
         text('keepAdjacent', args.keep_adjacent);
         text('drag', args.drag);
         const x = int(args.x);
@@ -476,6 +604,7 @@ export function registerCombatTools(kit: ToolKit): void {
         if (args.dash === true) request.dash = true;
         if (args.disengage === true) request.disengage = true;
         if (args.crawl === true) request.crawl = true;
+        if (args.enter_hazards === true) request.enterHazards = true;
         if (args.ignore_state_mods === true) request.ignoreStateMods = true;
         const result = beginMovement(c, ch.name, request, { roller: service.roller, globalEffects: service.globalEffects() });
         if (c.initiative?.movement !== undefined) deps.onPendingAttack?.(recordOf(exec));

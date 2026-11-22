@@ -130,6 +130,21 @@ describe('extractPseudoStickerCalls', () => {
     expect(result.calls[0]).toEqual({ image: 'c.png', emotion: '开心', note: 'test' });
   });
 
+  it('同样兼容 <qqbot_sticker> 伪调用（save 解析并补存，match 仅剥离不入库，半截扣住）', () => {
+    const text = '这图真可爱\n<qqbot_sticker><action>save</action><image>C:/media/d.png</image><emotion>心动</emotion><look>小猫歪头</look></qqbot_sticker>';
+    const saveRes = extractPseudoStickerCalls(text);
+    expect(saveRes.visible).toBe('这图真可爱');
+    expect(saveRes.calls).toEqual([{ image: 'C:/media/d.png', emotion: '心动', look: '小猫歪头' }]);
+
+    const matchText = '查一下\n<qqbot_sticker action="match" image="C:/media/e.png" emotion="无语"></qqbot_sticker>';
+    const matchRes = extractPseudoStickerCalls(matchText);
+    expect(matchRes.visible).toBe('查一下');
+    expect(matchRes.calls).toEqual([]);
+
+    expect(sanitizePseudoStickerText('前文\n<qqbot_sticker><image>x.png')).toBe('前文');
+    expect(sanitizePseudoStickerText('前文<qqbot_stick')).toBe('前文');
+  });
+
   it('剥离 qqbot_send_file 伪标签（不重复执行发送）', () => {
     const text = '文字\n<qqbot_send_file">\n<file_path>C:/x.png</file_path>\n</qqbot_send_file>';
     expect(sanitizePseudoToolText(text)).toBe('文字');

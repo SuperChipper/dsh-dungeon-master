@@ -1,7 +1,7 @@
 /** 角色卡与资源：dnd_character、dnd_resource、dnd_rest。 */
 import type { Adventure } from '../adventure.ts';
 import {
-type Campaign,type CharacterInput,type CharacterKind,assertNoPending,changeInventory,checkAllAirborneCrashes,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isAbsent,isOut,fightRooms,leaveInitiative,reactionBlocked,removeCharacter,requireCharacter,requireResource,rest,
+type Campaign,type Character,type CharacterInput,type CharacterKind,type PendingSpell,assertNoPending,changeInventory,checkAllAirborneCrashes,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isAbsent,isOut,fightRooms,leaveInitiative,pushLog,reactionBlocked,removeCharacter,requireCharacter,requireInitiative,requireResource,rest,
 restoreReaction,
 restoreResource,
 roomOf,
@@ -15,7 +15,7 @@ npcAlive
 } from '../story.ts';
 import { ABILITIES,type Ability,abilityModifier,proficiencyBonus } from '../rules.ts';
 import {
-DEFAULT_CONCENTRATION_STATES,breakConcentration,ensureTurnState,normalizeCondition,recordTurnSpellCast,upsertActiveState
+breakConcentration,concentratingOn,defaultStateRounds,ensureTurnState,isDefaultConcentrationState,isTransferableState,normalizeCondition,recordTurnSpellCast,transferConcentration,upsertActiveState
 } from '../conditions.ts';
 import { resolveEffectDef } from '../custom-effects.ts';
 import { buildFormulaContext,evalIntFormula } from '../formula.ts';
@@ -24,7 +24,9 @@ import { resolveSrdQuery,zhTable } from '../srd-lookup.ts';
 import { type CardSpell,mergeSpells,resolveSpells } from '../spell-links.ts';
 import { hookHint } from '../hooks.ts';
 import { assertCombatExit, canReact } from '../battlefield.ts';
+import { eligibleSpellReactors, holdNotice, hostileSpellcasterHints } from '../pending-attack.ts';
 import {
+SECRET_NOTE,
 parseReactions,str,
 int,
 strList,moduleNpcNamed,
@@ -36,6 +38,199 @@ parseWeapons,
 parseAbilities,srdList,requireSrd,srdMonsterInput,
 numberedNames,combatLedgerSuffix,type ToolKit
 } from './shared.ts';
+
+/** 5e 全施法者法术位表（施法者等级 1–20 → 1–9 环法术位上限） */
+const FULL_CASTER_SLOTS: Readonly<Record<number, readonly number[]>> = {
+  1: [2],
+  2: [3],
+  3: [4, 2],
+  4: [4, 3],
+  5: [4, 3, 2],
+  6: [4, 3, 3],
+  7: [4, 3, 3, 1],
+  8: [4, 3, 3, 2],
+  9: [4, 3, 3, 3, 1],
+  10: [4, 3, 3, 3, 2],
+  11: [4, 3, 3, 3, 2, 1],
+  12: [4, 3, 3, 3, 2, 1],
+  13: [4, 3, 3, 3, 2, 1, 1],
+  14: [4, 3, 3, 3, 2, 1, 1],
+  15: [4, 3, 3, 3, 2, 1, 1, 1],
+  16: [4, 3, 3, 3, 2, 1, 1, 1],
+  17: [4, 3, 3, 3, 2, 1, 1, 1, 1],
+  18: [4, 3, 3, 3, 3, 1, 1, 1, 1],
+  19: [4, 3, 3, 3, 3, 2, 1, 1, 1],
+  20: [4, 3, 3, 3, 3, 2, 2, 1, 1],
+};
+
+function splitTopLevelClasses(className: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let cur = '';
+  for (const ch of className) {
+    if (ch === '(' || ch === '（' || ch === '[' || ch === '【') depth++;
+    else if ((ch === ')' || ch === '）' || ch === ']' || ch === '】') && depth > 0) depth--;
+    if (depth === 0 && (ch === '/' || ch === '／' || ch === '、' || ch === '；' || ch === ';')) {
+      if (cur.trim().length > 0) parts.push(cur.trim());
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur.trim().length > 0) parts.push(cur.trim());
+  return parts;
+}
+
+type CasterKind = 'full' | 'artificer' | 'half' | 'third' | 'warlock' | 'noncaster';
+
+function classifyClassSegment(seg: string): CasterKind | undefined {
+  // 先认邪术师，避免把「邪术师」误识别成「术士」
+  if (/邪术师|warlock/i.test(seg)) return 'warlock';
+  if (/奇械师|artificer/i.test(seg)) return 'artificer';
+  if (/奥法骑士|诡术师|诡术浪客|eldritch\s*knight|arcane\s*trickster/i.test(seg)) return 'third';
+  if (/吟游诗人|诗人|牧师|德鲁伊|术士|法师|bard|cleric|druid|sorcerer|wizard/i.test(seg)) return 'full';
+  if (/圣武士|圣骑士|游侠|paladin|ranger/i.test(seg)) return 'half';
+  if (/战士|野蛮人|武僧|游荡者|盗贼|fighter|barbarian|monk|rogue/i.test(seg)) return 'noncaster';
+  return undefined;
+}
+
+/** 按 5e PHB 规则（含单施法职业兼职与多施法职业兼职表、契约魔法独立计算）推导应有的法术位上限；无法确定等级拆分时返回 undefined */
+export function computeExpected5eSlots(
+  className: string | undefined,
+  totalLevel: number,
+): { standard: Record<number, number>; pact?: { slotLevel: number; max: number } } | undefined {
+  if (!className || totalLevel < 1) return undefined;
+  const rawParts = splitTopLevelClasses(className);
+  if (rawParts.length === 0) return undefined;
+
+  const parsed: Array<{ kind: CasterKind; level: number }> = [];
+  if (rawParts.length === 1) {
+    const seg = rawParts[0]!;
+    const kind = classifyClassSegment(seg);
+    if (kind === undefined) return undefined;
+    const stripped = seg.replace(/（[^）]*）|\([^)]*\)/g, ' ');
+    const m = /(\d+)\s*级?/.exec(stripped);
+    const lv = m !== null ? Number(m[1]) : totalLevel;
+    if (lv !== totalLevel) return undefined;
+    parsed.push({ kind, level: lv });
+  } else {
+    let sum = 0;
+    for (const seg of rawParts) {
+      const kind = classifyClassSegment(seg);
+      if (kind === undefined) return undefined;
+      const stripped = seg.replace(/（[^）]*）|\([^)]*\)/g, ' ');
+      const m = /(\d+)\s*级?/.exec(stripped);
+      if (m === null) return undefined;
+      const lv = Number(m[1]);
+      if (!Number.isInteger(lv) || lv < 1) return undefined;
+      sum += lv;
+      parsed.push({ kind, level: lv });
+    }
+    if (sum !== totalLevel) return undefined;
+  }
+
+  // PHB p.164：只有拥有 >= 2 个「施法（Spellcasting）」特性职业时才按兼职施法者等级相加；单施法职业（如游侠5/游荡者2、邪术师6/诗人1）按该职业自身法术位表
+  const spellcasters = parsed.filter((p) =>
+    (p.kind === 'full' && p.level >= 1)
+    || (p.kind === 'artificer' && p.level >= 1)
+    || (p.kind === 'half' && p.level >= 2)
+    || (p.kind === 'third' && p.level >= 3),
+  );
+
+  let effectiveCasterLevel = 0;
+  if (spellcasters.length === 1) {
+    const only = spellcasters[0]!;
+    if (only.kind === 'full') effectiveCasterLevel = only.level;
+    else if (only.kind === 'artificer' || only.kind === 'half') effectiveCasterLevel = Math.ceil(only.level / 2);
+    else if (only.kind === 'third') effectiveCasterLevel = Math.ceil(only.level / 3);
+  } else if (spellcasters.length >= 2) {
+    for (const sc of spellcasters) {
+      if (sc.kind === 'full') effectiveCasterLevel += sc.level;
+      else if (sc.kind === 'artificer') effectiveCasterLevel += Math.ceil(sc.level / 2);
+      else if (sc.kind === 'half') effectiveCasterLevel += Math.floor(sc.level / 2);
+      else if (sc.kind === 'third') effectiveCasterLevel += Math.floor(sc.level / 3);
+    }
+  }
+
+  const standard: Record<number, number> = {};
+  const row = FULL_CASTER_SLOTS[Math.min(20, effectiveCasterLevel)];
+  if (row !== undefined) {
+    row.forEach((max, idx) => {
+      if (max > 0) standard[idx + 1] = max;
+    });
+  }
+
+  const warlockLv = parsed.filter((p) => p.kind === 'warlock').reduce((acc, p) => acc + p.level, 0);
+  const pact = warlockLv >= 1
+    ? {
+      slotLevel: Math.min(5, Math.ceil(warlockLv / 2)),
+      max: warlockLv === 1 ? 1 : warlockLv <= 10 ? 2 : warlockLv <= 16 ? 3 : 4,
+    }
+    : undefined;
+
+  return { standard, ...(pact !== undefined ? { pact } : {}) };
+}
+
+/** PC 升级或兼职改动时自动补齐新增生命骰与 5e 法术位上限（保留已消耗格数，新增上限自动以可用态补入） */
+function syncLevelUpResources(
+  c: Campaign,
+  ch: Character,
+  prevLevel: number | undefined,
+  prevClassName: string | undefined,
+): string[] {
+  if (ch.kind !== 'pc') return [];
+  const synced: string[] = [];
+  if (prevLevel !== undefined && ch.level > prevLevel && ch.resources !== undefined) {
+    const delta = ch.level - prevLevel;
+    for (const [rk, rr] of Object.entries(ch.resources)) {
+      if (rk.startsWith('生命骰') && rr.max < ch.level) {
+        const before = `${rr.current}/${rr.max}`;
+        rr.max = ch.level;
+        rr.current = Math.min(ch.level, rr.current + delta);
+        synced.push(`${rk} ${before}→${rr.current}/${rr.max}`);
+      }
+    }
+  }
+
+  const classChanged = ch.className !== prevClassName;
+  const leveledUp = prevLevel !== undefined && ch.level > prevLevel;
+  if (!leveledUp && !classChanged) return synced;
+
+  const expected = computeExpected5eSlots(ch.className, ch.level);
+  if (expected === undefined) return synced;
+
+  for (const [tierStr, expMax] of Object.entries(expected.standard)) {
+    const tier = Number(tierStr);
+    const key = `${tier}环法术位`;
+    const existing = ch.resources?.[key];
+    if (existing === undefined || existing.max < expMax) {
+      const before = existing !== undefined ? `${existing.current}/${existing.max}` : '未建';
+      const updated = setResource(c, ch.name, key, expMax, 'long');
+      synced.push(`${key} ${before}→${updated.current}/${updated.max}`);
+    }
+  }
+
+  if (expected.pact !== undefined) {
+    const { slotLevel, max: pactMax } = expected.pact;
+    const targetKey = `契约法术位（${slotLevel}环）`;
+    const existingEntry = Object.entries(ch.resources ?? {}).find(([k]) => k.startsWith('契约法术位'));
+    if (existingEntry === undefined) {
+      const updated = setResource(c, ch.name, targetKey, pactMax, 'short');
+      synced.push(`${targetKey} 未建→${updated.current}/${updated.max}`);
+    } else {
+      const [oldKey, oldRes] = existingEntry;
+      if (oldKey !== targetKey || oldRes.max < pactMax) {
+        const newMax = Math.max(oldRes.max, pactMax);
+        const gained = Math.max(0, newMax - oldRes.max);
+        const newCur = Math.min(newMax, oldRes.current + gained);
+        if (oldKey !== targetKey && ch.resources !== undefined) delete ch.resources[oldKey];
+        ch.resources = { ...(ch.resources ?? {}), [targetKey]: { current: newCur, max: newMax, reset: 'short' } };
+        synced.push(`${oldKey !== targetKey ? `${oldKey}→${targetKey}` : targetKey} ${oldRes.current}/${oldRes.max}→${newCur}/${newMax}`);
+      }
+    }
+  }
+  return synced;
+}
 
 /** 暂停时可备好 PC 卡，但不能借写卡改战场或访问敌方数据。 */
 function assertPausedSheet(c: Campaign, args: Record<string, unknown>): void {
@@ -55,7 +250,7 @@ function assertPausedSheet(c: Campaign, args: Record<string, unknown>): void {
 }
 
 export function registerCharacterTools(kit: ToolKit): void {
-  const { deps, service, recordOf, mutate, memberId, whoOf, register } = kit;
+  const { deps, service, recordOf, mutate, rollId, memberId, whoOf, register } = kit;
 
   register(
     'dnd_character',
@@ -100,15 +295,15 @@ export function registerCharacterTools(kit: ToolKit): void {
       hover: { type: 'boolean', description: 'True if the creature can hover (immune to falling/crash damage when prone or speed=0 while airborne).' },
       reactions: {
         type: 'array',
-        description: 'Reactions that can change an attack; attacks pause for the player when one applies (replaces the list). '
+        description: 'Reactions that can change an attack or spell; attacks/spells pause for the player when one applies (replaces the list). '
           + 'when: foe_attacks (a foe hits an ally or self: 尖刻言语), attacked (self is hit before damage: 护盾术), '
           + 'damaged (after taking damage is confirmed: 迷雾逃生, 炼狱叱喝), enemy_crit (a foe lands a crit: 时间变幻), '
-          + 'attacking (own attack misses: 导引打击). resource: what it spends; cost: units spent per use (default 1, e.g. 2 for Staff of Defense Shield).',
+          + 'attacking (own attack misses: 导引打击), foe_casts (a foe casts a spell within 60 ft: 法术反制). resource: what it spends; cost: units spent per use (default 1, e.g. 2 for Staff of Defense Shield).',
         items: {
           type: 'object',
           properties: {
             name: { type: 'string' },
-            when: { type: 'string', enum: ['foe_attacks', 'attacked', 'attacking', 'damaged', 'enemy_crit'] },
+            when: { type: 'string', enum: ['foe_attacks', 'attacked', 'attacking', 'damaged', 'enemy_crit', 'foe_casts'] },
             resource: { type: 'string' },
             cost: { type: 'integer', description: 'Resource units spent per reaction (default 1).' },
             range: { type: 'integer', description: 'Trigger range in feet (e.g. 哨兵 5, 长柄大师 10).' },
@@ -123,8 +318,9 @@ export function registerCharacterTools(kit: ToolKit): void {
       traits: {
         type: 'array',
         items: { type: 'string' },
-        description: 'Auto-handled traits (replaces the list): "不死坚韧"; fighting styles "巨武器战斗" (rerolls 1-2 on '
-          + 'two-handed weapon dice) and "箭术" (+2 to hit with ranged weapons); feat "精灵精准" (3d20 take highest on advantage attacks using dex/int/wis/cha). With these set, never add them by hand.',
+        description: 'Auto-handled traits (replaces the list): "不死坚韧", fighting styles "巨武器战斗"/"箭术", feats "精灵精准"/"战地施法者", '
+          + 'and conditional combat passives "巨兽杀手" (once/turn +1d8 when target < maxHp), "偷袭", "精通至圣斩", "祝福打击", "神圣狂怒", "凶蛮攻击", '
+          + '"精通重击"/"卓越重击", "集群战术", "血腥狂乱", "守护灵光", "生命门徒"/"神佑医者". With these set, never add them by hand.',
       },
       expertise: { type: 'array', items: { type: 'string' }, description: 'Skills with expertise (double proficiency), e.g. ["巧手","隐匿"].' },
       spells: {
@@ -285,6 +481,9 @@ export function registerCharacterTools(kit: ToolKit): void {
           }
         }
         if (action === 'update' && findCharacter(c, name) === undefined) throw new Error(`找不到角色「${name}」，要新建用 create`);
+        const prevExisting = action === 'update' ? findCharacter(c, name) : undefined;
+        const prevLevel = prevExisting?.level;
+        const prevClassName = prevExisting?.className;
         const abilities: Partial<Record<Ability, number>> = { ...srdBase?.abilities };
         for (const a of ABILITIES) {
           const v = int(args[a]);
@@ -356,7 +555,22 @@ export function registerCharacterTools(kit: ToolKit): void {
           if (maxHpChange > 0 && ch.hp > 0) ch.hp += maxHpChange;
           ch.hp = Math.min(ch.hp, ch.maxHp);
         }
-        lines.push(sheet(requireCharacter(c, character.name), whoOf(exec), c));
+        const finalCh = requireCharacter(c, character.name);
+        const syncedRes = action === 'update' && args.sync_resources !== false
+          ? syncLevelUpResources(c, finalCh, prevLevel, prevClassName)
+          : [];
+        if (syncedRes.length > 0) {
+          spellNotes.push(`升级/兼职自动同步资源：${syncedRes.join('、')}`);
+        }
+        const missingSpellResources = [...new Set(
+          (finalCh.spells ?? [])
+            .map((s) => s.resource?.trim())
+            .filter((rk): rk is string => Boolean(rk) && finalCh.resources?.[rk!] === undefined),
+        )];
+        if (missingSpellResources.length > 0) {
+          spellNotes.push(`角色能力引用了尚未建立的资源「${missingSpellResources.join('、')}」，请用 dnd_resource action="set" 补齐上限`);
+        }
+        lines.push(sheet(finalCh, whoOf(exec), c));
         if (spellNotes.length > 0) lines.push(`【DM】${spellNotes.join('；')}`);
         if (itemHint !== undefined) lines.push(itemHint);
         return lines.join('\n');
@@ -379,39 +593,44 @@ export function registerCharacterTools(kit: ToolKit): void {
 
   register(
     'dnd_resource',
-    'Track limited-use resources: spell slots (e.g. "1环法术位"), lay on hands pool ("圣疗池"), bardic inspiration '
-    + '("诗人激励"), class features ("战争祭司"), potions. set: create or change max; use: spend (fails if not enough); '
-    + 'restore: give back (omit amount to refill). Set the max the first time a resource comes up. Spend only when the owning player says they use it. '
+    'Track limited-use resources and transferable concentration: spell slots (e.g. "1环法术位", "契约法术位（3环）"), lay on hands pool ("圣疗池"), bardic inspiration '
+    + '("诗人激励"), class features ("战争祭司"), potions. set: create or change max (increasing max on level-up automatically adds the newly gained uses); use: spend (fails if not enough); '
+    + 'restore: give back (omit amount to refill); transfer: move an active transferable concentration spell (脆弱诅咒 Hex, 猎人印记 Hunter\'s Mark) to a new target at ZERO spell-slot cost after the previous target dropped to 0 HP. '
+    + 'Set the max the first time a resource comes up. Spend only when the owning player says they use it. '
     + 'Reactions are a built-in 0/1 combat resource, shown on dnd_character show and restored at the actor\'s next turn; do not create a second resource or spend it separately. Reaction tools account for it automatically. '
-    + 'While paused, only set on a PC is allowed, to configure a sheet without starting play; use/restore require an active adventure.',
+    + 'While paused, only set on a PC is allowed, to configure a sheet without starting play; use/restore/transfer require an active adventure.',
     {
-      action: { type: 'string', enum: ['set', 'use', 'restore'] },
+      action: { type: 'string', enum: ['set', 'use', 'restore', 'transfer'] },
       character: { type: 'string' },
-      resource: { type: 'string' },
+      resource: { type: 'string', description: 'Resource key (required for set/use/restore; optional for transfer).' },
       amount: { type: 'integer', description: 'use/restore: how much (default 1 / refill). For lay on hands, the HP spent.' },
-      target: { type: 'string', description: 'For use on targeted class features (e.g. "咒剑诅咒") or single-target apply_state: the target creature name.' },
+      target: { type: 'string', description: 'For transfer, targeted class features (e.g. "咒剑诅咒"), or single-target apply_state: the target creature name.' },
       targets: { type: 'array', items: { type: 'string' }, description: 'For use with apply_state on multiple creatures (e.g. 祝福术 on 3 allies, 灾祸术 on foes).' },
       apply_state: {
         type: 'string',
-        description: 'For use: atomically attach a structured active state/buff (e.g. "祝福术", "灾祸术", "护盾信仰", "加速术", "狂暴", "神圣武器", "闪避", "妖火"). Automatically applies attack/save/AC/speed modifiers, concentration management and round countdowns.',
+        description: 'For use/transfer: atomically attach or transfer a structured active state/buff (e.g. "脆弱诅咒", "猎人印记", "祝福术", "灾祸术", "护盾信仰", "加速术", "狂暴", "神圣武器", "闪避", "妖火", "无痕步", "朦胧术"). Automatically applies attack/save/AC/speed modifiers, concentration binding, cross-combat retention and round countdowns.',
       },
-      concentration: { type: 'boolean', description: 'For apply_state: whether this effect requires concentration (auto-breaks previous concentration). Auto-detected for standard spells like 祝福术/护盾信仰/加速术.' },
+      concentration: { type: 'boolean', description: 'For apply_state: whether this effect requires concentration (auto-breaks previous concentration). Auto-detected for standard spells like 祝福术/护盾信仰/加速术/脆弱诅咒/猎人印记/无痕步.' },
       drop_concentration: { type: 'boolean', description: 'Drop active concentration for this character (pass resource="专注" drop_concentration=true to drop without spending a resource).' },
-      slot_level: { type: 'integer', description: 'Optional spell slot level (1-9; auto-inferred when resource is like "3环法术位", used for upcast 灵体卫士 etc.).' },
-      rounds: { type: 'integer', description: 'For apply_state: duration in combat rounds (default 10 for 1-minute buffs); auto-ticks on the caster\'s turn.' },
+      slot_level: { type: 'integer', description: 'Optional spell slot level (1-9; auto-inferred when resource is like "3环法术位" or "契约法术位（3环）", used for upcast 灵体卫士 or 8h/24h 脆弱诅咒/猎人印记).' },
+      rounds: { type: 'integer', description: 'For apply_state: duration in 6-second combat rounds. Omit to use standard 5e spell duration automatically (600 for 1h Hex/Hunter\'s Mark/Pass without Trace, 4800 for 3-4 slot Hex/Hunter\'s Mark, 100 for 10-min Shield of Faith, 10 for 1-min buffs).' },
       hit_bonus: { type: 'integer', description: 'For apply_state: flat attack bonus while active (神圣武器 auto-computes max(1, CHA mod) if omitted).' },
       ac_bonus: { type: 'integer', description: 'For apply_state: flat AC bonus while active (护盾信仰/加速术 auto-apply +2 if omitted).' },
       action_cost: { type: 'string', enum: ['action', 'bonus', 'reaction', 'free'], description: 'Optional turn action-economy slot spent in combat (records 主动作/附赠动作 and warns on duplicate usage).' },
       temp_hp: { type: 'integer', description: 'Optional temporary HP override for features like "战斗英姿" (computed automatically from fighter level if omitted).' },
+      ignore_state_mods: { type: 'boolean', description: 'For transfer: allow transferring before the previous target drops to 0 HP when a special feature permits.' },
       max: { type: 'integer', description: 'For set.' },
-      current: { type: 'integer', description: 'For set: current value (default: full for a new resource).' },
+      current: { type: 'integer', description: 'For set: current value (omit to fill new resource or add +Δmax on level-up).' },
       reset: { type: 'string', enum: ['short', 'long', 'none'], description: 'For set: which rest refills it.' },
     },
-    ['action', 'character', 'resource'],
+    ['action', 'character'],
     (args, exec) => mutate(exec, (c) => {
       const name = String(args.character ?? '');
       const key = String(args.resource ?? '');
       const action = String(args.action);
+      if (action !== 'transfer' && key.trim().length === 0) {
+        throw new Error(`dnd_resource ${action} 需要提供 resource 参数`);
+      }
       if (/^(反应|reaction)$/i.test(key.trim())) {
         if (action === 'restore') {
           if (!c.active || c.initiative === undefined) throw new Error('反应名额只在战斗中记账，当前不在战斗中');
@@ -423,7 +642,7 @@ export function registerCharacterTools(kit: ToolKit): void {
         throw new Error('反应由战斗工具按 0/1 自动记账，在自己下回合开始恢复；不要用 dnd_resource 创建或手动消耗（仅误扣退费时可用 action=restore resource="反应"）。用 dnd_character show 查看');
       }
       if (!c.active && (action !== 'set' || requireCharacter(c, name).kind !== 'pc')) {
-        throw new Error('停团时只能用 dnd_resource set 配置 PC 资源；消耗和恢复请开团后操作');
+        throw new Error('停团时只能用 dnd_resource set 配置 PC 资源；消耗、恢复和专注转移请开团后操作');
       }
       if (action === 'set') {
         const max = int(args.max);
@@ -432,12 +651,81 @@ export function registerCharacterTools(kit: ToolKit): void {
         const r = setResource(c, name, key, max, reset, int(args.current));
         return `${requireCharacter(c, name).name}「${key.trim()}」${r.current}/${r.max}`;
       }
+
+      const globalEffects = service.globalEffects();
+      const executeConcentrationTransfer = (): string => {
+        if (c.initiative !== undefined) assertNoPending(c, '转移专注');
+        const ch = requireCharacter(c, name);
+        const targetName = str(args.target) ?? strList(args.targets)?.[0];
+        if (targetName === undefined) {
+          throw new Error('转移专注需要传 target="新目标名"');
+        }
+        const targetCh = requireCharacter(c, targetName);
+        const rawSpell = str(args.apply_state) ?? (!/^(?:专注|concentration|)$/i.test(key.trim()) ? key.trim() : undefined);
+        const res = transferConcentration(c, ch, targetCh, {
+          ...(rawSpell !== undefined ? { spellName: rawSpell } : {}),
+          force: args.ignore_state_mods === true,
+          globalEffects,
+        });
+        const warnings: string[] = [];
+        const onOwnTurn = c.initiative !== undefined && c.initiative.order[c.initiative.turn]?.name === ch.name;
+        const ts = onOwnTurn ? ensureTurnState(c) : undefined;
+        const costKind = (str(args.action_cost) as 'action' | 'bonus' | 'reaction' | 'free' | undefined) ?? 'bonus';
+        if (ts !== undefined && costKind === 'bonus') {
+          if (ts.bonusUsed !== undefined) {
+            warnings.push(`【动作经济提醒】${ch.name} 本回合此前已使用过附赠动作（${ts.bonusUsed}），每回合通常只有 1 个附赠动作`);
+          }
+          ts.bonusUsed = `转移${res.spellName}`;
+        } else if (ts !== undefined && costKind === 'action') {
+          if (ts.actionUsed !== undefined || ts.attacks > 0) {
+            warnings.push(`【动作经济提醒】${ch.name} 本回合此前已使用主动作（${ts.actionUsed ?? `已攻击×${ts.attacks}`}）`);
+          }
+          ts.actionUsed = `转移${res.spellName}`;
+        }
+        pushLog(c, `${ch.name} 将「${res.spellName}」专注转移至 ${targetCh.name}`);
+        const warnSuffix = warnings.length > 0 ? `\n${warnings.join('\n')}` : '';
+        return `${ch.name} 消耗附赠动作将「${res.spellName}」免费转移至「${targetCh.name}」（未消耗法术位，剩余 ${res.roundsLeft} 轮）${warnSuffix}${combatLedgerSuffix(c)}`;
+      };
+
+      if (action === 'transfer') {
+        return executeConcentrationTransfer();
+      }
+
       if (action === 'use') {
         const ch = requireCharacter(c, name);
-        const globalEffects = service.globalEffects();
-        if (args.drop_concentration === true && /^(专注|concentration)$/i.test(key.trim())) {
-          const broken = [...breakConcentration(c, ch.name, '主动解除专注'), ...checkAllAirborneCrashes(c, service.roller, globalEffects)];
-          return `${broken.length > 0 ? broken.join('；') : `${ch.name} 当前没有维持中的专注效果`}${combatLedgerSuffix(c)}`;
+        if (/^(专注|concentration)$/i.test(key.trim())) {
+          if (args.drop_concentration === true) {
+            const broken = [...breakConcentration(c, ch.name, '主动解除专注'), ...checkAllAirborneCrashes(c, service.roller, globalEffects)];
+            return `${broken.length > 0 ? broken.join('；') : `${ch.name} 当前没有维持中的专注效果`}${combatLedgerSuffix(c)}`;
+          }
+          if (str(args.target) !== undefined || (strList(args.targets)?.length ?? 0) > 0) {
+            return executeConcentrationTransfer();
+          }
+          throw new Error(`${ch.name} 解除专注请传 drop_concentration=true；若要免费转移「脆弱诅咒/猎人印记」等专注目标，请传 action="transfer" target="新目标名"`);
+        }
+
+        const rawApplyStatePre = str(args.apply_state);
+        const normApplyStatePre = rawApplyStatePre !== undefined ? normalizeCondition(rawApplyStatePre) : undefined;
+        // 防误扣法术位护栏：施法者已在维持同名可转移专注且原目标已倒下/可转移时，阻止重复扣法术位并引导用 action="transfer"
+        if (normApplyStatePre !== undefined && args.drop_concentration !== true && isTransferableState(c, normApplyStatePre, globalEffects)) {
+          const cs = ch.concentrationState;
+          const legacyMarked = concentratingOn(c, ch.name).filter((x) => normalizeCondition(x.state.name) === normApplyStatePre);
+          const hasActiveSameConc = (cs !== undefined && normalizeCondition(cs.name) === normApplyStatePre) || legacyMarked.length > 0;
+          if (hasActiveSameConc) {
+            const liveInCurrentFight = legacyMarked.some((x) =>
+              x.owner.hp > 0
+              && !x.owner.conditions.includes('死亡')
+              && (c.initiative !== undefined ? c.initiative.order.some((e) => e.name === x.owner.name) : roomOf(c, x.owner) === roomOf(c, ch)),
+            );
+            if (cs?.canTransfer === true || !liveInCurrentFight) {
+              const tgtHint = str(args.target) ?? strList(args.targets)?.[0] ?? '新目标名';
+              throw new Error(
+                `${ch.name} 仍在维持「${normApplyStatePre}」的专注，无需重复消耗「${key.trim()}」；`
+                + `请改用 dnd_resource action="transfer" character="${ch.name}" target="${tgtHint}" apply_state="${normApplyStatePre}" 免费转移目标`
+                + `（若确需放弃当前专注并消耗法术位重新施放，请传 drop_concentration=true）`,
+              );
+            }
+          }
         }
         const [matchedKey] = requireResource(ch, key);
         let curseTarget: ReturnType<typeof requireCharacter> | undefined;
@@ -537,21 +825,70 @@ export function registerCharacterTools(kit: ToolKit): void {
         }
 
         const effectiveApplyState = normApplyState ?? (isRageResource ? '狂暴' : undefined);
+        const casterSpellHints = c.initiative !== undefined && ch.kind !== 'monster' && slotLevel !== undefined
+          ? hostileSpellcasterHints(c, ch, { kind: 'spell', ...(effectiveApplyState !== undefined ? { spellName: effectiveApplyState } : {}) })
+          : [];
+        const casterHintSuffix = casterSpellHints.length > 0 ? `\n${casterSpellHints.join('\n')}` : '';
+
         if (effectiveApplyState !== undefined && effectiveApplyState.length > 0) {
           const effectDef = resolveEffectDef(effectiveApplyState, c.customEffects, globalEffects);
           const isConc = typeof args.concentration === 'boolean'
             ? args.concentration
-            : (effectDef?.concentration ?? DEFAULT_CONCENTRATION_STATES.has(effectiveApplyState));
+            : isDefaultConcentrationState(c, effectiveApplyState, globalEffects);
           const targetNames = strList(args.targets) ?? (str(args.target) !== undefined ? [str(args.target)!] : [ch.name]);
           const targetChars = targetNames.map((n) => requireCharacter(c, n));
-          const broken = isConc
-            ? [...breakConcentration(c, ch.name, `改换专注为「${effectiveApplyState}」`), ...checkAllAirborneCrashes(c, service.roller, globalEffects)]
-            : [];
-          const rounds = int(args.rounds) ?? effectDef?.defaultRounds ?? (isConc || effectiveApplyState === '狂暴' ? 10 : (effectiveApplyState === '闪避' ? 1 : undefined));
+          const explicitRounds = int(args.rounds);
+          // 兼容修正：脆弱诅咒/猎人印记标准最短为 1 小时（600 轮，3-4 环 4800 轮），若模型惯性填了 1 分钟的 rounds=10，自动修正为法术真实持续轮数
+          const autoSpellRounds = defaultStateRounds(effectiveApplyState, slotLevel, c, globalEffects);
+          const rounds = explicitRounds !== undefined && !(explicitRounds === 10 && (effectiveApplyState === '脆弱诅咒' || effectiveApplyState === '猎人印记'))
+            ? explicitRounds
+            : (isConc || effectDef?.defaultRounds !== undefined || effectiveApplyState === '狂暴'
+              ? autoSpellRounds
+              : (effectiveApplyState === '闪避' ? 1 : undefined));
           const expires = effectiveApplyState === '闪避' ? 'start_of_source_turn' as const : undefined;
           const hitBonus = int(args.hit_bonus);
           const acBonus = int(args.ac_bonus);
           const saveDc = effectDef?.aura?.hazard !== undefined ? inferSpellSaveDc(ch) : undefined;
+
+          if (c.initiative !== undefined && ch.kind === 'monster' && slotLevel !== undefined && args.drop_concentration !== true) {
+            const spellReactors = eligibleSpellReactors(c, ch, { spellName: effectiveApplyState });
+            if (spellReactors.length > 0) {
+              const id = rollId(c, exec);
+              const p: PendingSpell = {
+                kind: 'spell',
+                seq: id,
+                at: Date.now(),
+                attacker: ch.name,
+                target: targetChars[0]?.name ?? ch.name,
+                reactors: spellReactors,
+                declined: [],
+                claimed: [],
+                used: [],
+                spellName: effectiveApplyState,
+                spellLevel: slotLevel,
+                effect: {
+                  kind: 'state',
+                  stateName: effectiveApplyState,
+                  targets: targetChars.map((x) => x.name),
+                  concentration: isConc,
+                  ...(rounds !== undefined ? { rounds } : {}),
+                  ...(expires !== undefined ? { expires } : {}),
+                  ...(hitBonus !== undefined ? { hitBonus } : {}),
+                  ...(acBonus !== undefined ? { acBonus } : {}),
+                  ...(slotLevel !== undefined ? { slotLevel } : {}),
+                  ...(saveDc !== undefined ? { saveDc } : {}),
+                  ...(warnings.length > 0 ? { warnings } : {}),
+                },
+              };
+              requireInitiative(c).pending = p;
+              deps.onPendingAttack?.(recordOf(exec));
+              return `${baseLine}${warnSuffix}\n${ch.name} 正在施放「${effectiveApplyState}」（还没生效） #R${id}\n${holdNotice(p)}\n${SECRET_NOTE}`;
+            }
+          }
+
+          const broken = isConc
+            ? [...breakConcentration(c, ch.name, `改换专注为「${effectiveApplyState}」`), ...checkAllAirborneCrashes(c, service.roller, globalEffects)]
+            : [];
           for (const tCh of targetChars) {
             const up = upsertActiveState(c, tCh, {
               name: effectiveApplyState,
@@ -563,7 +900,7 @@ export function registerCharacterTools(kit: ToolKit): void {
               ...(acBonus !== undefined ? { acBonus } : {}),
               ...(slotLevel !== undefined ? { slotLevel } : {}),
               ...(saveDc !== undefined ? { saveDc } : {}),
-            }, { replaceConcentration: false });
+            }, { replaceConcentration: false, globalEffects });
             broken.push(...up.broken);
           }
           broken.push(...checkAllAirborneCrashes(c, service.roller, globalEffects));
@@ -575,16 +912,16 @@ export function registerCharacterTools(kit: ToolKit): void {
             acBonus !== undefined ? `AC${acBonus >= 0 ? '+' : ''}${acBonus}` : (effectiveApplyState === '护盾信仰' || effectiveApplyState === '加速术' ? 'AC+2' : ''),
           ].filter(Boolean).join('，');
           const brokenSuffix = broken.length > 0 ? `；${broken.join('；')}` : '';
-          return `${baseLine}；已对「${targetChars.map((x) => x.name).join('、')}」挂载状态「${effectiveApplyState}」${metaDesc ? `（${metaDesc}）` : ''}${brokenSuffix}${warnSuffix}${combatLedgerSuffix(c)}`;
+          return `${baseLine}；已对「${targetChars.map((x) => x.name).join('、')}」挂载状态「${effectiveApplyState}」${metaDesc ? `（${metaDesc}）` : ''}${brokenSuffix}${warnSuffix}${casterHintSuffix}${combatLedgerSuffix(c)}`;
         }
 
         if (c.initiative !== undefined && /^(时间变幻|迷雾逃生|炼狱叱喝|直觉闪避|风暴之怒|偏转飞弹)$/i.test(keyTrim)) {
           if (canReact(ch) && reactionBlocked(c, ch.name) === undefined) {
             spendReaction(c, ch.name);
-            return `${baseLine}；已同步记下本轮反应已消耗（0/1）${warnSuffix}${combatLedgerSuffix(c)}`;
+            return `${baseLine}；已同步记下本轮反应已消耗（0/1）${warnSuffix}${casterHintSuffix}${combatLedgerSuffix(c)}`;
           }
         }
-        return `${baseLine}${warnSuffix}${combatLedgerSuffix(c)}`;
+        return `${baseLine}${warnSuffix}${casterHintSuffix}${combatLedgerSuffix(c)}`;
       }
       const result = restoreResource(c, name, key, int(args.amount));
       return `${requireCharacter(c, name).name}「${result.key}」${result.before}→${result.resource.current}/${result.resource.max}`;

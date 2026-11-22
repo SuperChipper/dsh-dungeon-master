@@ -19,13 +19,13 @@ import type { ImQQBotConfig } from '../config.ts';
 import type { ChatScope } from '../types.ts';
 
 /** 终端类工具：命令字符串里可以读任何东西，受限会话一律不给 */
-const SHELL_TOOLS = new Set([
+export const SHELL_TOOLS: ReadonlySet<string> = new Set([
   'pwsh', 'bash',
   'terminal_open', 'terminal_send', 'terminal_read', 'terminal_list', 'terminal_signal', 'terminal_close',
 ]);
 
 /** 派生子 agent / 后台流程的工具：子 agent 查不到所属 QQ 会话，会绕过拦截 */
-const AGENT_TOOLS = new Set([
+export const AGENT_TOOLS: ReadonlySet<string> = new Set([
   'subagent', 'subagent_fork', 'workflow', 'spawn_teammate', 'ralph', 'create_worktree',
 ]);
 

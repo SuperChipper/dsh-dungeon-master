@@ -6,9 +6,9 @@
  * 这里给 cordis logger 挂一个 exporter 写文件；它随插件 fiber 注销，热重载不会重复写。
  */
 import { appendFileSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { format } from 'node:util';
+import { qqbotLogsDir } from './paths.ts';
 
 export interface LogMessage {
   ts: number;
@@ -28,7 +28,7 @@ const LEVEL_WARN = 2;
 const LEVEL_DEBUG = 3;
 
 export function defaultLogDir(): string {
-  return join(homedir(), '.dsh', 'qqbot-logs');
+  return qqbotLogsDir();
 }
 
 function pad(n: number, width = 2): string {

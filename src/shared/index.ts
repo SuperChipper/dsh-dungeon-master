@@ -5,3 +5,5 @@ export { getProfileDir, resolveProfileDir, resolveEnv, formatRelativeTime, build
 export { privilegedOpenids, isPrivilegedSender, accessPolicyFromConfig } from './permissions.ts';
 export { getScopePeer } from './scope.ts';
 export { sendMarkdownChunked } from './send-helper.ts';
+export { writeTextAtomic, writeJsonAtomic, type WriteAtomicOptions, type WriteJsonAtomicOptions } from './atomic-fs.ts';
+export * from './paths.ts';

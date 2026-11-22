@@ -4,8 +4,9 @@
  * 沿用 scripts/fetch-*.cjs 的文件格式（media/fanart/seen.json 存 booru 数字 id，
  * seen-pixiv.json 存 pixiv 字符串 id），两边混用也不会重复发。
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
 import type { FanartSource } from './types.ts';
 
 /** 每个源最多保留多少条（与脚本一致） */
@@ -56,8 +57,7 @@ export class FanartSeenStore {
     const kept = list.slice(-MAX_SEEN);
     // booru 那份给脚本读，脚本按数字 id 比较
     const out = source === 'booru' ? kept.map((x) => (/^\d+$/.test(x) ? Number(x) : x)) : kept;
-    mkdirSync(this.dir, { recursive: true });
-    writeFileSync(join(this.dir, FILES[source]), JSON.stringify(out));
+    writeJsonAtomic(join(this.dir, FILES[source]), out);
   }
 }
 

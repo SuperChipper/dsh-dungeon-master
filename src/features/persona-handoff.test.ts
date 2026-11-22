@@ -57,12 +57,13 @@ describe('交接输入覆盖', () => {
     expect(result.transcript.indexOf('新版 compact 摘要')).toBeLessThan(result.transcript.indexOf('仍保留的纠正'));
   });
 
-  it('不把 runtime-context、旧交接反复汇总；不再输入该人格以前已经交出的历史', () => {
+  it('不把 runtime-context、notes-recall、旧交接反复汇总；不再输入该人格以前已经交出的历史', () => {
     const result = collectHandoffInput('s', [user(1, '旧决定'),
       { ...user(2, '团况机密'), data: { source: { kind: 'runtime-context' }, content: [{ type: 'text', text: '团况机密' }] } },
       { ...user(3, '之前的跨人格原文'), data: { source: { kind: 'plugin', plugin: 'qqbot-persona-handoff' }, content: [{ type: 'text', text: '之前的跨人格原文' }] } },
-      user(4, '新的决定')], undefined, 1);
-    expect(result.transcript).toBe('[user/message #4]\n新的决定');
+      { ...user(4, '[共享笔记 · 可能相关]\n旧召回'), data: { source: { kind: 'qqbot-notes-recall', form: 'notice', summary: '共享笔记（1 条）：a.md' }, content: [{ type: 'text', text: '[共享笔记 · 可能相关]\n旧召回' }] } },
+      user(5, '新的决定')], undefined, 1);
+    expect(result.transcript).toBe('[user/message #5]\n新的决定');
   });
 
   it('兼容旧事件 message 字段，不把思考块带进交接', () => {

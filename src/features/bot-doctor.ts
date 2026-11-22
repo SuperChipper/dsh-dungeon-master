@@ -2,19 +2,15 @@
  * /bot-doctor 运行时自检（人设唯一真源、触发门控一致性、会话压缩锁、存储与外部服务可达性）。
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
 import type { ImQQBotConfig } from '../config.ts';
 import type { SessionRecord } from '../session/types.ts';
 import type { ChatScope } from '../types.ts';
+import { defaultEnvFiles } from '../shared/paths.ts';
 import { resolveGroupTriggerMode, type GroupTriggerMode } from './group-trigger.ts';
 import type { Persona, PersonaSwitchState } from './persona-store.ts';
 import type { HandoffState } from './persona-handoff.ts';
 import { readScheduleMigrations, scheduleStorageHome } from '../session/schedule-migration.ts';
-
-const PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 export type GsvProbeStatus = 'disabled' | 'reachable' | 'offline';
 
@@ -180,7 +176,7 @@ export async function runBotDoctor(deps: {
   const envFiles = deps.envFiles ?? (
     deps.env !== undefined || process.env.VITEST
       ? []
-      : [resolve(PLUGIN_ROOT, '.env.local'), resolve(PLUGIN_ROOT, '.env'), resolve(homedir(), '.dsh', '.env')]
+      : defaultEnvFiles()
   );
   const elHasKey = Boolean(el?.apiKey?.trim() || env[elEnvRef]?.trim() || hasEnvKeyInFiles(envFiles, elEnvRef));
   const roleVoiceCount = Object.values(el?.roleVoices ?? {}).filter((v) => typeof v === 'string' && v.trim() !== '').length;

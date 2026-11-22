@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import { AdventureLibrary } from './adventure.ts';
 import { CampaignStore, addSummary, applyDamage, startInitiative, upsertCharacter } from './campaign.ts';
-import { DndService } from './dnd-service.ts';
+import { DndService, DndSnapshotGate } from './dnd-service.ts';
+import { DndCombatAgents } from './combat-agent.ts';
 import { dndStateText, isRuntimeContextEvent, promptEpoch } from '../session/session-manager.ts';
 import type { DshAgent, SessionRecord } from '../session/index.ts';
 
@@ -154,5 +155,156 @@ describe('isRuntimeContextEvent', () => {
   it('玩家消息不算', () => {
     expect(isRuntimeContextEvent({ type: 'user/message', data: { source: { kind: 'user' } } })).toBe(false);
     expect(isRuntimeContextEvent({ type: 'user/message', message: { content: [] } })).toBe(false);
+  });
+});
+
+describe('DndSnapshotGate：单轮多次工具调用零重发 + 跨对话轮数节流 + 关键边界立即穿透', () => {
+  it('同一轮对话连续多次攻击扣血不触发 runtime-context 变化；跨对话默认每 4 轮同步一次，换房/压缩/撤销/结团立即穿透', () => {
+    const { service, key } = setup();
+    service.store.update(key, (c) => { startInitiative(c, () => 10); });
+
+    const events: Array<Record<string, unknown>> = [];
+    const surface = { contentGeneration: 0 };
+    const agent = { session: { id: 'sess-1', events, surface } } as unknown as DshAgent;
+    const record = { sessionKey: key, agent } as unknown as SessionRecord;
+    const gate = new DndSnapshotGate();
+    const evalState = () => dndStateText(agent, () => record, service, logger as never, undefined, { gate, intervalTurns: 4 });
+
+    const pushUserTurn = (seq: number) => {
+      events.push({ seq, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `第${seq}句` }] } });
+    };
+
+    const toolMutate = (fn: (c: Parameters<typeof service.store.update>[1] extends (c: infer C) => unknown ? C : never) => void) => {
+      service.store.update(key, fn);
+      service.recordAgentToolSync(key);
+    };
+
+    // 第 1 轮用户发言（Step 0）：首次注入完整团况
+    pushUserTurn(1);
+    const snap0 = evalState();
+    expect(snap0).toContain('战斗第 1 轮');
+
+    // 第 1 轮内连续 4 次工具调用（如 move + 3 连击扣血），哪怕中间宿主写过 runtime-context 事件，返回值恒定 === snap0（0 次重发）
+    events.push({ seq: 2, type: 'user/message', data: { source: { kind: 'runtime-context' } } });
+    for (let hit = 1; hit <= 4; hit++) {
+      toolMutate((c) => applyDamage(c, '巨鼠1', 1));
+      expect(evalState()).toBe(snap0);
+    }
+
+    // 第 2、3、4 轮用户对话（距上次同步 1、2、3 轮 < 4）：Agent 自身工具产生的扣血继续节流，不重刷整份团况
+    for (let u = 2; u <= 4; u++) {
+      pushUserTurn(u * 10);
+      toolMutate((c) => applyDamage(c, '卡厄斯', 1));
+      expect(evalState()).toBe(snap0);
+    }
+
+    // 第 5 轮用户对话（距上次同步满 4 轮）：自动同步最新团况！
+    pushUserTurn(50);
+    const snap5 = evalState();
+    expect(snap5).not.toBe(snap0);
+    expect(snap5).toContain('卡厄斯 9/12');
+
+    // 关键边界 1：下一轮刚过 1 轮，但执行了 dnd_undo（forceNextSnapshot）→ 立即穿透节流！
+    pushUserTurn(60);
+    toolMutate((c) => applyDamage(c, '卡厄斯', 2));
+    service.forceNextSnapshot(key);
+    const snapUndo = evalState();
+    expect(snapUndo).not.toBe(snap5);
+    expect(snapUndo).toContain('卡厄斯 7/12');
+
+    // 关键边界 2：单轮中途 dnd_move 切换房间（currentRoom 变化）→ 同轮内也立即刷新以拿到新房间 DM 笔记！
+    toolMutate((c) => { c.currentRoom = 'nave'; });
+    const snapRoom = evalState();
+    expect(snapRoom).not.toBe(snapUndo);
+
+    // 关键边界 3：上下文压缩（contentGeneration 递增）→ 立即刷新！
+    pushUserTurn(70);
+    toolMutate((c) => applyDamage(c, '卡厄斯', 1));
+    expect(evalState()).toBe(snapRoom); // 压缩前第 1 轮仍在节流期内
+    surface.contentGeneration += 1;
+    const snapCompacted = evalState();
+    expect(snapCompacted).not.toBe(snapRoom);
+    expect(snapCompacted).toContain('卡厄斯 6/12');
+
+    // 关键边界 4：工具外改档（未走 dnd_* mutate，如斜杠命令/后台修改）→ 下一轮用户消息立即穿透节流！
+    pushUserTurn(80);
+    service.store.update(key, (c) => applyDamage(c, '卡厄斯', 1));
+    const snapExternal = evalState();
+    expect(snapExternal).not.toBe(snapCompacted);
+    expect(snapExternal).toContain('卡厄斯 5/12');
+
+    // 关键边界 5：停团后立即返回空串作废旧快照
+    service.stop(key);
+    expect(evalState()).toBe('');
+  });
+
+  it('专用战斗子代理 decorateTurnText 同样按轮数节流，首轮注入、间隔轮次跳过、满轮或外部改档/撤销立即同步', async () => {
+    const { service, key } = setup();
+    service.store.update(key, (c) => { startInitiative(c, () => 10); });
+
+    const mainAgent = {
+      id: 'main',
+      status: 'idle',
+      session: { id: 'main', header: { cwd: process.cwd() }, events: [] },
+      followup: vi.fn(),
+      cancel: vi.fn(),
+      whenIdle: async () => {},
+    } as unknown as DshAgent;
+    const main = {
+      sessionKey: key,
+      sessionId: 'main',
+      agent: mainAgent,
+      handle: { agent: mainAgent, dispose: async () => {} },
+      scope: 'group',
+      peerId: 'G1',
+      senderId: 'U1',
+      lastActivity: Date.now(),
+      replyTarget: { scope: 'group', targetId: 'G1', msgId: 'M1' },
+    } as unknown as SessionRecord;
+
+    const agents = {
+      create: vi.fn(async (opts: { sessionId?: string; setup?: (s: unknown) => void }) => {
+        await opts.setup?.({
+          get: (n: string) => (n === 'tools' ? { restrict: () => {}, guard: () => {} } : { section: () => {}, suppressRuntimeContext: () => {} }),
+        });
+        const a = { ...mainAgent, id: opts.sessionId ?? 'child', session: { id: 'child', events: [] } } as unknown as DshAgent;
+        return { agent: a, dispose: async () => {} };
+      }),
+    };
+    const router = new DndCombatAgents(
+      agents as never,
+      service,
+      () => ({ enabled: true, provider: 'p', model: 'm', reasoningEffort: '', contextChars: 4000 }),
+      () => {},
+      logger as never,
+      undefined,
+      undefined,
+      () => 3, // 每 3 轮同步一次
+    );
+    const child = await router.select(main);
+
+    // 第 1 轮：注入完整精简快照
+    const t1 = router.decorateTurnText(child, '我砍第一刀');
+    expect(t1).toContain(DndService.TURN_SNAPSHOT_HEADER);
+
+    // 第 2、3 轮（距上次 1、2 轮 < 3）：子代理自身调用 dnd_* 工具产生的扣血不重复前置整份快照
+    service.store.update(key, (c) => applyDamage(c, '巨鼠1', 2));
+    service.recordAgentToolSync(key);
+    expect(router.decorateTurnText(child, '我砍第二刀')).toBe('我砍第二刀');
+    service.store.update(key, (c) => applyDamage(c, '巨鼠1', 1));
+    service.recordAgentToolSync(key);
+    expect(router.decorateTurnText(child, '结束回合')).toBe('结束回合');
+
+    // 第 4 轮（满 3 轮间隔）：重新同步最新快照
+    const t4 = router.decorateTurnText(child, '下一轮行动');
+    expect(t4).toContain(DndService.TURN_SNAPSHOT_HEADER);
+
+    // 紧接着下一轮若触发 dnd_undo（forceNextSnapshot）或外部改档，不等满 3 轮立即同步
+    service.store.update(key, (c) => applyDamage(c, '卡厄斯', 3));
+    service.forceNextSnapshot(key);
+    const tForced = router.decorateTurnText(child, '重来');
+    expect(tForced).toContain(DndService.TURN_SNAPSHOT_HEADER);
+    expect(tForced).toContain('9/12');
+    await router.dispose();
   });
 });

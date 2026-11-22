@@ -188,6 +188,8 @@ export interface WalkOptions {
   highAltitude?: boolean;
   /** 额外地形/法术区域耗速倍率（如蛛网/荆棘/灵体卫士减速区返回 2） */
   cellCostMultiplier?: (at: Cell) => number;
+  /** 可选禁行边（如第一遍无伤寻路时避开踏入火墙术/毒雾/敌方灵体卫士） */
+  avoid?: (from: Cell, to: Cell) => boolean;
 }
 
 const key = (at: Cell): string => `${at.x},${at.y}`;
@@ -220,6 +222,7 @@ export function walk(map: BattleMap | undefined, from: Cell, options: WalkOption
     for (const step of STEPS) {
       const next = { x: cur.x + step.x, y: cur.y + step.y };
       if (!passable(next) || options.blocked(next)) continue;
+      if (options.avoid?.(cur, next) === true) continue;
       if (step.x !== 0 && step.y !== 0 && map !== undefined
         && blocksMove(map, { x: cur.x + step.x, y: cur.y }, highAlt) && blocksMove(map, { x: cur.x, y: cur.y + step.y }, highAlt)) continue;
       const terrainDifficult = !highAlt && map !== undefined && areaAt(map, next)?.kind === 'difficult';

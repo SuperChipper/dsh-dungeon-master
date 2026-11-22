@@ -2,7 +2,7 @@
 name: dnd-rule-extension
 description: 在 dsh-dungeon-master 中确认、建模并热注册自定义 D&D 5e 村规、第三方职业扩展（如魔兽 5e 图腾/光环）、专武特效与个人宿命被动。当玩家提出或确认内置 SRD/PHB 表尚未覆盖的子职能力、专长、魔法武器附伤、光环或战场持续危害，或需要在代码中扩展战斗结算钩子时加载。
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # D&D 5e 扩展规则与村规热注册（`dnd-rule-extension`）
@@ -19,14 +19,11 @@ metadata:
 
 - **PHB 14 种标准状态 + 力竭（`力竭:1..6`）**，以及 `闪避`、`狂暴`（近战力量 `+2/+3/+4` + 物理三抗）、`祝福术`、`灾祸术`、`护盾信仰`、`加速术`、`妖火`、`神圣武器`、`战斗英姿`、`咒剑诅咒`。
 - **内置声明式特性与法术（`BUILTIN_EFFECTS`）**：
-  - `脆弱诅咒`（锁定目标命中 `+1d6` 黯蚀，专注）
-  - `猎人印记`（锁定目标武器命中 `+1d6` 武器同型，专注）
-  - `神恩`（武器命中 `+1d4` 光耀，专注）
-  - `变巨术`（武器命中 `+1d4` + 力量豁免优势，专注）
-  - `防护毒素`（毒素伤害抗性 + 对抗毒素/中毒豁免优势，非专注）
-  - `守护灵光`（圣武士未失能时，10 尺 / 18 级 30 尺内自身与友军全豁免自动 `+max(1, cha_mod)`）
-  - `灵体卫士`（15 尺敌方半速 + 回合开始/首次进圈或扫过触发感知豁免，`3d8` 基础 + 每高 1 环 `+1d8` 光耀半伤，专注）
+  - `脆弱诅咒`（锁定目标命中 `+1d6` 黯蚀，专注，支持 `dnd_resource transfer` 零消耗转移）、`猎人印记`（锁定目标武器命中 `+1d6` 武器同型，专注，支持 `transfer` 转移）
+  - `朦胧术`（攻击者具有劣势，专注）、`神恩`（武器命中 `+1d4` 光耀，专注）、`变巨术`（武器命中 `+1d4` + 力量豁免优势，专注）、`防护毒素`（毒素伤害抗性 + 对抗毒素/中毒豁免优势，非专注）
+  - `守护灵光`（圣武士未失能时，10 尺 / 18 级 30 尺内自身与友军全豁免自动 `+max(1, cha_mod)`）、`灵体卫士`（15 尺敌方半速 + 回合开始/首次进圈或扫过触发感知豁免，`3d8` 基础 + 每高 1 环 `+1d8` 光耀半伤，专注）
   - `生命门徒`（1 环及以上治疗法术额外恢复 `2 + slot_level`）、`神佑医者`（治疗他人时自身恢复 `2 + slot_level`）、`保全生命`（`5 * level` 治疗池，上限有效生命值一半）
+  - 条件战斗被动：`巨兽杀手` / `巨像屠夫`（目标低于满血每回合 1 次武器命中 `+1d8`）、`偷袭`（每回合 1 次 `ceil(class_level / 2)d6` 灵巧/远程武器附伤）、`精通至圣斩`（近战武器命中 `+1d8` 光耀）、`祝福打击`（自己回合每回合 1 次武器命中 `+1d8` 光耀）、`神圣狂怒`（狂暴中自己回合每回合 1 次 `+1d6 + floor(class_level / 2)` 光耀）、`凶蛮攻击`（近战武器重击额外 1 颗武器骰不翻倍）、`精通重击` / `卓越重击`（19–20 / 18–20 重击）、`战地施法者`（专注体质豁免优势）、`集群战术`（目标 5 尺内有未失能友军时优势）、`血腥狂乱`（对未满血目标近战优势）
 - **内置战场持续区域预设（`dnd_position action="zone"`）**：
   - `黑暗术`、`云雾术`、`毒雾`、`死云术`、`臭云术`、`蛛网术`、`匕首之云`、`月华之光`、`荆棘丛生`、`火墙术`、`沉默术`。
 
@@ -49,15 +46,16 @@ metadata:
 
 ### 第 2 步：安全公式语法
 公式由确定性递归下降解析器求值（不使用 `eval`）：
-- **可用变量**：`level`、`prof`、`slot_level`、`str`..`cha`、`str_mod`..`cha_mod`、`hp`、`max_hp`。
+- **可用变量**：`level`、`class_level`（兼职时结合顶层 `class_filter` 解析对应职业等级）、`prof`、`slot_level`（无环位时默认 `1`）、`str`..`cha`、`str_mod`..`cha_mod`、`hp`、`max_hp`、`target_hp`、`target_max_hp`。
 - **运算符与函数**：`+`、`-`、`*`、`/`、括号 `(...)`、`min(a, b, ...)`、`max(a, b, ...)`、`floor(x)`、`ceil(x)`、`abs(x)`。
 
 ### 第 3 步：映射到 6 类钩子
+顶层可选标记：`passive: true`（标记为常驻被动——同时支持从 `spells` 的特性/物品条目及非否定语境 `notes` 安全识别，可施放法术勿设）和 `class_filter`（如 `"游荡者|rogue"`，用于多职下计算 `class_level`）。
 
 | 钩子字段 | 核心配置项 | 典型场景 |
 | :--- | :--- | :--- |
-| `attack_mod` | `to_hit_formula`, `bonus_dice`, `advantage`, `crit_on` (18–20), `weapon_only`, `melee_only`, `ranged_only` | 战斗姿态、命中图腾、扩展重击区间 |
-| `hit_rider` | `damage_dice`, `bonus_formula`, `damage_type`（如 `"闪电"` 或 `"武器同型"`）, `marked_target_only`, `weapon_only`, `melee_only`, `str_attack_only`, `advantage_only`, `once_per_turn` | 元素附伤、巨像屠夫（`once_per_turn`）、优势触发附伤（`advantage_only`）、印记类锁定附伤（`marked_target_only`） |
+| `attack_mod` | `to_hit_formula`, `bonus_dice`, `advantage`, `crit_on` (18–20), `weapon_only`, `melee_only`, `ranged_only`, `target_below_max_hp`, `target_half_hp`, `target_conditions`, `ally_adjacent_to_target`, `first_round_only`, `requires_states` | 战斗姿态、命中图腾、扩展重击区间（19–20）、集群战术、血腥狂乱 |
+| `hit_rider` | `damage_dice`, `scaling_dice` (`{count_formula, sides}`), `weapon_die`, `bonus_formula`, `damage_type`（如 `"闪电"` 或 `"武器同型"`）, `marked_target_only`, `weapon_only`, `melee_only`, `ranged_only`, `finesse_or_ranged_only`, `str_attack_only`, `advantage_only`, `no_disadvantage`, `target_below_max_hp`, `target_half_hp`, `target_conditions`, `ally_adjacent_to_target`, `advantage_or_ally_adjacent`, `first_round_only`, `crit_only`, `own_turn_only`, `requires_states`, `once_per_turn` | 元素附伤、巨兽杀手/巨像屠夫（`target_below_max_hp` + `once_per_turn`）、偷袭（`scaling_dice` + `advantage_or_ally_adjacent`）、凶蛮攻击（`weapon_die` + `crit_only`）、优势触发附伤（`advantage_only`）、印记类锁定附伤（`marked_target_only`） |
 | `defense_mod` | `ac_bonus`（整数或公式）, `resistant`, `immune`, `vulnerable`, `attacker_advantage` | 护甲增益、元素抗性/免疫（如 `["闪电", "雷鸣"]` 或 `["*"]`） |
 | `save_mod` | `abilities`（`["con", "wis"]` 或 `"all"`）, `bonus_formula`, `bonus_dice`, `advantage`, `vs_tags`（如 `["concentration", "毒素"]`） | 专注豁免优势、特定伤害/状态豁免加成 |
 | `aura` | `radius`, `radius_at_18`, `target`（`"allies"`/`"enemies"`/`"all"`）, `include_self`, `save_bonus_formula`, `slow_factor`, `hazard`（`{damage_dice, upcast_per_slot, base_slot, damage_type, save_ability, half_on_save}`） | 圣武士/魔兽光环、萨满图腾光环、持续伤害减速光环 |

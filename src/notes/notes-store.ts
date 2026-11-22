@@ -11,9 +11,10 @@
  *   - `chats/<会话键>/` 下是只属于某个群/私聊的笔记（如某个群的跑团进度），只有那个会话检索得到，
  *     避免别的群的存档混进来。
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, appendFileSync } from 'node:fs';
 import { basename, dirname, extname, join, relative } from 'node:path';
 import type { Logger } from '../types.ts';
+import { writeTextAtomic } from '../shared/atomic-fs.ts';
 import { EXACT_STRONG_SCORE, scoreExact, type ExactScore } from '../features/exact-match.ts';
 import { fuseRankings, gateSimilarities, type SemanticGate } from '../features/rank-fusion.ts';
 import type { EmbeddingCache } from './embedding.ts';
@@ -860,7 +861,7 @@ export class NotesStore {
     const created = !existsSync(path);
 
     if (created) {
-      writeFileSync(path, `# ${title}\n\n${meta}\n\n${content}\n`, 'utf8');
+      writeTextAtomic(path, `# ${title}\n\n${meta}\n\n${content}\n`);
     } else {
       appendFileSync(path, `\n## ${title}\n\n${meta}\n\n${content}\n`, 'utf8');
     }
@@ -979,7 +980,7 @@ export class NotesStore {
       lines.splice(insertAt, 0, ...insertLines);
     }
 
-    writeFileSync(source, lines.join(eol), 'utf8');
+    writeTextAtomic(source, lines.join(eol));
     this.lastScan = 0;
     this.logger?.info(`im-qqbot: 笔记标记过期 ${file} › ${target.path} -> ${supersededBy}`);
     return {
@@ -1032,7 +1033,7 @@ export class NotesStore {
       };
     }
     appendFileSync(target.abs, `<!-- 归档自 ${file} › ${heading}，${today()} -->\n${cut.removed}\n\n`, 'utf8');
-    writeFileSync(source, cut.rest, 'utf8');
+    writeTextAtomic(source, cut.rest);
     this.lastScan = 0;
     this.logger?.info(`im-qqbot: 笔记小节归档 ${file} › ${heading} → ${target.rel}`);
     return {
@@ -1292,7 +1293,7 @@ export function planNoteInjection(
 
   const bounded = (text: string, cap: number): string => text.length <= cap ? text : `${text.slice(0, cap - 1)}…`;
   const header = '[共享笔记 · 可能相关]';
-  const footer = '（来自笔记库，仅供参考；共享笔记不代表本群经历。新旧冲突以新证据为准，无关则忽略；更多用 qqbot_notes_search。）';
+  const footer = '（来自笔记库，仅供参考；共享笔记不代表本群经历。新旧冲突以新证据为准，无关则忽略；更多用 qqbot_notes(action="search")。）';
   const prefixFor = (hit: NoteHit): string => {
     const owner = chatOwnerOf(hit.file);
     const name = owner === undefined ? hit.file : `[本会话] ${hit.file.split('/').slice(2).join('/')}`;

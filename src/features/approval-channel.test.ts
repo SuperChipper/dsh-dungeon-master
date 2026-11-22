@@ -392,4 +392,33 @@ describe('ApprovalChannel.cancelPending', () => {
     await expect(handler(makeRequest({ id: 'sess-qq' }), () => Promise.resolve('unavailable' as ApprovalOutcome)))
       .resolves.toBe('unavailable');
   });
+
+  it('extracts command from dsh snapshotEvents() when agent.session.events is absent', async () => {
+    const sent: SentMessage[] = [];
+    const ch = new ApprovalChannel(
+      createManager({ findBySessionId: (id) => (id === 'sess-qq' ? makeRecord(sessionKey('c2c', 'peer-qq')) : undefined) }),
+      createSender(sent),
+      createLogger(),
+    );
+    const { handler } = installAndCapture(ch, sent);
+
+    const req: ApprovalRequest = {
+      agent: {
+        id: 'sess-qq',
+        session: {
+          snapshotEvents: () => [
+            { type: 'tool/call', data: { callId: 'call-v4', arguments: JSON.stringify({ command: 'ls -la /tmp' }) } },
+          ],
+        },
+      },
+      toolName: 'bash',
+      callId: 'call-v4',
+    };
+
+    const p = handler(req, () => Promise.resolve('unavailable' as ApprovalOutcome));
+    await sleep(20);
+    expect(sent.at(-1)?.text).toContain('ls -la /tmp');
+    ch.cancelPending(sessionKey('c2c', 'peer-qq'));
+    await expect(p).resolves.toBe('cancelled');
+  });
 });

@@ -11,6 +11,7 @@ export type AgentSetup = (agentCtx: Context) => Promise<void> | void;
 export interface SessionEventLike {
   type: string;
   seq?: number;
+  readonly data?: Record<string, unknown>;
   usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
   message?: {
     content?: Array<{ type: string; text?: string }>;
@@ -23,6 +24,7 @@ export interface SessionEventLike {
 export interface DshAgent {
   readonly id: string;
   readonly ctx: Context;
+  readonly options?: { provider?: string; model?: string; reasoningEffort?: string };
   /** 当前生命周期状态（用于判断是否正在生成） */
   readonly status: 'idle' | 'running';
   /** 底层 session（events / snapshotEvents 用于统计/导出） */

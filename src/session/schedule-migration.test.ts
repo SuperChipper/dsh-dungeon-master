@@ -86,7 +86,7 @@ describe('schedule migration', () => {
     const hint = formatScheduleMigrationHint([
       { title: '同人图', prompt: '取一张', cron: { expression: '0 8 * * *', time_zone: 'Asia/Shanghai' } },
     ]);
-    expect(hint).toContain('qqbot_booru_fetch');
+    expect(hint).toContain('qqbot_fanart');
     expect(hint).toContain('tmp/');
   });
 

@@ -392,6 +392,8 @@ export interface DndConfig {
   turnButtons: boolean;
   /** 跑团期间也按 groupReplyProbability 随机插嘴（只吐槽、不结算）；false = 开团后只回 @ */
   interjections: boolean;
+  /** 团况快照按对话轮数节流间隔（默认 4 = 每 4 轮对话同步一次完整团况，单轮内工具循环始终零重发；设为 1 则每轮对话最多同步 1 次） */
+  snapshotIntervalTurns?: number;
   combatAgent: DndCombatAgentConfig;
 }
 
@@ -727,7 +729,7 @@ export const BrowserSchema: Schema<BrowserConfig> = Schema.object({
 });
 
 export const FanartSchema: Schema<FanartConfig> = Schema.object({
-  enabled: Schema.boolean().default(true).description('是否启用 qqbot_fanart_pick 搜图工具'),
+  enabled: Schema.boolean().default(true).description('是否启用 qqbot_fanart 搜图工具'),
   proxy: Schema.string().default('').description('pixiv/safebooru 用的 HTTP 代理（空=HTTPS_PROXY 或系统代理）'),
   poolDir: Schema.string().default('').description('CP 池目录（空=插件根目录/scripts）'),
 });
@@ -744,12 +746,16 @@ export const DndCombatAgentSchema: Schema<DndCombatAgentConfig> = Schema.object(
   contextChars: Schema.number().min(1000).max(30000).step(1).default(8000).description('开战交接的最近对话字数上限'),
 });
 
+export const DND_DEFAULT_SNAPSHOT_INTERVAL_TURNS = 4;
+
 /** 跑团子 Schema */
 export const DndSchema: Schema<DndConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('是否启用跑团（/dnd 命令与 dnd_* 工具）'),
   root: Schema.string().default('').description('跑团数据目录（空=工作目录/dnd）'),
   turnButtons: Schema.boolean().default(true).description('轮到玩家时发「结束回合 / 查看状态」按钮'),
   interjections: Schema.boolean().default(true).description('跑团期间也按插话概率随机吐槽（只吐槽、不结算行动）；关掉则开团后只回 @'),
+  snapshotIntervalTurns: Schema.number().min(1).max(20).step(1).default(DND_DEFAULT_SNAPSHOT_INTERVAL_TURNS)
+    .description('团况快照按对话轮数注入间隔（默认4=每4轮对话同步1次完整团况，单轮多次攻击/移动始终锁定零重发；1=每轮对话最多注入1次）'),
   combatAgent: DndCombatAgentSchema.default(DND_COMBAT_AGENT_DEFAULTS),
 });
 
@@ -926,7 +932,7 @@ export const ImageGenSchema: Schema<ImageGenConfig> = Schema.object({
   defaultComplexity: Schema.union(IMAGE_GEN_COMPLEXITIES.map((c) => Schema.const(c))).default(IMAGE_GEN_DEFAULTS.defaultComplexity).description('GPT Image 2.6 complexity 参数（空=不传）'),
   timeoutMs: Schema.number().min(5000).max(600000).step(1).default(IMAGE_GEN_DEFAULTS.timeoutMs).description('请求超时(ms)'),
   allowAllGroups: Schema.boolean().default(IMAGE_GEN_DEFAULTS.allowAllGroups).description('是否允许全部群聊调用生图（关闭时仅主人私聊、完全权限会话与白名单群可用）'),
-  allowedGroups: Schema.array(Schema.string()).default(IMAGE_GEN_DEFAULTS.allowedGroups).description('生图白名单 group_openid；本群也可通过 qqbot_image_gen_access 申请，主人确认后写入，与浏览/终端授权分开'),
+  allowedGroups: Schema.array(Schema.string()).default(IMAGE_GEN_DEFAULTS.allowedGroups).description('生图白名单 group_openid；本群也可通过 qqbot_access(capability="image_gen") 申请，主人确认后写入，与浏览/终端授权分开'),
 }).default(IMAGE_GEN_DEFAULTS);
 
 /** 附件发送子 Schema */
@@ -1146,6 +1152,7 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
     root: '',
     turnButtons: true,
     interjections: true,
+    snapshotIntervalTurns: DND_DEFAULT_SNAPSHOT_INTERVAL_TURNS,
     combatAgent: DND_COMBAT_AGENT_DEFAULTS,
   }).description('跑团配置'),
 });

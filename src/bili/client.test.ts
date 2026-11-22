@@ -65,13 +65,13 @@ describe('BiliClient credential store', () => {
 });
 
 describe('registerBiliTools', () => {
-  it('只注册只读工具，不注册发评论/投稿/私信', () => {
+  it('只注册只读工具与扫码认证入口，不注册发评论/投稿/私信', () => {
     const names: string[] = [];
     registerBiliTools(
       { register: (definition: unknown) => { names.push((definition as { name: string }).name); } },
       { client: {} as BiliClient, logger: { info: () => {}, warn: () => {} } },
     );
-    expect(names).toEqual(['bili_search', 'bili_video', 'bili_comments', 'bili_subtitle', 'bili_login', 'bili_login_check']);
+    expect(names).toEqual(['qqbot_bili', 'qqbot_bili_auth']);
     expect(names.some((name) => /reply|send|upload|favorite|message/i.test(name))).toBe(false);
   });
 
@@ -85,8 +85,8 @@ describe('registerBiliTools', () => {
         permission: () => ({ allowed: false, reason: '只有主人可以登录 B 站' }),
       },
     );
-    const login = defs.get('bili_login');
-    expect(login).toBeDefined();
-    await expect(login!.execute({}, { signal: new AbortController().signal, agent: {} })).rejects.toThrow('只有主人可以登录 B 站');
+    const auth = defs.get('qqbot_bili_auth');
+    expect(auth).toBeDefined();
+    await expect(auth!.execute({ action: 'login' }, { signal: new AbortController().signal, agent: {} })).rejects.toThrow('只有主人可以登录 B 站');
   });
 });

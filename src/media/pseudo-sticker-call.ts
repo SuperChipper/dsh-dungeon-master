@@ -14,6 +14,7 @@
 export interface PseudoStickerCall {
   image: string;
   emotion: string;
+  look?: string;
   note?: string;
   file?: string;
 }
@@ -25,8 +26,8 @@ export interface PseudoStickerExtraction {
   calls: PseudoStickerCall[];
 }
 
-const OPEN_TAG = '<qqbot_save_sticker';
-const COMPLETE_BLOCK = /<qqbot_save_sticker([^>]*)>([\s\S]*?)<\/qqbot_save_sticker>/gi;
+const STICKER_OPEN_TAGS = ['<qqbot_save_sticker', '<qqbot_sticker'] as const;
+const COMPLETE_BLOCK = /<(qqbot_save_sticker|qqbot_sticker)([^>]*)>([\s\S]*?)<\/\1>/gi;
 
 function readBodyTag(body: string, tag: string): string | undefined {
   const match = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i').exec(body);
@@ -44,11 +45,13 @@ function parseCall(attrs: string, body: string): PseudoStickerCall | undefined {
   const image = readBodyTag(body, 'image') ?? readAttr(attrs, 'image');
   const emotion = readBodyTag(body, 'emotion') ?? readAttr(attrs, 'emotion');
   if (image === undefined || emotion === undefined) return undefined;
+  const look = readBodyTag(body, 'look') ?? readAttr(attrs, 'look');
   const note = readBodyTag(body, 'note') ?? readAttr(attrs, 'note');
   const file = readBodyTag(body, 'file') ?? readAttr(attrs, 'file');
   return {
     image,
     emotion,
+    ...(look !== undefined ? { look } : {}),
     ...(note !== undefined ? { note } : {}),
     ...(file !== undefined ? { file } : {}),
   };
@@ -83,19 +86,25 @@ function stripPseudoBlock(text: string, tag: string): string {
  */
 export function extractPseudoStickerCalls(text: string): PseudoStickerExtraction {
   const calls: PseudoStickerCall[] = [];
-  let visible = text.replace(COMPLETE_BLOCK, (_whole, attrs: string, body: string) => {
-    const call = parseCall(attrs, body);
-    if (call !== undefined) calls.push(call);
+  let visible = text.replace(COMPLETE_BLOCK, (_whole, tagName: string, attrs: string, body: string) => {
+    const normalizedTag = tagName.toLowerCase();
+    const action = readBodyTag(body, 'action') ?? readAttr(attrs, 'action');
+    if (normalizedTag !== 'qqbot_sticker' || action === undefined || action.toLowerCase() === 'save') {
+      const call = parseCall(attrs, body);
+      if (call !== undefined) calls.push(call);
+    }
     return '';
   });
 
   // 未闭合块（流式中途）：从最后一个开标签一直扣到结尾
-  const lastOpen = visible.toLowerCase().lastIndexOf(OPEN_TAG);
-  if (lastOpen >= 0) {
-    visible = visible.slice(0, lastOpen);
+  for (const openTag of STICKER_OPEN_TAGS) {
+    const lastOpen = visible.toLowerCase().lastIndexOf(openTag);
+    if (lastOpen >= 0) visible = visible.slice(0, lastOpen);
   }
 
-  visible = stripTrailingPartialOpen(visible, OPEN_TAG);
+  for (const openTag of STICKER_OPEN_TAGS) {
+    visible = stripTrailingPartialOpen(visible, openTag);
+  }
   // 移除块后可能留下多余空行，但不破坏正常段落
   visible = visible.replace(/\n{3,}/g, '\n\n').trimEnd();
   return { visible, calls };

@@ -9,6 +9,7 @@ import {
   historyImageTag,
   numberHistoryImages,
 } from './history-images.ts';
+import { registerMediaRef, resolveMediaRef } from './media-ref-store.ts';
 import { buildAgentBody, wantsHistoryImages } from '../transport/inbound.ts';
 import { makeSenderLabeler } from '../features/message-format.ts';
 
@@ -47,7 +48,7 @@ describe('numberHistoryImages', () => {
 });
 
 describe('downloadRecentHistoryImages', () => {
-  it('只下载最近 limit 张，失败的保留 URL', async () => {
+  it('只下载最近 limit 张，失败的记为 qqref 短引用且不泄露原始 URL', async () => {
     const images = numberHistoryImages(history);
     const downloader = fakeDownloader(new Set(['https://q/c.jpg']));
     await downloadRecentHistoryImages(images, media, logger, 2, downloader);
@@ -56,7 +57,9 @@ describe('downloadRecentHistoryImages', () => {
     expect(images[0]!.localPath).toBeUndefined();
     expect(images[1]!.localPath).toBeDefined();
     expect(images[2]!.localPath).toBeUndefined();
-    expect(historyImageTag(images[2]!)).toBe('[图片#3: https://q/c.jpg]');
+    const expectedRef = registerMediaRef('https://q/c.jpg');
+    expect(historyImageTag(images[2]!)).toBe(`[图片#3: ${expectedRef}]`);
+    expect(resolveMediaRef(expectedRef)?.url).toBe('https://q/c.jpg');
   });
 
   it('同一 URL 第二次命中缓存，不重复下载', async () => {
@@ -79,13 +82,16 @@ describe('downloadRecentHistoryImages', () => {
 });
 
 describe('buildAgentBody 历史图片', () => {
-  it('历史行带 [图片#n] 标记，纯图片消息不再是空行', () => {
+  it('历史行带 [图片#n] 标记（未下载用 qqref 短引用），纯图片消息不再是空行', () => {
     const images = numberHistoryImages(history);
     images[1]!.localPath = 'C:/media/b.jpg';
     const body = buildAgentBody('[当前]', history, true, true, label, images);
 
-    expect(body).toContain('[甲 #U1] 看这个 [图片#1: https://q/a.jpg]');
-    expect(body).toContain('[乙 #U2] [图片#2: C:/media/b.jpg] [图片#3: https://q/c.jpg]');
+    const refA = registerMediaRef('https://q/a.jpg', { filename: 'a.jpg' });
+    const refC = registerMediaRef('https://q/c.jpg');
+    expect(body).toContain(`[甲 #U1] 看这个 [图片#1: ${refA}]`);
+    expect(body).toContain(`[乙 #U2] [图片#2: C:/media/b.jpg] [图片#3: ${refC}]`);
+    expect(body).not.toContain('https://q/');
     expect(body).toContain('[图片#n] 是历史消息里的图片');
   });
 

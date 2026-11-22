@@ -5,9 +5,8 @@
  * 只读，不修改 settings.yaml。
  */
 import { readFileSync, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { homedir } from 'node:os';
 import yaml from 'js-yaml';
+import { dshSettingsPath } from '../shared/paths.ts';
 import type { ModelRoute, ModelEntry } from './types.ts';
 
 /** settings.yaml 中的 provider 配置结构 */
@@ -80,7 +79,7 @@ export class SettingsReader {
     if (this.settingsCache !== undefined) return this.settingsCache;
 
     try {
-      const settingsPath = resolve(homedir(), '.dsh', 'settings.yaml');
+      const settingsPath = dshSettingsPath();
       if (!existsSync(settingsPath)) {
         this.settingsCache = null;
         return null;

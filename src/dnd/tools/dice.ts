@@ -3,23 +3,24 @@ import { rollD20,rollExpression } from '../dice.ts';
 import {
 type PendingAttack,
 type PendingRider,
-type PendingCheck,applyDamage,
+type PendingCheck,
+type PendingSpell,applyDamage,
 armorClass,assertCanAct,assertDeclaredByOwner,assertNoPending,attackModifier,
 changeCondition,checkAllAirborneCrashes,checkModifier,deathSave,findCharacter,
-findWeapon,grantTempHp,heal,hexbladeCurseOn,inInitiative,isRangedWeapon,pushCombatLedger,requireCharacter,
+findWeapon,grantTempHp,heal,hexbladeCurseOn,inInitiative,isRangedWeapon,pushCombatLedger,pushLog,requireCharacter,
 requireInitiative,requireResource,usesElvenAccuracy,useResource,weaponAttackModifier,spendReaction
 } from '../campaign.ts';
 import {
 activeEffectDefsFor,breakConcentration,collectHitRiders,computeAttackStateMods,computeCheckStateMods,computeDefenseStateMod,
-computeSaveStateMods,effectiveMaxHp,ensureTurnState,formatStateModSummary,hasCondition,movementSpeedInfo,normalizeCondition,recordTurnSpellCast,type CollectedRider
+computeSaveStateMods,concentratingSpellNames,defaultStateRounds,effectiveMaxHp,ensureTurnState,formatStateModSummary,hasCondition,isDefaultConcentrationState,isTransferableState,movementSpeedInfo,normalizeCondition,recordTurnSpellCast,transferConcentration,unhandledCombatPassives,type CollectedRider
 } from '../conditions.ts';
 import { buildFormulaContext,evalIntFormula } from '../formula.ts';
 import { ABILITY_NAMES,type Ability,type Skill,SKILLS,parseAbility,parseSkill,proficiencyBonus,skillLabel } from '../rules.ts';
 import {
-attackRangeNote,canReact,cellOf,distanceFeet,weaponReach
+attackRangeNote,canReact,cellOf,combatReachabilityHint,distanceFeet,weaponReach
 } from '../battlefield.ts';
 import {
-assertReactionAuthorized,eligibleReactors,holdNotice,
+assertReactionAuthorized,eligibleReactors,eligibleSpellReactors,holdNotice,hostileSpellcasterHints,
 manualReactors,
 mergeReactors
 } from '../pending-attack.ts';
@@ -190,6 +191,18 @@ export function registerDiceTools(kit: ToolKit): void {
         description: 'Spent BEFORE rolling, including on a miss. Not conditional on hit: use on_hit for pre-authorized Divine Smite/on-hit spending. Resource for this roll, e.g. "1环法术位" for guiding bolt, "诗人激励" (spent by '
           + 'the character it is on). Fails if none left. Only when the player said they use it.',
       },
+      spell_name: {
+        type: 'string',
+        description: 'Optional spell name when resolving a spell attack or save spell (enables 法术反制 / 护盾术 reactions and enemy spellcaster DM reminders).',
+      },
+      spell_level: {
+        type: 'integer',
+        description: 'Optional spell slot level (0-9; auto-inferred from `spend` if omitted). Used for Counterspell DC 10 + spell_level.',
+      },
+      is_spell: {
+        type: 'boolean',
+        description: 'Set false for monster abilities like dragon breath or traps so Counterspell does not trigger.',
+      },
       on_hit: {
         type: 'object',
         description: 'A PRE-AUTHORIZED rider, e.g. {name:"至圣斩",damage:"2d8",damage_type:"光耀",spend:"1环法术位"}. Waits for the FINAL hit after all defensive reactions; then spends once, rolls separately without Great Weapon Fighting, doubles dice on crit, applies its own defense, and combines HP loss as one hit. Final miss spends/rolls nothing. Not permission to choose for the player after rolling.',
@@ -324,7 +337,14 @@ export function registerDiceTools(kit: ToolKit): void {
       : `；后续 ${total - rolled} 击未掷，不会自动继续`;
     const summary = `【连击${settled === total ? '完成' : '停止'}】已结 ${settled}/${total} 击，命中 ${hits} 击，伤害合计 ${damage}（抗性、免疫及易伤调整后，扣临时生命前）${stop === undefined ? '' : `；${stop}`}${remaining}。`;
     const final = service.store.load(key);
-    return `${lines.join('\n')}\n${summary}\n${SECRET_NOTE}${final === undefined ? '' : combatLedgerSuffix(final)}`;
+    const finalActor = final === undefined ? undefined : findCharacter(final, actor.name);
+    const splitMoveHint = !failed && rolled < total && stop === '目标已倒下' && final !== undefined && finalActor !== undefined
+      ? combatReachabilityHint(final, finalActor, service.globalEffects(), { always: true })
+      : undefined;
+    const splitMoveLine = splitMoveHint !== undefined
+      ? `\n【拆分移动提示】${actor.name} 还有 ${total - rolled} 击未掷；${splitMoveHint}。`
+      : '';
+    return `${lines.join('\n')}\n${summary}${splitMoveLine}\n${SECRET_NOTE}${final === undefined ? '' : combatLedgerSuffix(final)}`;
   }
 
   function checkOne(args: Record<string, unknown>, exec: Exec, batch?: BatchStrike): string {
@@ -392,6 +412,9 @@ export function registerDiceTools(kit: ToolKit): void {
         const movement = state?.movement;
         const target = requireCharacter(c, String(args.target ?? ''));
         if (state?.pending !== undefined) assertNoPending(c, '再结算攻击');
+        if (movement !== undefined && movement.swapWith !== undefined) {
+          throw new Error(`先处理 ${movement.target} 与 ${movement.swapWith} 的换位确认窗口（用 dnd_apply target="${movement.target}" settle=true 或 decline=["${movement.swapWith}"]），换位确认不是借机攻击`);
+        }
         if (movement !== undefined && !(args.reaction === true && movement.target === target.name
           && movement.reactors.some((r) => r.character === ch.name)
           && !movement.declined.includes(ch.name) && !movement.used.some((r) => r.by === ch.name))) {
@@ -581,35 +604,64 @@ export function registerDiceTools(kit: ToolKit): void {
             curseNote = `（含咒剑诅咒 +${curseBonus}）`;
           }
         }
+        const spellName = str(args.spell_name);
+        const explicitSpellLevel = int(args.spell_level);
+        const spellLevel = explicitSpellLevel ?? (slotMatch !== null ? Number(slotMatch[1]) : undefined);
+        const isSpellAttack = args.is_spell !== false && (
+          args.is_spell === true
+          || spellName !== undefined
+          || spellLevel !== undefined
+          || slotMatch !== null
+          || (weapon === undefined && override !== undefined && (attackAbility === 'int' || attackAbility === 'wis' || attackAbility === 'cha'))
+        );
         const expression = attackExpression(ch, weapon, extra);
-        const auto = c.initiative === undefined || expression === undefined
+        const autoAtk = c.initiative === undefined
           ? []
           : eligibleReactors(c, ch, target, { hit, crit: effectiveCrit, natural: roll.natural });
+        const autoSpell = c.initiative !== undefined && isSpellAttack && (hit || wantHold)
+          ? eligibleSpellReactors(c, ch, { ...(spellName !== undefined ? { spellName } : {}), targets: [target.name] })
+          : [];
+        const auto = mergeReactors(autoAtk, autoSpell);
         const reactors = mergeReactors(auto, holdFor);
         // 能反应的人在场就先不落账；DM 手动挂起（hold / hold_for）时天然 1 也挂：重掷能改掉它
-        const hold = c.initiative !== undefined && (wantHold || (expression !== undefined && roll.natural !== 1 && auto.length > 0));
+        const hold = c.initiative !== undefined && (wantHold || (roll.natural !== 1 && auto.length > 0));
+        const pushHitPassiveNotes = (): void => {
+          for (const cn of collected.conditionalNotes) lines.push(`【条件被动】${cn}`);
+          if (args.ignore_state_mods !== true) {
+            const unhandled = unhandledCombatPassives(ch, c, globalEffects);
+            if (unhandled.length > 0) {
+              lines.push(`【未注册被动提醒】${ch.name} 有未入引擎的战斗被动：${unhandled.join('、')}（如本击满足条件请核对结算；常驻机制可用 dnd_rule define 注册后自动结算）`);
+            }
+          }
+        };
         let settledDamage = 0;
         let needsConcentrationSave = false;
         if (hold) {
           const dmg = hit && expression !== undefined ? rollAttackDamage(ch, weapon, expression, effectiveCrit, service.roller) : undefined;
-          const pendingRiders: PendingRider[] = hit
-            ? rollCollectedRiders(c, target, riders, effectiveCrit, service.roller, args.ignore_state_mods === true, globalEffects)
-            : riders.map((r) => {
-              const rDef = args.ignore_state_mods === true ? undefined : computeDefenseStateMod(target, r.damageType, undefined, c, globalEffects).defense;
-              return {
-                label: r.label,
-                expression: r.expression,
-                damageType: r.damageType,
-                ...(rDef !== undefined ? { defense: rDef } : {}),
-                ...(r.oncePerTurnRule !== undefined ? { oncePerTurnRule: r.oncePerTurnRule } : {}),
-              };
-            });
+          const pendingRiders: PendingRider[] = riders.map((r) => {
+            const rDef = args.ignore_state_mods === true ? undefined : computeDefenseStateMod(target, r.damageType, undefined, c, globalEffects).defense;
+            const shouldRoll = hit && (!r.critOnly || effectiveCrit);
+            const rolled = shouldRoll
+              ? rollExpression(!r.critOnly && effectiveCrit ? critExpression(r.expression) : r.expression, service.roller)
+              : undefined;
+            return {
+              label: r.label,
+              expression: r.expression,
+              damageType: r.damageType,
+              ...(rolled !== undefined ? { rawDamage: rolled.total, detail: rolled.detail } : {}),
+              ...(rDef !== undefined ? { defense: rDef } : {}),
+              ...(r.oncePerTurnRule !== undefined ? { oncePerTurnRule: r.oncePerTurnRule } : {}),
+              ...(r.critOnly === true ? { critOnly: true } : {}),
+            };
+          });
           if (dmg !== undefined) {
-            const riderPreview = pendingRiders.length > 0
-              ? `；附伤 ${pendingRiders.map((r) => `${r.label} ${r.detail ?? r.expression} ${r.damageType}`).join(' + ')}`
+            const activePreview = pendingRiders.filter((r) => !r.critOnly || effectiveCrit);
+            const riderPreview = activePreview.length > 0
+              ? `；附伤 ${activePreview.map((r) => `${r.label} ${r.detail ?? r.expression} ${r.damageType}`).join(' + ')}`
               : '';
             lines.push(`伤害（还没扣）${dmg.detail}${curseNote}${riderPreview}`);
           }
+          if (hit) pushHitPassiveNotes();
           pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote}${stateSuffix} → ${verdictText}（待反应）`, id);
           const p: PendingAttack = {
             kind: 'attack', seq: id, at: Date.now(), attacker: ch.name, target: target.name, natural: roll.natural, rollDetail: roll.detail,
@@ -626,6 +678,8 @@ export function registerDiceTools(kit: ToolKit): void {
             ...(defense !== undefined ? { defense } : {}),
             ...(onHit !== undefined ? { onHit } : {}),
             ...(pendingRiders.length > 0 ? { riders: pendingRiders } : {}),
+            ...(spellName !== undefined ? { spellName } : {}),
+            ...(spellLevel !== undefined ? { spellLevel } : {}),
           };
           requireInitiative(c).pending = p;
           lines.push(holdNotice(p));
@@ -634,6 +688,7 @@ export function registerDiceTools(kit: ToolKit): void {
           if (expression === undefined) {
             pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote}${stateSuffix} → ${verdictText}`, id);
             lines.push('没有伤害表达式：传 weapon（角色卡上的武器），或用 dnd_roll 掷伤害（重击时骰子翻倍）再 dnd_apply 扣血。');
+            pushHitPassiveNotes();
           } else {
             const dmg = rollAttackDamage(ch, weapon, expression, effectiveCrit, service.roller);
             const rolledRiders = rollCollectedRiders(c, target, riders, effectiveCrit, service.roller, args.ignore_state_mods === true, globalEffects);
@@ -647,9 +702,18 @@ export function registerDiceTools(kit: ToolKit): void {
             settledDamage = settlement.damage;
             needsConcentrationSave = settlement.needsConcentrationSave;
             lines.push(...settlement.lines);
+            pushHitPassiveNotes();
           }
         } else {
           pushCombatLedger(c, `${ch.name}${label !== undefined ? `（${label}）` : ''}→${target.name}：${roll.detail}${spiritNote}${extraNote}${stateSuffix} → ${verdictText}`, id);
+        }
+        if (ch.kind !== 'monster' && !hold) {
+          if (isSpellAttack) {
+            lines.push(...hostileSpellcasterHints(c, ch, { kind: 'spell', ...(spellName !== undefined ? { spellName } : {}) }));
+          }
+          if (hit && target.kind === 'monster') {
+            lines.push(...hostileSpellcasterHints(c, ch, { kind: 'attack', target, attackTotal: roll.total, targetAc, crit: effectiveCrit }));
+          }
         }
         const rangeNote = attackRangeNote(c, ch, target, { ...(weapon !== undefined ? { weapon } : {}), reaction: args.reaction === true, advantage: effectiveAdv });
         if (rangeNote !== undefined) lines.push(rangeNote);
@@ -738,6 +802,7 @@ export function registerDiceTools(kit: ToolKit): void {
             kind: 'roll', seq: id, at: Date.now(), attacker: ch.name, target: ch.name, label,
             rolls: [{ name: ch.name, natural: roll.natural, modifier: roll.modifier, advantage: saveMods.advantage, total: roll.total, detail: `${roll.detail}${extraNote}${stateSuffix}`, mod: 0 }],
             ...(dc !== undefined ? { dc } : {}),
+            ...(args.concentration === true ? { concentrationCheck: true } : {}),
             damageMod: 0, reactors: holdFor, declined: [], claimed: [], used: [],
           };
           requireInitiative(c).pending = p;
@@ -774,6 +839,7 @@ export function registerDiceTools(kit: ToolKit): void {
           kind: 'roll', seq: id, at: Date.now(), attacker: ch.name, target: ch.name, label,
           rolls: [{ name: ch.name, natural: roll.natural, modifier: roll.modifier, advantage: effectiveCheckAdv, total: roll.total, detail: `${roll.detail}${extraNote}${stateSuffix}`, mod: 0 }],
           ...(dc !== undefined ? { dc } : {}),
+          ...(kind === 'save' && args.concentration === true ? { concentrationCheck: true } : {}),
           damageMod: 0, reactors: holdFor, declined: [], claimed: [], used: [],
         };
         requireInitiative(c).pending = p;
@@ -818,7 +884,8 @@ export function registerDiceTools(kit: ToolKit): void {
       heal: { type: 'integer' },
       temp_hp: { type: 'integer' },
       caster: { type: 'string', description: 'Optional healer/caster character name (enables automatic 生命门徒/神佑医者 bonuses on leveled heals and concentration source binding).' },
-      slot_level: { type: 'integer', description: 'Optional spell slot level (1-9) when applying a leveled healing spell (triggers 生命门徒 +2+slot and 神佑医者 self-heal).' },
+      spell_name: { type: 'string', description: 'Optional spell name when applying direct spell damage (e.g. "魔法飞弹"; enables 护盾术 immunity & 法术反制 reactions and enemy DM reminders).' },
+      slot_level: { type: 'integer', description: 'Optional spell slot level (1-9) when applying a leveled healing or direct-damage spell.' },
       preserve_life: { type: 'boolean', description: 'True when applying 保全生命 (Preserve Life): caps each target\'s restored HP at half its effective max HP.' },
       drop_concentration: { type: 'boolean', description: 'Drop active concentration of the target creature(s), clearing their concentrated buffs/debuffs and battlefield zones.' },
       concentration: { type: 'boolean', description: 'Bind add_conditions to `caster`\'s concentration.' },
@@ -847,6 +914,9 @@ export function registerDiceTools(kit: ToolKit): void {
           },
           spend: { type: 'string', description: 'Resource the reactor spends.' },
           spend_amount: { type: 'integer', description: 'Charges/units spent for this reaction (default: ReactionDef.cost or 1, e.g. 2 for Staff of Defense Shield).' },
+          counterspell: { type: 'boolean', description: 'True when resolving Counterspell (法术反制) against a pending spell.' },
+          spell_ability: { type: 'string', description: 'Optional casting ability for Counterspell ability checks (int/wis/cha; auto-inferred if omitted).' },
+          slot_level: { type: 'integer', description: 'Spell slot level (1-9) used for this reaction (e.g. 3 or 4 for Counterspell).' },
         },
         required: ['by', 'name'],
         additionalProperties: false,
@@ -916,19 +986,73 @@ export function registerDiceTools(kit: ToolKit): void {
       const globalEffects = service.globalEffects();
       const casterName = str(args.caster);
       const casterCh = casterName !== undefined ? requireCharacter(c, casterName) : undefined;
+      const spellName = str(args.spell_name);
       const slotLevel = int(args.slot_level);
       const damageRoll = str(args.damage_roll) === undefined ? undefined : rollExpression(String(args.damage_roll), service.roller);
       const healRoll = str(args.heal_roll) === undefined ? undefined : rollExpression(String(args.heal_roll), service.roller);
+      const rollSeqId = damageRoll !== undefined || healRoll !== undefined ? rollId(c, exec) : undefined;
+      if (c.initiative !== undefined && casterCh?.kind === 'monster'
+        && (spellName !== undefined || (slotLevel !== undefined && str(args.damage_type) === '力场'))) {
+        const effSpellName = spellName ?? '魔法飞弹';
+        const mmTargets = resolved.flatMap(({ ch, values }) => {
+          const dmg = int(values.damage) ?? damageRoll?.total;
+          if (dmg === undefined || dmg <= 0) return [];
+          const explicitDef = parseDefense(values.defense);
+          const def = args.ignore_state_mods === true
+            ? explicitDef
+            : computeDefenseStateMod(ch, str(values.damage_type), explicitDef, c, globalEffects).defense;
+          return [{ name: ch.name, damage: dmg, ...(def !== undefined ? { defense: def } : {}) }];
+        });
+        const spellReactors = mmTargets.length > 0
+          ? eligibleSpellReactors(c, casterCh, { spellName: effSpellName, targets: mmTargets.map((t) => t.name) })
+          : [];
+        if (spellReactors.length > 0) {
+          const id = rollSeqId ?? rollId(c, exec);
+          const p: PendingSpell = {
+            kind: 'spell',
+            seq: id,
+            at: Date.now(),
+            attacker: casterCh.name,
+            target: mmTargets[0]!.name,
+            reactors: spellReactors,
+            declined: [],
+            claimed: [],
+            used: [],
+            spellName: effSpellName,
+            spellLevel: slotLevel ?? 1,
+            effect: {
+              kind: 'magic_missile',
+              targets: mmTargets,
+              ...(damageRoll !== undefined ? { damageDetail: damageRoll.detail } : {}),
+              damageType: str(args.damage_type) ?? '力场',
+            },
+          };
+          requireInitiative(c).pending = p;
+          deps.onPendingAttack?.(recordOf(exec));
+          const summary = damageRoll !== undefined
+            ? `${casterCh.name} 施放「${effSpellName}」伤害 ${damageRoll.detail}（还没扣） #R${id}`
+            : `${casterCh.name} 施放「${effSpellName}」（伤害还没扣） #R${id}`;
+          return `${summary}\n${holdNotice(p)}\n${SECRET_NOTE}`;
+        }
+      }
       const lines: string[] = [];
-      if (damageRoll !== undefined || healRoll !== undefined) {
-        const id = rollId(c, exec);
-        if (damageRoll !== undefined) lines.push(`公共伤害 ${damageRoll.detail} #R${id}`);
-        if (healRoll !== undefined) lines.push(`公共治疗 ${healRoll.detail} #R${id}`);
+      if (rollSeqId !== undefined) {
+        if (damageRoll !== undefined) lines.push(`公共伤害 ${damageRoll.detail} #R${rollSeqId}`);
+        if (healRoll !== undefined) lines.push(`公共治疗 ${healRoll.detail} #R${rollSeqId}`);
       }
       let blessedHealerApplied = false;
-      if (args.concentration === true && casterCh !== undefined && resolved.some(({ values }) => (strList(values.add_conditions)?.length ?? 0) > 0)) {
-        const brokenPrev = breakConcentration(c, casterCh.name, '施放新的专注效果');
-        lines.push(...brokenPrev);
+      const allAddedNorms = new Set(
+        resolved.flatMap(({ values }) => (strList(values.add_conditions) ?? []).map(normalizeCondition)),
+      );
+      if (casterCh !== undefined && args.concentration !== false && allAddedNorms.size > 0) {
+        const hasConcAddition = args.concentration === true || [...allAddedNorms].some((n) => isDefaultConcentrationState(c, n, globalEffects));
+        if (hasConcAddition) {
+          const prevDifferent = concentratingSpellNames(c, casterCh.name).filter((sName) => !allAddedNorms.has(normalizeCondition(sName)));
+          if (prevDifferent.length > 0) {
+            const brokenPrev = [...breakConcentration(c, casterCh.name, '施放新的专注效果'), ...checkAllAirborneCrashes(c, service.roller, globalEffects)];
+            lines.push(...brokenPrev);
+          }
+        }
       }
       for (const { ch, values } of resolved) {
         const details: string[] = [];
@@ -991,10 +1115,36 @@ export function registerDiceTools(kit: ToolKit): void {
         }
         const addRounds = int(values.rounds);
         for (const cond of strList(values.add_conditions) ?? []) {
+          const normCond = normalizeCondition(cond);
+          // 兼容模型用 dnd_apply 转移「脆弱诅咒/猎人印记」等可转移专注：自动识别在场维持该专注的施法者并无损转移 source 与剩余轮数
+          if (isTransferableState(c, normCond, globalEffects)) {
+            const curTurnActor = c.initiative?.order[c.initiative.turn]?.name;
+            let transferCaster = casterCh;
+            if (transferCaster === undefined) {
+              if (curTurnActor !== undefined && concentratingSpellNames(c, curTurnActor).includes(normCond)) {
+                transferCaster = findCharacter(c, curTurnActor);
+              } else {
+                const candidates = c.characters.filter((x) => x.name !== ch.name && concentratingSpellNames(c, x.name).includes(normCond));
+                if (candidates.length === 1) transferCaster = candidates[0];
+              }
+            }
+            if (transferCaster !== undefined && concentratingSpellNames(c, transferCaster.name).includes(normCond)) {
+              const tr = transferConcentration(c, transferCaster, ch, {
+                spellName: normCond,
+                force: args.ignore_state_mods === true,
+                globalEffects,
+              });
+              pushLog(c, `${transferCaster.name} 将「${tr.spellName}」专注转移至 ${ch.name}`);
+              details.push(`已将 ${transferCaster.name} 的「${tr.spellName}」专注转移至 ${ch.name}（剩 ${tr.roundsLeft} 轮）`);
+              continue;
+            }
+          }
+          const autoConc = casterCh !== undefined && (args.concentration === true || (args.concentration !== false && isDefaultConcentrationState(c, normCond, globalEffects)));
+          const effRounds = addRounds ?? (autoConc ? defaultStateRounds(normCond, slotLevel, c, globalEffects) : undefined);
           changeCondition(c, ch.name, cond, true, {
             ...(casterCh !== undefined ? { source: casterCh.name } : {}),
-            ...(args.concentration === true && casterCh !== undefined ? { concentration: true, replaceConcentration: false } : {}),
-            ...(addRounds !== undefined ? { roundsLeft: addRounds } : {}),
+            ...(autoConc ? { concentration: true, replaceConcentration: false } : {}),
+            ...(effRounds !== undefined ? { roundsLeft: effRounds } : {}),
             roller: service.roller,
             globalEffects,
           });
@@ -1032,6 +1182,10 @@ export function registerDiceTools(kit: ToolKit): void {
         if (details.length === 0) details.push(ch.kind === 'monster' ? `${ch.name} 状态已更新` : `${ch.name} HP ${ch.hp}/${ch.maxHp}`);
         details.push(`状态：${ch.conditions.join('、') || '无'}`);
         lines.push(details.join('；'));
+      }
+      if (c.initiative !== undefined && casterCh !== undefined && casterCh.kind !== 'monster'
+        && (spellName !== undefined || slotLevel !== undefined)) {
+        lines.push(...hostileSpellcasterHints(c, casterCh, { kind: 'spell', ...(spellName !== undefined ? { spellName } : {}) }));
       }
       return `${lines.join('\n')}${combatLedgerSuffix(c)}`;
     }),

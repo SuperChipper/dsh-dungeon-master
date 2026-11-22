@@ -172,6 +172,8 @@ export function zoneAffectsCharacter(c: Campaign, zone: BattleZone, ch: Characte
   return side === 'enemies' ? hostile : !hostile;
 }
 
+export type BattleZoneInput = Omit<Parameters<typeof createBattleZoneInput>[0], 'room'> & { room?: string };
+
 export function createBattleZoneInput(
   raw: {
     id?: string;
@@ -471,6 +473,108 @@ export function extraCellCostMultiplier(
     }
   }
   return mult;
+}
+
+/**
+ * 纯几何查询（零掷骰、零副作用）：从 prev 踏入 next 这一步会新触发或踩中哪些危害型领域/区域/光环
+ * （如火墙术、荆棘丛生、蛛网术、毒雾、月华之光、敌方灵体卫士等）。
+ * 供寻路自动绕行与拆分移动提醒使用：若起点已在非 perStep 区域内，往外走不会误判为再次踏入。
+ */
+export function stepHazardNamesAt(
+  c: Campaign,
+  mover: Character,
+  prev: { x: number; y: number; z?: number },
+  next: { x: number; y: number; z?: number },
+  room: string,
+  globalEffects?: Record<string, CustomEffectDef>,
+): string[] {
+  const names: string[] = [];
+  const pushUnique = (n: string): void => {
+    if (!names.includes(n)) names.push(n);
+  };
+  for (const zone of zonesInRoom(c, room)) {
+    if (!zoneAffectsCharacter(c, zone, mover)) continue;
+    const hasHarm = zone.damage !== undefined || (zone.onFailConditions?.length ?? 0) > 0;
+    if (!hasHarm) continue;
+    if (zone.perStep === true) {
+      if (zoneCoversCell(zone, next)) pushUnique(zone.name);
+      continue;
+    }
+    if (!zoneCoversCell(zone, prev) && zoneCoversCell(zone, next)) {
+      pushUnique(zone.name);
+    }
+  }
+  for (const other of c.characters) {
+    if (other.name === mover.name || other.hp <= 0 || other.conditions.includes('死亡') || isIncapacitated(other)) continue;
+    const otherCell = cellOfChar(c, other);
+    if (otherCell === undefined || otherCell.room !== room) continue;
+    for (const { def } of activeEffectDefsFor(other, c.customEffects, globalEffects)) {
+      const aura = def.aura;
+      if (aura?.hazard === undefined) continue;
+      const hostile = isHostilePair(mover, other);
+      if (aura.target === 'enemies' && !hostile) continue;
+      if (aura.target === 'allies' && hostile) continue;
+      const radius = other.level >= 18 && aura.radiusAt18 !== undefined ? aura.radiusAt18 : aura.radius;
+      if (dist3d(prev, otherCell) > radius && dist3d(next, otherCell) <= radius) {
+        pushUnique(`${other.name}的${def.name}`);
+      }
+    }
+  }
+  return names;
+}
+
+/**
+ * 纯几何查询（零副作用）：某一格上覆盖 mover 的所有领域/区域/光环技能名（含遮蔽/难行/伤害型区域与光环）。
+ */
+export function domainNamesAtCell(
+  c: Campaign,
+  mover: Character,
+  at: { x: number; y: number; z?: number },
+  room: string,
+  globalEffects?: Record<string, CustomEffectDef>,
+): string[] {
+  const names: string[] = [];
+  const pushUnique = (n: string): void => {
+    if (!names.includes(n)) names.push(n);
+  };
+  for (const z of zonesAtCell(c, room, at)) {
+    if (zoneAffectsCharacter(c, z, mover)) pushUnique(z.name);
+  }
+  for (const other of c.characters) {
+    if (other.name === mover.name || other.hp <= 0 || other.conditions.includes('死亡') || isIncapacitated(other)) continue;
+    const otherCell = cellOfChar(c, other);
+    if (otherCell === undefined || otherCell.room !== room) continue;
+    for (const { def } of activeEffectDefsFor(other, c.customEffects, globalEffects)) {
+      const aura = def.aura;
+      if (aura?.hazard === undefined && aura?.slowFactor === undefined) continue;
+      const hostile = isHostilePair(mover, other);
+      if (aura.target === 'enemies' && !hostile) continue;
+      if (aura.target === 'allies' && hostile) continue;
+      const radius = other.level >= 18 && aura.radiusAt18 !== undefined ? aura.radiusAt18 : aura.radius;
+      if (dist3d(at, otherCell) <= radius) {
+        pushUnique(`${other.name}的${def.name}`);
+      }
+    }
+  }
+  return names;
+}
+
+/** 当前房间是否存在持续战场区域或角色领域光环 */
+export function hasActiveDomainsInRoom(
+  c: Campaign,
+  room: string,
+  globalEffects?: Record<string, CustomEffectDef>,
+): boolean {
+  if (zonesInRoom(c, room).length > 0) return true;
+  for (const ch of c.characters) {
+    if (ch.hp <= 0 || ch.conditions.includes('死亡') || isIncapacitated(ch)) continue;
+    const cell = cellOfChar(c, ch);
+    if (cell === undefined || cell.room !== room) continue;
+    for (const { def } of activeEffectDefsFor(ch, c.customEffects, globalEffects)) {
+      if (def.aura?.hazard !== undefined || def.aura?.slowFactor !== undefined) return true;
+    }
+  }
+  return false;
 }
 
 /** 移动落位后：结算沿途踩入的持续区域伤害，以及进入/扫过的灵体卫士类危害光环（每回合每目标限 1 次） */

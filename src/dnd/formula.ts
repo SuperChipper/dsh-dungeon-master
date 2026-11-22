@@ -4,12 +4,13 @@
  * 供扩展规则引擎（dnd_rule）和内置被动/光环/治疗钩子统一求值，支持：
  * - 四则运算：+ - * / 与括号 ()、正负号
  * - 内置函数：min(a, b, ...)、max(a, b, ...)、floor(x)、ceil(x)、abs(x)
- * - 角色上下文变量：level, prof, slot_level, str_mod..cha_mod, str..cha, hp, max_hp
+ * - 角色上下文变量：level, class_level, prof, slot_level, str_mod..cha_mod, str..cha, hp, max_hp, target_hp, target_max_hp
  */
 import { abilityModifier, proficiencyBonus, type Ability } from './rules.ts';
 
 export interface FormulaContext {
   level: number;
+  class_level: number;
   prof: number;
   slot_level: number;
   str_mod: number;
@@ -26,14 +27,17 @@ export interface FormulaContext {
   cha: number;
   hp: number;
   max_hp: number;
+  target_hp: number;
+  target_max_hp: number;
 }
 
 export function buildFormulaContext(
   ch: { level: number; hp: number; maxHp: number; abilities: Record<Ability, number> },
-  extra: { slotLevel?: number } = {},
+  extra: { slotLevel?: number; classLevel?: number; targetHp?: number; targetMaxHp?: number } = {},
 ): FormulaContext {
   return {
     level: ch.level,
+    class_level: extra.classLevel ?? ch.level,
     prof: proficiencyBonus(ch.level),
     slot_level: extra.slotLevel ?? 1,
     str_mod: abilityModifier(ch.abilities.str),
@@ -50,7 +54,60 @@ export function buildFormulaContext(
     cha: ch.abilities.cha,
     hp: ch.hp,
     max_hp: ch.maxHp,
+    target_hp: extra.targetHp ?? 0,
+    target_max_hp: extra.targetMaxHp ?? 0,
   };
+}
+
+function splitTopLevelClassParts(className: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let cur = '';
+  for (const ch of className) {
+    if (ch === '(' || ch === '（' || ch === '[' || ch === '【') depth++;
+    else if ((ch === ')' || ch === '）' || ch === ']' || ch === '】') && depth > 0) depth--;
+    if (depth === 0 && (ch === '/' || ch === '／' || ch === '、' || ch === ';' || ch === '；')) {
+      if (cur.trim().length > 0) parts.push(cur.trim());
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur.trim().length > 0) parts.push(cur.trim());
+  return parts;
+}
+
+/** 从兼职或单职角色卡提取匹配某职业的职业等级（未匹配兼职数字时回退总等级） */
+export function extractClassLevel(
+  ch: { level: number; className?: string; notes?: string },
+  classFilter?: string,
+): number {
+  const fallback = Math.max(1, ch.level);
+  if (!classFilter || classFilter.trim().length === 0) return fallback;
+  let re: RegExp;
+  try {
+    re = new RegExp(classFilter, 'i');
+  } catch {
+    return fallback;
+  }
+  if (ch.className) {
+    const parts = splitTopLevelClassParts(ch.className);
+    const matched = parts.find((seg) => re.test(seg));
+    if (matched !== undefined) {
+      const stripped = matched.replace(/（[^）]*）|\([^)]*\)/g, ' ');
+      const m = /(\d+)\s*级?/.exec(stripped);
+      if (m !== null) return Math.max(1, Number(m[1]));
+      if (parts.length === 1) return fallback;
+    }
+  }
+  if (ch.notes) {
+    const src = classFilter;
+    const forward = new RegExp(`(?:${src})[^，,。\\n；;]{0,12}?(\\d+)\\s*级`, 'i').exec(ch.notes);
+    if (forward !== null) return Math.max(1, Number(forward[1]));
+    const backward = new RegExp(`(\\d+)\\s*级[^，,。\\n；;]{0,12}?(?:${src})`, 'i').exec(ch.notes);
+    if (backward !== null) return Math.max(1, Number(backward[1]));
+  }
+  return fallback;
 }
 
 type Token =
@@ -222,9 +279,9 @@ export function evalIntFormula(expr: string | number, ctx: FormulaContext): numb
 
 export function validateFormula(expr: string): void {
   evalFormula(expr, {
-    level: 6, prof: 3, slot_level: 3,
+    level: 6, class_level: 6, prof: 3, slot_level: 3,
     str_mod: 3, dex_mod: 2, con_mod: 2, int_mod: 0, wis_mod: 4, cha_mod: 3,
     str: 16, dex: 14, con: 14, int: 10, wis: 18, cha: 16,
-    hp: 30, max_hp: 50,
+    hp: 30, max_hp: 50, target_hp: 20, target_max_hp: 40,
   });
 }

@@ -2,10 +2,16 @@
  * 持久化群记忆（借鉴 dsh-pet：把群聊沉淀到磁盘 JSONL，重启后可回灌长期上下文）
  * 路径：~/.dsh/qqbot-memory/<appId>-<groupId>.jsonl
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { SELF_SENDER_ID } from '../transport/self-sent.ts';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
+import {
+  groupMemoryCursorPath,
+  groupMemoryPath,
+  qqbotMemoryDir,
+  sanitizeStorageKey,
+} from '../shared/paths.ts';
 import { DEFAULT_PERSONA_NAME } from './persona-store.ts';
 
 /** 群消息里的图片（只存 QQ 下发的 URL，真正用到时再下载） */
@@ -106,20 +112,54 @@ export function resolveBotSenderName(
   return 'bot';
 }
 
-function sanitize(s: string): string {
-  return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
+interface GroupMemoryCacheEntry {
+  size: number;
+  mtimeMs: number;
+  ino: number;
+  entries: GroupMemoryEntry[];
 }
 
-function memoryPath(appId: string, groupId: string): string {
-  return resolve(homedir(), '.dsh', 'qqbot-memory', `${sanitize(appId)}-${sanitize(groupId)}.jsonl`);
+const MAX_CACHED_GROUPS = 64;
+const memoryCache = new Map<string, GroupMemoryCacheEntry>();
+
+function touchCache(path: string, entry: GroupMemoryCacheEntry): void {
+  memoryCache.delete(path);
+  memoryCache.set(path, entry);
+  while (memoryCache.size > MAX_CACHED_GROUPS) {
+    const oldest = memoryCache.keys().next().value;
+    if (oldest === undefined) break;
+    memoryCache.delete(oldest);
+  }
+}
+
+/** 清空群记忆内存缓存（供测试隔离） */
+export function clearGroupMemoryCache(): void {
+  memoryCache.clear();
 }
 
 /** 追加一条群消息到持久化记忆（JSONL，写失败静默不阻断消息处理） */
 export function appendGroupMessage(appId: string, groupId: string, entry: GroupMemoryEntry): void {
   try {
-    const p = memoryPath(appId, groupId);
+    const p = groupMemoryPath(appId, groupId);
     mkdirSync(dirname(p), { recursive: true });
-    appendFileSync(p, JSON.stringify(entry) + '\n', 'utf8');
+    const line = `${JSON.stringify(entry)}\n`;
+    appendFileSync(p, line, 'utf8');
+    const cached = memoryCache.get(p);
+    if (cached !== undefined) {
+      try {
+        const st = statSync(p);
+        if (st.ino === cached.ino && st.size === cached.size + Buffer.byteLength(line, 'utf8')) {
+          cached.entries.push(entry);
+          cached.size = st.size;
+          cached.mtimeMs = st.mtimeMs;
+          touchCache(p, cached);
+        } else {
+          memoryCache.delete(p);
+        }
+      } catch {
+        memoryCache.delete(p);
+      }
+    }
   } catch {
     /* ignore */
   }
@@ -151,11 +191,20 @@ export function appendBotGroupMessage(
   return entry;
 }
 
-/** 读取全部群记忆（坏行跳过，读失败返回空） */
+/** 读取全部群记忆（带基于 stat 校验的内存缓存，坏行跳过，读失败返回空） */
 export function readAllGroupMessages(appId: string, groupId: string): GroupMemoryEntry[] {
   try {
-    const p = memoryPath(appId, groupId);
-    if (!existsSync(p)) return [];
+    const p = groupMemoryPath(appId, groupId);
+    if (!existsSync(p)) {
+      memoryCache.delete(p);
+      return [];
+    }
+    const st = statSync(p);
+    const cached = memoryCache.get(p);
+    if (cached !== undefined && cached.size === st.size && cached.mtimeMs === st.mtimeMs && cached.ino === st.ino) {
+      touchCache(p, cached);
+      return [...cached.entries];
+    }
     const entries: GroupMemoryEntry[] = [];
     for (const line of readFileSync(p, 'utf8').split('\n')) {
       const t = line.trim();
@@ -167,7 +216,8 @@ export function readAllGroupMessages(appId: string, groupId: string): GroupMemor
         /* 跳过坏行 */
       }
     }
-    return entries;
+    touchCache(p, { size: st.size, mtimeMs: st.mtimeMs, ino: st.ino, entries });
+    return [...entries];
   } catch {
     return [];
   }
@@ -214,14 +264,10 @@ export interface GroupHistoryCursor {
   messageId: string;
 }
 
-function cursorPath(appId: string, groupId: string): string {
-  return resolve(homedir(), '.dsh', 'qqbot-memory', `${sanitize(appId)}-${sanitize(groupId)}.cursor.json`);
-}
-
 /** 读取群历史游标（不存在或损坏返回 undefined） */
 export function readHistoryCursor(appId: string, groupId: string): GroupHistoryCursor | undefined {
   try {
-    const p = cursorPath(appId, groupId);
+    const p = groupMemoryCursorPath(appId, groupId);
     if (!existsSync(p)) return undefined;
     const c = JSON.parse(readFileSync(p, 'utf8')) as Partial<GroupHistoryCursor>;
     return typeof c.sessionId === 'string' && typeof c.messageId === 'string'
@@ -232,12 +278,10 @@ export function readHistoryCursor(appId: string, groupId: string): GroupHistoryC
   }
 }
 
-/** 写入群历史游标（失败静默：最坏情况是下次多注入几条重复历史） */
+/** 写入群历史游标（原子落盘，失败静默：最坏情况是下次多注入几条重复历史） */
 export function writeHistoryCursor(appId: string, groupId: string, cursor: GroupHistoryCursor): void {
   try {
-    const p = cursorPath(appId, groupId);
-    mkdirSync(dirname(p), { recursive: true });
-    writeFileSync(p, JSON.stringify(cursor), 'utf8');
+    writeJsonAtomic(groupMemoryCursorPath(appId, groupId), cursor);
   } catch {
     /* ignore */
   }
@@ -250,9 +294,9 @@ export function writeHistoryCursor(appId: string, groupId: string, cursor: Group
  */
 export function listMemoryChats(appId: string): string[] {
   try {
-    const dir = resolve(homedir(), '.dsh', 'qqbot-memory');
+    const dir = qqbotMemoryDir();
     if (!existsSync(dir)) return [];
-    const prefix = `${sanitize(appId)}-`;
+    const prefix = `${sanitizeStorageKey(appId)}-`;
     return readdirSync(dir)
       .filter((f) => f.startsWith(prefix) && f.endsWith('.jsonl'))
       .map((f) => f.slice(prefix.length, -'.jsonl'.length));

@@ -6,9 +6,10 @@
  * 剧情状态（flag、线索、任务、NPC）的读写在 story.ts，这里只存字段。
  * 写法参考 sticker-store：先写 .tmp 再 rename，避免写一半崩掉留下坏文件。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
 import { parseProgress } from './progress-patch.ts';
 import { rollD20, rollExpression, type Roller, cryptoRoller } from './dice.ts';
 import type { ChronicleEntry } from './chronicle.ts';
@@ -29,6 +30,7 @@ import { ABILITIES, type Ability, type Skill, abilityModifier, parseAbility, par
 import { type MoveRequest, battleGridLines, battleLines, canReact, cellOf, distancesFrom, hiddenFromPlayers } from './battlefield.ts';
 import {
   type ActiveState,
+  type ConcentrationRecord,
   type TurnActionState,
   INCAPACITATING_CONDITIONS,
   ZERO_SPEED_CONDITIONS,
@@ -36,15 +38,18 @@ import {
   breakConcentration,
   computeDefenseStateMod,
   concentratingOn,
-  concentratingZoneNames,
+  concentratingSpellNames,
   effectiveMaxHp,
   effectiveStates,
   exhaustionLevel,
+  externalConcentrationTags,
   hasCondition,
   isIncapacitated,
   normalizeCondition,
+  notifyConcentrationTargetDown,
   removeActiveState,
   stateAcBonus,
+  syncConcentrationAfterRemoval,
   tickActiveStatesOnTurnChange,
   upsertActiveState,
 } from './conditions.ts';
@@ -53,9 +58,9 @@ import { pendingSummaryLine } from './pending-attack.ts';
 import { DEFENSE_NAMES } from './save-effect.ts';
 import type { BattleMap } from './terrain.ts';
 import { type NpcState, afterChange, describeCondition, evalCondition, locationKnown, roomView, storySummaryLines } from './story.ts';
-import { type BattleZone, settleTurnBoundaryHazards } from './zones.ts';
+import { type BattleZone, type BattleZoneInput, settleTurnBoundaryHazards } from './zones.ts';
 
-export type { ActiveState, TurnActionState };
+export type { ActiveState, ConcentrationRecord, TurnActionState };
 
 export type CharacterKind = 'pc' | 'npc' | 'monster';
 
@@ -84,6 +89,8 @@ export interface Character {
   conditions: string[];
   /** 结构化生效状态（含持续轮数、专注归属、动态命中/AC加值）；旧存档缺省时自动从 conditions 推导 */
   activeStates?: ActiveState[];
+  /** 施法者本人维持的专注记录（使脆弱诅咒/猎人印记等可转移专注在原目标倒下、清尸或跨场战斗后依然保留在施法者身上） */
+  concentrationState?: ConcentrationRecord;
   /** 怪物/NPC 的命中加值与伤害（PC 按属性+熟练算） */
   attackBonus?: number;
   damage?: string;
@@ -157,16 +164,16 @@ export interface InitiativeEntry {
 /**
  * foe_attacks：敌人打队友时（尖刻言语）；attacked：自己被命中且非重击时（护盾术）；
  * attacking：自己攻击没中时（导引打击）；damaged：自己确认受伤害后（迷雾逃生、炼狱叱喝）；
- * enemy_crit：敌人打出重击时（时间变幻）
+ * enemy_crit：敌人打出重击时（时间变幻）；foe_casts：敌方在 60 尺内施法时（法术反制）
  */
 export interface ReactionDef {
   name: string;
-  when?: 'foe_attacks' | 'attacked' | 'attacking' | 'damaged' | 'enemy_crit';
+  when?: 'foe_attacks' | 'attacked' | 'attacking' | 'damaged' | 'enemy_crit' | 'foe_casts';
   /** 用掉的资源；卡上这项不够 cost 就不问他 */
   resource?: string;
   /** 每次使用消耗的资源点数（缺省 1；如防御法杖施放护盾术为 2） */
   cost?: number;
-  /** 够得着的距离（尺），量的是「反应者到自己那次攻击的发起者」；不填 = 不按距离筛 */
+  /** 够得着的距离（尺），量的是「反应者到自己那次攻击/施法发起者」；不填 = 不按距离筛 */
   range?: number;
   /**
    * 这个反应是一次新的攻击（哨兵：5 尺内有人打别人时反打一记），不是改数值。
@@ -181,12 +188,12 @@ export interface ReactionDef {
 }
 
 /**
- * 没写 reactions 的旧角色卡从备注认这几个常见能力，旧存档不用先补卡就有反应窗口。
- * 新卡用 dnd_character reactions 明写，写了就不再猜（空数组 = 明确没有）。
+ * 从角色卡 reactions / spells / notes 识别常见反应能力；显式传空数组 `reactions: []` 表示明确禁用自动推断。
  */
 const INFERRED_REACTIONS: Array<{ pattern: RegExp; def: ReactionDef }> = [
   { pattern: /尖刻言语|Cutting Words/i, def: { name: '尖刻言语', when: 'foe_attacks', resource: '诗人激励', range: 60 } },
-  { pattern: /护盾术/, def: { name: '护盾术', when: 'attacked' } },
+  { pattern: /护盾术|(?<!Fire\s)\bShield\b(?!\s+of\b)/i, def: { name: '护盾术', when: 'attacked' } },
+  { pattern: /法术反制|反制法术|Counterspell/i, def: { name: '法术反制', when: 'foe_casts', range: 60 } },
   { pattern: /导引打击|Guided Strike/i, def: { name: '导引打击', when: 'attacking', resource: '引导神力' } },
   // 时间变幻平时不每刀都弹，敌人重击时自动挂起防秒杀；普通检定/豁免仍由 DM 用 hold_for 挂起
   { pattern: /时间变幻|Chronal Shift/i, def: { name: '时间变幻', when: 'enemy_crit', resource: '时间变幻', range: 30 } },
@@ -216,10 +223,22 @@ function hasPositiveReactionMention(notes: string, pattern: RegExp): boolean {
 }
 
 export function reactionsOf(ch: Character): ReactionDef[] {
-  if (ch.reactions !== undefined) return ch.reactions;
-  const notes = ch.notes ?? '';
-  if (!notes) return [];
-  return INFERRED_REACTIONS.filter(({ pattern }) => hasPositiveReactionMention(notes, pattern)).map(({ def }) => def);
+  if (ch.reactions !== undefined && ch.reactions.length === 0) return [];
+  const out: ReactionDef[] = ch.reactions !== undefined ? [...ch.reactions] : [];
+  const pushUnique = (def: ReactionDef): void => {
+    if (!out.some((x) => x.name === def.name)) out.push(def);
+  };
+  for (const s of ch.spells ?? []) {
+    for (const { pattern, def } of INFERRED_REACTIONS) {
+      if (pattern.test(s.name)) pushUnique(def);
+    }
+  }
+  if (ch.reactions === undefined && ch.notes) {
+    for (const { pattern, def } of INFERRED_REACTIONS) {
+      if (hasPositiveReactionMention(ch.notes, pattern)) pushUnique(def);
+    }
+  }
+  return out;
 }
 
 export interface ReactorOption {
@@ -259,6 +278,7 @@ export interface PendingRider {
   damageType: string;
   defense?: 'resistant' | 'immune' | 'vulnerable';
   oncePerTurnRule?: string;
+  critOnly?: boolean;
 }
 
 /** 掷完骰、还没落账的一次攻击 */
@@ -292,6 +312,10 @@ export interface PendingAttack extends PendingBase {
   attackMod: number;
   acMod: number;
   damageMod: number;
+  spellName?: string;
+  spellLevel?: number;
+  countered?: boolean;
+  counteredBy?: string;
 }
 
 /** 玩家预先授权的命中追加；防守方反应全部结束后才掷骰和扣资源。 */
@@ -333,17 +357,56 @@ export interface PendingCheck extends PendingBase {
   onFail?: string[];
   /** 豁免失败附加状态绑定的专注施法者 */
   concentrationSource?: string;
+  /** 是否为受击体质专注豁免（挂起后若落账结果为失败，自动打断施法者专注） */
+  concentrationCheck?: boolean;
   /** 豁免失败附加状态的持续轮数 */
   failRounds?: number;
   damageMod: number;
+  spellName?: string;
+  spellLevel?: number;
+  countered?: boolean;
+  counteredBy?: string;
 }
 
-export type PendingRoll = PendingAttack | PendingCheck;
+/** 敌方施放持续区域、群体增益或魔法飞弹等待反应窗口（支持法术反制 / 护盾术挡魔法飞弹） */
+export interface PendingSpell extends PendingBase {
+  kind: 'spell';
+  spellName: string;
+  spellLevel?: number;
+  countered?: boolean;
+  counteredBy?: string;
+  shieldedTargets?: string[];
+  effect:
+    | { kind: 'zone'; zoneInput: BattleZoneInput; spellWarn?: string }
+    | {
+        kind: 'state';
+        stateName: string;
+        targets: string[];
+        concentration: boolean;
+        rounds?: number;
+        expires?: ActiveState['expires'];
+        hitBonus?: number;
+        acBonus?: number;
+        slotLevel?: number;
+        saveDc?: number;
+        warnings?: string[];
+      }
+    | {
+        kind: 'magic_missile';
+        targets: Array<{ name: string; damage: number; defense?: 'resistant' | 'immune' | 'vulnerable' }>;
+        damageDetail?: string;
+        damageType: string;
+      };
+}
 
-/** 移动在触发借机的格子暂停；反应攻击仍使用 pending，可以再被护盾等反应打断。 */
+export type PendingRoll = PendingAttack | PendingCheck | PendingSpell;
+
+/** 移动在触发借机或等待队友确认换位时暂停；反应攻击仍使用 pending，可以再被护盾等反应打断。 */
 export interface PendingMovement extends PendingBase {
   kind: 'move';
   resume: MoveRequest;
+  /** 友方换位确认窗口：记录待同意的友方角色名（不消耗对方反应） */
+  swapWith?: string;
 }
 
 export type ReactionWindow = PendingRoll | PendingMovement;
@@ -354,9 +417,15 @@ export function reactionWindow(c: Campaign | undefined): ReactionWindow | undefi
 
 /** 这笔是什么，给提示和报错用 */
 export function describePending(p: ReactionWindow): string {
-  if (p.kind === 'move') return `${p.target} 的移动（借机）`;
-  if (p.kind === 'attack') return `${p.attacker}→${p.target} 的攻击`;
+  if (p.kind === 'move') return p.swapWith !== undefined ? `${p.target} 请求与 ${p.swapWith} 交换站位` : `${p.target} 的移动（借机）`;
+  if (p.kind === 'spell') return `${p.attacker} 施放的「${p.spellName}」`;
+  if (p.kind === 'attack') {
+    return p.spellName !== undefined
+      ? `${p.attacker}→${p.target} 的「${p.spellName}」攻击`
+      : `${p.attacker}→${p.target} 的攻击`;
+  }
   const who = p.rolls.map((r) => r.name).join('、');
+  if (p.spellName !== undefined) return `${p.attacker} 施放的「${p.spellName}」（${who} ${p.label}）`;
   return p.attacker === who ? `${who} 的${p.label}` : `${p.attacker} 的效果（${who} ${p.label}）`;
 }
 
@@ -747,6 +816,8 @@ export function upsertCharacter(c: Campaign, input: CharacterInput): { character
 export function removeCharacter(c: Campaign, name: string): Character {
   const ch = requireCharacter(c, name);
   if (isOut(ch)) recordNpcDeath(c, ch);
+  breakConcentration(c, ch.name, '角色离场');
+  notifyConcentrationTargetDown(c, ch);
   c.characters = c.characters.filter((x) => x !== ch);
   if (c.initiative !== undefined) removeFromInitiative(c.initiative, ch.name);
   if (c.hexbladeCurses !== undefined) {
@@ -853,12 +924,15 @@ export function applyDamage(c: Campaign, name: string, amount: number, options: 
     if (ch.hp === 0 || isIncapacitated(ch)) {
       events.push(...breakConcentration(c, ch.name, '失去行动能力'));
     } else {
-      const spells = [...new Set([...concentratingOn(c, ch.name).map((x) => x.state.name), ...concentratingZoneNames(c, ch.name)])];
+      const spells = concentratingSpellNames(c, ch.name);
       if (spells.length > 0) {
         concentrationDc = Math.max(10, Math.floor(dmg / 2));
         events.push(`专注受击（${spells.join('、')}）：需过体质专注豁免 DC ${concentrationDc}`);
       }
     }
+  }
+  if (ch.hp === 0 && before > 0) {
+    events.push(...notifyConcentrationTargetDown(c, ch));
   }
   pushLog(c, `${ch.name} 受到 ${dmg} 点伤害（${hpTrail(ch, before)}）${events.length > 0 ? `，${events.join('、')}` : ''}`);
   if (ch.hp === 0 || isIncapacitated(ch)) {
@@ -1034,6 +1108,13 @@ export function changeCondition(
     checkAllAirborneCrashes(c, options.roller ?? cryptoRoller, options.globalEffects);
   } else {
     const removed = removeActiveState(ch, condition);
+    syncConcentrationAfterRemoval(c, ch, removed);
+    if (
+      removed.length === 0
+      && (norm === '专注' || norm.toLowerCase() === 'concentration' || (ch.concentrationState !== undefined && normalizeCondition(ch.concentrationState.name) === norm))
+    ) {
+      for (const line of breakConcentration(c, ch.name, '主动解除专注')) pushLog(c, line);
+    }
     for (const r of removed) pushLog(c, `${ch.name} 解除状态「${r}」`);
     checkAllAirborneCrashes(c, options.roller ?? cryptoRoller, options.globalEffects);
   }
@@ -1693,16 +1774,51 @@ export function endInitiative(c: Campaign, options: { keepChanges?: boolean } = 
     return { rounds, defeated, survivingMonsters, rehearsal: true, restored: true };
   }
 
-  for (const ch of dead) recordNpcDeath(c, ch);
+  for (const ch of dead) {
+    recordNpcDeath(c, ch);
+    notifyConcentrationTargetDown(c, ch);
+  }
   c.characters = c.characters.filter((ch) => !(ch.kind === 'monster' && isOut(ch)));
   for (const ch of c.characters) {
     if (ch.activeStates !== undefined) {
       const endNames = ch.activeStates
         .filter((s) => s.expires === 'end_of_combat' || s.name === '闪避')
         .map((s) => s.name);
-      for (const name of endNames) removeActiveState(ch, name);
+      for (const name of endNames) {
+        const removed = removeActiveState(ch, name);
+        syncConcentrationAfterRemoval(c, ch, removed);
+      }
     } else if (ch.conditions.includes('闪避')) {
       removeActiveState(ch, '闪避');
+    }
+  }
+  // 核对各存活施法者的 concentrationState：可转移专注（脆弱诅咒/猎人印记）在原目标被清理后继续保留在施法者身上，其余失去受术目标或战场区域的专注自动收尾
+  for (const ch of c.characters) {
+    const cs = ch.concentrationState;
+    if (cs === undefined) continue;
+    const norm = normalizeCondition(cs.name);
+    const remaining = concentratingOn(c, ch.name).filter((x) => normalizeCondition(x.state.name) === norm);
+    if (remaining.length > 0) {
+      const liveOne = remaining.find((x) => !isOut(x.owner) && x.owner.hp > 0);
+      if (cs.transferable === true) {
+        ch.concentrationState = {
+          name: norm,
+          ...(cs.slotLevel !== undefined ? { slotLevel: cs.slotLevel } : {}),
+          ...(remaining[0]!.state.roundsLeft !== undefined ? { roundsLeft: remaining[0]!.state.roundsLeft } : (cs.roundsLeft !== undefined ? { roundsLeft: cs.roundsLeft } : {})),
+          transferable: true,
+          ...(liveOne !== undefined ? { currentTarget: liveOne.owner.name, canTransfer: false } : { canTransfer: true }),
+        };
+      }
+    } else if (cs.transferable === true) {
+      ch.concentrationState = {
+        name: norm,
+        ...(cs.slotLevel !== undefined ? { slotLevel: cs.slotLevel } : {}),
+        ...(cs.roundsLeft !== undefined ? { roundsLeft: cs.roundsLeft } : {}),
+        transferable: true,
+        canTransfer: true,
+      };
+    } else {
+      delete ch.concentrationState;
     }
   }
   pushLog(c, `战斗结束（${rounds} 轮）${defeated.length > 0 ? `，击败 ${defeated.join('、')}` : ''}`);
@@ -2156,6 +2272,27 @@ const TRAIT_ALIASES: Record<string, string> = {
   'elven accuracy': ELVEN_ACCURACY,
   精灵准: ELVEN_ACCURACY,
   精灵精准专长: ELVEN_ACCURACY,
+  'colossus slayer': '巨兽杀手',
+  colossus_slayer: '巨兽杀手',
+  巨像屠夫: '巨兽杀手',
+  巨象屠夫: '巨兽杀手',
+  'sneak attack': '偷袭',
+  sneak_attack: '偷袭',
+  'improved divine smite': '精通至圣斩',
+  强化至圣斩: '精通至圣斩',
+  高等至圣斩: '精通至圣斩',
+  'blessed strikes': '祝福打击',
+  受祝打击: '祝福打击',
+  'divine fury': '神圣狂怒',
+  'savage attacks': '凶蛮攻击',
+  野蛮攻击: '凶蛮攻击',
+  'improved critical': '精通重击',
+  'superior critical': '卓越重击',
+  'war caster': '战地施法者',
+  战争施法者: '战地施法者',
+  'pack tactics': '集群战术',
+  'blood frenzy': '血腥狂乱',
+  嗜血狂乱: '血腥狂乱',
 };
 
 /** 把别名统一成工具认的特性名（「巨武器战斗风格」→「巨武器战斗」） */
@@ -2247,14 +2384,19 @@ export function requireResource(ch: Character, key: string): [string, Resource] 
   return found;
 }
 
-/** 建立或改写资源；current 省略时新建取满、已有保持不变（不超过新上限） */
+/** 建立或改写资源；current 省略时新建取满，已有资源若上限提高（如升级/兼职解锁法术位）自动加上新增差额，避免 0/0 升为 0/2 */
 export function setResource(c: Campaign, name: string, key: string, max: number, reset: Resource['reset'], current?: number): Resource {
   const ch = requireCharacter(c, name);
   const k = key.trim();
   if (k.length === 0) throw new Error('资源名不能为空');
   const cap = clampInt(max, 0, 999);
   const existing = ch.resources?.[k];
-  const value = current !== undefined ? clampInt(current, 0, cap) : Math.min(existing?.current ?? cap, cap);
+  const gained = existing !== undefined ? Math.max(0, cap - existing.max) : 0;
+  const value = current !== undefined
+    ? clampInt(current, 0, cap)
+    : existing !== undefined
+      ? clampInt(existing.current + gained, 0, cap)
+      : cap;
   const resource: Resource = { current: value, max: cap, reset };
   ch.resources = { ...ch.resources, [k]: resource };
   return resource;
@@ -2318,9 +2460,39 @@ export function rest(
       }
     }
     if (kind === 'short') {
+      // 短休（1 小时 = 600 轮）：清除 1 小时及以内的短时状态，保留超过 600 轮的长效状态/专注（如 3 环 8 小时脆弱诅咒/猎人印记）并扣减 600 轮
       if (ch.activeStates !== undefined) {
-        const timed = ch.activeStates.filter((s) => s.roundsLeft !== undefined || s.expires !== undefined).map((s) => s.name);
-        for (const t of timed) removeActiveState(ch, t);
+        const kept: ActiveState[] = [];
+        const expiredNames: string[] = [];
+        for (const s of ch.activeStates) {
+          if (s.expires !== undefined) {
+            expiredNames.push(s.name);
+          } else if (s.roundsLeft !== undefined) {
+            if (s.roundsLeft > 600) kept.push({ ...s, roundsLeft: s.roundsLeft - 600 });
+            else expiredNames.push(s.name);
+          } else {
+            kept.push(s);
+          }
+        }
+        if (kept.length > 0) ch.activeStates = kept;
+        else delete ch.activeStates;
+        for (const t of expiredNames) {
+          const norm = normalizeCondition(t);
+          if (!(ch.activeStates?.some((x) => normalizeCondition(x.name) === norm) ?? false)) {
+            ch.conditions = ch.conditions.filter((cond) => normalizeCondition(cond) !== norm);
+          }
+        }
+      }
+      if (ch.concentrationState !== undefined) {
+        const cs = ch.concentrationState;
+        if (cs.roundsLeft !== undefined) {
+          if (cs.roundsLeft > 600) {
+            cs.roundsLeft -= 600;
+            lines.push(`维持专注「${cs.name}」（剩余约 ${Math.round((cs.roundsLeft / 600) * 10) / 10} 小时）`);
+          } else {
+            delete ch.concentrationState;
+          }
+        }
       }
       const dice = Math.max(0, Math.trunc(spendFor.get(ch) ?? 0));
       if (dice > 0) {
@@ -2339,14 +2511,19 @@ export function rest(
           rolls.push(`${ch.hitDie}[${face}]${con >= 0 ? '+' : ''}${con}`);
         }
         ch.hitDiceUsed = (ch.hitDiceUsed ?? 0) + dice;
+        for (const [rk, rr] of Object.entries(ch.resources ?? {})) {
+          if (rk.startsWith('生命骰') && rr.max === ch.level) rr.current = Math.max(0, ch.level - ch.hitDiceUsed);
+        }
         const before = ch.hp;
         const effMax = effectiveMaxHp(ch);
         if (!ch.conditions.includes('死亡')) ch.hp = Math.min(effMax, ch.hp + healed);
         lines.push(`生命骰 ${rolls.join(' ')} = ${healed}，HP ${before}→${ch.hp}/${effMax}（剩 ${ch.level - ch.hitDiceUsed} 颗）`);
       }
     } else {
+      breakConcentration(c, ch.name);
+      delete ch.concentrationState;
       if (ch.activeStates !== undefined) {
-        const timed = ch.activeStates.filter((s) => s.roundsLeft !== undefined || s.expires !== undefined).map((s) => s.name);
+        const timed = ch.activeStates.filter((s) => s.roundsLeft !== undefined || s.expires !== undefined || s.concentration === true).map((s) => s.name);
         for (const t of timed) removeActiveState(ch, t);
       }
       const exh = exhaustionLevel(ch);
@@ -2471,7 +2648,9 @@ export function ensureSessionSummary(c: Campaign, now = Date.now()): boolean {
 
 function hpTag(ch: Character, c?: Campaign, globalEffects?: Record<string, CustomEffectDef>): string {
   const temp = ch.tempHp > 0 ? `+${ch.tempHp}` : '';
-  const cond = ch.conditions.length > 0 ? ` [${ch.conditions.join(',')}]` : '';
+  const extConc = c !== undefined ? externalConcentrationTags(c, ch) : [];
+  const tags = [...ch.conditions, ...extConc];
+  const cond = tags.length > 0 ? ` [${tags.join(',')}]` : '';
   return `${ch.name} ${ch.hp}${temp}/${ch.maxHp} AC${armorClass(c, ch, globalEffects)}${cond}`;
 }
 
@@ -2638,7 +2817,7 @@ export function playerStatus(c: Campaign, adv: Adventure, viewer?: string, forma
     }
     lines.push(`⚔ 第 ${s.round} 轮：${s.order.map((e, i) => (i === s.turn ? `▶${e.name}` : e.name)).join(' → ')}`);
     if (s.pending !== undefined) lines.push(`⏳ ${describePending(s.pending)}还没结算，等反应`);
-    if (s.movement !== undefined) lines.push(`⏳ ${s.movement.target} 暂停移动，等借机反应`);
+    if (s.movement !== undefined) lines.push(`⏳ ${s.movement.swapWith !== undefined ? `${s.movement.target} 请求与 ${s.movement.swapWith} 交换站位` : `${s.movement.target} 暂停移动，等借机反应`}`);
     return lines.join('\n');
   }
   const room = findRoom(graph, c.currentRoom);
@@ -2648,7 +2827,10 @@ export function playerStatus(c: Campaign, adv: Adventure, viewer?: string, forma
     const positions = partyPositions(c);
     for (const [roomId, members] of positions) {
       const where = positions.size > 1 ? `${findRoom(graph, roomId)?.name ?? roomId}：` : '';
-      lines.push(`${where}${members.map((ch) => `${ch.name} ${ch.hp}/${ch.maxHp}${ch.conditions.length > 0 ? `[${ch.conditions.join(',')}]` : ''}${resourceTag(ch)}`).join('；')}`);
+      lines.push(`${where}${members.map((ch) => {
+        const tags = [...ch.conditions, ...externalConcentrationTags(c, ch)];
+        return `${ch.name} ${ch.hp}/${ch.maxHp}${tags.length > 0 ? `[${tags.join(',')}]` : ''}${resourceTag(ch)}`;
+      }).join('；')}`);
     }
     const foes = c.characters.filter((ch) => ch.kind === 'monster' && !isOut(ch) && positions.has(ch.room ?? ''));
     if (foes.length > 0) lines.push(`敌人：${foes.map((ch) => `${ch.name}（${woundLabel(ch)}${ch.conditions.length > 0 ? `，${ch.conditions.join(',')}` : ''}）`).join('、')}`);
@@ -2679,7 +2861,7 @@ export function playerStatus(c: Campaign, adv: Adventure, viewer?: string, forma
   const mine = viewer === undefined ? [] : c.characters.filter((ch) => ch.playerId === viewer && !isOut(ch) && cellOf(c, ch) !== undefined);
   for (const ch of mine) lines.push(distancesFrom(c, ch.name, visible));
   if (s.pending !== undefined) lines.push(`⏳ ${describePending(s.pending)}还没结算，等反应`);
-  if (s.movement !== undefined) lines.push(`⏳ ${s.movement.target} 暂停移动，等借机反应`);
+  if (s.movement !== undefined) lines.push(`⏳ ${s.movement.swapWith !== undefined ? `${s.movement.target} 请求与 ${s.movement.swapWith} 交换站位` : `${s.movement.target} 暂停移动，等借机反应`}`);
   return lines.join('\n');
 }
 
@@ -2719,17 +2901,8 @@ export class CampaignStore {
   }
 
   public save(c: Campaign, now = Date.now()): void {
-    mkdirSync(this.root, { recursive: true });
     c.updatedAt = now;
-    const path = this.pathOf(c.key);
-    const tmp = `${path}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(c, null, 2)}\n`, 'utf8');
-    try {
-      renameSync(tmp, path);
-    } catch {
-      // Windows 上目标被占用时 rename 可能失败：退化为直接覆盖
-      writeFileSync(path, readFileSync(tmp));
-    }
+    writeJsonAtomic(this.pathOf(c.key), c, { indent: 2, trailingNewline: true });
   }
 
   /** 把旧团改名存档（重新开新团时用），返回存档文件名 */
@@ -2801,8 +2974,7 @@ export class CampaignStore {
   }
 
   private writeSnapshots(key: string, list: Snapshot[]): void {
-    mkdirSync(join(this.root, 'history'), { recursive: true });
-    writeFileSync(this.historyPath(key), JSON.stringify(list), 'utf8');
+    writeJsonAtomic(this.historyPath(key), list);
   }
 
   /** 撤销最近 steps 次改动，返回被撤销的改动标签（新→旧） */

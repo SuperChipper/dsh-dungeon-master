@@ -70,7 +70,7 @@ setFlag,
 setQuestStatus,siteCard,
 updateNpc
 } from '../story.ts';
-import { ABILITIES,ABILITY_NAMES,type Ability,type Skill,SKILLS,parseAbility,parseSkill,skillLabel } from '../rules.ts';
+import { ABILITIES,ABILITY_NAMES,type Ability,type Skill,SKILLS,abilityModifier,parseAbility,parseSkill,proficiencyBonus,skillLabel } from '../rules.ts';
 import { type SrdEntry,type SrdKind,candidatesText,resolveSrdQuery,zhTable } from '../srd-lookup.ts';
 import { type AbilityActionKind,type CardEntryKind,type SpellInput,type UrlCheck,spellLine } from '../spell-links.ts';
 import {
@@ -79,21 +79,36 @@ import {
   computeDefenseStateMod,
   effectiveMaxHp,
   ensureTurnState,
+  externalConcentrationTags,
   formatCharacterStates,
+  isDefaultConcentrationState,
+  markOncePerTurnUsed,
   recordTurnSpellCast,
   turnLedgerLine,
+  upsertActiveState,
 } from '../conditions.ts';
 import type { CustomEffectDef } from '../custom-effects.ts';
 import {
-type Placement,canReact,mapOf,turnPositionNote
+  type FormationInput,
+  type Placement,
+  type SideFormationSpec,
+  canReact,
+  mapOf,
+  parseFormationRank,
+  turnPositionNote,
+  upsertBattleZone,
 } from '../battlefield.ts';
 import { areaName,terrainLine } from '../terrain.ts';
+import { formatZoneSummary } from '../zones.ts';
 import {
 assertReactionAuthorized,assertWindowClosed,
+availableSpellSlots,
 consumesReaction,
-declineReaction,findReactor,
-holdNotice,isDamagedReaction,pendingHit,
+declineReaction,eligibleSpellReactors,findReactor,
+holdNotice,hostileSpellcasterHints,isCounterspellReaction,isDamagedReaction,isShieldReaction,isSpellcasterCharacter,pendingHit,
 manualReactors,mergeReactors,
+minReactionSpellSlot,
+parseSlotLevel,
 pendingState,
 reactionsOf,
 refreshReactors,
@@ -178,7 +193,7 @@ export function parseReactions(value: unknown): ReactionDef[] | undefined {
     const name = typeof o.name === 'string' ? o.name.trim() : '';
     if (name.length === 0) throw new Error('reactions 每一项要有 name');
     const def: ReactionDef = { name };
-    if (o.when === 'foe_attacks' || o.when === 'attacked' || o.when === 'attacking' || o.when === 'damaged' || o.when === 'enemy_crit') def.when = o.when;
+    if (o.when === 'foe_attacks' || o.when === 'attacked' || o.when === 'attacking' || o.when === 'damaged' || o.when === 'enemy_crit' || o.when === 'foe_casts') def.when = o.when;
     if (typeof o.resource === 'string' && o.resource.trim().length > 0) def.resource = o.resource.trim();
     if (typeof o.cost === 'number' && Number.isFinite(o.cost) && o.cost > 0) def.cost = Math.trunc(o.cost);
     if (typeof o.range === 'number' && Number.isFinite(o.range) && o.range > 0) def.range = Math.trunc(o.range);
@@ -250,13 +265,15 @@ export function rollCollectedRiders(
   ignoreStateMods = false,
   globalEffects?: Record<string, CustomEffectDef>,
 ): PendingRider[] {
-  return riders.map((r) => {
-    const expr = crit ? critExpression(r.expression) : r.expression;
+  const out: PendingRider[] = [];
+  for (const r of riders) {
+    if (r.critOnly === true && !crit) continue;
+    const expr = !r.critOnly && crit ? critExpression(r.expression) : r.expression;
     const rolled = rollExpression(expr, roller);
     const defMod = ignoreStateMods
       ? { defense: undefined }
       : computeDefenseStateMod(target, r.damageType, undefined, c, globalEffects);
-    return {
+    out.push({
       label: r.label,
       expression: r.expression,
       rawDamage: rolled.total,
@@ -264,8 +281,10 @@ export function rollCollectedRiders(
       damageType: r.damageType,
       ...(defMod.defense !== undefined ? { defense: defMod.defense } : {}),
       ...(r.oncePerTurnRule !== undefined ? { oncePerTurnRule: r.oncePerTurnRule } : {}),
-    };
-  });
+      ...(r.critOnly === true ? { critOnly: true } : {}),
+    });
+  }
+  return out;
 }
 
 /** 同一击的不同伤害分开过抗性，再合并扣血，避免多记死亡豁免或先触发一次不死坚韧。 */
@@ -285,10 +304,11 @@ export function settleAttackDamage(
   let type = amount > 0 ? damageType : undefined;
   const lines: string[] = [];
   for (const r of riders) {
+    if (r.critOnly === true && !crit) continue;
     let rRaw = r.rawDamage;
     let rDetail = r.detail;
     if (rRaw === undefined) {
-      const rolled = rollExpression(crit ? critExpression(r.expression) : r.expression, roller);
+      const rolled = rollExpression(!r.critOnly && crit ? critExpression(r.expression) : r.expression, roller);
       rRaw = rolled.total;
       rDetail = rolled.detail;
     }
@@ -296,8 +316,8 @@ export function settleAttackDamage(
     amount += added;
     if (added > 0 && /光耀|radiant/i.test(r.damageType)) type = '光耀';
     lines.push(`附伤「${r.label}」${rDetail ?? rRaw} ${r.damageType}${r.defense !== undefined ? `，${DEFENSE_NAMES[r.defense]} → ${added}` : ''}`);
-    if (r.oncePerTurnRule !== undefined && c.initiative?.turnState?.actor === attacker) {
-      c.initiative.turnState.oncePerTurnUsed = [...new Set([...(c.initiative.turnState.oncePerTurnUsed ?? []), r.oncePerTurnRule])];
+    if (r.oncePerTurnRule !== undefined) {
+      markOncePerTurnUsed(c, attacker, r.oncePerTurnRule);
     }
   }
   if (onHit !== undefined && (!onHit.criticalOnly || crit)) {
@@ -317,20 +337,62 @@ export function settleAttackDamage(
   return { lines, damage: amount, needsConcentrationSave: change.concentrationDc !== undefined };
 }
 
-export function parsePlacements(value: unknown): Placement[] {
-  if (!Array.isArray(value)) throw new Error('dnd_position: set 要给 placements 数组');
+function parseSideFormationSpec(raw: unknown, label: string): SideFormationSpec {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`${label} 必须是对象，包含 front / mid / back 数组`);
+  }
+  const o = raw as Record<string, unknown>;
+  const entry = str(o.entry ?? o.near ?? o.at);
+  const x = int(o.x);
+  const y = int(o.y);
+  const front = strList(o.front);
+  const mid = strList(o.mid ?? o.middle);
+  const back = strList(o.back ?? o.rear);
+  return {
+    ...(entry !== undefined ? { entry } : {}),
+    ...(x !== undefined ? { x } : {}),
+    ...(y !== undefined ? { y } : {}),
+    ...(front !== undefined ? { front } : {}),
+    ...(mid !== undefined ? { mid } : {}),
+    ...(back !== undefined ? { back } : {}),
+  };
+}
+
+export function parseFormationInput(value: unknown): FormationInput | undefined {
+  if (value === undefined) return undefined;
+  const base = parseSideFormationSpec(value, 'formation');
+  const o = value as Record<string, unknown>;
+  const autoRest = o.auto_rest === true || o.autoRest === true;
+  const enemies = o.enemies !== undefined ? parseSideFormationSpec(o.enemies, 'formation.enemies') : undefined;
+  return {
+    ...base,
+    ...(autoRest ? { autoRest: true } : {}),
+    ...(enemies !== undefined ? { enemies } : {}),
+  };
+}
+
+export function parsePlacements(value: unknown, allowOmit = false): Placement[] {
+  if (value === undefined && allowOmit) return [];
+  if (!Array.isArray(value)) throw new Error('dnd_position: set 要给 placements 数组或 formation 阵型');
   return value.map((raw) => {
     const o = (raw ?? {}) as Record<string, unknown>;
     const name = typeof o.name === 'string' ? o.name.trim() : '';
     if (name.length === 0) throw new Error('placements 每一项要有 name');
     const near = typeof o.near === 'string' && o.near.trim().length > 0 ? o.near.trim() : undefined;
-    if (o.x === undefined && o.y === undefined && near === undefined) throw new Error(`${name} 要给 x/y，或者 near（摆在门、地标或某人旁边）`);
+    const rank = o.rank === undefined ? undefined : parseFormationRank(o.rank);
+    if (o.rank !== undefined && rank === undefined) {
+      throw new Error(`${name} 的 rank 只能是 front / mid / back（或 前排 / 中排 / 后排）`);
+    }
+    if (o.x === undefined && o.y === undefined && near === undefined && rank === undefined) {
+      throw new Error(`${name} 要给 x/y、near，或 rank（front/mid/back 按阵型自动摆位）`);
+    }
     return {
       name,
       ...(o.x !== undefined ? { x: o.x as number } : {}),
       ...(o.y !== undefined ? { y: o.y as number } : {}),
       ...(o.z !== undefined ? { z: o.z as number } : {}),
       ...(near !== undefined ? { near } : {}),
+      ...(rank !== undefined ? { rank } : {}),
       ...(o.mark === true ? { mark: true } : {}),
     };
   });
@@ -500,9 +562,16 @@ export function sheet(ch: Character, who: (openid: string) => string = (id) => i
   const formattedStates = campaign !== undefined ? formatCharacterStates(campaign, ch) : (ch.conditions.join('、') || '无');
   if (formattedStates !== '无') lines.push(`状态：${campaign !== undefined && ch.activeStates === undefined && formattedStates === ch.conditions.join('、') ? ch.conditions.join('、') : formattedStates}`);
   if (ch.deathSaves !== undefined) lines.push(`死亡豁免：成功 ${ch.deathSaves.successes}/3 失败 ${ch.deathSaves.failures}/3`);
-  const resources = Object.entries(ch.resources ?? {}).map(([k, r]) => `${k} ${r.current}/${r.max}（${{ short: '短休回满', long: '长休回满', none: '不回复' }[r.reset]}）`);
+  const resourceEntries = Object.entries(ch.resources ?? {});
+  const hitDiceKeys = resourceEntries.map(([k]) => k).filter((k) => k.startsWith('生命骰'));
+  const preferredHitDieKey = hitDiceKeys.length > 1
+    ? (hitDiceKeys.find((k) => k.length > '生命骰'.length) ?? hitDiceKeys.at(-1))
+    : undefined;
+  const resources = resourceEntries
+    .filter(([k]) => preferredHitDieKey === undefined || !k.startsWith('生命骰') || k === preferredHitDieKey)
+    .map(([k, r]) => `${k} ${r.current}/${r.max}（${{ short: '短休回满', long: '长休回满', none: '不回复' }[r.reset]}）`);
   if (campaign?.initiative !== undefined && inInitiative(campaign, ch.name)) resources.push(`反应 ${campaign.initiative.reacted?.includes(ch.name) || !canReact(ch) || isSurprised(campaign, ch.name) ? 0 : 1}/1（自己下回合开始恢复）`);
-  if (ch.hitDie !== undefined) resources.push(`生命骰 ${ch.hitDie} ${ch.level - (ch.hitDiceUsed ?? 0)}/${ch.level}`);
+  if (ch.hitDie !== undefined && hitDiceKeys.length === 0) resources.push(`生命骰 ${ch.hitDie} ${ch.level - (ch.hitDiceUsed ?? 0)}/${ch.level}`);
   if (resources.length > 0) lines.push(`资源：${resources.join('、')}`);
   if ((ch.inventory?.length ?? 0) > 0 || ch.gp !== undefined) lines.push(`物品：${ch.inventory?.join('、') || '无'}${ch.gp !== undefined ? `；${ch.gp} gp` : ''}`);
   if (ch.traits !== undefined && ch.traits.length > 0) lines.push(`特性：${ch.traits.join('、')}`);
@@ -512,11 +581,12 @@ export function sheet(ch: Character, who: (openid: string) => string = (id) => i
   return lines.join('\n');
 }
 
-/** dnd_character show brief=true：一行状态，够回答「我还剩多少血/法术位」 */
+/** dnd_character show brief=true：一行状态，够回答「我还剩多少血/法术位/专注」 */
 export function characterBrief(c: Campaign, ch: Character): string {
   const room = roomOf(c, ch);
+  const tags = [...ch.conditions, ...externalConcentrationTags(c, ch)];
   return `${ch.name} HP ${ch.hp}/${ch.maxHp}${ch.tempHp > 0 ? `+${ch.tempHp}` : ''} AC ${armorClass(c, ch)}`
-    + `${ch.conditions.length > 0 ? ` [${ch.conditions.join(',')}]` : ''}${resourceTag(ch, c)}${isAbsent(ch) ? ' [暂离]' : (room !== undefined ? ` @${room}` : '')}`;
+    + `${tags.length > 0 ? ` [${tags.join(',')}]` : ''}${resourceTag(ch, c)}${isAbsent(ch) ? ' [暂离]' : (room !== undefined ? ` @${room}` : '')}`;
 }
 
 export function parseSkills(values: string[] | undefined): Skill[] | undefined {
@@ -752,7 +822,9 @@ export function battlemapHint(c: Campaign, adventure: Adventure, room: string): 
     ? `这张场地图用模组地图做底图（dnd_map 发给玩家看），只标了屋子轮廓外的墙（涂黑的格子自动算墙）：屋里的石柱、坑、隔墙、门和障碍要按房间描述用 dnd_position terrain 补上（width=${map.width} height=${map.height} 不变就保留底图）。`
     : '';
   return `【场地】${terrainLine(map)}。${artNote}`
-    + (door !== undefined ? `队伍是从「${areaName(door)}」进来的：PC 用 set placements near="${areaName(door)}" 摆在门边。` : 'PC 摆位可以用 near=门或地标的名字。');
+    + (door !== undefined
+      ? `队伍是从「${areaName(door)}」进来的：PC 用 set placements near="${areaName(door)}" 摆在门边（或一次调用 dnd_position action="set" 传 formation={entry:"${areaName(door)}", front:[前排], mid:[中排], back:[后排]} 自动按前中后成阵，同时在 placements 或 formation.enemies 给出敌方站位）。`
+      : 'PC 摆位可以用 near=门或地标的名字（推荐直接传 formation={front:[前排], mid:[中排], back:[后排]} 自动排布我方阵型，同时用 placements 或 formation.enemies 给出敌方站位）。');
 }
 
 /** 参战者里有人不在交战房间时的提醒：多半是赶过来了但没 dnd_move，战后位置会对不上 */
@@ -841,7 +913,11 @@ export function turnPrompt(ch: Character | undefined, name: string, options: Tur
  * 每个回合整段重复只是在上下文里堆 token。破例（反应/借机攻击打断了顺序、goto 修过指针）后下一个 PC 回合再给一次完整的。
  * 会改 c.initiative 上的记录，调用方要在 store.update 里用。
  */
-export function combatTurnPrompt(c: Campaign, name: string, extra: { recentSenders?: readonly string[]; force?: boolean } = {}): string {
+export function combatTurnPrompt(
+  c: Campaign,
+  name: string,
+  extra: { recentSenders?: readonly string[]; force?: boolean; globalEffects?: Record<string, CustomEffectDef> } = {},
+): string {
   const ch = findCharacter(c, name);
   const state = c.initiative;
   const kind = ch?.kind === 'pc' ? 'pc' : 'monster';
@@ -853,7 +929,7 @@ export function combatTurnPrompt(c: Campaign, name: string, extra: { recentSende
   if (!briefed.includes(kind)) state.briefed = [...briefed, kind];
   if (kind === 'pc') delete state.rebrief;
   else if (extra.force === true) state.rebrief = true;
-  const position = turnPositionNote(c, name);
+  const position = turnPositionNote(c, name, extra.globalEffects);
   const reaction = ch?.kind === 'pc' ? `\n反应 ${canReact(ch) && reactionBlocked(c, ch.name) === undefined ? 1 : 0}/1` : '';
   return `${turnPrompt(ch, name, { full, absent })}${reaction}${position.length > 0 ? `\n${position}` : ''}${combatLedgerSuffix(c)}`;
 }
@@ -913,7 +989,11 @@ export async function fetchSrd(kind: 'monsters' | 'spells', rawIndex: string): P
   return (await res.json()) as Record<string, unknown>;
 }
 
-export const SRD_TRAITS: Record<string, string> = { 'Undead Fortitude': UNDEAD_FORTITUDE };
+export const SRD_TRAITS: Record<string, string> = {
+  'Undead Fortitude': UNDEAD_FORTITUDE,
+  'Pack Tactics': '集群战术',
+  'Blood Frenzy': '血腥狂乱',
+};
 
 /** SRD 怪物 JSON → 角色卡字段：AC、HP、六维、第一个带命中加值的攻击、会自动处理的特性 */
 export function srdMonsterInput(data: Record<string, unknown>): Omit<CharacterInput, 'name'> {
@@ -1014,7 +1094,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
   const mutate = <T>(exec: Exec, fn: (c: Campaign, adventure: Adventure) => T, options: { allowPaused?: boolean } = {}): T => {
     const key = recordOf(exec).sessionKey;
     const { adventure } = (options.allowPaused ? service.active(key) ?? service.saved(key) : undefined) ?? service.require(key);
-    return service.store.update(key, (c) => {
+    const out = service.store.update(key, (c) => {
       seedChronicle(c, adventure);
       const before = markChronicle(c);
       const wasRehearsal = c.initiative?.rehearsal === true;
@@ -1026,6 +1106,8 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       if (!isRehearsal) recordChanges(before, c, adventure);
       return (story.length > 0 && typeof result === 'string' ? `${result}\n【剧情】${story.join('；')}` : result) as T;
     }, () => `${exec.label ?? ''}${(exec.rolls ?? []).map((n) => ` #R${n}`).join('')}`, options);
+    service.recordAgentToolSync?.(key);
+    return out;
   };
 
   /** 新的一骰：编号记到这次调用上，结果里给模型看 */
@@ -1090,9 +1172,23 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     return `${entry.name} 重掷 #R${id}：${old} 作废 → ${r.detail}`;
   };
 
-  /** 豁免/检定落账：带伤害或失败状态的按效果结算，单纯检定只报最终成败 */
+  /** 豁免/检定落账：带伤害或失败状态的按效果结算，单纯检定只报最终成败（若为专注豁免且失败，自动打断专注） */
   const settleCheck = (c: Campaign, p: PendingCheck): string[] => {
-    if (p.damage === undefined && (p.onFail?.length ?? 0) === 0) return [`落账：${pendingState(p)}。按这个结果演。`];
+    if (p.damage === undefined && (p.onFail?.length ?? 0) === 0) {
+      const out = [`落账：${pendingState(p)}。按这个结果演。`];
+      if (p.concentrationCheck === true && p.dc !== undefined) {
+        for (const r of p.rolls) {
+          if (r.total + r.mod < p.dc) {
+            const broken = [
+              ...breakConcentration(c, r.name, '专注豁免失败'),
+              ...checkAllAirborneCrashes(c, service.roller, service.globalEffects()),
+            ];
+            if (broken.length > 0) out.push(`专注中断：${broken.join('；')}`);
+          }
+        }
+      }
+      return out;
+    }
     const saves: RolledSave[] = p.rolls.map((r) => ({
       name: r.name,
       natural: r.natural,
@@ -1112,13 +1208,36 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     return [`落账：${describePending(p)}`, ...saveOutcomeLines(outcomes)];
   };
 
+  /** 从职业/备注推断施法关键属性（智力/感知/魅力），供法术反制高环检定使用 */
+  const inferCastingAbility = (ch: Character): Ability => {
+    const cls = `${ch.className ?? ''} ${ch.notes ?? ''}`;
+    if (/法师|奇械师|wizard|artificer/i.test(cls)) return 'int';
+    if (/牧师|德鲁伊|游侠|cleric|druid|ranger/i.test(cls)) return 'wis';
+    if (/术士|邪术师|吟游诗人|诗人|圣武士|sorcerer|warlock|bard|paladin/i.test(cls)) return 'cha';
+    let best: Ability = 'int';
+    for (const ab of ['wis', 'cha'] as const) {
+      if (ch.abilities[ab] > ch.abilities[best]) best = ab;
+    }
+    return best;
+  };
+
   /** dnd_apply 处理待结算的部分：先改数值、记不用，最后才落账。reopened：重掷后有新的人能反应，要重发按钮 */
   const resolvePending = (c: Campaign, args: Record<string, unknown>, exec: Exec): { text: string; reopened: boolean } => {
     const p = requirePending(c);
     const named = requireCharacter(c, String(args.target ?? ''));
-    // 攻击按被打的人对账；豁免/检定按掷骰的人（群体豁免里改哪一骰靠它指定）
-    const entry = p.kind === 'roll' ? p.rolls.find((r) => r.name === named.name) : undefined;
-    if (p.kind === 'attack' && named.name !== p.target) throw new Error(`待结算这笔打的是 ${p.target}，不是 ${named.name}`);
+    const reaction = args.reaction as Record<string, unknown> | undefined;
+    const rxNameRaw = reaction !== undefined ? str(reaction.name) ?? '反应' : undefined;
+    const isCounterReaction = reaction !== undefined && (reaction.counterspell === true || (rxNameRaw !== undefined && isCounterspellReaction(rxNameRaw)));
+    // 攻击按被打的人对账；豁免/检定按掷骰的人（法术反制与整笔结算也兼容施法者名）
+    const entry = p.kind === 'roll'
+      ? (p.rolls.find((r) => r.name === named.name) ?? (named.name === p.attacker ? p.rolls[0] : undefined))
+      : undefined;
+    if (p.kind === 'attack' && named.name !== p.target && !(isCounterReaction && named.name === p.attacker)) {
+      throw new Error(`待结算这笔打的是 ${p.target}，不是 ${named.name}`);
+    }
+    if (p.kind === 'spell' && named.name !== p.target && named.name !== p.attacker) {
+      throw new Error(`待结算这笔施放的是 ${p.attacker}（目标 ${p.target}），不是 ${named.name}`);
+    }
     if (p.kind === 'roll' && entry === undefined) {
       throw new Error(`待结算这笔掷骰的是 ${p.rolls.map((r) => r.name).join('、')}，没有 ${named.name}：target 填被改的那个掷骰人`);
     }
@@ -1144,42 +1263,109 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     const lines: string[] = [];
     for (const name of strList(args.decline) ?? []) declineReaction(p, requireCharacter(c, name).name);
 
-    const reaction = args.reaction as Record<string, unknown> | undefined;
     if (reaction !== undefined) {
-      const name = str(reaction.name) ?? '反应';
+      const name = rxNameRaw ?? '反应';
       const reactor = findReactor(c, p, String(reaction.by ?? ''), name);
       const def = reactionsOf(reactor).find((r) => r.name === name);
       assertReactionAuthorized(p, reactor, name, reaction.authorization);
       if (args.declared_by !== undefined) assertDeclaredByOwner(reactor, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec) }, '反应');
-      const spendKey = str(reaction.spend) ?? def?.resource;
+
+      const explicitSpend = str(reaction.spend);
       const rawAmount = int(reaction.spend_amount) ?? def?.cost ?? 1;
       const spendAmount = Math.max(1, rawAmount);
+      let spendKey = explicitSpend ?? def?.resource;
+      const minSlot = minReactionSpellSlot(name);
+      const reqSlot = spendKey !== undefined ? parseSlotLevel(spendKey) : undefined;
+      if (spendKey !== undefined && explicitSpend === undefined && reactor.resources?.[spendKey] === undefined && minSlot !== undefined) {
+        spendKey = undefined;
+      }
+      if (spendKey !== undefined && explicitSpend === undefined && reactor.resources?.[spendKey] !== undefined && reactor.resources[spendKey]!.current < spendAmount) {
+        if (reqSlot !== undefined && minSlot !== undefined) {
+          const higher = availableSpellSlots(reactor, Math.max(reqSlot, minSlot))[0];
+          if (higher !== undefined) spendKey = higher.key;
+        }
+      }
+      const reqSpellSlotLevel = int(reaction.slot_level) ?? minSlot;
+      if (spendKey === undefined && explicitSpend === undefined && reqSpellSlotLevel !== undefined) {
+        const candidates = availableSpellSlots(reactor, reqSpellSlotLevel);
+        const exactMatch = int(reaction.slot_level) !== undefined
+          ? candidates.find((s) => s.level === int(reaction.slot_level))
+          : candidates[0];
+        if (exactMatch !== undefined) spendKey = exactMatch.key;
+        else if (Object.keys(reactor.resources ?? {}).some((k) => parseSlotLevel(k) !== undefined)) {
+          throw new Error(`${reactor.name} 没有可用的 ${reqSpellSlotLevel} 环及以上法术位`);
+        }
+      }
       const spent = spendKey === undefined ? undefined : useResource(c, reactor.name, spendKey, spendAmount);
       const effects: string[] = [];
+
+      const wantsCounterspell = reaction.counterspell === true || isCounterspellReaction(name);
+      if (wantsCounterspell) {
+        if (p.countered === true) {
+          throw new Error(`${describePending(p)}已经被 ${p.counteredBy} 反制了`);
+        }
+        const castSlot = int(reaction.slot_level) ?? (spent !== undefined ? parseSlotLevel(spent.key) : undefined) ?? 3;
+        const targetSpellLevel = p.spellLevel;
+        if (targetSpellLevel === undefined || targetSpellLevel <= castSlot) {
+          p.countered = true;
+          p.counteredBy = reactor.name;
+          effects.push(`${castSlot} 环法术反制自动成功，${describePending(p)}失效`);
+        } else {
+          const dc = 10 + targetSpellLevel;
+          const explicitAb = str(reaction.spell_ability);
+          const ab = explicitAb !== undefined ? parseAbility(explicitAb) : inferCastingAbility(reactor);
+          if (ab === undefined) throw new Error(`未知施法属性「${explicitAb}」`);
+          const jackOfAllTrades = /诗人|吟游诗人|bard/i.test(reactor.className ?? '') && reactor.level >= 2
+            ? Math.floor(proficiencyBonus(reactor.level) / 2)
+            : 0;
+          const mod = abilityModifier(reactor.abilities[ab]) + jackOfAllTrades;
+          const checkId = rollId(c, exec);
+          const roll = rollD20(mod, 'none', service.roller);
+          const ok = roll.total >= dc;
+          if (ok) {
+            p.countered = true;
+            p.counteredBy = reactor.name;
+          }
+          effects.push(`${ABILITY_NAMES[ab]}检定 ${roll.detail}（${ok ? '反制成功，目标法术失效' : '未达反制要求，法术继续生效'} #R${checkId}）`);
+        }
+      }
+
       const reroll = str(reaction.reroll);
       if (reroll !== undefined) {
+        if (p.kind !== 'attack' && p.kind !== 'roll') throw new Error('当前待结算窗口不支持重掷 d20');
         if (reroll.toLowerCase() !== 'd20') throw new Error('reroll 只支持 "d20"：整颗 d20 重掷，必须用新结果');
         effects.push(p.kind === 'attack' ? rerollAttack(c, p, exec) : rerollCheck(c, entry!, exec));
       }
       const attackMod = str(reaction.attack_mod);
       if (attackMod !== undefined) {
+        if (p.kind !== 'attack' && p.kind !== 'roll') throw new Error('当前待结算窗口不支持 attack_mod');
         const r = signedRoll(attackMod, service.roller);
         if (p.kind === 'attack') p.attackMod += r.total;
         else entry!.mod += r.total;
         effects.push(`${p.kind === 'attack' ? '攻击' : `${entry!.name} 的骰`} ${r.detail}`);
       }
-      const acMod = int(reaction.ac_mod);
+      let acMod = int(reaction.ac_mod);
+      if (acMod === undefined && isShieldReaction(name) && p.kind === 'attack') {
+        acMod = 5;
+      }
       if (acMod !== undefined) {
         if (p.kind !== 'attack') throw new Error('ac_mod 只对攻击有用；豁免/检定用 attack_mod 加减那一骰');
         p.acMod += acMod;
-        if (reactor.name === p.target && /^(护盾术|Shield)$/i.test(name) && acMod === 5) {
+        if (reactor.name === p.target && isShieldReaction(name) && acMod === 5) {
           const state = requireInitiative(c);
           state.shielded = [...new Set([...(state.shielded ?? []), reactor.name])];
         }
         effects.push(`AC ${acMod >= 0 ? '+' : ''}${acMod}`);
       }
+      if (isShieldReaction(name) && p.kind === 'spell' && p.effect.kind === 'magic_missile') {
+        p.shieldedTargets = [...new Set([...(p.shieldedTargets ?? []), reactor.name])];
+        const state = requireInitiative(c);
+        state.shielded = [...new Set([...(state.shielded ?? []), reactor.name])];
+        effects.push('护盾术完全挡下魔法飞弹并 +5 AC 至下回合开始');
+      }
       const damageMod = str(reaction.damage_mod);
       if (damageMod !== undefined) {
+        if (p.kind === 'spell') throw new Error('法术反制窗口不支持 damage_mod');
         if (p.kind === 'roll' && p.damage === undefined) throw new Error('这笔没有伤害，damage_mod 用不上');
         const r = signedRoll(damageMod, service.roller);
         p.damageMod += r.total;
@@ -1204,6 +1390,9 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       pushLog(c, `${reactor.name} 用「${name}」（${effect}）`);
       const spentSuffix = spent !== undefined ? `，用掉「${spent.key}」${spent.before}→${spent.resource.current}/${spent.resource.max}` : '';
       lines.push(`${reactor.name} 用「${name}」：${effect}${spentSuffix}`);
+      if (wantsCounterspell && reactor.kind !== 'monster') {
+        lines.push(...hostileSpellcasterHints(c, reactor, { kind: 'spell', spellName: name }));
+      }
       if (counter) {
         lines.push(`${name} 是一次新的攻击，不改这笔的数字：这笔落账之后，用 dnd_check character=${reactor.name} type=attack target=${p.attacker} reaction=true 结算还击（还击不打中也不影响这笔）。`);
       }
@@ -1219,7 +1408,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     }
 
     // 未命中被改成命中（或重掷作废了旧伤害）时，这时才有伤害可掷
-    if (p.kind === 'attack' && pendingHit(p) && p.rawDamage === undefined) {
+    if (p.kind === 'attack' && p.countered !== true && pendingHit(p) && p.rawDamage === undefined) {
       const attacker = requireCharacter(c, p.attacker);
       const weapon = p.weapon === undefined ? undefined : findWeapon(attacker, p.weapon);
       const expression = attackExpression(attacker, weapon, p.extraDamage);
@@ -1231,21 +1420,27 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
         p.rawDamage = dmg.total;
         p.damageDetail = dmg.detail;
         for (const rider of p.riders ?? []) {
+          if (rider.critOnly === true && !effectiveCrit) {
+            delete rider.rawDamage;
+            delete rider.detail;
+            continue;
+          }
           if (rider.rawDamage === undefined) {
-            const rr = rollExpression(effectiveCrit ? critExpression(rider.expression) : rider.expression, service.roller);
+            const rr = rollExpression(!rider.critOnly && effectiveCrit ? critExpression(rider.expression) : rider.expression, service.roller);
             rider.rawDamage = rr.total;
             rider.detail = rr.detail;
           }
         }
-        const riderInfo = p.riders?.length
-          ? `；附伤 ${p.riders.map((r) => `${r.label} ${r.detail ?? r.rawDamage} ${r.damageType}`).join(' + ')}`
+        const activeRiders = (p.riders ?? []).filter((r) => !r.critOnly || effectiveCrit);
+        const riderInfo = activeRiders.length > 0
+          ? `；附伤 ${activeRiders.map((r) => `${r.label} ${r.detail ?? r.rawDamage} ${r.damageType}`).join(' + ')}`
           : '';
         lines.push(`现在命中${effectiveCrit ? '（重击）' : ''}，伤害 ${dmg.detail}${riderInfo}`);
       }
     }
 
     // 改命中反应全部答复后，若最终仍命中且有伤害，解锁受伤后反应（迷雾逃生、炼狱叱喝等）
-    if (p.kind === 'attack' && waitingOn(p).length === 0) {
+    if (p.kind === 'attack' && p.countered !== true && waitingOn(p).length === 0) {
       const postDamage = unlockDamagedReactors(c, p);
       if (postDamage.length > 0) {
         p.at = Date.now();
@@ -1269,8 +1464,8 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
 
     assertWindowClosed(p);
     delete requireInitiative(c).pending;
-    // 兜底：若受伤后反应曾被提前记账，但后续反应使本次攻击未命中或 0 伤害，自动退回其资源与反应名额
-    if (p.kind === 'attack' && (!pendingHit(p) || (p.rawDamage !== undefined && Math.max(0, p.rawDamage + p.damageMod) <= 0))) {
+    // 兜底：若受伤后反应曾被提前记账，但后续反应使本次攻击未命中、0 伤害或被反制，自动退回其资源与反应名额
+    if (p.kind === 'attack' && (p.countered === true || !pendingHit(p) || (p.rawDamage !== undefined && Math.max(0, p.rawDamage + p.damageMod) <= 0))) {
       for (const u of [...p.used]) {
         const ch = findCharacter(c, u.by);
         const def = ch === undefined ? undefined : reactionsOf(ch).find((r) => r.name === u.name);
@@ -1287,7 +1482,66 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     if (p.used.length > 0 && reaction === undefined) {
       lines.push(`本笔反应汇总：${p.used.map((u) => `${u.by}「${u.name}」${u.effect}`).join('；')}（回复群聊时务必报出反应骰点数，勿漏报）`);
     }
-    if (p.kind === 'roll') {
+    if (p.countered === true) {
+      pushCombatLedger(c, `${describePending(p)}被 ${p.counteredBy} 反制失效${usedNote}`, p.seq);
+      lines.push(`${describePending(p)}已被 ${p.counteredBy} 反制失效，没有产生任何效果（施法者已消耗的法术位不退还）。`);
+    } else if (p.kind === 'spell') {
+      if (p.effect.kind === 'zone') {
+        const { zone, broken, affected } = upsertBattleZone(c, p.effect.zoneInput);
+        pushCombatLedger(c, `${p.attacker}→放置区域「${zone.name}」${usedNote}`, p.seq);
+        lines.push(`已放置持续区域：${formatZoneSummary(zone)}`);
+        if (affected.length > 0) lines.push(`当前处于区域内的单位：${affected.join('、')}`);
+        if (broken.length > 0) lines.push(...broken);
+        if (p.effect.spellWarn !== undefined) lines.push(p.effect.spellWarn);
+      } else if (p.effect.kind === 'state') {
+        const st = p.effect;
+        const globalEffects = service.globalEffects();
+        const broken = st.concentration
+          ? [...breakConcentration(c, p.attacker, `改换专注为「${st.stateName}」`), ...checkAllAirborneCrashes(c, service.roller, globalEffects)]
+          : [];
+        const applied: string[] = [];
+        for (const tn of st.targets) {
+          const tCh = findCharacter(c, tn);
+          if (tCh === undefined) continue;
+          const up = upsertActiveState(c, tCh, {
+            name: st.stateName,
+            source: p.attacker,
+            ...(st.concentration ? { concentration: true } : {}),
+            ...(st.rounds !== undefined ? { roundsLeft: st.rounds } : {}),
+            ...(st.expires !== undefined ? { expires: st.expires } : {}),
+            ...(st.hitBonus !== undefined ? { hitBonus: st.hitBonus } : {}),
+            ...(st.acBonus !== undefined ? { acBonus: st.acBonus } : {}),
+            ...(st.slotLevel !== undefined ? { slotLevel: st.slotLevel } : {}),
+            ...(st.saveDc !== undefined ? { saveDc: st.saveDc } : {}),
+          }, { replaceConcentration: false, globalEffects });
+          broken.push(...up.broken);
+          applied.push(tCh.name);
+        }
+        broken.push(...checkAllAirborneCrashes(c, service.roller, globalEffects));
+        pushCombatLedger(c, `${p.attacker}→「${st.stateName}」生效(${applied.join('、')})${usedNote}`, p.seq);
+        lines.push(`「${st.stateName}」生效，已挂载至「${applied.join('、')}」`);
+        if (broken.length > 0) lines.push(...broken);
+        if (st.warnings?.length) lines.push(...st.warnings);
+      } else {
+        const mm = p.effect;
+        const shielded = new Set(p.shieldedTargets ?? []);
+        const appliedSummary: string[] = [];
+        for (const entryItem of mm.targets) {
+          if (shielded.has(entryItem.name)) {
+            lines.push(`${entryItem.name} 有「护盾术」保护，完全免疫「${p.spellName}」伤害`);
+            appliedSummary.push(`${entryItem.name}护盾免疫`);
+            continue;
+          }
+          const tCh = findCharacter(c, entryItem.name);
+          if (tCh === undefined || tCh.conditions.includes('死亡')) continue;
+          const finalDmg = saveDamage(entryItem.damage, false, 'half', entryItem.defense);
+          const change = applyDamage(c, tCh.name, finalDmg, { damageType: mm.damageType, roller: service.roller });
+          lines.push(`${hpLine(change)}${entryItem.defense !== undefined ? `（${DEFENSE_NAMES[entryItem.defense]}）` : ''}`);
+          appliedSummary.push(`${tCh.name}受${finalDmg}`);
+        }
+        pushCombatLedger(c, `${p.attacker}→「${p.spellName}」落账：${appliedSummary.join('、')}${usedNote}`, p.seq);
+      }
+    } else if (p.kind === 'roll') {
       lines.push(...settleCheck(c, p));
     } else if (!pendingHit(p)) {
       pushCombatLedger(c, `${p.attacker}→${p.target} 落账：未命中${usedNote}`, p.seq);
@@ -1296,7 +1550,8 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       const effectiveCrit = p.crit || p.autoCritOnHit === true;
       const raw = Math.max(0, p.rawDamage + p.damageMod);
       const amount = saveDamage(raw, false, 'half', p.defense);
-      pushCombatLedger(c, `${p.attacker}→${p.target} 落账：受 ${amount}${p.riders?.length ? ` + 附伤(${p.riders.map((r) => `${r.label}`).join('+')})` : ''}${usedNote}`, p.seq);
+      const settledRiders = (p.riders ?? []).filter((r) => !r.critOnly || effectiveCrit);
+      pushCombatLedger(c, `${p.attacker}→${p.target} 落账：受 ${amount}${settledRiders.length > 0 ? ` + 附伤(${settledRiders.map((r) => `${r.label}`).join('+')})` : ''}${usedNote}`, p.seq);
       lines.push(`${p.attacker}→${p.target} 落账：${p.defense !== undefined ? `${DEFENSE_NAMES[p.defense]} ` : ''}受 ${amount}`);
       lines.push(...settleAttackDamage(c, p.attacker, p.target, raw, effectiveCrit, p.damageType, p.defense, p.onHit, service.roller, p.riders ?? []).lines);
     } else {
@@ -1310,7 +1565,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
 
   /**
    * dnd_check type=save 的伤害/状态/多目标结算。spendFrom：花资源的人（施法者，或没有 targets 时掷豁免的人）；
-   * 来源不是角色（陷阱）时不扣资源。hold：挂起等反应（时间变幻），不传就当场结算。
+   * 来源不是角色（陷阱）时不扣资源。hold：挂起等反应（时间变幻、法术反制），不传就当场结算。
    */
   const saveEffectText = (
     c: Campaign, args: Record<string, unknown>, targets: SaveTarget[], source: string | undefined, hasSheet: boolean,
@@ -1327,16 +1582,39 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     const onSave = args.on_save === 'none' ? 'none' : 'half';
     const onFail = strList(args.on_fail_conditions);
     const failRounds = int(args.rounds);
-    const isConcControl = args.concentration === true && (onFail?.length ?? 0) > 0 && source !== undefined && hasSheet;
+    const globalEffects = service.globalEffects();
+    const autoConcOnFail = args.concentration !== false && (onFail ?? []).some((cond) => isDefaultConcentrationState(c, cond, globalEffects));
+    const isConcControl = (args.concentration === true || autoConcOnFail) && (onFail?.length ?? 0) > 0 && source !== undefined && hasSheet;
     const concSource = isConcControl ? source : undefined;
+    const spellName = str(args.spell_name);
+    const explicitSpellLevel = int(args.spell_level);
     const spent = spendKey === undefined ? undefined : useResource(c, spender, spendKey);
     const slotMatch = spent === undefined ? null : /([1-9])\s*环/.exec(spent.key);
+    const inferredSlotLevel = slotMatch !== null ? Number(slotMatch[1]) : undefined;
+    const spellLevel = explicitSpellLevel ?? inferredSlotLevel;
     const spellWarn = slotMatch !== null && args.reaction !== true && c.initiative?.order[c.initiative.turn]?.name === spender
-      ? recordTurnSpellCast(ensureTurnState(c), spender, spent!.key, Number(slotMatch[1]), 'action')
+      ? recordTurnSpellCast(ensureTurnState(c), spender, spellName ?? spent!.key, Number(slotMatch[1]), 'action')
       : undefined;
     const concBroken = concSource !== undefined
       ? [...breakConcentration(c, concSource, '施放新的专注效果'), ...checkAllAirborneCrashes(c, service.roller, service.globalEffects())]
       : [];
+    const sourceCh = source !== undefined && hasSheet ? findCharacter(c, source) : undefined;
+    const isSpellSave = args.is_spell !== false && sourceCh !== undefined && (
+      args.is_spell === true
+      || spellName !== undefined
+      || spellLevel !== undefined
+      || isConcControl
+      || isSpellcasterCharacter(sourceCh)
+    );
+    const autoSpell = c.initiative !== undefined && isSpellSave && sourceCh?.kind === 'monster'
+      ? eligibleSpellReactors(c, sourceCh, {
+        ...(spellName !== undefined ? { spellName } : {}),
+        targets: targets.map((t) => t.name),
+      })
+      : [];
+    const effectiveHold = hold !== undefined || autoSpell.length > 0
+      ? mergeReactors(hold ?? [], autoSpell)
+      : undefined;
     const rolled = rollSaveEffect(c, {
       targets, ability, dc, damage, damageType, onSave, ...(onFail !== undefined ? { onFail } : {}),
       advantage: advantageOf(args.advantage), bonus: int(args.bonus), bonusDice: str(args.bonus_dice),
@@ -1349,7 +1627,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     const id = rollId(c, exec);
     const label = `${ABILITY_NAMES[ability]}豁免`;
     const head = [
-      source !== undefined ? `${source} 的效果：` : '',
+      source !== undefined ? `${source}${spellName !== undefined ? `「${spellName}」` : ' 的效果'}：` : '',
       label,
       rolled.damageRoll !== undefined
         ? `，伤害 ${rolled.damageRoll.detail}${damageType ? ` ${damageType}` : ''}（成功${onSave === 'none' ? '无伤' : '减半'}）`
@@ -1360,7 +1638,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     const lines = [head, ...concBroken, ...(spellWarn !== undefined ? [spellWarn] : [])];
     const spentLine = spent === undefined ? undefined : `用掉「${spent.key}」，剩 ${spent.resource.current}/${spent.resource.max}`;
 
-    if (hold !== undefined) {
+    if (effectiveHold !== undefined) {
       const rolls: PendingD20[] = rolled.saves.flatMap((s) => (s.skipped !== undefined || s.total === undefined
         ? []
         : [{
@@ -1378,7 +1656,9 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
         ...(onFail !== undefined && onFail.length > 0 ? { onFail } : {}),
         ...(concSource !== undefined ? { concentrationSource: concSource } : {}),
         ...(failRounds !== undefined ? { failRounds } : {}),
-        damageMod: 0, reactors: hold, declined: [], claimed: [], used: [],
+        ...(spellName !== undefined ? { spellName } : {}),
+        ...(spellLevel !== undefined ? { spellLevel } : {}),
+        damageMod: 0, reactors: effectiveHold, declined: [], claimed: [], used: [],
       };
       requireInitiative(c).pending = p;
       for (const r of rolls) {
@@ -1387,6 +1667,9 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       }
       for (const s of rolled.saves) if (s.skipped !== undefined) lines.push(`- ${s.name}：${s.skipped}，跳过`);
       if (spentLine !== undefined) lines.push(spentLine);
+      if (sourceCh !== undefined && sourceCh.kind !== 'monster' && isSpellSave) {
+        lines.push(...hostileSpellcasterHints(c, sourceCh, { kind: 'spell', ...(spellName !== undefined ? { spellName } : {}) }));
+      }
       lines.push(holdNotice(p));
       lines.push(SECRET_NOTE);
       deps.onPendingAttack?.(recordOf(exec));
@@ -1408,6 +1691,9 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     }
     lines.push(...saveOutcomeLines(outcomes));
     if (spentLine !== undefined) lines.push(spentLine);
+    if (sourceCh !== undefined && sourceCh.kind !== 'monster' && isSpellSave) {
+      lines.push(...hostileSpellcasterHints(c, sourceCh, { kind: 'spell', ...(spellName !== undefined ? { spellName } : {}) }));
+    }
     lines.push(args.secret === true ? HIDDEN_ROLL_NOTE : SECRET_NOTE);
     return `${lines.join('\n')}${combatLedgerSuffix(c)}`;
   };

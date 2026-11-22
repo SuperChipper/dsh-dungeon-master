@@ -13,7 +13,10 @@ import { str, type ToolKit } from './shared.ts';
 
 function formatEffectHooks(def: CustomEffectDef): string {
   const parts: string[] = [];
+  if (def.passive) parts.push('常驻被动');
+  if (def.classFilter) parts.push(`限职业:${def.classFilter}`);
   if (def.concentration) parts.push('专注');
+  if (def.transferable) parts.push('可转移专注');
   if (def.defaultRounds !== undefined) parts.push(`默认${def.defaultRounds}轮`);
   if (def.attackMod) {
     const a = def.attackMod;
@@ -22,17 +25,36 @@ function formatEffectHooks(def: CustomEffectDef): string {
       a.bonusDice ? `命中骰+${a.bonusDice}` : '',
       a.advantage ? (a.advantage === 'advantage' ? '优势' : '劣势') : '',
       a.critOn !== undefined ? `${a.critOn}-20重击` : '',
+      a.targetBelowMaxHp ? '目标受损' : '',
+      a.targetHalfHp ? '目标半血' : '',
+      a.targetConditions?.length ? `目标含[${a.targetConditions.join('/')}]` : '',
+      a.allyAdjacentToTarget ? '友方贴身' : '',
+      a.firstRoundOnly ? '首轮' : '',
+      a.requiresStates?.length ? `需[${a.requiresStates.join('/')}]` : '',
     ].filter(Boolean).join('/');
     if (sub) parts.push(`攻击(${sub})`);
   }
   if (def.hitRider) {
     const r = def.hitRider;
-    const expr = [r.damageDice, r.bonusFormula ? `+${r.bonusFormula}` : ''].filter(Boolean).join('');
+    const scaling = r.scalingDice ? `${r.scalingDice.countFormula}d${r.scalingDice.sides}` : undefined;
+    const expr = [r.damageDice, scaling, r.weaponDie ? '1×武器骰' : undefined, r.bonusFormula ? `+${r.bonusFormula}` : ''].filter(Boolean).join('+');
     const flags = [
       r.markedTargetOnly ? '锁定目标' : '',
+      r.targetBelowMaxHp ? '目标受损' : '',
+      r.targetHalfHp ? '目标半血' : '',
+      r.targetConditions?.length ? `目标含[${r.targetConditions.join('/')}]` : '',
       r.advantageOnly ? '仅优势' : '',
+      r.noDisadvantage ? '无劣势' : '',
+      r.advantageOrAllyAdjacent ? '优势或友方贴身' : '',
+      r.allyAdjacentToTarget ? '友方贴身' : '',
       r.oncePerTurn ? '1次/回合' : '',
+      r.ownTurnOnly ? '仅自己回合' : '',
+      r.firstRoundOnly ? '仅首轮' : '',
+      r.critOnly ? '仅重击' : '',
+      r.requiresStates?.length ? `需[${r.requiresStates.join('/')}]` : '',
+      r.finesseOrRangedOnly ? '灵巧/远程' : '',
       r.meleeOnly ? '近战' : '',
+      r.rangedOnly ? '远程' : '',
       r.weaponOnly ? '武器' : '',
     ].filter(Boolean).join('·');
     parts.push(`附伤(${expr} ${r.damageType}${flags ? `，${flags}` : ''})`);
@@ -94,15 +116,18 @@ export function registerRuleTools(kit: ToolKit): void {
       name: { type: 'string', description: '规则/特性/状态标准名（如 "风暴遗誓·二阶"、"段云·雷鸣斩"、"虔诚光环"）' },
       aliases: { type: 'array', items: { type: 'string' }, description: '可选同义词/英文名列表' },
       description: { type: 'string', description: '规则效果简述（方便核对）' },
+      passive: { type: 'boolean', description: '设为 true 表示常驻被动特性（除 traits 外，还可从卡面被动能力与非否定备注安全激活；切勿给法术位消耗类法术设 true）' },
+      class_filter: { type: 'string', description: '可选职业正则（如 "游荡者|rogue"），用于在兼职角色中提取 class_level 及校验备注被动归属' },
       concentration: { type: 'boolean', description: '作为状态挂载时是否默认需要维持专注' },
-      default_rounds: { type: 'integer', description: '作为状态挂载时的默认持续轮数（如 1 分钟填 10）' },
+      transferable: { type: 'boolean', description: '作为专注状态挂载时，原目标倒下或战斗结束后专注是否保留在施法者身上并支持免费转移目标（如脆弱诅咒、猎人印记）' },
+      default_rounds: { type: 'integer', description: '作为状态挂载时的默认持续轮数（如 1 分钟填 10，1 小时填 600）' },
       attack_mod: {
         type: 'object',
-        description: '攻击检定修正：{to_hit_formula, bonus_dice, advantage, crit_on, weapon_only, melee_only, ranged_only}。公式可用 level / prof / str_mod..cha_mod / slot_level / min() / max() / floor()',
+        description: '攻击检定修正：{to_hit_formula, bonus_dice, advantage, crit_on, weapon_only, melee_only, ranged_only, target_below_max_hp, target_half_hp, target_conditions, ally_adjacent_to_target, first_round_only, requires_states}。公式可用 level / class_level / prof / str_mod..cha_mod / slot_level / hp / max_hp / target_hp / target_max_hp / min() / max() / floor() / ceil()',
       },
       hit_rider: {
         type: 'object',
-        description: '命中自动附伤：{damage_dice, bonus_formula, damage_type, marked_target_only, weapon_only, melee_only, str_attack_only, advantage_only, once_per_turn}',
+        description: '命中自动附伤：{damage_dice, scaling_dice:{count_formula,sides}, weapon_die, bonus_formula, damage_type, marked_target_only, weapon_only, melee_only, ranged_only, finesse_or_ranged_only, str_attack_only, advantage_only, no_disadvantage, target_below_max_hp, target_half_hp, target_conditions, ally_adjacent_to_target, advantage_or_ally_adjacent, first_round_only, crit_only, own_turn_only, requires_states, once_per_turn}',
       },
       defense_mod: {
         type: 'object',

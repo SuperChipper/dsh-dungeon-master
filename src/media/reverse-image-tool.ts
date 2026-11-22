@@ -13,11 +13,11 @@
  * 不要对每张收到的图自动发起。
  */
 import { readFileSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { extname, basename, join } from 'node:path';
+import { extname, basename } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { ContentBlock } from '@deepseek-ai/dsh-llm';
 import type { Logger } from '../types.ts';
+import { dshEnvPath } from '../shared/paths.ts';
 
 export const REVERSE_IMAGE_TOOL_NAME = 'qqbot_reverse_image';
 
@@ -99,7 +99,7 @@ function saucenaoKey(): string {
   const fromEnv = process.env.QQBOT_SAUCENAO_KEY;
   if (fromEnv !== undefined && fromEnv !== '') return fromEnv;
   try {
-    const text = readFileSync(join(homedir(), '.dsh', '.env'), 'utf8');
+    const text = readFileSync(dshEnvPath(), 'utf8');
     const match = /^\s*QQBOT_SAUCENAO_KEY\s*=\s*(.+)$/m.exec(text);
     if (match?.[1] !== undefined) return match[1].trim().replace(/^["']|["']$/g, '');
   } catch {

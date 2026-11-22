@@ -23,7 +23,7 @@ export function registerSaveTools(kit: ToolKit): void {
     + 'after keeping unresolved matters. The entire merged save must fit 1500 characters; oversized writes are rejected and the old save stays intact. '
     + 'Only the merged latest one is injected next time. '
     + 'Player-known information only: no DCs, monster stats or DM-only notes. Use this instead of '
-    + 'qqbot_notes_save for campaign progress.',
+    + 'qqbot_notes(action="save") for campaign progress.',
     {
       summary: { type: 'string', description: 'Full rewrite (replaces the whole save). Prefer set/append/remove.' },
       set: {
@@ -148,6 +148,7 @@ export function registerSaveTools(kit: ToolKit): void {
           }
         }
         const undone = service.store.undo(key, steps);
+        service.forceNextSnapshot?.(key);
         const preSteps: string[] = [];
         if (rollArg !== undefined) {
           const remain = service.store.snapshots(key);

@@ -73,8 +73,9 @@ const DM_RULES = [
   '- PC 的回合只有他本人说「没了/结束」或点按钮才结束（next 传他的 declared_by），别人催不算。收到「[系统 · 按钮] X 点了结束回合」说明工具已经推进，不要再为 X next。',
   '- 不是当前回合的人宣告了行动：说「记下了，等你的回合」，不提前结算；借机攻击和反应传 reaction=true。叙事里的「轮到谁」必须和工具一致，对不上先 goto。敌人倒光就 end。',
   '- 结果里有「待结算」时先停手：掷骰窗口报成败、问反应；移动借机窗口在触发格等玩家，不先把人走完或 next。PC 反应只认本人明确选择后的服务器 authorization，提问或 declared_by 都不算同意。豁免和检定要不要挂反应窗口由你判（dnd_check hold_for），尤其敌人对奇塔露自己法术的豁免。',
-  '- 连击提前返回时先处理停点，照已结击数和骰号继续，不把整批重掷，也不自动向倒下的目标补刀。',
-  '- 站位只认 dnd_position 和最新团况的站位行，不凭记忆和前面的叙述。开战按【场地】提示画图、摆位；移动把玩家的原话交给工具（to、keep_adjacent、away_from、dash、drag、disengage），玩家报了坐标才用 x/y；退到门外的人 move 到门外。走错了 dnd_undo 重走，不用 set 瞬移改正。',
+  '- 连击提前返回时先处理停点，照已结击数和骰号继续，不把整批重掷，也不自动向倒下的目标补刀。5e 允许在多次攻击、动作、附赠动作前后拆分移动：中途击倒当前目标且还有剩余攻击与移动力时，按【拆分移动提示】询问玩家是否 dnd_position move 转火其他目标，不要因为贴身没怪就默认收手。',
+  '- 站位只认 dnd_position 和最新团况的站位行，不凭记忆和前面的叙述。严禁目测坐标断言「走不到 / 绕不开火墙或领域」而拒绝调用 move——玩家宣告接近某目标时必须直接调 dnd_position action="move" to="目标名"，寻路会自动绕开墙、敌人与危险领域区域（火墙术、荆棘丛生、蛛网术、灵体卫士等），并在经过领域技能时给出拆分移动提醒（只有玩家明确要直线硬闯危险区才传 enter_hazards=true）。开战按【场地】提示画图、摆位（优先一次调用 dnd_position action="set"，用 formation={front:[前排], mid:[中排], back:[后排], auto_rest:true} 按前中后优先级自动排好我方，再配合 placements 或 formation.enemies 给出敌方站位，免手算全员坐标撞墙叠格）；移动把玩家的原话交给工具（to、swap、keep_adjacent、away_from、dash、drag、disengage；与队友换位传 swap="队友名"，若对方玩家已在近期消息明确同意可补传 ally_declared_by，否则工具会暂停并弹出「同意换位/不同意」按钮等本人确认，不消耗反应），玩家报了坐标才用 x/y；退到门外的人 move 到门外。走错了 dnd_undo 重走，不用 set 瞬移改正。',
+  '- 可转移专注（脆弱诅咒、猎人印记）在原目标倒下或战斗结束后自动保留在施法者身上（团况显示 [专注:…(可转移)]），后续回合转移目标时调用 dnd_resource action="transfer" target="新目标"（消耗附赠动作、零法术位消耗），切勿重复扣减法术位或用裸 dnd_apply 覆盖专注归属。',
   '- 跟玩家讲站位用人话，只讲角色看得见的人，不念坐标。要看图就原样贴 show 返回的「玩家视角示意图」（含 ``` 两行），或让他们点「查看状态」、发 /dnd status，不要手画。',
   '- 上下文压缩后第一次裁定之前，先对一遍最新团况的 HP、先攻指针、站位和最近记录。谁已行动、挂在目标身上的效果（猎人印记、专注）最容易走样，拿不准就查或问。',
   '',
@@ -84,7 +85,7 @@ const DM_RULES = [
   '- 玩家讲的角色来历里没了结的事（找的人、欠的债、逃开的地方），用 dnd_hook add 记成钩子；工具结果里的「背景钩子」接不接你定，1-2 档随手用，再往上先 plan，那个人亲自出现之前先问玩家。',
   '- 工具记不到的（临场编的人和事、俘虏、承诺和欠账、线头、背景新发现、本桌裁定）用 dnd_chronicle add 记；一段剧情告一段落、接交任务、快下线时用 dnd_progress 记进度。',
   '- 收团用 dnd_end（与玩家 /dnd end 同一暂停流程），只存档用 dnd_progress；交接记清具体停点、刚发生的事、已定行动、同行与留守、未结事项和下次第一步。dnd_prepare 用来提前准备下一次团的内容（先用 dnd_prepare show 看候选下一站与模组原书目录，再用 dnd_lookup 查卡片，未展开的表格与细则可只读查阅该模组目录并提炼进 dnd_prepare save，避免下次开团临时翻书），不重复总结过去发生的事，也不能当作已发生事实或念给玩家。',
-  '- 笔记（qqbot_notes_save）只记跨团通用、玩家知道的东西（玩家偏好、DM 约定、角色梗）：DC、怪物数值、DM 笔记、秘密不写；跑团进度只写团档。',
+  '- 笔记（qqbot_notes action="save"）只记跨团通用、玩家知道的东西（玩家偏好、DM 约定、角色梗）：DC、怪物数值、DM 笔记、秘密不写；跑团进度只写团档。',
   '- 没有角色卡的玩家，问清名字和职业再建卡。玩家问规则可以提醒他用 /dnd search、/dnd spells 查 wiki；要看地图用 dnd_map。',
   '- 如果现在是要你写对话的压缩摘要（checkpoint）：技术类小节没有必要就写 (none)，工具用法、文件路径不用留。把篇幅留给 Critical Context，用中文逐条保留跑团剧情：按时间排的关键事件、去过和清空的地点、NPC 身份与关系、俘虏、承诺和欠账、没了结的线头、角色背景要点、玩家长期约定和本桌裁定。战斗中还要写明：这一轮谁已行动、谁用过反应、挂在目标身上的效果（猎人印记、专注、神圣武器）；站位和 HP 团况里有，不用转述。',
 ].join('\n');
@@ -207,8 +208,8 @@ export class DndService {
       DM_RULES,
       '【专用战斗代理】',
       '你接替主 DM 主持当前这场战斗。只处理战斗、战斗规则提问和当场反应；所有数值仍实时通过 dnd_* 写入团档。',
-      '主 DM 已经讲过开战场景，不重复开场。先核对每轮消息开头的最新【团况 · DM 视角】（单回合内连续调用工具时不再每步重发整份快照，回合内变化直接以每次工具返回的结果与【当前回合账本】为准）；最近对话只补充行动意图与效果，不覆盖团档。能力不明用 dnd_character show 查卡或 dnd_srd 查规则，不自行猜测。',
-      '【角色能力与被动】包含职业、属性、熟练与专精、武器、法术、反应、资源和备注；固定加值只认结构化字段，备注里的被动与临时增益仍须核对，不能漏算，也不能把已计算的加值重复添加。traits 含「精灵精准」「守护灵光」「生命门徒」「神佑医者」、武器多段 riders、以及状态/资源触发的「战斗英姿」「咒剑诅咒」「脆弱诅咒」「猎人印记」「神恩」「变巨术」「狂暴」「灵体卫士」「防护毒素」与 dnd_rule 已登记扩展规则均由工具自动结算，勿再用 dnd_roll 手掷或重复填进 damage。持续区域法术/毒雾/黑暗术用 dnd_position action=zone 放置，飞行单位用 z 高度移动。',
+      '主 DM 已经讲过开战场景，不重复开场。先核对最近的【团况 · DM 视角】基线快照（每数轮对话同步一次，单轮内连续调用工具与间隔轮次内不再重复刷屏；快照之后的最新 HP、资源、先攻与站位变化直接以紧随其后的 dnd_* 工具返回与【当前回合账本】为准）；最近对话只补充行动意图与效果，不覆盖团档。能力不明用 dnd_character show 查卡或 dnd_srd 查规则，不自行猜测。',
+      '【角色能力与被动】包含职业、属性、熟练与专精、武器、法术、反应、资源和备注；固定加值只认结构化字段，未接入引擎的备注被动仍须核对，但已自动结算项切勿重复手掷或重复填进 damage。已自动结算包括：14种PHB状态与力竭、巨武器战斗、箭术、精灵精准、战地施法者、不死坚韧、守护灵光、生命门徒、神佑医者、巨兽杀手/巨像屠夫、偷袭、精通至圣斩、祝福打击、神圣狂怒、凶蛮攻击、精通重击/卓越重击、集群战术、血腥狂乱、武器多段 riders、以及状态/资源触发的战斗英姿、咒剑诅咒、脆弱诅咒、猎人印记、神恩、变巨术、狂暴、灵体卫士、防护毒素与 dnd_rule 已登记扩展规则（当出现【条件被动】或【未注册被动提醒】时按提示核对）。持续区域法术/毒雾/黑暗术用 dnd_position action=zone 放置，飞行单位用 z 高度移动。',
       '每次只处理当前宣告；轮到 PC 或有反应待答就停。敌人倒光或战斗以其他方式确定结束，用 dnd_initiative end（若演练/切磋未开 rehearsal=true 但临时画了竞技场地形，结束前先 dnd_position clear_terrain 清理），并在本条回复中完整播报最后一轮的掷骰过程与胜负收场，播报完即停，等待主 DM 接手战后剧情。',
       '专注、猎人印记、临时增益、未完成动作、本桌裁定不能只留在叙述里：备注用 dnd_character update notes、状态用 dnd_apply add_conditions/remove_conditions，本桌裁定用 dnd_chronicle 记清目标、持续时间和已使用情况。',
       '战斗结束后不继续探索、不重开下一场、不替玩家选择行动；主 DM 会收到系统生成的最新团况与队伍消耗。',
@@ -230,6 +231,8 @@ export class DndService {
   public onStateChange?: (key: string) => void;
   /** 这段对话 system prompt 里锁住的背景，见 promptSections */
   private readonly background = new PromptLatch();
+  private readonly forceSnapshotSeq = new Map<string, number>();
+  private readonly agentSyncedSnapshots = new Map<string, { main: string; combat: string }>();
   private readonly cwd: string;
 
   public constructor(options: { store: CampaignStore; library: AdventureLibrary; mapDir: string; roller?: Roller; cwd?: string }) {
@@ -295,6 +298,7 @@ export class DndService {
       throw new Error(`没有这个模组: ${id ?? '(空)'}。可用：${ids}`);
     }
     this.background.forget(key);
+    this.forceNextSnapshot(key);
     if (existing !== undefined && existing.adventureId === adventure.id && !fresh) {
       existing.active = true;
       existing.sessionStartedAt = Date.now();
@@ -333,6 +337,7 @@ export class DndService {
     ensureSessionSummary(campaign);
     this.store.save(campaign);
     this.background.forget(key);
+    this.forceNextSnapshot(key);
     this.checkIns.delete(key);
     this.onStateChange?.(key);
     return campaign;
@@ -455,5 +460,135 @@ export class DndService {
     const room = findRoom(roomGraph(adventure), campaign.currentRoom);
     const notes = room === undefined ? '' : roomView(campaign, adventure, room).dmNotes;
     return notes ? `本房间环境与 DM 笔记（只给你裁定地形/机关用，不要直接念）：${notes}` : '';
+  }
+
+  /** 标记该会话下一次进入模型步骤时跳过轮数节流、立即刷新完整团况（用于 dnd_undo 回滚、开停团、战斗交回等） */
+  public forceNextSnapshot(key: string): void {
+    this.forceSnapshotSeq.set(key, (this.forceSnapshotSeq.get(key) ?? 0) + 1);
+    this.agentSyncedSnapshots.delete(key);
+  }
+
+  public snapshotForceSeq(key: string): number {
+    return this.forceSnapshotSeq.get(key) ?? 0;
+  }
+
+  /**
+   * 记录本次团档变动来自 Agent 自身刚执行的 dnd_* 工具（模型已在紧邻的工具返回值中拿到增量明细），
+   * 允许后续在轮数节流窗口内暂缓重发整份团况；反之若发生工具外改档（外部命令/后台变更），将立即识别并穿透节流。
+   */
+  public recordAgentToolSync(key: string): void {
+    try {
+      this.agentSyncedSnapshots.set(key, {
+        main: this.stateSnapshot(key),
+        combat: this.combatStateSnapshot(key),
+      });
+    } catch {
+      this.agentSyncedSnapshots.delete(key);
+    }
+  }
+
+  public isExternallyDirty(key: string, kind: 'main' | 'combat', currentSnap: string, lastInjected?: string): boolean {
+    const baseline = this.agentSyncedSnapshots.get(key)?.[kind] ?? lastInjected;
+    return baseline !== undefined && baseline !== currentSnap;
+  }
+
+  /**
+   * 决定团况快照是否跨越关键场景边界的签名：
+   * 换房间（需新房间 DM 笔记）、开战/结战、开场揭幕、签到/暂离变化或上下文压缩（epoch 变化）时立即刷新。
+   */
+  public snapshotStructuralKey(key: string, epoch = ''): string {
+    const found = this.active(key);
+    if (found === undefined) return `${epoch}|inactive`;
+    const { campaign } = found;
+    const ci = this.checkIns.get(key);
+    const ciKey = ci === undefined ? '' : `${ci.openedAt}:${ci.started ? 1 : 0}:${[...ci.arrived.keys()].sort().join(',')}`;
+    const absentKey = campaign.characters.filter((ch) => ch.absent === true).map((ch) => ch.name).join(',');
+    return [
+      epoch,
+      campaign.currentRoom,
+      campaign.chapter ?? '',
+      inOpening(campaign) ? 'open' : 'play',
+      campaign.initiative !== undefined ? 'combat' : 'explore',
+      ciKey,
+      absentKey,
+    ].join('|');
+  }
+}
+
+interface SnapshotGateEntry {
+  lastInjected: string;
+  lastTurnTag?: string;
+  lastStructKey: string;
+  lastForceSeq: number;
+  turnsSinceInject: number;
+}
+
+/**
+ * 团况 runtime-context 节流门控：
+ * 1. 单轮对话内（turnTag 未变）：多次连续调用攻击/移动/豁免等工具时锁定返回本轮初同一快照字符串，
+ *    使宿主 diff 判定无变化、单轮工具循环内 0 次重发 runtime-context；
+ * 2. 跨对话轮次（turnTag 递增）：默认每 `intervalTurns`（默认 4）轮对话才刷新一次完整团况，
+ *    间隔轮次内直接复用紧邻上文中的工具返回值与【当前回合账本】；
+ * 3. 遇到关键边界（换房间、开战/结战、压缩 epoch 变化、dnd_undo 回滚、签到变化、结团清空）立即穿透节流同步。
+ */
+export class DndSnapshotGate {
+  private readonly entries = new WeakMap<object, SnapshotGateEntry>();
+
+  public resolve(options: {
+    agentKey: object;
+    fresh: string;
+    turnTag?: string;
+    structKey: string;
+    forceSeq: number;
+    externallyDirty?: boolean;
+    intervalTurns: number;
+  }): string {
+    const { agentKey, fresh, turnTag, structKey, forceSeq, externallyDirty } = options;
+    const interval = Math.max(1, Math.trunc(options.intervalTurns || 4));
+    if (fresh === '') {
+      this.entries.delete(agentKey);
+      return '';
+    }
+    const prev = this.entries.get(agentKey);
+    if (prev === undefined) {
+      this.entries.set(agentKey, {
+        lastInjected: fresh,
+        ...(turnTag !== undefined ? { lastTurnTag: turnTag } : {}),
+        lastStructKey: structKey,
+        lastForceSeq: forceSeq,
+        turnsSinceInject: 0,
+      });
+      return fresh;
+    }
+
+    const boundaryChanged = structKey !== prev.lastStructKey || forceSeq !== prev.lastForceSeq;
+
+    // 同一轮对话的多步工具调用循环内：除换房间 / dnd_undo / 开结战等结构性边界外，一律锁定不重发！
+    if (turnTag !== undefined && turnTag === prev.lastTurnTag) {
+      if (!boundaryChanged) return prev.lastInjected;
+      prev.lastInjected = fresh;
+      prev.lastStructKey = structKey;
+      prev.lastForceSeq = forceSeq;
+      prev.turnsSinceInject = 0;
+      return fresh;
+    }
+
+    // 进入新的一轮用户对话
+    if (turnTag !== undefined) prev.lastTurnTag = turnTag;
+    prev.turnsSinceInject += 1;
+
+    if (boundaryChanged || externallyDirty === true || prev.turnsSinceInject >= interval) {
+      prev.lastStructKey = structKey;
+      prev.lastForceSeq = forceSeq;
+      if (fresh !== prev.lastInjected) {
+        prev.lastInjected = fresh;
+        prev.turnsSinceInject = 0;
+        return fresh;
+      }
+      prev.turnsSinceInject = interval;
+      return prev.lastInjected;
+    }
+
+    return prev.lastInjected;
   }
 }

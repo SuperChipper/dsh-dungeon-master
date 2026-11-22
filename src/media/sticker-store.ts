@@ -13,13 +13,12 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  renameSync,
-  rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { isWithin, isWithinReal } from '../shared/tool-guard.ts';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
 import { sniffImageExt } from './image-sniff.ts';
 import type { Logger } from '../types.ts';
 
@@ -343,11 +342,11 @@ export class StickerStore {
       order: 91,
       text: [
         '【表情收藏】',
-        '你有一批自己的表情包。看到一张图、内心产生明确情绪，并且觉得以后会想用它表达这种情绪时，可以调用 qqbot_save_sticker 收藏：',
+        '你有一批自己的表情包。看到一张图、内心产生明确情绪，并且觉得以后会想用它表达这种情绪时，可以调用 qqbot_sticker(action="save", ...) 收藏：',
         'image=图片本地路径（复制用户消息里的 - Image: 行），emotion=你此刻的情绪/场景（如「破防」「被萌到」「无语」「骄傲」），look=图里实际画的是什么（谁、在做什么，以后你靠这句认图），note=一句为什么想存。',
         '只在真正想用的时候存：普通截图、长文截图、与情绪无关的图不要存；重复图片会按内容哈希自动跳过，不要为了凑数反复存。',
-        '必须通过真正的工具调用收藏：不要把 <qqbot_save_sticker>、<image>、<emotion> 这类标签写进回复正文——那不是调用，会被当普通文字发出去。',
-        '如果要同时回复和收藏：先发起 qqbot_save_sticker 工具调用（正文留空），拿到工具结果后再写回复。',
+        '必须通过真正的工具调用收藏：不要把 <qqbot_sticker>、<qqbot_save_sticker>、<image>、<emotion> 这类标签写进回复正文——那不是调用，会被当普通文字发出去。',
+        '如果要同时回复和收藏：先发起 qqbot_sticker(action="save", ...) 工具调用（正文留空），拿到工具结果后再写回复。',
         '从下一回合起，新收藏的图会自动出现在表情清单或最新的「新收藏的表情」里，想发时用 qqbot_send_file。',
       ].join('\n'),
     }];
@@ -418,20 +417,7 @@ export class StickerStore {
   private writeIndex(entries: StickerIndexEntry[]): void {
     // 同一毫秒内连写两次时 index.json 的 mtime 不变，收藏比对的缓存要显式作废
     this.collection = undefined;
-    mkdirSync(this.root, { recursive: true });
-    const tmp = `${this.indexPath}.tmp-${process.pid}-${Date.now()}`;
-    writeFileSync(tmp, `${JSON.stringify(entries, null, 2)}\n`, 'utf8');
-    try {
-      renameSync(tmp, this.indexPath);
-    } catch (err) {
-      // Windows 上目标被占用时 rename 可能失败：退回覆盖写并清理临时文件
-      try {
-        writeFileSync(this.indexPath, readFileSync(tmp));
-      } finally {
-        try { rmSync(tmp, { force: true }); } catch { /* ignore */ }
-      }
-      this.logger?.warn(`im-qqbot: 索引原子替换失败，已回退写入: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    writeJsonAtomic(this.indexPath, entries, { indent: 2, trailingNewline: true });
   }
 
   /** 旧条目没有 sha256 时惰性补齐（只读文件，缺失文件跳过） */

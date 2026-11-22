@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
+import { sanitizeStorageKey } from '../shared/paths.ts';
 import { symbols, type Context } from '@deepseek-ai/cordis';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { DndCombatAgentConfig } from '../config.ts';
@@ -84,6 +86,8 @@ interface ActiveCombat {
   triedRoutes: Set<string>;
   lastDialogue?: { text: string; fromChild: boolean };
   lastInjectedSnapshot?: string;
+  turnsSinceSnapshot?: number;
+  lastForceSeq?: number;
   lastPrompt?: string;
   pendingTurnEnd?: Promise<void>;
 }
@@ -220,6 +224,7 @@ interface PartySnapshotItem {
   maxHp: number;
   tempHp: number;
   conditions: string[];
+  concentration?: string;
   resources?: Record<string, Resource>;
   notes?: string;
   inventory: string[];
@@ -234,6 +239,7 @@ function partySnapshotItemsFromCharacters(characters: readonly Character[]): Par
     maxHp: ch.maxHp,
     tempHp: ch.tempHp ?? 0,
     conditions: [...(ch.conditions ?? [])],
+    ...(ch.concentrationState !== undefined ? { concentration: ch.concentrationState.name } : {}),
     ...(ch.resources !== undefined ? { resources: structuredClone(ch.resources) } : {}),
     ...(ch.notes !== undefined ? { notes: ch.notes } : {}),
     inventory: [...(ch.inventory ?? [])],
@@ -277,6 +283,9 @@ function formatPartyDelta(beforeJson: string, c: Campaign): string {
     const prevCond = prev.conditions ?? [];
     if (JSON.stringify(prevCond) !== JSON.stringify(curr.conditions)) {
       diffs.push(`状态 [${prevCond.join('、') || '无'}]→[${curr.conditions.join('、') || '无'}]`);
+    }
+    if ((prev.concentration ?? '') !== (curr.concentration ?? '')) {
+      diffs.push(`专注 ${prev.concentration ?? '无'}→${curr.concentration ?? '无'}`);
     }
     const resKeys = new Set([...Object.keys(prev.resources ?? {}), ...Object.keys(curr.resources ?? {})]);
     const resDiffs: string[] = [];
@@ -364,6 +373,7 @@ export class DndCombatAgents {
     private readonly logger: Logger,
     private readonly directory = join(service.store.root, '..', 'combat-runs'),
     private readonly fallback?: (main: SessionRecord) => CombatFallbackState | undefined,
+    private readonly snapshotIntervalTurns: () => number = () => 4,
   ) {}
 
   private candidateFallbacks(main: SessionRecord, excludeKeys: ReadonlySet<string>): CombatRoute[] {
@@ -454,7 +464,7 @@ export class DndCombatAgents {
 
   /**
    * 关闭战斗子代理每步工具改档的 runtime-context 刷屏，
-   * 改为仅在每轮新消息进入子代理、且精简战况较上一轮发生变化时前置一次精简战斗快照。
+   * 并按对话轮数节流（默认每 4 轮对话同步一次完整精简战况；首轮接管、备用通道恢复、dnd_undo 回滚时立即同步）。
    */
   public decorateTurnText(record: SessionRecord, text: string): string {
     const active = this.active.get(record.sessionKey);
@@ -466,8 +476,35 @@ export class DndCombatAgents {
       this.logger.warn(`im-qqbot: 注入战斗精简快照失败: ${err instanceof Error ? err.message : String(err)}`);
       return text;
     }
-    if (!snap || snap === active.lastInjectedSnapshot) return text;
+    if (!snap) return text;
+    const forceSeq = this.service.snapshotForceSeq?.(record.sessionKey) ?? 0;
+    const interval = Math.max(1, Math.trunc(this.snapshotIntervalTurns() || 4));
+    const isFirst = active.lastInjectedSnapshot === undefined;
+    const isForced = active.lastForceSeq !== undefined && forceSeq !== active.lastForceSeq;
+    const extDirty = !isFirst && this.service.isExternallyDirty?.(record.sessionKey, 'combat', snap, active.lastInjectedSnapshot) === true;
+
+    if (isFirst) {
+      active.lastInjectedSnapshot = snap;
+      active.turnsSinceSnapshot = 0;
+      active.lastForceSeq = forceSeq;
+      this.service.recordAgentToolSync?.(record.sessionKey);
+      return `${snap}\n\n${text}`;
+    }
+
+    const nextTurns = (active.turnsSinceSnapshot ?? 0) + 1;
+    if (!isForced && !extDirty && nextTurns < interval) {
+      active.turnsSinceSnapshot = nextTurns;
+      return text;
+    }
+
+    active.lastForceSeq = forceSeq;
+    if (snap === active.lastInjectedSnapshot) {
+      active.turnsSinceSnapshot = interval;
+      return text;
+    }
     active.lastInjectedSnapshot = snap;
+    active.turnsSinceSnapshot = 0;
+    this.service.recordAgentToolSync?.(record.sessionKey);
     return `${snap}\n\n${text}`;
   }
 
@@ -496,16 +533,12 @@ export class DndCombatAgents {
     return { ...msg, content: nextContent };
   }
 
-  private file(key: string): string { return join(this.directory, `${key.replace(/[^a-zA-Z0-9_-]/g, '_')}.json`); }
+  private file(key: string): string { return join(this.directory, `${sanitizeStorageKey(key)}.json`); }
 
   private save(run: CombatRun): void {
-    mkdirSync(this.directory, { recursive: true });
-    const file = this.file(run.sessionKey);
-    const tmp = `${file}.tmp`;
-    writeFileSync(tmp, JSON.stringify(run, null, 2), 'utf8');
-    renameSync(tmp, file);
+    writeJsonAtomic(this.file(run.sessionKey), run, { indent: 2 });
     // 每场单独保留，latest 文件仅用于恢复和 /dnd combat。
-    writeFileSync(join(this.directory, `${run.id}.json`), JSON.stringify(run, null, 2), 'utf8');
+    writeJsonAtomic(join(this.directory, `${run.id}.json`), run, { indent: 2 });
   }
 
   private checkpoint(run: CombatRun): void {
@@ -901,6 +934,7 @@ export class DndCombatAgents {
     };
     active.child = newChild;
     active.lastInjectedSnapshot = undefined;
+    active.turnsSinceSnapshot = 0;
     active.lastPrompt = replayPrompt;
     this.syncTools(newChild);
     this.save(active.run);
@@ -954,6 +988,7 @@ export class DndCombatAgents {
     ].join('\n');
     this.checkpoint(run);
     this.active.delete(run.sessionKey);
+    this.service.forceNextSnapshot?.(run.sessionKey);
     if (status === 'failed') this.failed.add(run.sessionKey);
     else this.failed.delete(run.sessionKey);
     this.syncTools(main);

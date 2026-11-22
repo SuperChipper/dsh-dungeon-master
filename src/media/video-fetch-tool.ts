@@ -44,7 +44,7 @@ export interface VideoFetchDeps {
   ffmpegPath?: string;
 }
 
-interface FetchArgs {
+export interface VideoFetchArgs {
   url?: string;
   page?: number;
   quality?: number;
@@ -92,8 +92,64 @@ async function downloadSegment(url: string, outPath: string, capBytes: number): 
   return written;
 }
 
-export function registerVideoFetchTool(tools: ToolsRegistryLike, deps: VideoFetchDeps): void {
+/** 执行一次 B 站免登录视频下载（单段直下或 multi-part 无损拼接）并返回结果描述 */
+export async function fetchBiliVideo(deps: VideoFetchDeps, args: VideoFetchArgs): Promise<string> {
   const { client, logger } = deps;
+  const raw = typeof args.url === 'string' ? args.url.trim() : '';
+  if (raw === '') throw new Error('qqbot_video_fetch: url 不能为空');
+  const bvid = bvidOf(raw);
+  const pageNo = Math.max(1, Math.trunc(args.page ?? 1));
+  const qn = Math.trunc(args.quality ?? 64);
+  const capBytes = Math.max(1, args.max_mb ?? DEFAULT_MAX_MB) * 1024 * 1024;
+
+  const info = await client.video(bvid);
+  const page = info.pages.find((item) => item.page === pageNo) ?? info.pages[pageNo - 1];
+  const cid = page?.cid ?? info.cid;
+  if (!cid) throw new Error(`${bvid} 没有第 ${pageNo} P`);
+
+  const play = await client.playUrl(bvid, cid, qn);
+  const dir = join(MEDIA_ROOT, 'video');
+  await mkdir(dir, { recursive: true });
+  const stamp = Date.now();
+  const target = join(dir, `${bvid}-p${pageNo}-${stamp}.mp4`);
+
+  let bytes = 0;
+  if (play.segments.length === 1) {
+    bytes = await downloadSegment(play.segments[0]!.url, target, capBytes);
+  } else {
+    // 老视频按 10 分钟切段，逐段落盘后用 ffmpeg 无损拼接
+    if (deps.ffmpegPath === undefined) {
+      await rm(target, { force: true });
+      throw new Error(`这个视频被切成 ${play.segments.length} 段，需要 ffmpeg 拼接，但本机没找到 ffmpeg`);
+    }
+    const parts: string[] = [];
+    try {
+      for (const [index, segment] of play.segments.entries()) {
+        const part = `${target}.part${index}`;
+        bytes += await downloadSegment(segment.url, part, capBytes - bytes);
+        parts.push(part);
+      }
+      const listFile = `${target}.concat.txt`;
+      await writeFile(listFile, parts.map((part) => `file '${part.replace(/'/g, "'\\''")}'`).join('\n'), 'utf8');
+      await run(deps.ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', target]);
+      await rm(listFile, { force: true });
+    } finally {
+      await Promise.all(parts.map((part) => rm(part, { force: true })));
+    }
+    bytes = (await stat(target)).size;
+  }
+
+  logger.info(`im-qqbot: 视频已下载 ${bvid} p${pageNo} ${mb(bytes)} -> ${target}`);
+  const seconds = page?.duration ?? info.duration;
+  return [
+    `已下载《${info.title}》第 ${pageNo} P（${qualityLabel(play.quality || qn)}，${mb(bytes)}，${mmss(seconds)}）`,
+    `path: ${target}`,
+    `下一步：把 path 传给 qqbot_describe_video（要文字稿再加 qqbot_transcribe）。`,
+  ].join('\n');
+}
+
+export function registerVideoFetchTool(tools: ToolsRegistryLike, deps: VideoFetchDeps): void {
+  const { logger } = deps;
 
   const definition = {
     name: VIDEO_FETCH_TOOL_NAME,
@@ -117,59 +173,7 @@ export function registerVideoFetchTool(tools: ToolsRegistryLike, deps: VideoFetc
       schema: { type: 'string' },
       render: (_args: unknown, value: unknown): ContentBlock[] => [{ type: 'text', text: String(value) }],
     },
-    async execute(args: FetchArgs): Promise<string> {
-      const raw = typeof args.url === 'string' ? args.url.trim() : '';
-      if (raw === '') throw new Error('qqbot_video_fetch: url 不能为空');
-      const bvid = bvidOf(raw);
-      const pageNo = Math.max(1, Math.trunc(args.page ?? 1));
-      const qn = Math.trunc(args.quality ?? 64);
-      const capBytes = Math.max(1, args.max_mb ?? DEFAULT_MAX_MB) * 1024 * 1024;
-
-      const info = await client.video(bvid);
-      const page = info.pages.find((item) => item.page === pageNo) ?? info.pages[pageNo - 1];
-      const cid = page?.cid ?? info.cid;
-      if (!cid) throw new Error(`${bvid} 没有第 ${pageNo} P`);
-
-      const play = await client.playUrl(bvid, cid, qn);
-      const dir = join(MEDIA_ROOT, 'video');
-      await mkdir(dir, { recursive: true });
-      const stamp = Date.now();
-      const target = join(dir, `${bvid}-p${pageNo}-${stamp}.mp4`);
-
-      let bytes = 0;
-      if (play.segments.length === 1) {
-        bytes = await downloadSegment(play.segments[0]!.url, target, capBytes);
-      } else {
-        // 老视频按 10 分钟切段，逐段落盘后用 ffmpeg 无损拼接
-        if (deps.ffmpegPath === undefined) {
-          await rm(target, { force: true });
-          throw new Error(`这个视频被切成 ${play.segments.length} 段，需要 ffmpeg 拼接，但本机没找到 ffmpeg`);
-        }
-        const parts: string[] = [];
-        try {
-          for (const [index, segment] of play.segments.entries()) {
-            const part = `${target}.part${index}`;
-            bytes += await downloadSegment(segment.url, part, capBytes - bytes);
-            parts.push(part);
-          }
-          const listFile = `${target}.concat.txt`;
-          await writeFile(listFile, parts.map((part) => `file '${part.replace(/'/g, "'\\''")}'`).join('\n'), 'utf8');
-          await run(deps.ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', target]);
-          await rm(listFile, { force: true });
-        } finally {
-          await Promise.all(parts.map((part) => rm(part, { force: true })));
-        }
-        bytes = (await stat(target)).size;
-      }
-
-      logger.info(`im-qqbot: 视频已下载 ${bvid} p${pageNo} ${mb(bytes)} -> ${target}`);
-      const seconds = page?.duration ?? info.duration;
-      return [
-        `已下载《${info.title}》第 ${pageNo} P（${qualityLabel(play.quality || qn)}，${mb(bytes)}，${mmss(seconds)}）`,
-        `path: ${target}`,
-        `下一步：把 path 传给 qqbot_describe_video（要文字稿再加 qqbot_transcribe）。`,
-      ].join('\n');
-    },
+    execute: (args: VideoFetchArgs): Promise<string> => fetchBiliVideo(deps, args),
   };
 
   tools.register(definition);

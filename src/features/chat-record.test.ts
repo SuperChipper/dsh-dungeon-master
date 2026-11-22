@@ -21,9 +21,21 @@ describe('renderChatRecord', () => {
     expect(renderChatRecord(text)).toBe(`[聊天记录，共 2 条]\n1. Sanae：${EMPTY_ITEM_NOTE}\n2. Hikari：念一遍`);
   });
 
-  it('表情标签转成文字，附件行保留（forward 改写后的图片编号不能丢）', () => {
-    const text = `[群聊的聊天记录]\n=== 消息 1 ===\n[消息内容] ${sticker}\n[发送者] 甲\n[附件1] [图片#2: C:/m/a.jpg] 尺寸:9x9`;
-    expect(renderChatRecord(text)).toBe('[聊天记录，共 1 条]\n1. 甲：[表情包]\n   [附件1] [图片#2: C:/m/a.jpg] 尺寸:9x9');
+  it('表情标签转成文字，已改写的图片编号行保留，非图片附件剥除长 URL', () => {
+    const longUrl = 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=SECRET&rkey=very_long_token';
+    const text = [
+      '[群聊的聊天记录]',
+      '=== 消息 1 ===',
+      `[消息内容] ${sticker}`,
+      '[发送者] 甲',
+      '[附件1] [图片#2: C:/m/a.jpg] 尺寸:9x9',
+      `[附件2] 类型:文件 文件名:a.zip 大小:1KB URL:${longUrl}`,
+    ].join('\n');
+    const rendered = renderChatRecord(text);
+    expect(rendered).toBe(
+      '[聊天记录，共 1 条]\n1. 甲：[表情包]\n   [附件1] [图片#2: C:/m/a.jpg] 尺寸:9x9\n   [附件2] 类型:文件 文件名:a.zip 大小:1KB',
+    );
+    expect(rendered).not.toContain('multimedia.nt.qq.com.cn');
   });
 
   it('普通消息原样返回', () => {

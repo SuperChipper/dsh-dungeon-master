@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import { NotesStore, cutSection } from './notes-store.ts';
 import { NoteMetricsStore } from './note-metrics.ts';
-import { NOTES_MANAGE_TOOL_NAME, NOTES_SAVE_TOOL_NAME, NOTES_SEARCH_TOOL_NAME, registerNotesTools } from './notes-tools.ts';
+import { NOTES_MANAGE_TOOL_NAME, NOTES_TOOL_NAME, registerNotesTools } from './notes-tools.ts';
 import { pickNoteStats, renderNoteStats } from '../features/note-stats.ts';
 import { notesCommand, parseNotesArgs } from '../commands/notes.ts';
 import { SessionManager } from '../session/session-manager.ts';
@@ -55,8 +55,8 @@ function setup(recordOrNull: Record<string, unknown> | null = { scope: 'c2c', pe
   registerNotesTools(ctx as never, store, manager, logger as never, { ownerOpenid: 'OWNER' });
   const execCtx = (agentOver?: Record<string, unknown>) => (record === undefined && agentOver === undefined ? {} : { agent: agentOver ?? {} });
   const call = (args: Record<string, unknown>) => tools.get(NOTES_MANAGE_TOOL_NAME)!.execute(args, execCtx()) as Promise<{ message: string }>;
-  const callSave = (args: Record<string, unknown>) => tools.get(NOTES_SAVE_TOOL_NAME)!.execute(args, execCtx());
-  const callSearch = (args: Record<string, unknown>, agentOver?: Record<string, unknown>) => tools.get(NOTES_SEARCH_TOOL_NAME)!.execute(args, execCtx(agentOver));
+  const callSave = (args: Record<string, unknown>) => tools.get(NOTES_TOOL_NAME)!.execute({ action: 'save', ...args }, execCtx());
+  const callSearch = (args: Record<string, unknown>, agentOver?: Record<string, unknown>) => tools.get(NOTES_TOOL_NAME)!.execute({ action: 'search', ...args }, execCtx(agentOver));
   const archived = (): string[] => {
     const dir = join(root, '.archive');
     return existsSync(dir) ? readdirSync(dir, { recursive: true }).map(String).filter((name) => name.endsWith('.md')) : [];
@@ -242,7 +242,7 @@ describe('qqbot_notes_manage', () => {
     expect(hit?.meta?.supersededBy).toBeUndefined();
   });
 
-  it('qqbot_notes_save 与 qqbot_notes_search：支持范围元数据、本机 cwd 感知与 all_scopes 权限边界', async () => {
+  it('qqbot_notes(save / search)：支持范围元数据、本机 cwd 感知与 all_scopes 权限边界', async () => {
     // 1. 本机会话保存项目笔记与角色笔记，并检验 budget_chars 校验
     const local = setup(null);
     await expect(local.callSave({ title: 'x', content: 'y', budget_chars: 20 })).rejects.toThrow(/60-2000/);
@@ -292,8 +292,8 @@ describe('qqbot_notes_manage', () => {
     const groupCtx = { get: () => ({ register: (d: Tool) => groupTools.set(d.name, d) }) };
     const groupManager = { findByAgent: () => ({ scope: 'group', peerId: 'G2' }), noteMetrics: local.metrics };
     registerNotesTools(groupCtx as never, local.store, groupManager as never, logger as never, { ownerOpenid: 'OWNER' });
-    const groupRes = await groupTools.get(NOTES_SEARCH_TOOL_NAME)!.execute(
-      { query: '小笨猫 点歌 保护指数', all_scopes: true, project: 'voice-lab', persona: '哈基米' },
+    const groupRes = await groupTools.get(NOTES_TOOL_NAME)!.execute(
+      { action: 'search', query: '小笨猫 点歌 保护指数', all_scopes: true, project: 'voice-lab', persona: '哈基米' },
       { agent: {} },
     ) as { hits: Array<Record<string, unknown>> };
     expect(groupRes.hits.map((h) => h.file)).toEqual([]);

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { AdventureLibrary } from './adventure.ts';
 import { CampaignStore, requireCharacter, summarize, upsertCharacter } from './campaign.ts';
+import { turnPositionNote } from './battlefield.ts';
 import { DndService } from './dnd-service.ts';
 import { registerDndTools } from './dnd-tools.ts';
 import { buildReactionKeyboard, DndTurnButtons, ACK, reactionOptionKey } from './turn-buttons.ts';
@@ -399,5 +400,303 @@ describe('借机是持久化的移动停止点', () => {
     expect(paused).toContain('移动待结算');
     expect(paused).toContain('甲·借机攻击');
     expect(paused).not.toContain('全程没离开触及');
+  });
+});
+
+describe('友方交换站位（swap）：移动预算、借机拦截与队友同意确认', () => {
+  it('队友已在近期消息发言同意时（ally_declared_by），支持贴身 5 尺换位与远距走近再换位，精确计入移动消耗', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => {
+      c.initiative!.turn = 1; // 轮到 甲
+      c.initiative!.positions = {
+        甲: { x: 0, y: 2, room: c.currentRoom },
+        乙: { x: 3, y: 2, room: c.currentRoom }, // 距甲 15 尺
+        狼: { x: 4, y: 2, room: c.currentRoom }, // 贴着乙
+      };
+    });
+    // 甲(0,2) 走到 (2,2) 花 10 尺，再与 乙(3,2) 互换花 5 尺，共 15/30 尺；乙 退到 (2,2)，甲 顶上前排 (3,2) 贴住 狼！
+    const out = await t.call('dnd_position', {
+      action: 'move',
+      name: '甲',
+      swap: '乙',
+      declared_by: 'U1',
+      ally_declared_by: 'U2',
+    });
+    expect(out).toContain('与 乙 交换站位');
+    expect(out).toContain('15/30 尺');
+    expect(out).toContain('贴身：狼');
+    expect(t.campaign().initiative!.positions!.甲).toMatchObject({ x: 3, y: 2 });
+    expect(t.campaign().initiative!.positions!.乙).toMatchObject({ x: 2, y: 2 });
+    expect(t.campaign().initiative!.movement).toBeUndefined();
+    // 乙 换位离开 狼 的触及也会提示 DM
+    expect(out).toContain('乙 配合换位离开了 狼 的触及范围');
+  });
+
+  it('未传 ally_declared_by 时弹出换位确认窗口：不消耗反应（即使队友本轮已用反应也可同意），支持按钮与自然语言答复', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => {
+      c.initiative!.turn = 1; // 轮到 甲
+      c.initiative!.reacted = ['乙']; // 乙 本轮反应已经用过（0/1）！
+      c.initiative!.positions = {
+        甲: { x: 1, y: 3, room: c.currentRoom },
+        乙: { x: 2, y: 3, room: c.currentRoom },
+        狼: { x: 8, y: 8, room: c.currentRoom },
+      };
+    });
+
+    // 1) action="swap" 也支持，且未传 ally_declared_by 时暂停等 乙 本人确认
+    const askOut = await t.call('dnd_position', {
+      action: 'swap',
+      name: '甲',
+      to: '乙',
+      declared_by: 'U1',
+    });
+    expect(askOut).toContain('【换位待确认】');
+    expect(t.onPendingAttack).toHaveBeenCalledOnce();
+    const pm = t.campaign().initiative!.movement!;
+    expect(pm.swapWith).toBe('乙');
+    expect(pm.reactors).toEqual([{ character: '乙', reaction: '同意换位' }]);
+
+    // 按钮面板显示「乙·同意换位」与「不同意」
+    const kb = buildReactionKeyboard(pm);
+    expect(kb.content.rows[0]!.buttons[0]!.render_data.label).toContain('同意换位');
+    expect(kb.content.rows[1]!.buttons[0]!.render_data.label).toBe('不同意');
+
+    // 确认前不能偷调借机攻击、不能推进回合、不能强行 settle；甲 的玩家 P1 不能代点 乙 的按钮
+    await expect(t.call('dnd_check', { type: 'attack', character: '乙', target: '甲', reaction: true })).rejects.toThrow('换位确认窗口');
+    await expect(t.call('dnd_apply', { target: '甲', settle: true })).rejects.toThrow('反应窗口还开着');
+    expect(t.press({ a: 'react', r: pm.seq, i: 0 }, 'P1')).toBe(ACK.denied);
+
+    // 2) 乙 的玩家 P2 点「同意换位」按钮（不消耗反应！）→ settle 完成换位
+    expect(t.press({ a: 'react', r: pm.seq, i: 0 }, 'P2')).toBe(ACK.ok);
+    expect(t.followup.mock.calls.at(-1)?.[0].content[0].text).toContain('本人已同意与 甲 交换站位');
+    const settled = await t.call('dnd_apply', { target: '甲', settle: true });
+    expect(settled).toContain('与 乙 交换站位');
+    expect(t.campaign().initiative!.positions!.甲).toMatchObject({ x: 2, y: 3 });
+    expect(t.campaign().initiative!.positions!.乙).toMatchObject({ x: 1, y: 3 });
+    expect(t.campaign().initiative!.moved!.甲).toBe(5);
+
+    // 3) 再次请求换位，测试自然语言回复「不同意」取消换位，双方停在原位且延迟的冲刺不消耗
+    await t.call('dnd_position', { action: 'move', name: '甲', swap: '乙', dash: true, declared_by: 'U1' });
+    const declineReply = pendingReactionReply(
+      { kind: 'group', groupOpenid: 'G1', senderId: 'P2', content: '不换', messageId: 'm-swap-no' } as never,
+      t.manager as never,
+      true,
+    );
+    expect(declineReply?.note).toContain('不同意交换站位');
+    const aborted = await t.call('dnd_apply', { target: '甲', settle: true });
+    expect(aborted).toContain('乙 未同意交换站位');
+    expect(aborted).toContain('冲刺动作未消耗');
+    expect(t.campaign().initiative!.positions!.甲).toMatchObject({ x: 2, y: 3 });
+    expect(t.campaign().initiative!.positions!.乙).toMatchObject({ x: 1, y: 3 });
+    expect(t.campaign().initiative!.dashed).toBeUndefined();
+  });
+
+  it('换位那一步离开敌方触及时先在换位前暂停结算借机（两人绝不叠格），且拦截与敌人或失能队友换位', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => {
+      c.initiative!.turn = 1; // 轮到 甲
+      // 狼 在 (0,0)，甲 在 (1,0)（距狼 5 尺），乙 在 (2,0)（距狼 10 尺）
+      // 甲 与 乙 换位从 (1,0)→(2,0) 会离开 狼 的 5 尺触及！
+      c.initiative!.positions = {
+        狼: { x: 0, y: 0, room: c.currentRoom },
+        甲: { x: 1, y: 0, room: c.currentRoom },
+        乙: { x: 2, y: 0, room: c.currentRoom },
+      };
+    });
+
+    // 不能与敌人换位
+    await expect(t.call('dnd_position', { action: 'swap', name: '甲', swap: '狼', declared_by: 'U1' }))
+      .rejects.toThrow('敌对单位');
+
+    // 队友失能时不能主动配合换位
+    await t.call('dnd_apply', { target: '乙', add_conditions: ['麻痹'] });
+    await expect(t.call('dnd_position', { action: 'swap', name: '甲', swap: '乙', declared_by: 'U1', ally_declared_by: 'U2' }))
+      .rejects.toThrow('失能');
+    await t.call('dnd_apply', { target: '乙', remove_conditions: ['麻痹'] });
+
+    // 同意换位但踏入 (2,0) 离开 狼 触及：在 (1,0) 暂停等 狼 借机，此时甲仍在 (1,0)、乙仍在 (2,0) 不重叠
+    const paused = await t.call('dnd_position', {
+      action: 'move',
+      name: '甲',
+      swap: '乙',
+      declared_by: 'U1',
+      ally_declared_by: 'U2',
+    });
+    expect(paused).toContain('移动待结算');
+    expect(paused).toContain('狼·借机攻击');
+    expect(t.campaign().initiative!.positions!.甲).toMatchObject({ x: 1, y: 0 });
+    expect(t.campaign().initiative!.positions!.乙).toMatchObject({ x: 2, y: 0 });
+
+    // 狼 放弃借机后 settle → 完成与 乙 的位置互换！
+    const done = await t.call('dnd_apply', { target: '甲', decline: ['狼'], settle: true });
+    expect(done).toContain('与 乙 交换站位');
+    expect(t.campaign().initiative!.positions!.甲).toMatchObject({ x: 2, y: 0 });
+    expect(t.campaign().initiative!.positions!.乙).toMatchObject({ x: 1, y: 0 });
+  });
+});
+
+describe('领域区域自动绕行与拆分移动（Breaking Up Your Move）提醒', () => {
+  it('复刻 18.蛇人巢穴 火墙术场景：move to="蛇人纯血3" 自动走南侧无火走廊 (1,2)→(1,3)→(2,4)→(3,4) 耗 15 尺无伤贴身，且连击斩杀首目标后提示拆分移动转火', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => {
+      upsertCharacter(c, { name: '维斯珀', playerId: 'P2', className: '法师', level: 7, maxHp: 40, abilities: { int: 18 } });
+      upsertCharacter(c, { name: '丛云', playerId: 'P1', className: '战士', level: 7, maxHp: 60, speed: 30, weapons: [{ name: '段云', damage: '1d8+4' }], reactions: [] });
+      upsertCharacter(c, { name: '卡厄斯', playerId: 'P2', className: '圣武士', level: 7, maxHp: 60, reactions: [] });
+      upsertCharacter(c, { name: '蛇人恶种1', kind: 'monster', maxHp: 10, hp: 6, ac: 12, room: c.currentRoom, reactions: [] });
+      upsertCharacter(c, { name: '蛇人纯血3', kind: 'monster', maxHp: 40, hp: 40, ac: 12, room: c.currentRoom, reactions: [] });
+      c.initiative = {
+        round: 2,
+        turn: 0,
+        order: [
+          { name: '丛云', init: 18 },
+          { name: '维斯珀', init: 15 },
+          { name: '蛇人恶种1', init: 12 },
+          { name: '蛇人纯血3', init: 10 },
+        ],
+        moved: { 丛云: 5 }, // 本回合已从 (0,2) 走到 (1,2) 耗 5 尺，剩 25/30 尺
+        positions: {
+          卡厄斯: { x: 1, y: 1, room: c.currentRoom },
+          丛云: { x: 1, y: 2, room: c.currentRoom },
+          维斯珀: { x: 0, y: 2, room: c.currentRoom },
+          蛇人恶种1: { x: 2, y: 1, room: c.currentRoom },
+          蛇人纯血3: { x: 4, y: 3, room: c.currentRoom },
+        },
+      };
+    });
+    // 8×6 蛇人巢穴地形：y=0、y=5、x=7 为墙，x=0 为门外走廊，y=1..4, x=1..6 为室内空地
+    await t.call('dnd_position', {
+      action: 'terrain',
+      width: 8,
+      height: 6,
+      areas: [
+        { kind: 'wall', x: 0, y: 0, w: 8, h: 1 },
+        { kind: 'wall', x: 1, y: 5, w: 7, h: 1 },
+        { kind: 'wall', x: 7, y: 1, w: 1, h: 5 },
+        { kind: 'outside', name: '门外走廊', x: 0, y: 1, w: 1, h: 5 },
+      ],
+    });
+    // 维斯珀放置火墙术覆盖 (2..7, 2..3)
+    await t.call('dnd_position', {
+      action: 'zone',
+      name: '火墙术',
+      caster: '维斯珀',
+      shape: 'rect',
+      x: 2,
+      y: 2,
+      w: 6,
+      h: 2,
+      damage: '5d8',
+      damage_type: '火焰',
+      save_ability: 'dex',
+      save_dc: 15,
+      concentration: true,
+    });
+
+    // 1. 回合站位提示直接标出可无伤绕开火墙术近战触及 蛇人纯血3
+    const posNote = turnPositionNote(t.campaign(), '丛云', t.service.globalEffects());
+    expect(posNote).toContain('蛇人纯血3(15尺无伤绕开区域可达)');
+
+    // 2. 连击 2 刀砍 蛇人恶种1，第 1 刀直接斩杀 -> 【连击停止】自动给出【拆分移动提示】告知可绕火转火 蛇人纯血3
+    t.rolls.push(18, 6); // 命中并造成 6+4=10 斩杀恶种1
+    const multiOut = await t.call('dnd_check', {
+      type: 'attack',
+      character: '丛云',
+      target: '蛇人恶种1',
+      weapon: '段云',
+      declared_by: 'U1',
+      attacks: [{}, {}],
+    });
+    expect(multiOut).toContain('【连击停止】');
+    expect(multiOut).toContain('【拆分移动提示】丛云 还有 1 击未掷');
+    expect(multiOut).toContain('蛇人纯血3(15尺无伤绕开区域可达)');
+
+    // 3. 丛云 move to="蛇人纯血3"：自动从南侧 y=4 绕开火墙术，耗 15 尺（累计 20/30 尺），0 火焰伤害，落点 (3,4) 贴身纯血3！
+    const moveOut = await t.call('dnd_position', {
+      action: 'move',
+      name: '丛云',
+      to: '蛇人纯血3',
+      declared_by: 'U1',
+    });
+    expect(moveOut).toContain('走 15 尺');
+    expect(moveOut).toContain('20/30 尺');
+    expect(moveOut).toContain('贴身：蛇人纯血3');
+    expect(moveOut).toContain('已自动绕开领域/区域「火墙术」');
+    expect(moveOut).not.toContain('区域·火墙术');
+    expect(requireCharacter(t.campaign(), '丛云').hp).toBe(60);
+    expect(t.campaign().initiative!.positions!.丛云).toMatchObject({ x: 3, y: 4 });
+  });
+
+  it('当挡路敌人封死唯一无伤通路而踩进领域技能时，给出域外停步坐标、清怪拆分移动绕行与友方专注提醒；传 enter_hazards=true 可显式直穿', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => {
+      upsertCharacter(c, { name: '维斯珀', playerId: 'P2', className: '法师', level: 7, maxHp: 40, abilities: { int: 18 } });
+      upsertCharacter(c, { name: '丛云', playerId: 'P1', className: '战士', level: 7, maxHp: 60, speed: 30, reactions: [] });
+      upsertCharacter(c, { name: '蛇人恶种1', kind: 'monster', maxHp: 20, ac: 12, room: c.currentRoom, reactions: [] });
+      upsertCharacter(c, { name: '蛇人纯血5', kind: 'monster', maxHp: 40, ac: 12, room: c.currentRoom, reactions: [] });
+      c.initiative = {
+        round: 2,
+        turn: 0,
+        order: [{ name: '丛云', init: 18 }, { name: '维斯珀', init: 15 }, { name: '蛇人恶种1', init: 12 }, { name: '蛇人纯血5', init: 10 }],
+        positions: {
+          丛云: { x: 1, y: 2, room: c.currentRoom },
+          维斯珀: { x: 0, y: 2, room: c.currentRoom },
+          蛇人恶种1: { x: 2, y: 1, room: c.currentRoom }, // 堵死北侧 y=1 唯一无火通道！
+          蛇人纯血5: { x: 4, y: 1, room: c.currentRoom },
+        },
+      };
+    });
+    // 南侧 y=4 设墙封死，使北侧 y=1 成为唯一非火墙走廊，且正被 (2,1) 的蛇人恶种1 挡住
+    await t.call('dnd_position', {
+      action: 'terrain',
+      width: 8,
+      height: 5,
+      areas: [
+        { kind: 'wall', x: 0, y: 0, w: 8, h: 1 },
+        { kind: 'wall', x: 0, y: 4, w: 8, h: 1 },
+        { kind: 'wall', x: 7, y: 1, w: 1, h: 3 },
+      ],
+    });
+    await t.call('dnd_position', {
+      action: 'zone',
+      name: '火墙术',
+      caster: '维斯珀',
+      shape: 'rect',
+      x: 2,
+      y: 2,
+      w: 5,
+      h: 2,
+      damage: '5d8',
+      damage_type: '火焰',
+      save_ability: 'dex',
+      save_dc: 15,
+      concentration: true,
+    });
+
+    // 丛云直接 move to="蛇人纯血5"：因 (2,1) 被恶种1堵死，只能踩进火墙 (2,2)→(3,1) 过去，同时输出完整拆分移动提醒！
+    t.rolls.push(2, 2, 2, 2, 2, 18); // 5d8=10，豁免成功减半受 5 点火焰
+    const crossed = await t.call('dnd_position', {
+      action: 'move',
+      name: '丛云',
+      to: '蛇人纯血5',
+      declared_by: 'U1',
+    });
+    expect(crossed).toContain('领域/拆分移动提醒：本次移动经过「火墙术」');
+    expect(crossed).toContain('停在域外边缘 (1,2)');
+    expect(crossed).toContain('若先攻击清掉或推开挡路的「蛇人恶种1」，再用剩余移动力拆分移动，只需 10 尺即可无伤绕开');
+    expect(crossed).toContain('「火墙术」为友方 维斯珀 专注维持');
+
+    // 退回该步并清掉挡路的恶种1，验证传 enter_hazards=true 时允许直线硬闯，不传时自动走 (2,1) 无伤绕开
+    await t.call('dnd_undo', { action: 'undo', steps: 1 });
+    await t.call('dnd_apply', { target: '蛇人恶种1', damage: 30 });
+    const safeMove = await t.call('dnd_position', {
+      action: 'move',
+      name: '丛云',
+      x: 3,
+      y: 2,
+      enter_hazards: true,
+      declared_by: 'U1',
+    });
+    expect(safeMove).toContain('领域/拆分移动提醒：本次移动经过「火墙术」');
   });
 });

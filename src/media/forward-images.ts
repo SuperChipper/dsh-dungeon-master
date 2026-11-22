@@ -10,6 +10,7 @@
 import type { MediaConfig } from '../config.ts';
 import type { Logger } from '../types.ts';
 import { downloadRecentHistoryImages, type HistoryImage } from './history-images.ts';
+import { mediaRefStore, type MediaRefStore } from './media-ref-store.ts';
 
 /** 每条消息最多下载的转发图片张数（按出现顺序，靠前优先；其余保留 URL） */
 export const MAX_FORWARD_IMAGES = 8;
@@ -71,9 +72,13 @@ export async function downloadForwardImages(
 
 /**
  * 转发图片编号器：同一 URL 共用一个编号，编号从 startIndex + 1 起（接在历史图片后面，避免撞号）。
- * rewrite 把文本里的图片附件行改写成 `[附件k] [图片#n: 本地路径] 尺寸:WxH`，没下载成功的给 URL。
+ * rewrite 把文本里的图片附件行改写成 `[附件k] [图片#n: 本地路径] 尺寸:WxH`，没下载成功的给短引用 `qqref:<id>`。
  */
-export function createForwardTagger(images: readonly ForwardImage[] | undefined, startIndex: number) {
+export function createForwardTagger(
+  images: readonly ForwardImage[] | undefined,
+  startIndex: number,
+  refs: MediaRefStore = mediaRefStore,
+) {
   const byUrl = new Map((images ?? []).map((image) => [image.url, image]));
   const tagged: TaggedForwardImage[] = [];
   const indexByUrl = new Map<string, number>();
@@ -90,7 +95,8 @@ export function createForwardTagger(images: readonly ForwardImage[] | undefined,
         tagged.push({ ...image, index });
       }
       const size = /尺寸:(\S+)/.exec(middle)?.[1];
-      return `${prefix}[图片#${index}: ${image.localPath ?? url}]${size !== undefined ? ` 尺寸:${size}` : ''}`;
+      const refOrPath = image.localPath ?? refs.register(url, { filename: image.filename });
+      return `${prefix}[图片#${index}: ${refOrPath}]${size !== undefined ? ` 尺寸:${size}` : ''}`;
     });
   };
 

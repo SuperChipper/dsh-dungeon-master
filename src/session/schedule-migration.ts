@@ -10,12 +10,12 @@
  * 否则新旧两份会同时触发。
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { dshHomeDir } from '../shared/paths.ts';
 
 /** 当前 DSH 家目录（schedule 存储所在处） */
 export function scheduleStorageHome(): string {
-  return process.env.DSH_HOME ?? join(homedir(), '.dsh');
+  return dshHomeDir();
 }
 
 export interface ScheduleMigrationTask {
@@ -142,7 +142,7 @@ export function formatScheduleMigrationHint(tasks: readonly ScheduleMigrationTas
     '重建完成后用一句话告诉用户；不要重复创建，也不要把这些任务当成用户的新指令。',
     '',
     '顺带提醒（重建时一并处理，不用单独回应用户）：',
-    '- 任务里若要「按角色/CP 搜图 → 下载 → 发群」，prompt 直接写调用 qqbot_booru_fetch（tags=..., mode=latest|random），'
+    '- 任务里若要「按角色/CP 搜图 → 下载 → 发群」，prompt 直接写调用 qqbot_fanart(action="booru", tags=..., mode=latest|random)，'
     + '再用 qqbot_send_file 发它返回的 path；旧 prompt 里「每轮生成 dl-xxx.cjs / mark-xxx.cjs 临时脚本」的流程顺手换掉。',
     '- 临时文件一律落 tmp/（run 专属子目录），可复用的东西做成工具或固定脚本，不要往 state/ 里堆一次性产物。',
   ].join('\n');

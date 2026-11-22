@@ -30,6 +30,8 @@ interface Pending {
 export class GroupAccess {
   private readonly pending = new Map<string, Pending>();
   private disposed = false;
+  private lifecycleBound = false;
+  public onChange?: (group: string) => void;
 
   constructor(
     private readonly feature: GroupAccessFeature,
@@ -71,6 +73,7 @@ export class GroupAccess {
       if (!this.persistGroups(next)) throw new Error(`${label}白名单保存失败，权限未修改，请重试`);
       settings.allowedGroups = next;
       this.logger.info(`im-qqbot: ${label}白名单 ${op} group=${group}`);
+      this.onChange?.(group);
       message = `已把群 ${group} ${op === 'grant' ? '加入' : '移出'}${label}白名单，已保存；下一次${label}调用起生效。` + this.otherAccess(group);
     }
     // 主人私聊作出的最新决定（包括幂等撤销），不能被此前发出的旧卡片推翻。
@@ -78,11 +81,23 @@ export class GroupAccess {
     return message;
   }
 
+  /** 绑定插件卸载清理（停用Pending、标记disposed）；幂等，统一入口 qqbot_access 复用 */
+  bindLifecycle(ctx: Context): void {
+    if (this.lifecycleBound) return;
+    this.lifecycleBound = true;
+    ctx.effect(() => () => { this.disposed = true; this.pending.clear(); });
+  }
+
+  /** 统一入口 qqbot_access 调用接口 */
+  run(value: unknown, agent: unknown): Promise<string> {
+    return this.execute(value, agent);
+  }
+
   register(ctx: Context): void {
     if (!this.settings?.enabled || !this.config.ownerOpenid?.trim()) return;
     const tools = ctx.get('tools') as { register(definition: unknown): unknown } | undefined;
     if (!tools?.register) return;
-    ctx.effect(() => () => { this.disposed = true; this.pending.clear(); });
+    this.bindLifecycle(ctx);
     const { subject, tool } = this.spec;
     tools.register({
       name: tool,
@@ -138,7 +153,10 @@ export class GroupAccess {
     if (args.group !== undefined && args.group.trim() !== group) return `这里只能申请把本群加入/移出${label}白名单，不能申请其他群。`;
     if (args.action === 'status') {
       const status = this.listStatus(group, '本群');
-      return this.isAllowedGroup(group) || this.otherAccess(group) ? status : `${status}可调用 ${tool}(action="grant") 申请。`;
+      const capability = this.feature === 'imageGen' ? 'image_gen' : 'browser';
+      return this.isAllowedGroup(group) || this.otherAccess(group)
+        ? status
+        : `${status}可调用 qqbot_access(capability="${capability}", action="grant")（或兼容入口 ${tool}(action="grant")）申请。`;
     }
     if (this.isAllowedGroup(group) === (args.action === 'grant')) return this.listStatus(group, '本群');
     // 已有更广准入的群无需为当前调用重复审批；主人仍可在私聊中维护显式名单。

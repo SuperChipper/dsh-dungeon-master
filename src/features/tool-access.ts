@@ -8,9 +8,7 @@
  *   - 群里：模型只能「申请」把本群加入/移出，bot 发一条带按钮的确认，
  *     只有主人本人点「同意」才生效。点击者 openid 由 QQ 回调给出，模型和群友都伪造不了。
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { existsSync, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
 import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm';
@@ -19,6 +17,8 @@ import type { ImQQBotConfig } from '../config.ts';
 import type { DshAgent, SessionManager } from '../session/index.ts';
 import type { Logger, ReplyTarget } from '../types.ts';
 import { hasFullToolAccess, type ToolAccessGrants, type ToolGuardSession } from '../shared/tool-guard.ts';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
+import { qqbotToolAccessPath } from '../shared/paths.ts';
 import { accessKeyboard, decodeButtonData } from './button-utils.ts';
 
 export const TOOL_ACCESS_TOOL_NAME = 'qqbot_tool_access';
@@ -42,7 +42,7 @@ export class ToolAccessStore implements ToolAccessGrants {
   private data: GrantsFile = { groups: [], users: [] };
   private readonly path: string;
 
-  public constructor(path = resolve(homedir(), '.dsh-qqbot', 'tool-access.json')) {
+  public constructor(path = qqbotToolAccessPath()) {
     this.path = path;
     try {
       if (existsSync(path)) {
@@ -72,8 +72,7 @@ export class ToolAccessStore implements ToolAccessGrants {
     if (op === 'grant' ? has : !has) return false;
     if (op === 'grant') list.push(id);
     else list.splice(list.indexOf(id), 1);
-    mkdirSync(dirname(this.path), { recursive: true });
-    writeFileSync(this.path, JSON.stringify(this.data, null, 2), 'utf8');
+    writeJsonAtomic(this.path, this.data, { indent: 2 });
     return true;
   }
 }
@@ -95,7 +94,7 @@ interface ToolsRegistryLike {
   register(definition: unknown): unknown;
 }
 
-interface AccessArgs {
+export interface AccessArgs {
   action: 'status' | 'grant' | 'revoke';
   group?: string;
   user?: string;
@@ -117,6 +116,7 @@ function label(kind: Kind, id: string): string {
 /** 白名单服务：合并配置与运行时授予，提供工具注册和按钮处理 */
 export class ToolAccess {
   private readonly pending = new Map<string, Pending>();
+  public onChange?: (kind: Kind, id: string) => void;
 
   public constructor(
     private readonly config: ImQQBotConfig,
@@ -140,6 +140,7 @@ export class ToolAccess {
     const changed = this.store.apply(op, kind, id);
     this.logger.info(`im-qqbot: 终端白名单 ${op} ${kind}=${id} changed=${changed}`);
     if (!changed) return `${label(kind, id)} ${op === 'grant' ? '已经在' : '本来就不在'}终端白名单里。`;
+    this.onChange?.(kind, id);
     return `已把${label(kind, id)}${op === 'grant' ? '加入' : '移出'}终端白名单，下一次工具调用起生效。`;
   }
 
@@ -171,6 +172,11 @@ export class ToolAccess {
       }),
     });
     this.logger.info('im-qqbot: qqbot_tool_access 已注册');
+  }
+
+  /** 统一入口 qqbot_access 等外部包装调用，直接走相同授权检查与审批流 */
+  public run(args: AccessArgs, agent: DshAgent | undefined): Promise<string> {
+    return this.execute(args, agent);
   }
 
   private async execute(args: AccessArgs, agent: DshAgent | undefined): Promise<string> {

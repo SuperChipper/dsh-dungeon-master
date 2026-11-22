@@ -36,6 +36,7 @@ import {
   type HistoryImage,
 } from '../media/history-images.ts';
 import { createForwardTagger, type ForwardImage, type TaggedForwardImage } from '../media/forward-images.ts';
+import { registerMediaRef, shortenQqMediaUrls } from '../media/media-ref-store.ts';
 import { ASR_OFFLINE_HINT } from '../media/asr.ts';
 import { buildGifSheetNote, isGifBytes, makeGifSheet, type GifSheet } from '../media/gif-sheet.ts';
 import { formatMessageTime, makeSenderLabeler, MENTION_MARK, quoteHeader, type SenderLabeler } from '../features/message-format.ts';
@@ -300,13 +301,36 @@ export async function handleInbound(
     source: { kind: 'user' as const },
   });
 
+  // 共享笔记自动召回不在 userMessage 正文里拼接：暂存检索条件，由 agent/pre-step
+  // 进入模型步骤时独立生成 `qqbot-notes-recall` 上下文消息插在 userMessage 之前。
+  const notesQuery = buildNotesQuery(bodyMsg, bodyState);
+  const noteMediaTypes = [
+    ...(msg.attachments ?? []).map((a) => a.type),
+    ...(mwState.downloadedFiles ?? []).map((f) => f.contentType),
+    ...(mwState.downloadedQuoteFiles ?? []).map((f) => f.contentType),
+    ...(forwardImages.length ? ['image'] : []),
+  ].filter((value): value is string => typeof value === 'string');
+  const operations = inboundOperations(notesQuery, noteMediaTypes);
+  if (!ctx.signal.aborted) {
+    manager.stageNoteRecall?.(message.id, {
+      query: notesQuery,
+      operations,
+      scope,
+      peerId,
+      messageId: msg.messageId,
+      steered,
+    });
+  }
+
   // 阻塞等待本轮 turn 收敛，避免后续消息在 turn 运行期间被 followup 打断（短时消息经 turnSlot 自动 steer）
+  let submitted = false;
   try {
     await runInboundTurn(
       record.agent,
       message,
       ctx.signal,
       () => {
+        submitted = true;
         logger.info(`→ ${steered ? 'steer' : 'followup'} sent: key=${scope}:${peerId}`);
         if (scope === 'group') {
           clearGroupHistory(config.appId, msg.groupOpenid ?? msg.senderId);
@@ -319,6 +343,8 @@ export async function handleInbound(
     );
   } catch (err) {
     logger.warn(`whenIdle rejected: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    if (!submitted) manager.unstageNoteRecall?.(message.id);
   }
 
   // 上下文超阈值时后台压缩（只针对 QQ 会话；steer 注入分支由外层回合统一收尾压缩）
@@ -374,15 +400,6 @@ async function assembleAgentBody(
       + '你在那条里说「已经写好 / 已经记下 / 已经移动」的事都没有发生。需要的话现在用真正的工具调用重做，并在回复里如实更正；工具调用不要写进正文。';
   const migrationHint = manager.takeScheduleMigration(scope, peerId);
   const handoffHint = await manager.takeHandoff(scope, peerId);
-  // 共享笔记自动召回：用当前消息（含真正被引用的原文，剥掉内部媒体路径/发送者标签等假阳性源）检索，命中才注入
-  const rawQuote = state.quote?.text || state.quote?.entry?.content || '';
-  const quotedForNotes = rawQuote ? (splitQuote(rawQuote).quote ?? state.quote?.entry?.content ?? '') : '';
-  const notesQuery = sanitizeNotesQuery([userContent, quotedForNotes].filter(Boolean).join('\n'));
-  const mediaTypes = [...(msg.attachments ?? []).map(a => a.type),
-    ...(state.downloadedFiles ?? []).map(f => f.contentType), ...(state.downloadedQuoteFiles ?? []).map(f => f.contentType),
-    ...(forwardImages.length ? ['image'] : [])];
-  const operations = inboundOperations(notesQuery, mediaTypes.filter((value): value is string => typeof value === 'string'));
-  const notesHint = await manager.notesHint(notesQuery, scope, peerId, msg.messageId, steered, operations);
 
   const forwardHint = buildForwardHint(forwardImages);
   const replyStyleHint = buildReplyStyleHint(state.replyDesire as { mode?: string } | undefined);
@@ -390,10 +407,18 @@ async function assembleAgentBody(
     ? '[补充消息] 在上一条消息尚未回复完成时紧接着收到以下补充/跟进，请连同上面尚未回复的内容一并处理：'
     : '';
 
-  const base = [dynamicCtx, stickerHints, forwardHint, notesHint, unsentHint, skippedHint, handoffHint, migrationHint, replyStyleHint, steerHint, userMessage].filter(Boolean).join('\n');
+  const base = [dynamicCtx, stickerHints, forwardHint, unsentHint, skippedHint, handoffHint, migrationHint, replyStyleHint, steerHint, userMessage].filter(Boolean).join('\n');
   const agentBody = buildAgentBody(base, history, isGroup, wasMentioned || implicit, label, historyImages);
 
   return agentBody;
+}
+
+/** 构造共享笔记自动召回的检索 query（仅含当前正文与真正被引用的原文，剥除平台组装伪影） */
+export function buildNotesQuery(msg: ProcessedMessage, state: MiddlewareState): string {
+  const userContent = buildUserContent(msg, state);
+  const rawQuote = state.quote?.text || state.quote?.entry?.content || '';
+  const quotedForNotes = rawQuote ? (splitQuote(rawQuote).quote ?? state.quote?.entry?.content ?? '') : '';
+  return sanitizeNotesQuery([userContent, quotedForNotes].filter(Boolean).join('\n'));
 }
 
 /** 笔记检索查询里需要剥掉的平台/组装伪影（本地路径、合并标签、占位符等），防止误触发精确匹配强命中 */
@@ -404,6 +429,7 @@ const NOTES_QUERY_NOISE: readonly RegExp[] = [
   /【表情[^】]*】/g,
   /\[附件\d+\][^\n]*/g,
   /\[图片#\d+:\s*[^\]]*\](?:\s*尺寸:\S+)?/g,
+  /\bqqref:[0-9a-f]{8,16}\b/gi,
   /\[群聊的聊天记录\]/g,
   /\[聊天记录，共\s*\d+\s*条\]/g,
   /^===\s*消息\s*\d+\s*===$/gm,
@@ -464,7 +490,7 @@ export function buildForwardHint(images: readonly TaggedForwardImage[]): string 
     parts.push(`${local.join(' ')} 已下载到本地，可直接看（原生附图时标为「[转发图片#n]」）或用 qqbot_describe_image 传路径查看`);
   }
   if (remote.length > 0) {
-    parts.push(`${remote.join(' ')} 未下载，只有 URL（可能已过期），需要时用 qqbot_describe_image 传 URL`);
+    parts.push(`${remote.join(' ')} 未下载，已记为短引用（qqref:...，可能已过期），需要时把 qqref:... 传给 qqbot_describe_image 查看`);
   }
   return parts.join('；') + '。';
 }
@@ -537,13 +563,14 @@ export function buildQuotePart(quote: ResolvedQuote | undefined, label: SenderLa
 
   const { quote: quoted, context } = splitQuote(quote.text || quote.entry?.content || 'Original content unavailable');
   // 平台没给原文时，ref 索引里记过的那条（入站或 bot 自己发的）还能补回来
-  const quoteText = quoted ?? quote.entry?.content ?? QUOTE_MISSING_NOTE;
+  const rawQuoteText = quoted ?? quote.entry?.content ?? QUOTE_MISSING_NOTE;
+  const quoteText = shortenQqMediaUrls(rawQuoteText);
 
   const from = quote.entry?.senderId === SELF_SENDER_ID
     ? '你自己'
     : quote.entry?.senderId ? label(quote.entry.senderId, quote.entry.senderName) : undefined;
   const contextPart = context !== undefined
-    ? `[Platform context begins]\n${context}\n[Platform context ends]\n`
+    ? `[Platform context begins]\n${shortenQqMediaUrls(context)}\n[Platform context ends]\n`
     : '';
   return `${contextPart}${quoteHeader(from)}\n${quoteText}\n[Quoted message ends]\n`;
 }
@@ -609,8 +636,9 @@ function buildDynamicCtx(msg: ProcessedMessage, state: MiddlewareState): string 
       } else if ((state.processedAttachments ?? []).some(pa => pa.type === 'voice' && pa.asrOffline)) {
         lines.push(`- Voice: (${ASR_OFFLINE_HINT})`);
       } else {
-        const urls = voices.map(a => a.url).filter(Boolean);
-        if (urls.length > 0) lines.push(`- Voice: ${urls.join(', ')}`);
+        if (voices.some((a) => Boolean(a.url))) {
+          lines.push(`- Voice: (未转写，${voices.length} 条语音，音频链接已省略)`);
+        }
       }
     }
   }
@@ -638,7 +666,7 @@ function buildDynamicCtx(msg: ProcessedMessage, state: MiddlewareState): string 
  * 渲染单个媒体附件（image/video/file）的上下文行内容，不含列表前缀。
  * 当前消息与引用消息共用，保证附件格式统一。语音不在此处理（见 buildDynamicCtx）。
  */
-function renderMediaLine(
+export function renderMediaLine(
   kind: Exclude<MediaKind, 'voice'>,
   filename: string | undefined,
   localPath: string | undefined,
@@ -647,9 +675,12 @@ function renderMediaLine(
 ): string {
   switch (kind) {
     case 'image':
-      return localPath
-        ? `Image: ${localPath}`
-        : `Image: ${url ?? filename ?? 'image'}`;
+      if (localPath) return `Image: ${localPath}`;
+      if (url && /^(?:https?:)?\/\//i.test(url)) {
+        const ref = registerMediaRef(url, { filename });
+        return `Image: ${ref} (${filename ? `${filename}, ` : ''}未下载)`;
+      }
+      return `Image: ${filename ?? 'image'} (download failed)`;
     case 'video':
       return localPath
         ? `Video: ${localPath}`
@@ -703,10 +734,10 @@ export function buildAgentBody(
   }
 
   const historyLines = history.map(h => {
-    const tags = (imagesByMessage.get(h.messageId) ?? []).map(historyImageTag);
+    const tags = (imagesByMessage.get(h.messageId) ?? []).map((image) => historyImageTag(image));
     const time = formatMessageTime(h.timestamp, now);
     const senderLabel = isBotMemoryEntry(h) ? '[你自己]' : label(h.senderId, h.senderName);
-    const line = `${senderLabel} ${[renderChatRecord(h.content), ...tags].filter(Boolean).join(' ')}`;
+    const line = `${senderLabel} ${[shortenQqMediaUrls(renderChatRecord(h.content)), ...tags].filter(Boolean).join(' ')}`;
     return time ? `${time} ${line}` : line;
   });
 
@@ -715,7 +746,7 @@ export function buildAgentBody(
   ];
   if (historyImages.length > 0) {
     notes.push('[图片#n] 是历史消息里的图片。当前消息问到它们时：消息末尾附了「[历史图片#n]」的直接看，'
-      + '其余的用 qqbot_describe_image 传路径/URL 查看（URL 可能已过期）。');
+      + '其余的用 qqbot_describe_image 传路径或 qqref:... 短引用查看（未下载的引用可能已过期）。');
   }
 
   return [

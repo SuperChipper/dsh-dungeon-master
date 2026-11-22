@@ -7,7 +7,7 @@ import { AdventureLibrary } from './adventure.ts';
 import { type Campaign, CampaignStore, findCharacter, playerStatus, upsertCharacter } from './campaign.ts';
 import { DndService } from './dnd-service.ts';
 import { registerDndTools } from './dnd-tools.ts';
-import { chooseReaction, classifyReactionReply, eligibleReactors, recordReactionReply, reactionReplyNote, reactionsOf } from './pending-attack.ts';
+import { chooseReaction, classifyReactionReply, eligibleReactors, eligibleSpellReactors, hostileSpellcasterHints, recordReactionReply, reactionReplyNote, reactionsOf } from './pending-attack.ts';
 import { ACK, DndTurnButtons, buildReactionKeyboard, reactionOptionKey } from './turn-buttons.ts';
 import { encodeButtonData } from '../features/button-utils.ts';
 import { pendingReactionReply } from '../gateway/middleware-setup.ts';
@@ -913,5 +913,521 @@ describe('2026-11-15 角斗场反应与回滚加固', () => {
     const done = await t.call('dnd_undo', { action: 'undo', roll: `R${id}`, confirm: true });
     expect(done).toContain('【前置步骤提醒】');
     expect(done).toContain('dnd_position action=move');
+  });
+
+  it('法术反制与护盾术：从 spells 自动推断并支持高环法术位兜底；reactions: [] 明确禁用', () => {
+    const t = setup();
+    t.service.store.update(t.key, (c) => {
+      upsertCharacter(c, {
+        name: '奥术师',
+        player: 'arc',
+        playerId: 'P5',
+        className: '法师',
+        level: 7,
+        maxHp: 40,
+        ac: 13,
+        abilities: { int: 18 },
+        reactions: [{ name: '时间变幻', when: 'enemy_crit', resource: '时间变幻' }],
+        spells: [{ name: '护盾术', level: 1 }, { name: '法术反制', level: 3 }],
+        room: c.currentRoom,
+      });
+      findCharacter(c, '奥术师')!.resources = {
+        '1环法术位': { current: 0, max: 4, reset: 'long' },
+        '2环法术位': { current: 2, max: 3, reset: 'long' },
+        '3环法术位': { current: 0, max: 3, reset: 'long' },
+        '4环法术位': { current: 1, max: 1, reset: 'long' },
+        时间变幻: { current: 1, max: 1, reset: 'long' },
+      };
+      upsertCharacter(c, {
+        name: '禁用盾',
+        player: 'no',
+        playerId: 'P6',
+        maxHp: 30,
+        ac: 14,
+        reactions: [],
+        spells: [{ name: '护盾术', level: 1 }],
+      });
+      c.initiative!.order.push({ name: '奥术师', init: 14 });
+    });
+
+    const camp = t.campaign();
+    const mage = findCharacter(camp, '奥术师')!;
+    const wolf = findCharacter(camp, '狼')!;
+    expect(reactionsOf(mage).map((r) => r.name)).toEqual(['时间变幻', '护盾术', '法术反制']);
+    expect(reactionsOf(findCharacter(camp, '禁用盾')!)).toEqual([]);
+
+    // 1 环已空但 2 环有空余 -> 护盾术仍可触发；法术反制只算 3+ 环，4 环有空余时可触发
+    expect(eligibleReactors(camp, wolf, mage, { hit: true, crit: false, natural: 15 }).filter((r) => r.character === '奥术师').map((r) => r.reaction)).toEqual(['护盾术']);
+    // 普攻绝不误触法术反制
+    expect(eligibleReactors(camp, wolf, mage, { hit: true, crit: false, natural: 15 }).filter((r) => r.character === '奥术师').map((r) => r.reaction)).not.toContain('法术反制');
+    expect(eligibleSpellReactors(camp, wolf).map((r) => `${r.character}·${r.reaction}`)).toContain('奥术师·法术反制');
+
+    // 高环位也全部用光后不再触发
+    t.service.store.update(t.key, (c) => {
+      const m = findCharacter(c, '奥术师')!;
+      m.resources!['2环法术位']!.current = 0;
+      m.resources!['4环法术位']!.current = 0;
+    });
+    const depleted = t.campaign();
+    const mDep = findCharacter(depleted, '奥术师')!;
+    expect(eligibleReactors(depleted, wolf, mDep, { hit: true, crit: false, natural: 15 }).filter((r) => r.character === '奥术师')).toEqual([]);
+    expect(eligibleSpellReactors(depleted, wolf).map((r) => r.character)).not.toContain('奥术师');
+  });
+
+  it('敌方豁免法术（3环火球术 / 5环怪物定身术）自动触发60尺法术反制，含口头回应与高环施法属性检定', async () => {
+    const t = setup();
+    t.record.recentSenders.push({ id: 'P5', at: Date.now() });
+    t.service.store.update(t.key, (c) => {
+      upsertCharacter(c, {
+        name: '奇塔露',
+        player: 'qtl',
+        playerId: 'P5',
+        className: '法师',
+        level: 7,
+        maxHp: 35,
+        ac: 13,
+        abilities: { int: 18 },
+        spells: [{ name: '法术反制', level: 3 }],
+      });
+      findCharacter(c, '奇塔露')!.resources = {
+        '3环法术位': { current: 2, max: 3, reset: 'long' },
+        '4环法术位': { current: 1, max: 1, reset: 'long' },
+      };
+      upsertCharacter(c, {
+        name: '敌方法师',
+        kind: 'monster',
+        className: '法师',
+        level: 9,
+        maxHp: 50,
+        ac: 12,
+        abilities: { int: 18 },
+        room: c.currentRoom,
+      });
+      findCharacter(c, '敌方法师')!.resources = {
+        '3环法术位': { current: 2, max: 3, reset: 'long' },
+        '5环法术位': { current: 1, max: 1, reset: 'long' },
+      };
+      c.initiative = {
+        round: 1,
+        turn: 0,
+        order: [{ name: '敌方法师', init: 20 }, { name: '奇塔露', init: 16 }, { name: '卡厄斯', init: 5 }],
+        positions: {
+          敌方法师: { x: 0, y: 0, room: c.currentRoom },
+          卡厄斯: { x: 2, y: 0, room: c.currentRoom },
+          奇塔露: { x: 13, y: 0, room: c.currentRoom }, // 65 尺 > 60 尺
+        },
+      };
+    });
+
+    // 1) 超出 60 尺不挂起法术反制，火球直接命中卡厄斯
+    t.rolls.push(4, 4, 4, 4, 4, 4, 4, 4, 2); // 8d6=32, 敏捷豁免 2+0=2 失败
+    const farCast = await t.call('dnd_check', {
+      character: '敌方法师',
+      type: 'save',
+      ability: '敏捷',
+      dc: 15,
+      damage: '8d6',
+      damage_type: '火焰',
+      spend: '3环法术位',
+      spell_name: '火球术',
+      targets: [{ name: '卡厄斯' }],
+    });
+    expect(farCast).not.toContain('待结算');
+    expect(t.hp('卡厄斯')).toBe(0);
+    expect(findCharacter(t.campaign(), '敌方法师')!.resources!['3环法术位']!.current).toBe(1);
+
+    // 恢复卡厄斯 HP 并把奇塔露挪到 50 尺内（60 尺反制范围）
+    t.service.store.update(t.key, (c) => {
+      const ks = findCharacter(c, '卡厄斯')!;
+      ks.hp = 29;
+      ks.conditions = [];
+      delete ks.deathSaves;
+      c.initiative!.positions!['奇塔露'] = { x: 10, y: 0, room: c.currentRoom };
+    });
+
+    // 2) 3 环火球在 50 尺内自动挂起，文字回应「用3环法术反制」签发授权，反制后火球彻底失效且敌方法术位不退还
+    t.rolls.push(4, 4, 4, 4, 4, 4, 4, 4, 2);
+    const nearCast = await t.call('dnd_check', {
+      character: '敌方法师',
+      type: 'save',
+      ability: '敏捷',
+      dc: 15,
+      damage: '8d6',
+      damage_type: '火焰',
+      spend: '3环法术位',
+      spell_name: '火球术',
+      targets: [{ name: '卡厄斯' }],
+    });
+    expect(nearCast).toContain('待结算');
+    expect(nearCast).toContain('奇塔露·法术反制');
+    expect(t.hp('卡厄斯')).toBe(29);
+    expect(classifyReactionReply(t.campaign(), 'P5', '用3环法术反制')).toMatchObject({
+      kind: 'use',
+      choices: [{ character: '奇塔露', reaction: '法术反制' }],
+    });
+    expect(classifyReactionReply(t.campaign(), 'P5', '法术反制有效吗？')).toMatchObject({ kind: 'question' });
+
+    const auth1 = t.consent('奇塔露', '法术反制');
+    const countered = await t.call('dnd_apply', {
+      target: '卡厄斯',
+      reaction: { by: '奇塔露', name: '法术反制', authorization: auth1, slot_level: 3 },
+      settle: true,
+    });
+    expect(countered).toContain('自动成功');
+    expect(countered).toContain('反制失效');
+    expect(t.hp('卡厄斯')).toBe(29);
+    expect(findCharacter(t.campaign(), '奇塔露')!.resources!['3环法术位']!.current).toBe(1);
+    expect(findCharacter(t.campaign(), '敌方法师')!.resources!['3环法术位']!.current).toBe(0);
+    expect(t.campaign().initiative!.reacted).toContain('奇塔露');
+
+    // 3) 5 环怪物定身术用 3 环反制需过 DC 15 智力检定（+4）：失败继续生效，成功则失效
+    t.service.store.update(t.key, (c) => { delete c.initiative!.reacted; });
+    t.rolls.push(2); // 卡厄斯感知豁免 2 失败
+    await t.call('dnd_check', {
+      character: '敌方法师',
+      type: 'save',
+      ability: '感知',
+      dc: 15,
+      on_fail_conditions: ['麻痹'],
+      concentration: true,
+      spend: '5环法术位',
+      spell_name: '怪物定身术',
+      targets: [{ name: '卡厄斯' }],
+    });
+    const authFail = t.consent('奇塔露', '法术反制');
+    t.rolls.push(9); // d20=9 + 4 = 13 < DC 15 反制失败！
+    const failedCounter = await t.call('dnd_apply', {
+      target: '卡厄斯',
+      reaction: { by: '奇塔露', name: '法术反制', authorization: authFail, slot_level: 3 },
+      settle: true,
+    });
+    expect(failedCounter).toContain('未达反制要求');
+    expect(findCharacter(t.campaign(), '卡厄斯')!.conditions).toContain('麻痹');
+
+    t.service.store.update(t.key, (c) => {
+      delete c.initiative!.reacted;
+      findCharacter(c, '卡厄斯')!.conditions = [];
+      delete findCharacter(c, '卡厄斯')!.activeStates;
+      findCharacter(c, '敌方法师')!.resources!['5环法术位']!.current = 1;
+      findCharacter(c, '奇塔露')!.resources!['3环法术位']!.current = 2;
+    });
+    t.rolls.push(2);
+    await t.call('dnd_check', {
+      character: '敌方法师',
+      type: 'save',
+      ability: '感知',
+      dc: 15,
+      on_fail_conditions: ['麻痹'],
+      concentration: true,
+      spend: '5环法术位',
+      spell_name: '怪物定身术',
+      targets: [{ name: '卡厄斯' }],
+    });
+    const authPass = t.consent('奇塔露', '法术反制');
+    t.rolls.push(12); // d20=12 + 4 = 16 >= DC 15 反制成功！
+    const passedCounter = await t.call('dnd_apply', {
+      target: '卡厄斯',
+      reaction: { by: '奇塔露', name: '法术反制', authorization: authPass, slot_level: 3 },
+      settle: true,
+    });
+    expect(passedCounter).toContain('反制成功');
+    expect(findCharacter(t.campaign(), '卡厄斯')!.conditions).not.toContain('麻痹');
+  });
+
+  it('敌方法术攻击无damage仍挂起护盾术（默认+5 AC）与法术反制；敌方魔法飞弹触发护盾术全免疫与法术反制', async () => {
+    const t = setup();
+    t.record.recentSenders.push({ id: 'P5', at: Date.now() });
+    t.service.store.update(t.key, (c) => {
+      upsertCharacter(c, {
+        name: '奇塔露',
+        player: 'qtl',
+        playerId: 'P5',
+        className: '法师',
+        level: 5,
+        maxHp: 30,
+        ac: 13,
+        abilities: { int: 18 },
+        spells: [{ name: '护盾术', level: 1 }, { name: '法术反制', level: 3 }],
+      });
+      findCharacter(c, '奇塔露')!.resources = {
+        '1环法术位': { current: 2, max: 3, reset: 'long' },
+        '3环法术位': { current: 2, max: 2, reset: 'long' },
+      };
+      findCharacter(c, 'Kriv')!.reactions = [];
+      findCharacter(c, '刻德温')!.reactions = [];
+      upsertCharacter(c, {
+        name: '敌方法师',
+        kind: 'monster',
+        level: 5,
+        abilities: { int: 18 },
+        attackBonus: 7,
+        maxHp: 45,
+        ac: 12,
+        room: c.currentRoom,
+      });
+      c.initiative = { round: 1, turn: 0, order: [{ name: '敌方法师', init: 20 }, { name: '奇塔露', init: 16 }, { name: '卡厄斯', init: 5 }] };
+    });
+
+    // 1) 未传 damage 的法术攻击同样自动挂起护盾术与法术反制，且用护盾术时 ac_mod 自动默认 +5 挡下 15 命中
+    t.rolls.push(8); // 8+7=15 vs AC 13 命中，护盾术 +5 AC -> 18 未命中
+    const atkHold = await t.call('dnd_check', {
+      character: '敌方法师',
+      type: 'attack',
+      target: '奇塔露',
+      ability: 'int',
+      spell_name: '灼热射线',
+      spell_level: 2,
+    });
+    expect(atkHold).toContain('奇塔露·护盾术');
+    expect(atkHold).toContain('奇塔露·法术反制');
+    const shieldAuth = t.consent('奇塔露', '护盾术');
+    const shieldRes = await t.call('dnd_apply', {
+      target: '奇塔露',
+      reaction: { by: '奇塔露', name: '护盾术', authorization: shieldAuth },
+      settle: true,
+    });
+    expect(shieldRes).toContain('AC +5');
+    expect(shieldRes).toContain('未命中');
+    expect(t.campaign().initiative!.shielded).toContain('奇塔露');
+    expect(findCharacter(t.campaign(), '奇塔露')!.resources!['1环法术位']!.current).toBe(1);
+
+    // 2) 魔法飞弹自动挂起，护盾术完全免疫自身伤害而队友照常吃伤
+    t.service.store.update(t.key, (c) => { delete c.initiative!.reacted; });
+    const mmHold = await t.call('dnd_apply', {
+      caster: '敌方法师',
+      spell_name: '魔法飞弹',
+      slot_level: 1,
+      damage_type: '力场',
+      targets: [{ name: '奇塔露', damage: 10 }, { name: '卡厄斯', damage: 9 }],
+    });
+    expect(mmHold).toContain('待结算');
+    expect(mmHold).toContain('奇塔露·护盾术');
+    expect(mmHold).toContain('奇塔露·法术反制');
+    expect(t.hp('奇塔露')).toBe(30);
+    expect(t.hp('卡厄斯')).toBe(29);
+
+    const mmShieldAuth = t.consent('奇塔露', '护盾术');
+    const mmRes = await t.call('dnd_apply', {
+      target: '奇塔露',
+      reaction: { by: '奇塔露', name: '护盾术', authorization: mmShieldAuth },
+      settle: true,
+    });
+    expect(mmRes).toContain('护盾术');
+    expect(mmRes).toContain('免疫');
+    expect(t.hp('奇塔露')).toBe(30);
+    expect(t.hp('卡厄斯')).toBe(20);
+
+    // 3) 魔法飞弹被法术反制后，全员 0 伤
+    t.service.store.update(t.key, (c) => { delete c.initiative!.reacted; });
+    await t.call('dnd_apply', {
+      caster: '敌方法师',
+      spell_name: '魔法飞弹',
+      slot_level: 1,
+      damage_type: '力场',
+      targets: [{ name: '奇塔露', damage: 10 }, { name: '卡厄斯', damage: 9 }],
+    });
+    const mmCounterAuth = t.consent('奇塔露', '法术反制');
+    const mmCountered = await t.call('dnd_apply', {
+      target: '奇塔露',
+      reaction: { by: '奇塔露', name: '法术反制', authorization: mmCounterAuth, slot_level: 3 },
+      settle: true,
+    });
+    expect(mmCountered).toContain('反制失效');
+    expect(t.hp('卡厄斯')).toBe(20);
+  });
+
+  it('敌方持续区域（火墙术）与状态法术（灵体卫士）自动触发法术反制，反制后不落地、跳过后正常生效', async () => {
+    const t = setup();
+    t.record.recentSenders.push({ id: 'P5', at: Date.now() });
+    t.service.store.update(t.key, (c) => {
+      upsertCharacter(c, {
+        name: '奇塔露',
+        player: 'qtl',
+        playerId: 'P5',
+        className: '法师',
+        level: 7,
+        maxHp: 35,
+        ac: 13,
+        abilities: { int: 18 },
+        spells: [{ name: '法术反制', level: 3 }],
+      });
+      findCharacter(c, '奇塔露')!.resources = {
+        '3环法术位': { current: 2, max: 3, reset: 'long' },
+        '4环法术位': { current: 1, max: 1, reset: 'long' },
+      };
+      upsertCharacter(c, {
+        name: '敌方牧师',
+        kind: 'monster',
+        className: '牧师',
+        level: 7,
+        maxHp: 50,
+        ac: 16,
+        abilities: { wis: 18 },
+        room: c.currentRoom,
+      });
+      findCharacter(c, '敌方牧师')!.resources = {
+        '3环法术位': { current: 2, max: 3, reset: 'long' },
+        '4环法术位': { current: 2, max: 2, reset: 'long' },
+      };
+      c.initiative!.order.push({ name: '奇塔露', init: 16 }, { name: '敌方牧师', init: 11 });
+    });
+    await t.call('dnd_position', { action: 'terrain', width: 10, height: 10, areas: [] });
+
+    // 1) 敌方放置火墙术：消耗 4 环位后挂起，4 环反制后区域不生成
+    const zoneHold = await t.call('dnd_position', {
+      action: 'zone',
+      name: '火墙术',
+      caster: '敌方牧师',
+      x: 3,
+      y: 3,
+      spend: '4环法术位',
+    });
+    expect(zoneHold).toContain('待结算');
+    expect(zoneHold).toContain('奇塔露·法术反制');
+    expect(t.campaign().initiative!.zones).toBeUndefined();
+    const zAuth = t.consent('奇塔露', '法术反制');
+    await t.call('dnd_apply', {
+      target: '敌方牧师',
+      reaction: { by: '奇塔露', name: '法术反制', authorization: zAuth, slot_level: 4 },
+      settle: true,
+    });
+    expect(t.campaign().initiative!.zones).toBeUndefined();
+    expect(findCharacter(t.campaign(), '敌方牧师')!.resources!['4环法术位']!.current).toBe(1);
+
+    // 跳过反制 -> 落账后火墙术成功生效
+    t.service.store.update(t.key, (c) => { delete c.initiative!.reacted; });
+    await t.call('dnd_position', { action: 'zone', name: '火墙术', caster: '敌方牧师', x: 3, y: 3, spend: '4环法术位' });
+    const zSettled = await t.call('dnd_apply', { target: '敌方牧师', decline: ['奇塔露'], settle: true });
+    expect(zSettled).toContain('已放置持续区域：火墙术');
+    expect(t.campaign().initiative!.zones?.some((z) => z.name === '火墙术')).toBe(true);
+
+    // 2) 敌方施放 3 环灵体卫士：反制成功后不挂载状态，但法术位不退回
+    t.service.store.update(t.key, (c) => { delete c.initiative!.reacted; });
+    const buffHold = await t.call('dnd_resource', {
+      action: 'use',
+      character: '敌方牧师',
+      resource: '3环法术位',
+      apply_state: '灵体卫士',
+    });
+    expect(buffHold).toContain('待结算');
+    const bAuth = t.consent('奇塔露', '法术反制');
+    const buffCountered = await t.call('dnd_apply', {
+      target: '敌方牧师',
+      reaction: { by: '奇塔露', name: '法术反制', authorization: bAuth, slot_level: 3 },
+      settle: true,
+    });
+    expect(buffCountered).toContain('反制失效');
+    expect(findCharacter(t.campaign(), '敌方牧师')!.conditions).not.toContain('灵体卫士');
+    expect(findCharacter(t.campaign(), '敌方牧师')!.resources!['3环法术位']!.current).toBe(1);
+  });
+
+  it('PC 施法与攻击命中敌方法师时触发仅限 DM 可见的法术反制/护盾术战术提醒（绝不发玩家按钮）', async () => {
+    const t = setup();
+    t.service.store.update(t.key, (c) => {
+      upsertCharacter(c, {
+        name: '黑蜘蛛',
+        kind: 'monster',
+        className: '法师',
+        level: 6,
+        maxHp: 40,
+        ac: 12,
+        spells: [{ name: '法术反制', level: 3 }, { name: '护盾术', level: 1 }],
+        room: c.currentRoom,
+      });
+      findCharacter(c, '黑蜘蛛')!.resources = {
+        '1环法术位': { current: 2, max: 3, reset: 'long' },
+        '3环法术位': { current: 2, max: 2, reset: 'long' },
+      };
+      const ks = findCharacter(c, '卡厄斯')!;
+      ks.className = '法师';
+      ks.weapons = [{ name: '短剑', damage: '1d6' }];
+      ks.resources = {
+        '1环法术位': { current: 3, max: 3, reset: 'long' },
+        '2环法术位': { current: 2, max: 2, reset: 'long' },
+        '3环法术位': { current: 2, max: 2, reset: 'long' },
+      };
+      c.initiative = {
+        round: 1,
+        turn: 0,
+        order: [{ name: '卡厄斯', init: 20 }, { name: '黑蜘蛛', init: 10 }],
+        positions: {
+          卡厄斯: { x: 1, y: 1, room: c.currentRoom },
+          黑蜘蛛: { x: 6, y: 1, room: c.currentRoom }, // 25 尺 <= 60 尺
+        },
+      };
+    });
+
+    // 1) PC 放火球、放火墙、施放状态法术，均提醒黑蜘蛛持有「法术反制」且不自动挂窗口
+    t.rolls.push(3, 3, 3, 3, 3, 3, 3, 3, 2);
+    const fb = await t.call('dnd_check', {
+      character: '卡厄斯',
+      type: 'save',
+      ability: '敏捷',
+      dc: 15,
+      damage: '8d6',
+      damage_type: '火焰',
+      spend: '3环法术位',
+      spell_name: '火球术',
+      targets: [{ name: '黑蜘蛛' }],
+      declared_by: 'P3',
+    });
+    expect(fb).toContain('【DM战术提醒】敌方「黑蜘蛛」（距 25 尺、反应 1/1）持有「法术反制」');
+    expect(fb).not.toContain('待结算');
+
+    const zoneRes = await t.call('dnd_position', { action: 'zone', name: '火墙术', caster: '卡厄斯', x: 4, y: 4 });
+    expect(zoneRes).toContain('【DM战术提醒】敌方「黑蜘蛛」（距 25 尺、反应 1/1）持有「法术反制」');
+
+    const bufRes = await t.call('dnd_resource', {
+      action: 'use',
+      character: '卡厄斯',
+      resource: '2环法术位',
+      apply_state: '防护毒素',
+    });
+    expect(bufRes).toContain('【DM战术提醒】敌方「黑蜘蛛」（距 25 尺、反应 1/1）持有「法术反制」');
+
+    // 2) PC 攻击命中黑蜘蛛（AC 12）：总值 15 可被护盾术(+5→17)挡下；总值 18 单靠护盾术挡不下
+    t.rolls.push(13, 3); // d20=13 + 2 = 15 (12<=15<17)
+    const hitBlockable = await t.call('dnd_check', {
+      character: '卡厄斯',
+      type: 'attack',
+      target: '黑蜘蛛',
+      weapon: '短剑',
+      declared_by: 'P3',
+    });
+    expect(hitBlockable).toContain('【DM战术提醒】敌方「黑蜘蛛」（反应 1/1）持有「护盾术」');
+    expect(hitBlockable).toContain('可直接挡下本击');
+
+    t.rolls.push(16, 3); // d20=16 + 2 = 18 (>=17)
+    const hitTooHigh = await t.call('dnd_check', {
+      character: '卡厄斯',
+      type: 'attack',
+      target: '黑蜘蛛',
+      weapon: '短剑',
+      declared_by: 'P3',
+    });
+    expect(hitTooHigh).toContain('单靠「护盾术」（+5 AC）挡不下本击');
+
+    // 3) 超过 60 尺不再提示法术反制；反应耗尽(0/1)后两类均不提示
+    t.service.store.update(t.key, (c) => {
+      c.initiative!.positions!['黑蜘蛛'] = { x: 15, y: 1, room: c.currentRoom }; // 70 尺
+    });
+    const outOfRange = await t.call('dnd_position', { action: 'zone', name: '火墙术', caster: '卡厄斯', x: 5, y: 5 });
+    expect(outOfRange).not.toContain('法术反制');
+
+    t.service.store.update(t.key, (c) => {
+      c.initiative!.positions!['黑蜘蛛'] = { x: 6, y: 1, room: c.currentRoom };
+      c.initiative!.reacted = ['黑蜘蛛'];
+    });
+    const spentRx = await t.call('dnd_position', { action: 'zone', name: '火墙术', caster: '卡厄斯', x: 6, y: 6 });
+    expect(spentRx).not.toContain('【DM战术提醒】');
+    t.rolls.push(13, 3);
+    const hitSpentRx = await t.call('dnd_check', {
+      character: '卡厄斯',
+      type: 'attack',
+      target: '黑蜘蛛',
+      weapon: '短剑',
+      declared_by: 'P3',
+    });
+    expect(hitSpentRx).not.toContain('【DM战术提醒】');
   });
 });

@@ -101,7 +101,8 @@ export function buildReactionKeyboard(p: ReactionWindow): InlineKeyboard {
   const perRow = options.length + 1 > MAX_KEYBOARD_ROWS ? BUTTONS_PER_ROW : 1;
   const rows: InlineKeyboard['content']['rows'] = [];
   for (let i = 0; i < options.length; i += perRow) rows.push({ buttons: options.slice(i, i + perRow) });
-  rows.push({ buttons: [callbackButton('dnd-pass', '不用', 0, encodeButtonData({ t: 'dnd', a: 'pass', r: p.seq }))] });
+  const passLabel = p.kind === 'move' && p.swapWith !== undefined ? '不同意' : '不用';
+  rows.push({ buttons: [callbackButton('dnd-pass', passLabel, 0, encodeButtonData({ t: 'dnd', a: 'pass', r: p.seq }))] });
   return { content: { rows } };
 }
 
@@ -220,8 +221,10 @@ export class DndTurnButtons {
     const p = reactionWindow(this.service.active(record.sessionKey)?.campaign);
     if (p === undefined) return;
     if (!this.disabled && record.scope === 'group' && p.reactors.some((r) => r.npc !== true)) {
-      const text = `⚡ ${describePending(p)}还没结算。要用反应的点下面，只有本人点才算，也可以直接打字说。`
-        + '不限时，等本人答复；人不在的话 DM 会替他跳过。';
+      const text = p.kind === 'move' && p.swapWith !== undefined
+        ? `🔄 **${p.target}** 请求与 **${p.swapWith}** 交换站位（不消耗反应）。请 **${p.swapWith}** 本人点下面按钮，也可以直接打字说「同意 / 不同意」。`
+        : `⚡ ${describePending(p)}还没结算。要用反应的点下面，只有本人点才算，也可以直接打字说。`
+          + '不限时，等本人答复；人不在的话 DM 会替他跳过。';
       try {
         await this.sender.sendMarkdown(record.replyTarget, text, { keyboard: buildReactionKeyboard(p) });
       } catch (err) {
@@ -274,7 +277,10 @@ export class DndTurnButtons {
         return waitingOn(pending);
       }, `按钮 不用反应 ${fresh.join('、')}`);
       if (record !== undefined && left !== undefined && left.length === 0) {
-        this.notifyDm(record, `[系统 · 按钮] 反应都答复了，${fresh.join('、')} 不用。用 dnd_apply target=${p.target} settle=true 落账，再接着结算。`);
+        const msg = p.kind === 'move' && p.swapWith !== undefined
+          ? `[系统 · 按钮] ${fresh.join('、')} 点了「不同意」交换站位。用 dnd_apply target=${p.target} settle=true 结束本次换位请求（停在原位）。`
+          : `[系统 · 按钮] 反应都答复了，${fresh.join('、')} 不用。用 dnd_apply target=${p.target} settle=true 落账，再接着结算。`;
+        this.notifyDm(record, msg);
       }
       return ACK.ok;
     }
@@ -557,16 +563,19 @@ export class DndTurnButtons {
     if (reactionWindow(found.campaign) !== undefined) return ACK.failed;
 
     const next = this.service.store.update(key, (c) => {
-      const { round, current, newRound, skipped } = nextTurn(c);
-      return { round, newRound, skipped, prompt: combatTurnPrompt(c, current.name) };
+      const { round, current, newRound, skipped, expired, hazardNotes } = nextTurn(c, this.service.roller, this.service.globalEffects());
+      return { round, newRound, skipped, expired, hazardNotes, prompt: combatTurnPrompt(c, current.name, { globalEffects: this.service.globalEffects() }) };
     }, `按钮 结束回合 ${pc.name}`);
+    this.service.recordAgentToolSync?.(key);
     this.logger.info(`im-qqbot: 跑团按钮结束回合 key=${key} ${pc.name} by=${clicker ?? '?'}`);
 
     if (record !== undefined) {
+      const expiredText = next.expired.length > 0 ? `【状态/区域到期】${next.expired.join('；')}\n` : '';
+      const hazardText = next.hazardNotes.length > 0 ? `【回合切换自动结算（回复里照实播报掷骰过程）】\n${next.hazardNotes.map((h) => `- ${h}`).join('\n')}\n` : '';
       const text = `[系统 · 按钮] ${pc.name}${pc.player !== undefined ? `〈${pc.player}〉` : ''} 点了「结束回合」，`
         + `先攻已由工具推进（不要再为 ${pc.name} 调用 dnd_initiative next）。`
         + `${next.skipped.length > 0 ? `受惊跳过：${next.skipped.join('、')}。` : ''}`
-        + `${next.newRound ? `进入第 ${next.round} 轮。` : ''}${next.prompt}`;
+        + `${expiredText}${hazardText}${next.newRound ? `进入第 ${next.round} 轮。` : ''}${next.prompt}`;
       this.notifyDm(record, text);
       if (this.manager.combatAgents === undefined) this.schedule(record);
     }

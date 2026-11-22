@@ -30,8 +30,9 @@ export function registerBrowserTool(ctx: Context, config: ImQQBotConfig, manager
   tools.register({
     name: 'qqbot_browser',
     description: 'Browse and extract content from websites such as X or Xiaohongshu using Playwright. '
-      + 'Available in owner private chat and explicitly allowed QQ groups. If a group needs permission, use qqbot_browser_access '
-      + 'with action="grant" when a user asks, and wait for owner approval. Each group has its own isolated browser and login state. '
+      + 'Available in owner private chat and explicitly allowed QQ groups. If a group needs permission, use '
+      + 'qqbot_access(capability="browser", action="grant") when a user asks, and wait for owner approval. '
+      + 'Each group has its own isolated browser and login state. '
       + 'Use open with an http(s) URL, then read the text and accessibility snapshot. Use CSS or Playwright text/role selectors '
       + 'for click/fill/press; scroll moves one viewport; screenshot returns a local PNG path (use qqbot_send_file to send it). '
       + 'read again after a dynamic page loads. close releases the browser while keeping local login state. '
@@ -55,7 +56,7 @@ export function registerBrowserTool(ctx: Context, config: ImQQBotConfig, manager
       const isOwner = record?.scope === 'c2c' && record.peerId === owner && record.senderId === owner;
       const isAllowedGroup = record?.scope === 'group' && groupOnList(record.peerId, config.browser?.allowedGroups);
       if (!record || (!isOwner && !isAllowedGroup)) {
-        throw new Error('浏览工具仅限主人私聊或浏览群白名单内的群使用；可按用户要求调用 qqbot_browser_access(action="grant") 申请，等主人审批');
+        throw new Error('浏览工具仅限主人私聊或浏览群白名单内的群使用；可按用户要求调用 qqbot_access(capability="browser", action="grant") 申请，等主人审批');
       }
       if (disposed) throw new Error('浏览器服务已关闭');
       const key = isOwner ? 'owner' : `group:${record.peerId}`;

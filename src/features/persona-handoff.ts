@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { BlockAssembler, type GenerateOptions } from '@deepseek-ai/dsh-llm';
 import type { SessionEventLike } from '../session/types.ts';
 import { pickLowestEffort, type JudgeLlm } from './reply-judge.ts';
-import { createPersonaHandoffMessage, isPersonaHandoffSource } from '../shared/message-source.ts';
+import { createPersonaHandoffMessage, isNotesRecallSource, isPersonaHandoffSource } from '../shared/message-source.ts';
+import { writeJsonAtomic } from '../shared/atomic-fs.ts';
 import { formatScheduleMigrationHint, type ScheduleMigrationTask } from '../session/schedule-migration.ts';
 
 export const HANDOFF_CHUNK_CHARS = 96_000;
@@ -143,7 +144,7 @@ export function collectHandoffInput(
     if (visible !== undefined && event.type === 'tool/call') return;
     const message = messageOf(event);
     const source = message.source as { kind?: string; plugin?: string } | undefined;
-    if (source?.kind === 'runtime-context' || isPersonaHandoffSource(source)) return;
+    if (source?.kind === 'runtime-context' || isPersonaHandoffSource(source) || isNotesRecallSource(source)) return;
     // tool/call 的参数在工具结果中未必回显，保留它以区分计划、调用与执行结果。
     const text = dialogue ? contentText(message.content) : event.type === 'tool/result'
       ? JSON.stringify({ message, error: bodyOf(event).error })
@@ -215,11 +216,7 @@ export class PersonaHandoffStore {
   }
 
   private save(state: HandoffState): void {
-    mkdirSync(this.dir, { recursive: true });
-    const path = this.pathFor(state.chatKey);
-    const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`;
-    writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
-    renameSync(tmp, path);
+    writeJsonAtomic(this.pathFor(state.chatKey), state, { indent: 2 });
   }
 
   public begin(chatKey: string, fromPersona: string, input: HandoffInput): HandoffAttempt {

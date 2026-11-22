@@ -7,6 +7,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { basename, dirname, join, resolve } from 'node:path';
+import { dshHomeDir } from './paths.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -114,7 +115,7 @@ export function getProfileDir(baseDir: string = PLUGIN_ROOT): string | null {
  * 只接受带 package.json 的目录。
  */
 function profileDirFromEnv(): string | null {
-  const home = process.env.DSH_HOME ?? join(os.homedir(), '.dsh');
+  const home = dshHomeDir();
   const candidates: string[] = [];
   if (process.env.DSH_PROFILE_DIR) candidates.push(resolve(process.env.DSH_PROFILE_DIR));
   if (process.env.DSH_PROFILE) candidates.push(resolve(home, 'profiles', process.env.DSH_PROFILE));

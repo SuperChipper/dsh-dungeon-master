@@ -388,6 +388,66 @@ describe('dnd_position 工具', () => {
     const text = await call('dnd_check', { type: 'skill', character: '卡厄斯', skill: '察觉', dc: 10, secret: true, declared_by: 'P1' });
     expect(text).toContain('当场说结果');
   });
+
+  it('formation 前/中/后排自动阵型摆位：只需传前中后排优先级与敌人站位，自动朝敌分层落位且不撞墙不叠格', async () => {
+    const { call, service, key } = setup();
+    service.store.update(key, (c) => {
+      upsertCharacter(c, { name: '丛云', player: 'M1', playerId: 'P1', className: '战士', maxHp: 50, weapons: [{ name: '太刀', damage: '1d8' }] });
+      upsertCharacter(c, { name: '恩佐', player: 'E1', playerId: 'P1', className: '吟游诗人', maxHp: 38 });
+      upsertCharacter(c, { name: '维斯珀', player: 'V1', playerId: 'P1', className: '法师', maxHp: 32 });
+      upsertCharacter(c, { name: '奇塔露', player: 'Q1', playerId: 'P1', className: '邪术师', maxHp: 36 });
+      upsertCharacter(c, { name: '蛇人纯血2', kind: 'monster', maxHp: 40, room: c.currentRoom });
+      upsertCharacter(c, { name: '蛇人祭司', kind: 'monster', maxHp: 55, room: c.currentRoom });
+    });
+    await call('dnd_initiative', { action: 'start' });
+    await call('dnd_position', {
+      action: 'terrain',
+      width: 8,
+      height: 6,
+      areas: [
+        { kind: 'wall', x: 0, y: 0, w: 8, h: 1 },
+        { kind: 'wall', x: 1, y: 5, w: 7, h: 1 },
+        { kind: 'wall', x: 7, y: 1, w: 1, h: 5 },
+        { kind: 'outside', name: '门外走廊', x: 0, y: 1, w: 1, h: 4 },
+        { kind: 'door', name: '西门', x: 1, y: 2, w: 1, h: 2, to: 'nave' },
+      ],
+    });
+    const out = await call('dnd_position', {
+      action: 'set',
+      formation: {
+        entry: '西门',
+        front: ['卡厄斯', '丛云'],
+        mid: ['恩佐'],
+        back: ['奇塔露'],
+        auto_rest: true, // 漏写的法师「维斯珀」自动识别为后排补齐
+        enemies: {
+          x: 5,
+          y: 2,
+          front: ['地精', '蛇人纯血2'],
+          back: ['蛇人祭司'],
+        },
+      },
+    });
+    expect(out).not.toContain('同一格');
+    const pos = service.store.load(key)!.initiative!.positions!;
+    const partyNames = ['卡厄斯', '丛云', '恩佐', '维斯珀', '奇塔露'];
+    for (const n of partyNames) expect(pos[n]).toBeDefined();
+    // 验证无任何两人叠格
+    const coordSet = new Set(Object.values(pos).map((p) => `${p.x},${p.y}`));
+    expect(coordSet.size).toBe(8);
+
+    const enemyCells = [pos['地精']!, pos['蛇人纯血2']!, pos['蛇人祭司']!];
+    const distToFoes = (name: string): number =>
+      Math.min(...enemyCells.map((e) => Math.max(Math.abs(pos[name]!.x - e.x), Math.abs(pos[name]!.y - e.y)) * 5));
+
+    // 前排比中排更靠近敌群，中排比后排更靠近敌群
+    expect(distToFoes('卡厄斯')).toBeLessThan(distToFoes('恩佐'));
+    expect(distToFoes('丛云')).toBeLessThan(distToFoes('恩佐'));
+    expect(distToFoes('恩佐')).toBeLessThan(distToFoes('奇塔露'));
+    expect(distToFoes('恩佐')).toBeLessThan(distToFoes('维斯珀'));
+    // 敌方前排（地精/纯血2）比敌方后排（祭司）更靠近西门
+    expect(pos['地精']!.x).toBeLessThan(pos['蛇人祭司']!.x);
+  });
 });
 
 describe('长柄大师：进入触及范围也吃借机', () => {

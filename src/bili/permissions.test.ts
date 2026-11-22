@@ -37,9 +37,9 @@ describe('Bilibili read-only subtitle permission', () => {
       permission: (_agent, kind = 'login') => biliPermission(record, kind, config),
     });
     const context = { signal: new AbortController().signal, agent: {} };
-    expect(await definitions.get('bili_subtitle')!.execute({ bvid: 'BV139HA6JEE6' }, context)).toContain('测试字幕');
+    expect(await definitions.get('qqbot_bili')!.execute({ action: 'subtitle', bvid: 'BV139HA6JEE6' }, context)).toContain('测试字幕');
     expect(reads).toBe(1);
-    await expect(definitions.get('bili_login')!.execute({}, context)).rejects.toThrow('扫码登录只能');
-    await expect(definitions.get('bili_login_check')!.execute({ qrcodeKey: 'test' }, context)).rejects.toThrow('扫码登录只能');
+    await expect(definitions.get('qqbot_bili_auth')!.execute({ action: 'login' }, context)).rejects.toThrow('扫码登录只能');
+    await expect(definitions.get('qqbot_bili_auth')!.execute({ action: 'check', qrcodeKey: 'test' }, context)).rejects.toThrow('扫码登录只能');
   });
 });

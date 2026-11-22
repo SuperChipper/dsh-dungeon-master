@@ -28,30 +28,36 @@ import {
 } from './campaign.ts';
 import {
   breakConcentration,
-  concentratingOn,
-  concentratingZoneNames,
+  concentratingSpellNames,
   ensureTurnState,
   hasCondition,
   isIncapacitated,
   isInvisibleState,
   movementSpeedInfo,
+  normalizeCondition,
+  syncConcentrationAfterRemoval,
 } from './conditions.ts';
 import type { CustomEffectDef } from './custom-effects.ts';
 import { cryptoRoller, type Roller } from './dice.ts';
 import {
   type BattleZone,
+  type BattleZoneInput,
   createBattleZoneInput,
+  domainNamesAtCell,
   extraCellCostMultiplier,
   formatZonePlayerLegend,
   formatZoneSummary,
+  hasActiveDomainsInRoom,
   isCellHeavilyObscured,
   settleMovementHazards,
+  stepHazardNamesAt,
   zonesAtCell,
   zonesInRoom,
 } from './zones.ts';
 import {
   type BattleMap,
   type Cell,
+  type Reach,
   areaAt,
   areaCells,
   areaName,
@@ -144,6 +150,54 @@ function requireAltitude(value: unknown, label: string, ceiling?: number): numbe
   return value;
 }
 
+export type FormationRank = 'front' | 'mid' | 'back';
+
+export function parseFormationRank(raw: unknown): FormationRank | undefined {
+  if (typeof raw !== 'string' && typeof raw !== 'number') return undefined;
+  const s = String(raw).trim().toLowerCase();
+  if (s === 'front' || s === 'frontline' || s === '前排' || s === '前' || s === '1') return 'front';
+  if (s === 'mid' || s === 'middle' || s === 'midline' || s === '中排' || s === '中' || s === '2') return 'mid';
+  if (s === 'back' || s === 'rear' || s === 'backline' || s === '后排' || s === '后' || s === '3') return 'back';
+  return undefined;
+}
+
+/** 按职业与武器习惯推断默认排位（供 formation.autoRest 补齐漏写的参战队友） */
+export function inferDefaultRank(ch: Character): FormationRank {
+  const cls = ch.className ?? '';
+  const weapons = ch.weapons ?? [];
+  const hasMelee = weapons.some((w) => !isRangedWeapon(w));
+  const hasRanged = weapons.some((w) => isRangedWeapon(w));
+  if (/法师|术士|邪术师|wizard|sorcerer|warlock/i.test(cls) && !/咒剑|hexblade/i.test(`${cls} ${ch.notes ?? ''}`)) {
+    return 'back';
+  }
+  if (/野蛮人|战士|圣武士|武僧|barbarian|fighter|paladin|monk/i.test(cls)) {
+    return !hasMelee && hasRanged ? 'back' : 'front';
+  }
+  if (!hasMelee && hasRanged) return 'back';
+  return 'mid';
+}
+
+export interface SideFormationSpec {
+  /** 入场基准点（门名、地标名或角色名）；省略时自动取本房间队伍进入的门或与对手保持战术间距的一侧 */
+  entry?: string;
+  /** 或直接指定基准点坐标 */
+  x?: number;
+  y?: number;
+  /** 前排角色名列表（顶在最靠近对手的一线） */
+  front?: string[];
+  /** 中排角色名列表（紧随前排之后策应） */
+  mid?: string[];
+  /** 后排角色名列表（处于最远离对手的安全后侧） */
+  back?: string[];
+}
+
+export interface FormationInput extends SideFormationSpec {
+  /** 若为 true，自动将当前房间先攻表内其余未列出的我方参战者按职业默认排位一并摆好 */
+  autoRest?: boolean;
+  /** 可选：敌方阵型（也可直接用 placements 传敌方坐标或 near） */
+  enemies?: SideFormationSpec;
+}
+
 export interface Placement {
   name: string;
   x?: number;
@@ -152,6 +206,8 @@ export interface Placement {
   z?: number;
   /** 不给坐标时：摆在这个人/地标/地形（门）旁边最近的空格，按 placements 的顺序一个个占 */
   near?: string;
+  /** 阵型排位优先级：front（前排）/ mid（中排）/ back（后排），自动按与敌群距离分层摆位 */
+  rank?: FormationRank;
   /** 不是角色卡上的东西：门、柱子、没建卡的俘虏 */
   mark?: boolean;
 }
@@ -222,12 +278,359 @@ function unknownSpot(c: Campaign, room: string, query: string): Error {
   return new Error(`这个房间里找不到「${query}」。能用的：${[...new Set(names)].join('、') || '（还没有人摆位、也没有场地图）'}`);
 }
 
-/** 摆位/修正：不算移动力、不触发借机。开战摆位、强制位移（推、拖）、纠错都走这里 */
-export function setPositions(c: Campaign, placements: readonly Placement[]): string[] {
+const FORMATION_STEPS: readonly Cell[] = [
+  { x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 },
+  { x: 1, y: 1 }, { x: 1, y: -1 }, { x: -1, y: 1 }, { x: -1, y: -1 },
+];
+
+/** 多源 8 向最短步数距离（每格 5 尺，自动绕墙与矮障碍、禁止双墙斜穿角） */
+function gridFeetFromSeeds(
+  map: BattleMap | undefined,
+  seeds: readonly Cell[],
+  bounds: { x0: number; y0: number; x1: number; y1: number },
+): Map<string, number> {
+  const dist = new Map<string, number>();
+  const queue: Cell[] = [];
+  const inWin = (at: Cell): boolean =>
+    at.x >= bounds.x0 && at.x <= bounds.x1 && at.y >= bounds.y0 && at.y <= bounds.y1;
+  const passable = (at: Cell): boolean => inWin(at) && !blocksMove(map, at);
+
+  for (const s of seeds) {
+    if (passable(s)) {
+      const k = cellKey(s);
+      if (!dist.has(k)) {
+        dist.set(k, 0);
+        queue.push({ x: s.x, y: s.y });
+      }
+      continue;
+    }
+    // 种子本身是阻挡格（如以「石棺/祭坛」或站着怪物的格子为参照）时，从其相邻可通行格起算 5 尺
+    for (const st of FORMATION_STEPS) {
+      const nb = { x: s.x + st.x, y: s.y + st.y };
+      if (!passable(nb)) continue;
+      const k = cellKey(nb);
+      if (!dist.has(k)) {
+        dist.set(k, CELL_FEET);
+        queue.push(nb);
+      }
+    }
+  }
+
+  let head = 0;
+  while (head < queue.length) {
+    const cur = queue[head++]!;
+    const curFeet = dist.get(cellKey(cur))!;
+    for (const st of FORMATION_STEPS) {
+      const next = { x: cur.x + st.x, y: cur.y + st.y };
+      if (!passable(next)) continue;
+      if (
+        st.x !== 0 && st.y !== 0 && map !== undefined
+        && blocksMove(map, { x: cur.x + st.x, y: cur.y })
+        && blocksMove(map, { x: cur.x, y: cur.y + st.y })
+      ) continue;
+      const nk = cellKey(next);
+      if (dist.has(nk)) continue;
+      dist.set(nk, curFeet + CELL_FEET);
+      queue.push(next);
+    }
+  }
+  return dist;
+}
+
+function resolveSideAnchorCells(
+  c: Campaign,
+  room: string,
+  spec: SideFormationSpec | undefined,
+  fallbackNear: string | undefined,
+  isMonsterSide: boolean,
+  opponentCells: readonly Cell[],
+): Cell[] {
+  if (spec?.x !== undefined || spec?.y !== undefined) {
+    return [{
+      x: requireCoord(spec.x ?? 0, isMonsterSide ? 'enemies.x' : 'formation.x'),
+      y: requireCoord(spec.y ?? 0, isMonsterSide ? 'enemies.y' : 'formation.y'),
+    }];
+  }
+  const entryName = spec?.entry ?? fallbackNear;
+  if (entryName !== undefined) {
+    const spot = spotCells(c, room, entryName);
+    if (spot === undefined) throw unknownSpot(c, room, entryName);
+    return spot.cells;
+  }
+  const map = mapOf(c, room);
+  if (!isMonsterSide && map !== undefined) {
+    const enteredFrom = c.enteredFrom?.[room];
+    if (enteredFrom !== undefined) {
+      const door = map.areas.find((a) => a.kind === 'door' && a.to === enteredFrom)
+        ?? map.areas.find((a) => a.kind === 'outside' && a.to === enteredFrom);
+      if (door !== undefined) {
+        const dc = areaCells(map, door);
+        if (dc.length > 0) return dc;
+      }
+    }
+    const doors = map.areas.filter((a) => a.kind === 'door');
+    if (doors.length === 1) {
+      const dc = areaCells(map, doors[0]!);
+      if (dc.length > 0) return dc;
+    }
+    if (doors.length > 1 && opponentCells.length > 0) {
+      // 多扇门且未记 enteredFrom 时，选离敌群较远的那扇门作入场门
+      const bestDoor = doors
+        .map((d) => ({ cells: areaCells(map, d) }))
+        .filter((d) => d.cells.length > 0)
+        .sort((a, b) => minFeet(opponentCells, b.cells[0]!) - minFeet(opponentCells, a.cells[0]!))[0];
+      if (bestDoor !== undefined) return bestDoor.cells;
+    }
+  }
+  if (map !== undefined) {
+    const bounds = { x0: 0, y0: 0, x1: map.width - 1, y1: map.height - 1 };
+    const walkable: Cell[] = [];
+    for (let y = 0; y < map.height; y++) {
+      for (let x = 0; x < map.width; x++) {
+        if (!blocksMove(map, { x, y }) && areaAt(map, { x, y })?.kind !== 'outside') walkable.push({ x, y });
+      }
+    }
+    if (walkable.length > 0) {
+      if (opponentCells.length > 0) {
+        const oppDist = gridFeetFromSeeds(map, opponentCells, bounds);
+        const oppAvgY = opponentCells.reduce((s, p) => s + p.y, 0) / opponentCells.length;
+        // 自动在与对手相距约 20 尺（房间偏小时取最大可用间距）的室内一侧落锚
+        const maxD = Math.max(0, ...walkable.map((w) => oppDist.get(cellKey(w)) ?? 0));
+        const targetD = Math.min(20, Math.max(10, maxD - 5));
+        walkable.sort((a, b) => {
+          const da = oppDist.get(cellKey(a)) ?? 20;
+          const db = oppDist.get(cellKey(b)) ?? 20;
+          return Math.abs(da - targetD) - Math.abs(db - targetD)
+            || Math.abs(a.y - oppAvgY) - Math.abs(b.y - oppAvgY)
+            || (isMonsterSide ? b.x - a.x : a.x - b.x);
+        });
+        return [walkable[0]!];
+      }
+      const cy = Math.floor(map.height / 2);
+      walkable.sort((a, b) =>
+        (isMonsterSide ? b.x - a.x : a.x - b.x) || Math.abs(a.y - cy) - Math.abs(b.y - cy),
+      );
+      return [walkable[0]!];
+    }
+  }
+  // 无场地图空地：根据对手位置拉开约 20 尺（4 格）对峙阵线
+  if (opponentCells.length > 0) {
+    const minX = Math.min(...opponentCells.map((p) => p.x));
+    const maxX = Math.max(...opponentCells.map((p) => p.x));
+    const avgY = Math.round(opponentCells.reduce((s, p) => s + p.y, 0) / opponentCells.length);
+    if (isMonsterSide) {
+      return [{ x: Math.min(MAX_COORD - 2, maxX + 4), y: Math.max(1, Math.min(MAX_COORD - 1, avgY)) }];
+    }
+    const westX = minX - 4;
+    return [{
+      x: westX >= 1 ? westX : Math.min(MAX_COORD - 2, maxX + 4),
+      y: Math.max(1, Math.min(MAX_COORD - 1, avgY)),
+    }];
+  }
+  return [isMonsterSide ? { x: 6, y: 2 } : { x: 1, y: 2 }];
+}
+
+function placeSideByRanks(
+  c: Campaign,
+  room: string,
+  entries: ReadonlyArray<{ ch: Character; rank: FormationRank; z: number }>,
+  spec: SideFormationSpec | undefined,
+  fallbackNear: string | undefined,
+  isMonsterSide: boolean,
+  fallbackOpponentHints: readonly Cell[] = [],
+): void {
+  if (entries.length === 0) return;
   const state = requireInitiative(c);
-  if (placements.length === 0) throw new Error('set 要给 placements');
+  const map = mapOf(c, room);
+  const entryNames = new Set(entries.map((e) => e.ch.name));
+  const existingOpponents = placedIn(c, room)
+    .filter(({ ch }) => !entryNames.has(ch.name) && (ch.kind === 'monster') !== isMonsterSide)
+    .map(({ cell }) => ({ x: cell.x, y: cell.y }));
+  const refOpponents = existingOpponents.length > 0 ? existingOpponents : [...fallbackOpponentHints];
+
+  const anchorCells = resolveSideAnchorCells(c, room, spec, fallbackNear, isMonsterSide, refOpponents);
+  const anchorAvgX = anchorCells.reduce((s, p) => s + p.x, 0) / anchorCells.length;
+  const anchorAvgY = anchorCells.reduce((s, p) => s + p.y, 0) / anchorCells.length;
+
+  // 若对侧尚未摆位，优先采用对侧入场锚点提示，否则在房间另一侧（或东侧 +5 格）建立虚拟威胁参考点
+  const opponentSeeds: Cell[] = refOpponents.length > 0
+    ? refOpponents
+    : [map !== undefined
+      ? {
+          x: anchorAvgX < map.width / 2 ? Math.max(0, map.width - 2) : 1,
+          y: Math.max(0, Math.min(map.height - 1, Math.round(anchorAvgY))),
+        }
+      : {
+          x: Math.min(MAX_COORD, Math.round(anchorAvgX) + (isMonsterSide ? -5 : 5)),
+          y: Math.max(0, Math.min(MAX_COORD, Math.round(anchorAvgY))),
+        }];
+
+  const allRef = [...anchorCells, ...opponentSeeds];
+  const bounds = map !== undefined
+    ? { x0: 0, y0: 0, x1: map.width - 1, y1: map.height - 1 }
+    : {
+        x0: Math.max(0, Math.min(...allRef.map((p) => p.x)) - 6),
+        y0: Math.max(0, Math.min(...allRef.map((p) => p.y)) - 6),
+        x1: Math.min(MAX_COORD, Math.max(...allRef.map((p) => p.x)) + 6),
+        y1: Math.min(MAX_COORD, Math.max(...allRef.map((p) => p.y)) + 6),
+      };
+
+  const dAnchorMap = gridFeetFromSeeds(map, anchorCells, bounds);
+  const dOppMap = gridFeetFromSeeds(map, opponentSeeds, bounds);
+
+  const isCellSafe = (at: Cell): boolean =>
+    !zonesAtCell(c, room, { ...at, z: 0 }).some((z) => z.damage !== undefined || (z.onFailConditions?.length ?? 0) > 0);
+  const isCellOutside = (at: Cell): boolean => map !== undefined && areaAt(map, at)?.kind === 'outside';
+
+  const allFree: Cell[] = [];
+  for (let y = bounds.y0; y <= bounds.y1; y++) {
+    for (let x = bounds.x0; x <= bounds.x1; x++) {
+      const at = { x, y };
+      if (blocksMove(map, at)) continue;
+      if (occupant(c, room, at, '') !== undefined) continue;
+      if (existingOpponents.some((o) => o.x === x && o.y === y)) continue;
+      allFree.push(at);
+    }
+  }
+  if (allFree.length < entries.length) {
+    throw new Error(`房间「${room}」内可站立的空格不足（需 ${entries.length} 格，仅剩 ${allFree.length} 格）`);
+  }
+
+  const reachableFree = allFree.filter((at) => dAnchorMap.has(cellKey(at)));
+  const baseCandidates = reachableFree.length >= entries.length ? reachableFree : allFree;
+  const safeCandidates = baseCandidates.filter(isCellSafe);
+  const cleanPool = safeCandidates.length >= entries.length ? safeCandidates : baseCandidates;
+
+  // 若并未显式把锚点钉在敌人脸上，开战阵型默认与真敌群保留 >=10 尺缓冲，避免还没开打就把全队塞进怪堆贴脸
+  const explicitCloseAnchor = spec?.x !== undefined && spec?.y !== undefined && existingOpponents.length > 0
+    && minFeet(existingOpponents, { x: spec.x, y: spec.y }) <= MELEE_REACH_FEET;
+  const buffered = !explicitCloseAnchor && existingOpponents.length > 0
+    ? cleanPool.filter((at) => (dOppMap.get(cellKey(at)) ?? distanceFeet(at, existingOpponents[0]!)) >= 10)
+    : cleanPool;
+  const workingSet = buffered.length >= entries.length ? buffered : cleanPool;
+
+  const frontGroup = entries.filter((e) => e.rank === 'front');
+  const midGroup = entries.filter((e) => e.rank === 'mid');
+  const backGroup = entries.filter((e) => e.rank === 'back');
+  const activeTierCount = [frontGroup, midGroup, backGroup].filter((g) => g.length > 0).length;
+
+  // 从入场锚点向外扩张出紧凑小队驻区（默认先取锚点周围 5 尺九宫格，不够站或层数不够再逐格扩圈，避免冲到场地另一头）
+  const dAnc = (at: Cell): number => dAnchorMap.get(cellKey(at)) ?? Math.round(Math.hypot(at.x - anchorAvgX, at.y - anchorAvgY) * CELL_FEET);
+  const dOpp = (at: Cell): number => dOppMap.get(cellKey(at)) ?? minFeet(opponentSeeds, at);
+  let maxRadius = CELL_FEET;
+  let squadPool = workingSet.filter((at) => dAnc(at) <= maxRadius);
+  const distinctOppDepths = (pts: readonly Cell[]): number => new Set(pts.map(dOpp)).size;
+  const desiredPoolSize = Math.min(workingSet.length, Math.max(entries.length + 2, activeTierCount * 2));
+  while ((squadPool.length < desiredPoolSize || distinctOppDepths(squadPool) < Math.min(activeTierCount, distinctOppDepths(workingSet))) && maxRadius < 200) {
+    maxRadius += CELL_FEET;
+    squadPool = workingSet.filter((at) => dAnc(at) <= maxRadius);
+  }
+  if (squadPool.length < entries.length) squadPool = [...workingSet];
+
+  const takenKeys = new Set<string>();
+  const squadPlaced: Cell[] = [];
+  const lateralBias = (at: Cell): number => Math.abs(at.y - anchorAvgY) + Math.abs(at.x - anchorAvgX) * 0.25;
+  const squadCohesion = (at: Cell): number => {
+    if (squadPlaced.length === 0) return 0;
+    const mf = minFeet(squadPlaced, at);
+    return mf <= 10 ? 0 : mf;
+  };
+
+  const takeBest = (
+    group: ReadonlyArray<{ ch: Character; rank: FormationRank; z: number }>,
+    cmp: (a: Cell, b: Cell) => number,
+  ): number | undefined => {
+    let tierMaxDOpp: number | undefined;
+    for (const item of group) {
+      let avail = squadPool.filter((at) => !takenKeys.has(cellKey(at)));
+      if (avail.length === 0) avail = workingSet.filter((at) => !takenKeys.has(cellKey(at)));
+      avail.sort(cmp);
+      const chosen = avail[0]!;
+      takenKeys.add(cellKey(chosen));
+      squadPlaced.push(chosen);
+      const chosenDOpp = dOpp(chosen);
+      tierMaxDOpp = tierMaxDOpp === undefined ? chosenDOpp : Math.max(tierMaxDOpp, chosenDOpp);
+      (state.positions ??= {})[item.ch.name] = {
+        x: chosen.x,
+        y: chosen.y,
+        ...(item.z > 0 ? { z: item.z } : {}),
+        room,
+      };
+    }
+    return tierMaxDOpp;
+  };
+
+  // 1. 前排（front）：优先踏入室内（非门外走廊）、离对手最近、紧靠入场阵线居中并肩排开
+  const frontMaxDOpp = takeBest(frontGroup, (a, b) => {
+    const outA = isCellOutside(a) ? 1 : 0;
+    const outB = isCellOutside(b) ? 1 : 0;
+    return outA - outB
+      || dOpp(a) - dOpp(b)
+      || squadCohesion(a) - squadCohesion(b)
+      || dAnc(a) - dAnc(b)
+      || lateralBias(a) - lateralBias(b);
+  });
+
+  // 2. 中排（mid）：排在前排身后一排（dOpp >= frontMaxDOpp + 5），若无前排则取驻区中段
+  const poolSortedOpp = [...squadPool].map(dOpp).sort((a, b) => a - b);
+  const medianDOpp = poolSortedOpp[Math.floor(poolSortedOpp.length / 2)] ?? 15;
+  const targetMidDOpp = frontMaxDOpp !== undefined ? frontMaxDOpp + CELL_FEET : medianDOpp;
+  const midMaxDOpp = takeBest(midGroup, (a, b) => {
+    const rankBucket = (p: Cell): number => {
+      if (frontMaxDOpp === undefined) return 0;
+      const d = dOpp(p);
+      return d >= targetMidDOpp ? 0 : (d >= frontMaxDOpp ? 1 : 2);
+    };
+    return rankBucket(a) - rankBucket(b)
+      || Math.abs(dOpp(a) - targetMidDOpp) - Math.abs(dOpp(b) - targetMidDOpp)
+      || squadCohesion(a) - squadCohesion(b)
+      || (isCellOutside(a) ? 1 : 0) - (isCellOutside(b) ? 1 : 0)
+      || dAnc(a) - dAnc(b)
+      || lateralBias(a) - lateralBias(b);
+  });
+
+  // 3. 后排（back）：排在中排/前排更后侧（dOpp >= prevTierMaxDOpp + 5），可自然退守门廊/门口后排掩护位
+  const prevTierDOpp = midMaxDOpp ?? frontMaxDOpp;
+  const targetBackDOpp = prevTierDOpp !== undefined ? prevTierDOpp + CELL_FEET : (poolSortedOpp.at(-1) ?? 20);
+  takeBest(backGroup, (a, b) => {
+    const rankBucket = (p: Cell): number => {
+      if (prevTierDOpp === undefined) return 0;
+      const d = dOpp(p);
+      return d >= targetBackDOpp ? 0 : (d >= prevTierDOpp ? 1 : 2);
+    };
+    return rankBucket(a) - rankBucket(b)
+      || (prevTierDOpp !== undefined
+        ? Math.abs(dOpp(a) - targetBackDOpp) - Math.abs(dOpp(b) - targetBackDOpp)
+        : dOpp(b) - dOpp(a))
+      || squadCohesion(a) - squadCohesion(b)
+      || dAnc(a) - dAnc(b)
+      || lateralBias(a) - lateralBias(b);
+  });
+}
+
+/** 摆位/修正：不算移动力、不触发借机。支持直接坐标、near 锚点，以及按前排/中排/后排（formation / rank）全自动排阵 */
+export function setPositions(
+  c: Campaign,
+  placements: readonly Placement[],
+  formation?: FormationInput,
+): string[] {
+  const state = requireInitiative(c);
+  if (placements.length === 0 && formation === undefined) {
+    throw new Error('set 要给 placements 或 formation（前排/中排/后排自动阵型）');
+  }
   const notes: string[] = [];
-  for (const p of placements) {
+  const touchedNames: string[] = [];
+  const directNames = new Set<string>();
+
+  const directPlacements = placements.filter(
+    (p) => p.mark === true || p.x !== undefined || p.y !== undefined || (p.near !== undefined && p.rank === undefined),
+  );
+  const rankedFromPlacements = placements.filter(
+    (p) => p.mark !== true && p.x === undefined && p.y === undefined && p.rank !== undefined,
+  );
+
+  // 第一阶段：先放置所有地标与显式 x/y、near 单位（如直接给出的敌方站位），供后续阵型自动朝敌排布
+  for (const p of directPlacements) {
     if (p.mark === true) {
       const x = requireCoord(p.x, `${p.name} 的 x`);
       const y = requireCoord(p.y, `${p.name} 的 y`);
@@ -251,18 +654,107 @@ export function setPositions(c: Campaign, placements: readonly Placement[]): str
       at = free;
     } else {
       at = { x: requireCoord(p.x, `${p.name} 的 x`), y: requireCoord(p.y, `${p.name} 的 y`) };
-      if (blocksMove(map, at, z >= 15)) throw new Error(`(${at.x},${at.y}) 是${map === undefined ? '' : terrainHere(map, at)}，${ch.name} 站不上去；换一格，或用 near`);
+      if (blocksMove(map, at, z >= 15)) throw new Error(`(${at.x},${at.y}) 是${map === undefined ? '' : terrainHere(map, at)}，${ch.name} 站不上去；换一格，或用 near / formation`);
     }
     (state.positions ??= {})[ch.name] = { x: at.x, y: at.y, ...(z > 0 ? { z } : {}), room };
+    directNames.add(ch.name);
+    touchedNames.push(ch.name);
     if (z > 0 && (ch.flySpeed ?? 0) <= 0 && ch.hover !== true && !hasCondition(ch, '飞行术')) {
       notes.push(`【DM】${ch.name} 置于高空 ↑${z}尺，但角色卡未记录 fly_speed 且未挂「飞行术」；若天生会飞请用 dnd_character update fly_speed=60 补齐。`);
     }
   }
+
+  // 收集按排位（front / mid / back）放置的角色（支持敌方阵型 + 我方阵型）
+  type RankedEntry = { ch: Character; room: string; rank: FormationRank; z: number; near?: string };
+  const monsterRanked = new Map<string, RankedEntry>();
+  const allyRanked = new Map<string, RankedEntry>();
+
+  const registerRanked = (rawName: string, rank: FormationRank, rawZ?: number, near?: string, expectMonster?: boolean): void => {
+    const ch = requireCharacter(c, rawName);
+    if (directNames.has(ch.name)) return;
+    if (isAbsent(ch)) throw new Error(`${ch.name} 已暂时移出队伍，不能摆位；等本人点「签到」归队或 dnd_character update absent=false`);
+    if (expectMonster === true && ch.kind !== 'monster') {
+      throw new Error(`${ch.name} 不是敌方怪物，不能放进 formation.enemies；请放进 formation.front/mid/back`);
+    }
+    if (expectMonster === false && ch.kind === 'monster') {
+      throw new Error(`${ch.name} 是敌方怪物，不能放进我方 formation.front/mid/back；请用 placements 或 formation.enemies 给出敌方站位`);
+    }
+    const room = roomOf(c, ch);
+    if (room === undefined) throw new Error(`${ch.name} 没有所在房间，先 dnd_character update room`);
+    const map = mapOf(c, room);
+    const z = requireAltitude(rawZ, `${ch.name} 的 z`, map?.ceiling);
+    const bucket = ch.kind === 'monster' ? monsterRanked : allyRanked;
+    bucket.set(ch.name, { ch, room, rank, z, ...(near !== undefined ? { near } : {}) });
+  };
+
+  for (const p of rankedFromPlacements) {
+    registerRanked(p.name, p.rank!, p.z, p.near);
+  }
+  if (formation?.enemies !== undefined) {
+    for (const n of formation.enemies.front ?? []) registerRanked(n, 'front', undefined, undefined, true);
+    for (const n of formation.enemies.mid ?? []) registerRanked(n, 'mid', undefined, undefined, true);
+    for (const n of formation.enemies.back ?? []) registerRanked(n, 'back', undefined, undefined, true);
+  }
+  if (formation !== undefined) {
+    for (const n of formation.front ?? []) registerRanked(n, 'front', undefined, undefined, false);
+    for (const n of formation.mid ?? []) registerRanked(n, 'mid', undefined, undefined, false);
+    for (const n of formation.back ?? []) registerRanked(n, 'back', undefined, undefined, false);
+    if (formation.autoRest === true) {
+      const targetRoom = [...allyRanked.values()][0]?.room ?? markRoom(c, state);
+      for (const orderItem of state.order) {
+        const ch = findCharacter(c, orderItem.name);
+        if (ch === undefined || ch.kind === 'monster' || isOut(ch) || isAbsent(ch)) continue;
+        if (roomOf(c, ch) !== targetRoom) continue;
+        if (directNames.has(ch.name) || allyRanked.has(ch.name) || cellOf(c, ch) !== undefined) continue;
+        registerRanked(ch.name, inferDefaultRank(ch), undefined, undefined, false);
+      }
+    }
+  }
+
+  // 先清除即将重排阵型的单位旧坐标，避免自己旧位置占格干扰新阵型选点
+  for (const e of [...monsterRanked.values(), ...allyRanked.values()]) {
+    delete state.positions?.[e.ch.name];
+  }
+
+  // 第二阶段：若有敌方阵型，先根据我方入场方向把敌方按前/中/后排落位
+  const byRoom = <T extends { room: string }>(items: Iterable<T>): Map<string, T[]> => {
+    const m = new Map<string, T[]>();
+    for (const item of items) m.set(item.room, [...(m.get(item.room) ?? []), item]);
+    return m;
+  };
+
+  for (const [room, list] of byRoom(monsterRanked.values())) {
+    const fallbackNear = list.find((x) => x.near !== undefined)?.near;
+    const allyHintNear = [...allyRanked.values()].find((x) => x.room === room && x.near !== undefined)?.near;
+    const partyHintCells = (formation !== undefined || allyHintNear !== undefined)
+      ? resolveSideAnchorCells(c, room, formation, allyHintNear, false, [])
+      : [];
+    placeSideByRanks(c, room, list, formation?.enemies, fallbackNear, true, partyHintCells);
+    for (const item of list) {
+      touchedNames.push(item.ch.name);
+      if (item.z > 0 && (item.ch.flySpeed ?? 0) <= 0 && item.ch.hover !== true && !hasCondition(item.ch, '飞行术')) {
+        notes.push(`【DM】${item.ch.name} 置于高空 ↑${item.z}尺，但未记录 fly_speed。`);
+      }
+    }
+  }
+
+  // 第三阶段：根据场上实际敌群位置，将我方按 front（前排）→ mid（中排）→ back（后排）自动成阵
+  for (const [room, list] of byRoom(allyRanked.values())) {
+    const fallbackNear = list.find((x) => x.near !== undefined)?.near;
+    placeSideByRanks(c, room, list, formation, fallbackNear, false);
+    for (const item of list) {
+      touchedNames.push(item.ch.name);
+      if (item.z > 0 && (item.ch.flySpeed ?? 0) <= 0 && item.ch.hover !== true && !hasCondition(item.ch, '飞行术')) {
+        notes.push(`【DM】${item.ch.name} 置于高空 ↑${item.z}尺，但角色卡未记录 fly_speed 且未挂「飞行术」；若天生会飞请用 dnd_character update fly_speed=60 补齐。`);
+      }
+    }
+  }
+
   // 全部放好再查重叠：同一次调用里两个人互换位置不算冲突
-  for (const p of placements) {
-    if (p.mark === true) continue;
-    const ch = requireCharacter(c, p.name);
-    const cell = state.positions![ch.name]!;
+  for (const name of [...new Set(touchedNames)]) {
+    const ch = requireCharacter(c, name);
+    const cell = state.positions?.[ch.name];
+    if (cell === undefined) continue;
     const other = occupant(c, cell.room, cell, ch.name);
     if (other !== undefined && !notes.some((n) => n.includes(ch.name) && n.includes('同一格'))) {
       notes.push(`【DM】${ch.name} 和 ${other.name} 在同一格 ${fmtCoord(cell)}，不是故意的话改一下。`);
@@ -297,7 +789,7 @@ export function removePosition(c: Campaign, name: string): string {
 /** 放置或更新战场持续区域效果（黑暗术、毒雾、蛛网术、荆棘丛生、月华之光等） */
 export function upsertBattleZone(
   c: Campaign,
-  raw: Omit<Parameters<typeof createBattleZoneInput>[0], 'room'> & { room?: string },
+  raw: BattleZoneInput,
 ): { zone: BattleZone; broken: string[]; affected: string[] } {
   const state = requireInitiative(c);
   const caster = raw.source !== undefined ? requireCharacter(c, raw.source) : undefined;
@@ -305,13 +797,23 @@ export function upsertBattleZone(
   const x = requireCoord(raw.x, '区域 x');
   const y = requireCoord(raw.y, '区域 y');
   const seqHint = (state.zones?.length ?? 0) + 1;
-  const zone = createBattleZoneInput({ ...raw, room, x, y, ...(caster !== undefined ? { source: caster.name } : {}) }, seqHint);
+  const prevSameZone = caster !== undefined
+    ? (state.zones ?? []).find((z) => z.concentration === true && z.source === caster.name && normalizeCondition(z.name) === normalizeCondition(raw.name))
+    : undefined;
+  const zone = createBattleZoneInput({
+    ...raw,
+    room,
+    x,
+    y,
+    ...(caster !== undefined ? { source: caster.name } : {}),
+    ...(raw.rounds === undefined && prevSameZone?.roundsLeft !== undefined ? { rounds: prevSameZone.roundsLeft } : {}),
+    ...(raw.saveDc === undefined && prevSameZone?.saveDc !== undefined ? { saveDc: prevSameZone.saveDc } : {}),
+  }, seqHint);
 
   const broken: string[] = [];
   if (zone.concentration === true && zone.source !== undefined) {
-    const prevStates = concentratingOn(c, zone.source).filter((s) => s.state.name !== zone.name);
-    const prevZones = concentratingZoneNames(c, zone.source).filter((zName) => zName !== zone.name);
-    if (prevStates.length > 0 || prevZones.length > 0) {
+    const prevSpells = concentratingSpellNames(c, zone.source).filter((sName) => normalizeCondition(sName) !== normalizeCondition(zone.name));
+    if (prevSpells.length > 0) {
       broken.push(...breakConcentration(c, zone.source, `改换专注为「${zone.name}」`));
       for (const line of broken) pushLog(c, line);
     }
@@ -320,11 +822,17 @@ export function upsertBattleZone(
   const existing = (state.zones ?? []).filter((z) => {
     if (z.id === zone.id) return false;
     // 同一施法者重放/挪动同名专注区域（如移动月华之光）时原地更新，不留残影
-    if (zone.concentration === true && zone.source !== undefined && z.source === zone.source && z.name === zone.name) return false;
+    if (zone.concentration === true && zone.source !== undefined && z.source === zone.source && normalizeCondition(z.name) === normalizeCondition(zone.name)) return false;
     return true;
   });
   existing.push(zone);
   state.zones = existing;
+  if (zone.concentration === true && caster !== undefined) {
+    caster.concentrationState = {
+      name: normalizeCondition(zone.name),
+      ...(zone.roundsLeft !== undefined ? { roundsLeft: zone.roundsLeft } : {}),
+    };
+  }
   pushLog(c, `放置战场区域：${formatZoneSummary(zone)}`);
 
   const affected = placedIn(c, room)
@@ -347,7 +855,13 @@ export function removeBattleZone(c: Campaign, idOrName: string, room?: string): 
   const rest = list.filter((z) => !removed.includes(z));
   if (rest.length === 0) delete state.zones;
   else state.zones = rest;
-  for (const r of removed) pushLog(c, `移除战场区域「${r.name}」`);
+  for (const r of removed) {
+    pushLog(c, `移除战场区域「${r.name}」`);
+    if (r.concentration === true && r.source !== undefined) {
+      const caster = findCharacter(c, r.source);
+      if (caster !== undefined) syncConcentrationAfterRemoval(c, caster, [r.name]);
+    }
+  }
   return removed;
 }
 
@@ -370,10 +884,16 @@ export interface MoveRequest {
   dash?: boolean;
   /** 拖着一个贴身的人走：每格算双倍，他落在你身后那一格 */
   drag?: string;
+  /** 与一名友方角色交换站位（若距离超过 5 尺则先走到其相邻空格，再在对方同意下互换格子） */
+  swap?: string;
+  /** 友方玩家是否已同意本次交换站位（NPC/同一玩家控制/已传有效 ally_declared_by 或交互按钮确认后为 true） */
+  swapApproved?: boolean;
   /** 撤离动作：这次移动不触发借机 */
   disengage?: boolean;
   /** 倒地时保持爬行（不自动扣半速起身，每格按双倍移动力计算） */
   crawl?: boolean;
+  /** 允许直接穿行伤害/控制类领域区域（默认在可用移动力内自动优先绕开危险区域） */
+  enterHazards?: boolean;
   /** 特例豁免移动类状态限制（如自由行动戒指） */
   ignoreStateMods?: boolean;
   /** 反应/他人回合里的移动：不计入本回合移动力 */
@@ -407,10 +927,12 @@ export interface MoveResult {
   /** 走完贴着的敌人 */
   adjacent: string[];
   dragged?: { name: string; to: BattleCell };
+  swapped?: { name: string; from: BattleCell; to: BattleCell };
   /** 移动力不够、没走到想去的地方 */
   short?: string;
   notes: string[];
   opportunity?: { reactors: ReactorOption[]; resume: MoveRequest };
+  swapConsent?: { ally: string; allyCell: BattleCell; resume: MoveRequest };
 }
 
 /** 按直线走过的格子（含起点终点）；没有场地图、直接给坐标时用 */
@@ -447,11 +969,46 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
   if (from === undefined) throw new Error(`${ch.name} 还没摆位，先 dnd_position set`);
   const map = mapOf(c, from.room);
   const fromZ = from.z ?? 0;
-  const targetZ = request.z !== undefined ? requireAltitude(request.z, 'z', map?.ceiling) : fromZ;
-  const isAirborneMove = fromZ > 0 || targetZ > 0;
+  const swapPartner = request.swap === undefined ? undefined : requireCharacter(c, request.swap);
+  let swapAllyCell: BattleCell | undefined;
+  let swapAllyMoveInfo: ReturnType<typeof movementSpeedInfo> | undefined;
+  if (swapPartner !== undefined) {
+    if (swapPartner.name === ch.name) throw new Error('不能和自己交换站位');
+    if (request.drag !== undefined) throw new Error('swap（交换站位）与 drag（拖带）不能同时使用');
+    if (request.x !== undefined || request.y !== undefined || request.to !== undefined || request.adjacentTo !== undefined || request.awayFrom !== undefined) {
+      throw new Error('swap 会直接走向队友并互换所在格，无需同时传 x/y/to/adjacent_to/away_from');
+    }
+    if (isAbsent(swapPartner) || isOut(swapPartner) || swapPartner.hp <= 0) {
+      throw new Error(`${swapPartner.name} 不在场或已倒地，无法配合交换站位`);
+    }
+    if (isHostile(ch, swapPartner)) {
+      throw new Error(`${swapPartner.name} 是敌对单位，不能用友方换位（swap）交换站位`);
+    }
+    swapAllyCell = cellOf(c, swapPartner);
+    if (swapAllyCell === undefined || swapAllyCell.room !== from.room) {
+      throw new Error(`${swapPartner.name} 不在当前房间的站位上`);
+    }
+    if (request.z !== undefined && request.z !== (swapAllyCell.z ?? 0)) {
+      throw new Error(`swap 会与队友互换所在格，不能单独指定与 ${swapPartner.name} 不同的高度 z`);
+    }
+    if (request.ignoreStateMods !== true) {
+      if (isIncapacitated(swapPartner)) {
+        throw new Error(`${swapPartner.name} 当前处于失能状态，无法主动配合交换站位（若要拖带请用 drag）`);
+      }
+      swapAllyMoveInfo = movementSpeedInfo(swapPartner, swapPartner.speed ?? DEFAULT_SPEED);
+      if (swapAllyMoveInfo.zeroSpeed) {
+        throw new Error(`${swapPartner.name} 当前移动速度为 0（${swapAllyMoveInfo.zeroReasons.join('、')}），无法主动配合交换站位`);
+      }
+    }
+  }
+  const allyZ = swapAllyCell?.z ?? 0;
+  const targetZ = swapPartner !== undefined
+    ? (request.swapApproved !== true && distanceFeet(from, swapAllyCell!) <= MELEE_REACH_FEET ? fromZ : allyZ)
+    : (request.z !== undefined ? requireAltitude(request.z, 'z', map?.ceiling) : fromZ);
+  const isAirborneMove = fromZ > 0 || targetZ > 0 || allyZ > 0;
   const canFly = (ch.flySpeed ?? 0) > 0 || ch.hover === true || hasCondition(ch, '飞行术');
-  if (targetZ > 0 && !canFly && request.ignoreStateMods !== true) {
-    throw new Error(`${ch.name} 没有飞行速度（fly_speed）也未处于「飞行术」状态，无法升空到 z=${targetZ} 尺`);
+  if ((targetZ > 0 || (swapPartner !== undefined && allyZ > 0)) && !canFly && request.ignoreStateMods !== true) {
+    throw new Error(`${ch.name} 没有飞行速度（fly_speed）也未处于「飞行术」状态，无法升空到 z=${Math.max(targetZ, allyZ)} 尺`);
   }
 
   const reaction = request.reaction === true;
@@ -528,16 +1085,139 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
       return reachesOf(other).some((reach) => dA <= reach && dB > reach);
     }).length;
   const factor = (dragged === undefined ? 1 : 2) * (crawling ? 2 : 1);
+  const entersHazardAtZ = (zLevel: number) => (a: Cell, b: Cell): boolean =>
+    stepHazardNamesAt(c, ch, { ...a, z: zLevel }, { ...b, z: zLevel }, from.room, options.globalEffects).length > 0;
+  const entersHazard = entersHazardAtZ(targetZ);
+  const pathHazardNames = (pts: readonly Cell[], zLevel = targetZ): string[] => {
+    const out: string[] = [];
+    for (let i = 1; i < pts.length; i++) {
+      for (const h of stepHazardNamesAt(c, ch, { ...pts[i - 1]!, z: zLevel }, { ...pts[i]!, z: zLevel }, from.room, options.globalEffects)) {
+        if (!out.includes(h)) out.push(h);
+      }
+    }
+    return out;
+  };
+  let avoidedHazards: string[] = [];
+  let targetSpotScore: ((at: Cell) => number) | undefined;
 
   let dest: Cell;
   let path: Cell[];
   let horizFeet: number;
   let short: string | undefined;
+  let swapAdjCell: Cell | undefined;
+  let swapAdjZ = 0;
   const explicit = request.x !== undefined || request.y !== undefined;
   const target = request.to ?? request.adjacentTo;
-  const pureVertical = !explicit && target === undefined && request.awayFrom === undefined && request.z !== undefined;
+  const pureVertical = swapPartner === undefined && !explicit && target === undefined && request.awayFrom === undefined && request.z !== undefined;
 
-  if (pureVertical) {
+  if (swapPartner !== undefined && swapAllyCell !== undefined) {
+    const remaining = reaction ? baseSpeed : plannedSpeed - used;
+    const maxFeet = request.feet ?? remaining;
+    const stepHigh = allyZ >= 15;
+    const mapMult = !stepHigh && map !== undefined && areaAt(map, swapAllyCell)?.kind === 'difficult' ? 2 : 1;
+    const zoneMult = extraCellCostMultiplier(c, ch, swapAllyCell, from.room, options.globalEffects);
+    const swapStepFeet = CELL_FEET * factor * Math.max(mapMult, zoneMult);
+    const allyCanFly = (swapPartner.flySpeed ?? 0) > 0 || swapPartner.hover === true || hasCondition(swapPartner, '飞行术');
+
+    let approachPath: Cell[];
+    let approachFeet: number;
+    const alreadyAdjacent = distanceFeet(from, swapAllyCell) <= MELEE_REACH_FEET
+      && (from.x !== swapAllyCell.x || from.y !== swapAllyCell.y || fromZ !== allyZ)
+      && wallBetween(map, from, swapAllyCell) === undefined;
+
+    if (alreadyAdjacent) {
+      swapAdjCell = { x: from.x, y: from.y };
+      swapAdjZ = fromZ;
+      if (swapAdjZ > 0 && !allyCanFly && request.ignoreStateMods !== true) {
+        throw new Error(`${swapPartner.name} 没有飞行能力，无法换到空中 z=${swapAdjZ} 尺位置`);
+      }
+      if (keepCell !== undefined && distanceFeet(swapAllyCell, keepCell) > MELEE_REACH_FEET) {
+        throw new Error(`与 ${swapPartner.name} 交换站位后在 ${fmtCoord(swapAllyCell)}，不再贴着 ${keep!.name}`);
+      }
+      if (maxFeet < swapStepFeet) {
+        throw new Error(`${ch.name} 剩余移动力不足以与 ${swapPartner.name} 交换站位（需 ${swapStepFeet} 尺，可用 ${Math.max(0, maxFeet)}/${plannedSpeed} 尺${plannedDash ? '' : '；冲刺传 dash=true'}）`);
+      }
+      approachPath = [{ x: from.x, y: from.y }];
+      approachFeet = 0;
+    } else {
+      swapAdjZ = allyZ;
+      if (swapAdjZ > 0 && !allyCanFly && request.ignoreStateMods !== true) {
+        throw new Error(`${swapPartner.name} 没有飞行能力，无法在空中 z=${swapAdjZ} 尺交换站位`);
+      }
+      if (keepCell !== undefined && distanceFeet(swapAllyCell, keepCell) > MELEE_REACH_FEET) {
+        throw new Error(`与 ${swapPartner.name} 交换站位后在 ${fmtCoord(swapAllyCell)}，不再贴着 ${keep!.name}`);
+      }
+      const pickBestSwapAdj = (reachedMap: Map<string, Reach>): { at: Cell; feet: number; provokes: number } | undefined => {
+        let cand: { at: Cell; feet: number; provokes: number } | undefined;
+        for (const [k, r] of reachedMap) {
+          const at = parseKey(k);
+          if (taken(at) && !(at.x === from.x && at.y === from.y && swapAdjZ === fromZ)) continue;
+          if (distanceFeet({ ...at, z: swapAdjZ }, swapAllyCell!) > MELEE_REACH_FEET) continue;
+          if (at.x === swapAllyCell!.x && at.y === swapAllyCell!.y && swapAdjZ === allyZ) continue;
+          if (wallBetween(map, at, swapAllyCell!) !== undefined) continue;
+          if (cand === undefined || r.feet < cand.feet || (r.feet === cand.feet && r.provokes < cand.provokes)) {
+            cand = { at, feet: r.feet, provokes: r.provokes };
+          }
+        }
+        return cand;
+      };
+      const anyReached = walk(map, from, { blocked, provokes: provokesOn, costFactor: factor, highAltitude, cellCostMultiplier: cellCostMult });
+      let best = pickBestSwapAdj(anyReached);
+      if (best === undefined) {
+        throw new Error(`无法与 ${swapPartner.name} 交换站位：其周围 5 尺没有可落脚的空格（被墙壁或其他生物堵满）`);
+      }
+      let chosenReached = anyReached;
+      if (request.enterHazards !== true) {
+        const anyHaz = pathHazardNames(pathTo(anyReached, best.at)!, swapAdjZ);
+        if (anyHaz.length > 0) {
+          const safeReached = walk(map, from, {
+            blocked,
+            provokes: provokesOn,
+            costFactor: factor,
+            highAltitude,
+            cellCostMultiplier: cellCostMult,
+            avoid: entersHazardAtZ(swapAdjZ),
+          });
+          const safeBest = pickBestSwapAdj(safeReached);
+          if (safeBest !== undefined && Math.max(safeBest.feet + swapStepFeet, Math.abs(allyZ - fromZ) * factor) <= maxFeet) {
+            best = safeBest;
+            chosenReached = safeReached;
+            avoidedHazards = anyHaz;
+          }
+        }
+      }
+      const totalNeeded = Math.max(best.feet + swapStepFeet, Math.abs(allyZ - fromZ) * factor);
+      if (totalNeeded > maxFeet) {
+        throw new Error(`${ch.name} 移动力不足以走到 ${swapPartner.name} 身边并完成换位（共需 ${totalNeeded} 尺，当前可用 ${Math.max(0, maxFeet)}/${plannedSpeed} 尺${plannedDash ? '' : '；若使用冲刺请传 dash=true'}）`);
+      }
+      swapAdjCell = best.at;
+      approachPath = pathTo(chosenReached, best.at)!;
+      approachFeet = best.feet;
+    }
+
+    if (request.ignoreStateMods !== true && swapAllyMoveInfo !== undefined && swapAllyMoveInfo.fearSources.length > 0) {
+      const allyLandCell: BattleCell = { x: swapAdjCell.x, y: swapAdjCell.y, ...(swapAdjZ > 0 ? { z: swapAdjZ } : {}), room: from.room };
+      for (const srcName of swapAllyMoveInfo.fearSources) {
+        const srcCh = findCharacter(c, srcName);
+        const srcCell = srcCh === undefined ? undefined : cellOf(c, srcCh);
+        if (srcCh !== undefined && srcCell !== undefined && srcCell.room === from.room) {
+          if (distanceFeet(allyLandCell, srcCell) < distanceFeet(swapAllyCell, srcCell)) {
+            throw new Error(`${swapPartner.name} 正对 ${srcCh.name} 处于「恐慌」状态，不能通过换位移向恐惧源`);
+          }
+        }
+      }
+    }
+
+    if (request.swapApproved === true) {
+      dest = { x: swapAllyCell.x, y: swapAllyCell.y };
+      path = [...approachPath, dest];
+      horizFeet = approachFeet + swapStepFeet;
+    } else {
+      dest = swapAdjCell;
+      path = approachPath;
+      horizFeet = approachFeet;
+    }
+  } else if (pureVertical) {
     dest = { x: from.x, y: from.y };
     if (blocksMove(map, dest, targetZ >= 15)) throw new Error(`(${dest.x},${dest.y}) 无法停靠`);
     const occupied = occupant(c, from.room, { ...dest, z: targetZ }, ch.name);
@@ -558,11 +1238,33 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
       path = straightPath(from, dest);
       horizFeet = Math.max(Math.abs(from.x - dest.x), Math.abs(from.y - dest.y)) * CELL_FEET * factor;
     } else {
-      const reached = walk(map, from, { blocked, provokes: provokesOn, costFactor: factor, highAltitude, cellCostMultiplier: cellCostMult, stopAt: dest });
-      const found = pathTo(reached, dest);
-      if (found === undefined) throw new Error(`走不到 (${dest.x},${dest.y})：被墙或敌人堵死了`);
-      path = found;
-      horizFeet = reached.get(cellKey(dest))!.feet;
+      const anyReached = walk(map, from, { blocked, provokes: provokesOn, costFactor: factor, highAltitude, cellCostMultiplier: cellCostMult, stopAt: dest });
+      const anyFound = pathTo(anyReached, dest);
+      if (anyFound === undefined) throw new Error(`走不到 (${dest.x},${dest.y})：被墙或敌人堵死了`);
+      path = anyFound;
+      horizFeet = anyReached.get(cellKey(dest))!.feet;
+      if (request.enterHazards !== true) {
+        const anyHaz = pathHazardNames(anyFound);
+        if (anyHaz.length > 0) {
+          const budget = request.feet ?? (reaction ? baseSpeed : plannedSpeed - used);
+          const safeReached = walk(map, from, {
+            blocked,
+            provokes: provokesOn,
+            costFactor: factor,
+            highAltitude,
+            cellCostMultiplier: cellCostMult,
+            avoid: entersHazard,
+            stopAt: dest,
+          });
+          const safeFound = pathTo(safeReached, dest);
+          const safeFeet = safeFound === undefined ? undefined : safeReached.get(cellKey(dest))!.feet;
+          if (safeFound !== undefined && safeFeet !== undefined && safeFeet <= Math.max(budget, horizFeet)) {
+            path = safeFound;
+            horizFeet = safeFeet;
+            avoidedHazards = anyHaz;
+          }
+        }
+      }
     }
   } else {
     if (target === undefined && request.awayFrom === undefined) throw new Error('move 要给 x/y/z，或者 to / adjacent_to / away_from 之一');
@@ -581,6 +1283,7 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
       score = spot.blocking
         ? (at) => Math.max(0, minFeet(spot.cells, at) - MELEE_REACH_FEET)
         : (at) => minFeet(spot.cells, at);
+      targetSpotScore = score;
       goal = spot.label;
     } else {
       const away = requireCharacter(c, request.awayFrom!);
@@ -589,20 +1292,50 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
       score = (at) => -distanceFeet({ ...at, z: targetZ }, awayCell);
       goal = `远离 ${away.name}`;
     }
-    const reached = walk(map, from, { blocked, provokes: provokesOn, costFactor: factor, highAltitude, cellCostMultiplier: cellCostMult, maxFeet });
-    let best: { at: Cell; s: number; feet: number; provokes: number } | undefined;
-    for (const [k, r] of reached) {
-      const at = parseKey(k);
-      if (taken(at) && !(at.x === from.x && at.y === from.y && targetZ === fromZ)) continue;
-      if (keepCell !== undefined && distanceFeet({ ...at, z: targetZ }, keepCell) > MELEE_REACH_FEET) continue;
-      const s = score(at);
-      if (best === undefined || s < best.s || (s === best.s && (r.feet < best.feet || (r.feet === best.feet && r.provokes < best.provokes)))) {
-        best = { at, s, feet: r.feet, provokes: r.provokes };
+    const pickBestGoal = (reachedMap: Map<string, Reach>): { at: Cell; s: number; feet: number; provokes: number } | undefined => {
+      let cand: { at: Cell; s: number; feet: number; provokes: number } | undefined;
+      for (const [k, r] of reachedMap) {
+        const at = parseKey(k);
+        if (taken(at) && !(at.x === from.x && at.y === from.y && targetZ === fromZ)) continue;
+        if (keepCell !== undefined && distanceFeet({ ...at, z: targetZ }, keepCell) > MELEE_REACH_FEET) continue;
+        const s = score(at);
+        if (cand === undefined || s < cand.s || (s === cand.s && (r.feet < cand.feet || (r.feet === cand.feet && r.provokes < cand.provokes)))) {
+          cand = { at, s, feet: r.feet, provokes: r.provokes };
+        }
+      }
+      return cand;
+    };
+    const anyReached = walk(map, from, { blocked, provokes: provokesOn, costFactor: factor, highAltitude, cellCostMultiplier: cellCostMult, maxFeet });
+    let best = pickBestGoal(anyReached);
+    if (best === undefined) throw new Error(`${keep === undefined ? '' : `贴着 ${keep.name} 的`}格子都走不到或站满了`);
+    let chosenReached = anyReached;
+    if (request.enterHazards !== true) {
+      const anyHaz = pathHazardNames(pathTo(anyReached, best.at)!);
+      if (anyHaz.length > 0) {
+        const safeReached = walk(map, from, {
+          blocked,
+          provokes: provokesOn,
+          costFactor: factor,
+          highAltitude,
+          cellCostMultiplier: cellCostMult,
+          avoid: entersHazard,
+          maxFeet,
+        });
+        const safeBest = pickBestGoal(safeReached);
+        const preferSafe = safeBest !== undefined && (
+          target !== undefined
+            ? (safeBest.s === 0 || (best.s > 0 && safeBest.s <= best.s))
+            : safeBest.s <= best.s
+        );
+        if (preferSafe && safeBest !== undefined) {
+          best = safeBest;
+          chosenReached = safeReached;
+          avoidedHazards = anyHaz;
+        }
       }
     }
-    if (best === undefined) throw new Error(`${keep === undefined ? '' : `贴着 ${keep.name} 的`}格子都走不到或站满了`);
     dest = best.at;
-    path = pathTo(reached, dest)!;
+    path = pathTo(chosenReached, dest)!;
     horizFeet = best.feet;
     if (target !== undefined && best.s > 0) {
       const limit = keep !== undefined ? `要贴着 ${keep.name}，最多` : request.feet !== undefined ? `限 ${request.feet} 尺，只够` : '移动力只够';
@@ -610,7 +1343,10 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
     }
   }
   const blocker = occupant(c, from.room, { ...dest, z: targetZ }, ch.name);
-  if (blocker !== undefined && blocker.name !== dragged?.name) throw new Error(`${fmtCoord({ ...dest, z: targetZ })} 已经站着 ${blocker.name}，换一格，或用 to`);
+  const allowedSwapOccupant = swapPartner !== undefined && request.swapApproved === true && blocker?.name === swapPartner.name;
+  if (blocker !== undefined && blocker.name !== dragged?.name && !allowedSwapOccupant) {
+    throw new Error(`${fmtCoord({ ...dest, z: targetZ })} 已经站着 ${blocker.name}，换一格，或用 to`);
+  }
   if (keepCell !== undefined && distanceFeet({ ...dest, z: targetZ }, keepCell) > MELEE_REACH_FEET) {
     throw new Error(`走到 ${fmtCoord({ ...dest, z: targetZ })} 就不贴着 ${keep!.name} 了；不给坐标、传 to + keep_adjacent，工具会挑贴着他的格子`);
   }
@@ -690,11 +1426,15 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
       const reactorOptions: ReactorOption[] = here.map(({ character, reaction }) => ({ character, reaction,
         ...(requireCharacter(c, character).kind !== 'pc' || requireCharacter(c, character).playerId === undefined ? { npc: true } : {}) }));
       opportunity = { reactors: reactorOptions, resume: {
-        x: fullDest.x, y: fullDest.y, ...(fullDestZ !== 0 || fromZ !== 0 ? { z: fullDestZ } : {}), interrupt: true, reaction,
+        ...(swapPartner !== undefined
+          ? { swap: swapPartner.name, ...(request.swapApproved === true ? { swapApproved: true } : {}) }
+          : { x: fullDest.x, y: fullDest.y, ...(fullDestZ !== 0 || fromZ !== 0 ? { z: fullDestZ } : {}) }),
+        interrupt: true, reaction,
         ignoredReactors: [...new Set([...(request.ignoredReactors ?? []), ...here.map((t) => t.character)])],
         ...(request.drag !== undefined ? { drag: request.drag } : {}),
         ...(request.keepAdjacent !== undefined ? { keepAdjacent: request.keepAdjacent } : {}),
         ...(request.crawl === true ? { crawl: true } : {}),
+        ...(request.enterHazards === true ? { enterHazards: true } : {}),
         ...(request.ignoreStateMods === true ? { ignoreStateMods: true } : {}),
       } };
       path3d = path3d.slice(0, first + 1);
@@ -710,9 +1450,10 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
     }
   }
 
-  // 未超出基础速度前就因借机暂停时，不提前扣掉冲刺和主动作；等后续 settle 继续超速路段时再落账
+  // 未超出基础速度前就因借机或等待队友同意换位暂停时，不提前扣掉冲刺和主动作；等后续 settle 继续超速路段时再落账
   const actualTotal = usedBefore + standCost + feet;
-  const deferDash = opportunity !== undefined && wantsDash && !alreadyDashed && actualTotal <= baseSpeed;
+  const pausedForConsent = swapPartner !== undefined && request.swapApproved !== true && opportunity === undefined;
+  const deferDash = (opportunity !== undefined || pausedForConsent) && wantsDash && !alreadyDashed && actualTotal <= baseSpeed;
   if (deferDash && opportunity !== undefined) {
     opportunity.resume.dash = true;
     short = '已在借机触发处暂停，剩余路程与冲刺待反应结算后再继续';
@@ -785,6 +1526,18 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
       draggedTo = { name: dragged.name, to: cell };
     }
   }
+  let swapped: MoveResult['swapped'];
+  if (swapPartner !== undefined && swapAllyCell !== undefined && swapAdjCell !== undefined && opportunity === undefined && request.swapApproved === true) {
+    const allyDest: BattleCell = {
+      x: swapAdjCell.x,
+      y: swapAdjCell.y,
+      ...(swapAdjZ > 0 ? { z: swapAdjZ } : {}),
+      room: from.room,
+    };
+    state.positions[swapPartner.name] = allyDest;
+    swapped = { name: swapPartner.name, from: swapAllyCell, to: allyDest };
+    pushLog(c, `${ch.name} 与 ${swapPartner.name} 交换站位 ${fmtCoord(allyDest)}↔${fmtCoord(swapAllyCell)}`);
+  }
   const moved = state.moved ?? {};
   const notes: string[] = [...moveInfo.notes, ...blockedSightNotes];
   if (autoStandUp) {
@@ -799,9 +1552,185 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
 
   const hazardLines = settleMovementHazards(c, ch, path3d, options.roller ?? cryptoRoller, options.globalEffects);
   notes.push(...hazardLines);
+
+  // 领域/区域绕行提示与 5e 拆分移动提醒
+  const stepCostAt = (step: BattleCell): number => {
+    const stepHigh = (step.z ?? 0) >= 15;
+    const mapMult = !stepHigh && map !== undefined && areaAt(map, step)?.kind === 'difficult' ? 2 : 1;
+    const zoneMult = extraCellCostMultiplier(c, ch, step, from.room, options.globalEffects);
+    return CELL_FEET * factor * Math.max(mapMult, zoneMult);
+  };
+  const leftAfterMove = reaction ? 0 : Math.max(0, speed - (moved[ch.name] ?? 0));
+  const crossedDomains: string[] = [];
+  const crossedHazards: string[] = [];
+  let firstDomainEntryIdx: number | undefined;
+  for (let i = 1; i < path3d.length; i++) {
+    const prevStep = path3d[i - 1]!;
+    const curStep = path3d[i]!;
+    const prevDom = domainNamesAtCell(c, ch, prevStep, from.room, options.globalEffects);
+    const curDom = domainNamesAtCell(c, ch, curStep, from.room, options.globalEffects);
+    const stepHaz = stepHazardNamesAt(c, ch, prevStep, curStep, from.room, options.globalEffects);
+    for (const h of stepHaz) {
+      if (!crossedHazards.includes(h)) crossedHazards.push(h);
+      if (!crossedDomains.includes(h)) crossedDomains.push(h);
+    }
+    for (const d of curDom) {
+      if (!crossedDomains.includes(d)) crossedDomains.push(d);
+    }
+    if (firstDomainEntryIdx === undefined && [...stepHaz, ...curDom].some((d) => !prevDom.includes(d))) {
+      firstDomainEntryIdx = i;
+    }
+  }
+  if (avoidedHazards.length > 0 && crossedHazards.length === 0) {
+    notes.push(
+      `已自动绕开领域/区域「${avoidedHazards.join('、')}」（走安全路线耗 ${feet} 尺，未触发区域效果${!reaction ? `；本回合还剩 ${leftAfterMove}/${speed} 尺移动力，可在攻击/动作后继续拆分移动` : ''}；若玩家本意是直线穿行该区域可 dnd_undo 后传 enter_hazards=true）`,
+    );
+  }
+  if (crossedDomains.length > 0 && path3d.length >= 2) {
+    const splitTips: string[] = [];
+    if (firstDomainEntryIdx !== undefined && !reaction) {
+      const edgeCell = path3d[firstDomainEntryIdx - 1]!;
+      const edgeFeet = path3d.slice(1, firstDomainEntryIdx).reduce((sum, st) => sum + stepCostAt(st), 0);
+      const leftAtEdge = Math.max(0, speed - (usedBefore + standCost + edgeFeet));
+      splitTips.push(
+        `若不想直接踩进领域，可 dnd_undo 后先停在域外边缘 ${fmtCoord(edgeCell)}（耗 ${edgeFeet} 尺，还剩 ${leftAtEdge}/${speed} 尺），先执行攻击/推撞/施法/换位等动作，再用剩余移动力拆分移动`,
+      );
+    }
+    if (crossedHazards.length > 0 && !reaction) {
+      const findSafeGoalIn = (
+        reachedMap: Map<string, Reach>,
+        allowFoeOccupied = false,
+      ): { at: Cell; feet: number } | undefined => {
+        if (targetSpotScore !== undefined) {
+          let bestSafe: { at: Cell; feet: number; provokes: number } | undefined;
+          for (const [k, r] of reachedMap) {
+            const at = parseKey(k);
+            const nonFoeOccupied = others.some(
+              ({ ch: o, cell }) => (!allowFoeOccupied || !isHostile(ch, o)) && cell.x === at.x && cell.y === at.y && (cell.z ?? 0) === targetZ,
+            );
+            if (nonFoeOccupied && !(at.x === from.x && at.y === from.y && targetZ === fromZ)) continue;
+            if (keepCell !== undefined && distanceFeet({ ...at, z: targetZ }, keepCell) > MELEE_REACH_FEET) continue;
+            if (targetSpotScore(at) !== 0) continue;
+            if (bestSafe === undefined || r.feet < bestSafe.feet || (r.feet === bestSafe.feet && r.provokes < bestSafe.provokes)) {
+              bestSafe = { at, feet: r.feet, provokes: r.provokes };
+            }
+          }
+          return bestSafe === undefined ? undefined : { at: bestSafe.at, feet: bestSafe.feet };
+        }
+        const r = reachedMap.get(cellKey(fullDest));
+        return r === undefined ? undefined : { at: fullDest, feet: r.feet };
+      };
+      if (foes.length > 0) {
+        const unblockedBudget = Math.max(speed - used, feet);
+        const unblockedReached = walk(map, from, {
+          blocked: () => false,
+          provokes: provokesOn,
+          costFactor: factor,
+          highAltitude,
+          cellCostMultiplier: cellCostMult,
+          avoid: entersHazard,
+          maxFeet: unblockedBudget,
+        });
+        const unblockedGoal = findSafeGoalIn(unblockedReached, true);
+        if (unblockedGoal !== undefined) {
+          const uPath = pathTo(unblockedReached, unblockedGoal.at) ?? [];
+          const blockingFoes = foes
+            .filter(({ cell }) => uPath.some((p) => p.x === cell.x && p.y === cell.y && Math.abs((cell.z ?? 0) - targetZ) < CELL_FEET))
+            .map(({ ch: f }) => f.name);
+          if (blockingFoes.length > 0) {
+            splitTips.push(`若先攻击清掉或推开挡路的「${blockingFoes.join('、')}」，再用剩余移动力拆分移动，只需 ${unblockedGoal.feet} 尺即可无伤绕开`);
+          }
+        }
+      }
+      if (!committedDash) {
+        const dashBudget = Math.max(0, baseSpeed * 2 - used);
+        if (dashBudget > feet) {
+          const dashReached = walk(map, from, {
+            blocked,
+            provokes: provokesOn,
+            costFactor: factor,
+            highAltitude,
+            cellCostMultiplier: cellCostMult,
+            avoid: entersHazard,
+            maxFeet: dashBudget,
+          });
+          const dashGoal = findSafeGoalIn(dashReached, false);
+          if (dashGoal !== undefined) {
+            splitTips.push(`若改用冲刺（dash=true）可花 ${dashGoal.feet} 尺无伤绕开`);
+          }
+        }
+      }
+    }
+    for (const z of zonesInRoom(c, from.room)) {
+      if (!crossedDomains.includes(z.name) || z.concentration !== true || z.source === undefined) continue;
+      if (z.source === ch.name) {
+        splitTips.push(`「${z.name}」由 ${ch.name} 本人专注维持，可在移动前自由解除专注清场`);
+      } else {
+        const srcCh = findCharacter(c, z.source);
+        if (srcCh !== undefined && !isHostile(ch, srcCh)) {
+          splitTips.push(`「${z.name}」为友方 ${z.source} 专注维持`);
+        }
+      }
+    }
+    if (firstDomainEntryIdx === undefined && !reaction && leftAfterMove > 0) {
+      splitTips.push(`落位后还剩 ${leftAfterMove}/${speed} 尺移动力，可在走出领域执行攻击/施法等动作后继续拆分移动`);
+    }
+    notes.push(
+      `领域/拆分移动提醒：本次移动经过「${crossedDomains.join('、')}」。5e 允许在动作、多次攻击、附赠动作前后拆分移动${splitTips.length > 0 ? `——${splitTips.join('；')}` : ''}`,
+    );
+  }
+
+  if (swapped !== undefined && swapPartner !== undefined) {
+    const allyHazardLines = settleMovementHazards(c, swapPartner, [swapped.from, swapped.to], options.roller ?? cryptoRoller, options.globalEffects);
+    notes.push(...allyHazardLines);
+    const allyDisengaged = state.disengaged?.includes(swapPartner.name) === true;
+    const allyInvisible = request.ignoreStateMods !== true && isInvisibleState(swapPartner) && !hasCondition(swapPartner, '妖火');
+    if (!allyDisengaged && !allyInvisible) {
+      const allyLeaves = foes
+        .filter(({ ch: foe, cell }) =>
+          inInitiative(c, foe.name)
+          && canReact(foe)
+          && !hasCondition(foe, '失明')
+          && reactionBlocked(c, foe.name) === undefined
+          && canReactorSeeAt(foe, cell, swapped!.from).ok
+          && reachesOf(foe).some((reach) => distanceFeet(swapped!.from, cell) <= reach && distanceFeet(swapped!.to, cell) > reach),
+        )
+        .map(({ ch: foe }) => foe.name);
+      if (allyLeaves.length > 0) {
+        notes.push(`${swapPartner.name} 配合换位离开了 ${allyLeaves.join('、')} 的触及范围（敌方可决定是否消耗反应对其借机）`);
+      }
+    }
+  }
   // 若沿途区域伤害已将角色击倒/击杀，不再保留借机恢复窗口
   if (opportunity !== undefined && (ch.hp <= 0 || isOut(ch))) {
     opportunity = undefined;
+  }
+
+  let swapConsent: MoveResult['swapConsent'];
+  if (
+    swapPartner !== undefined
+    && swapAllyCell !== undefined
+    && request.swapApproved !== true
+    && opportunity === undefined
+    && ch.hp > 0
+    && !isOut(ch)
+  ) {
+    swapConsent = {
+      ally: swapPartner.name,
+      allyCell: swapAllyCell,
+      resume: {
+        swap: swapPartner.name,
+        swapApproved: true,
+        interrupt: request.interrupt,
+        reaction,
+        ...(deferDash ? { dash: true } : {}),
+        ...(request.ignoredReactors !== undefined ? { ignoredReactors: request.ignoredReactors } : {}),
+        ...(request.keepAdjacent !== undefined ? { keepAdjacent: request.keepAdjacent } : {}),
+        ...(request.crawl === true ? { crawl: true } : {}),
+        ...(request.enterHazards === true ? { enterHazards: true } : {}),
+        ...(request.ignoreStateMods === true ? { ignoreStateMods: true } : {}),
+      },
+    };
   }
 
   // 若区域伤害导致高空坠机（z 已清零），同步返回值中的 to
@@ -821,25 +1750,35 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
     enters,
     disengaged,
     stayedIn,
-    detour: feet > distanceFeet(from, postPos) * factor,
+    detour: swapped === undefined && feet > distanceFeet(from, postPos) * factor,
     ...(area !== undefined && area.kind !== 'wall' ? { where: areaName(area) } : {}),
     adjacent: adjacentFoes(c, ch, postPos),
     ...(draggedTo !== undefined ? { dragged: draggedTo } : {}),
+    ...(swapped !== undefined ? { swapped } : {}),
     ...(short !== undefined ? { short } : {}),
     notes,
     ...(opportunity !== undefined ? { opportunity } : {}),
+    ...(swapConsent !== undefined ? { swapConsent } : {}),
   };
 }
 
 export function moveResultText(r: MoveResult): string {
-  const how = [r.detour ? '绕开挡路的' : '', r.dragged !== undefined ? `拖着 ${r.dragged.name}，每格算双倍` : ''].filter(Boolean).join('，');
+  const how = [
+    r.swapped !== undefined ? `与 ${r.swapped.name} 交换站位` : '',
+    r.detour ? '绕开挡路的' : '',
+    r.dragged !== undefined ? `拖着 ${r.dragged.name}，每格算双倍` : '',
+  ].filter(Boolean).join('，');
   const lines = [`${r.name} ${fmtCoord(r.from)}→${fmtCoord(r.to)}，走 ${r.feet} 尺${how ? `（${how}）` : ''}，本回合累计 ${r.totalFeet}/${r.speed} 尺${r.dashed ? '（冲刺）' : ''}`];
   const now = [
     (r.to.z ?? 0) > 0 ? `离地 ${r.to.z} 尺` : '',
     r.where !== undefined ? `站在${r.where}` : '',
     r.adjacent.length > 0 ? `贴身：${r.adjacent.join('、')}` : '没贴着敌人',
   ].filter(Boolean);
-  lines.push(`现在：${now.join('；')}${r.dragged !== undefined ? `；${r.dragged.name} 在 ${fmtCoord(r.dragged.to)}` : ''}`);
+  const partnerSuffix = [
+    r.dragged !== undefined ? `；${r.dragged.name} 在 ${fmtCoord(r.dragged.to)}` : '',
+    r.swapped !== undefined ? `；${r.swapped.name} 换至 ${fmtCoord(r.swapped.to)}` : '',
+  ].join('');
+  lines.push(`现在：${now.join('；')}${partnerSuffix}`);
   if (r.short !== undefined) lines.push(`【DM】${r.short}。`);
   if (r.totalFeet > r.speed) lines.push(`【DM】超过速度 ${r.speed}：${r.dashed ? '冲刺也不够' : '没冲刺的话要传 dash=true'}，不合法就 dnd_undo。`);
   if (r.disengaged) lines.push('撤离：这次移动不触发借机。');
@@ -852,6 +1791,9 @@ export function moveResultText(r: MoveResult): string {
   }
   lines.push(...r.notes.map((n) => `【DM】${n}`));
   if (r.opportunity !== undefined) lines.push(`【移动待结算】在触发处停下：${r.opportunity.reactors.map((r) => `${r.character}·${r.reaction}`).join('、')}。先问玩家，不能提前 next、攻击或走完剩余路程。借机用 dnd_check type=attack reaction=true target=${r.name}；不用传 dnd_apply target=${r.name} decline=[角色名]；全部处理后 settle=true 继续移动。`);
+  if (r.swapConsent !== undefined) {
+    lines.push(`【换位待确认】${r.name} 已就位 ${fmtCoord(r.to)}，请求与 ${r.swapConsent.ally} ${fmtCoord(r.swapConsent.allyCell)} 交换站位（不消耗反应）。请先询问 ${r.swapConsent.ally} 的玩家本人点击下方「同意换位 / 不同意」按钮或打字回复，在此之前停下，不能提前 next 或攻击。本人同意后调用 dnd_apply target="${r.name}" settle=true 完成换位；若不同意或跳过则传 dnd_apply target="${r.name}" decline=["${r.swapConsent.ally}"] settle=true 停在原位。`);
+  }
   return lines.join('\n');
 }
 
@@ -870,8 +1812,105 @@ export function unplaced(c: Campaign): string[] {
   });
 }
 
+/**
+ * 计算某角色在当前剩余移动力下，可拆分移动近战触及的远端敌方目标（含是否自动绕开危险领域）。
+ * - 默认仅在房间存在持续区域/光环时返回，避免空旷普通战斗刷屏；
+ * - 传入 `{ always: true }` 时（如连击中途击倒当前目标、仍有剩余攻击与移动力），始终计算可转火可达性。
+ */
+export function combatReachabilityHint(
+  c: Campaign,
+  ch: Character,
+  globalEffects?: Record<string, CustomEffectDef>,
+  options: { always?: boolean } = {},
+): string | undefined {
+  if (c.initiative === undefined || isOut(ch) || ch.hp <= 0) return undefined;
+  const from = cellOf(c, ch);
+  if (from === undefined) return undefined;
+  if (options.always !== true && !hasActiveDomainsInRoom(c, from.room, globalEffects)) return undefined;
+  const state = c.initiative;
+  const dashed = state.dashed?.includes(ch.name) === true;
+  const fromZ = from.z ?? 0;
+  const rawSpeed = fromZ > 0
+    ? (ch.flySpeed ?? (hasCondition(ch, '飞行术') ? 60 : (ch.speed ?? DEFAULT_SPEED)))
+    : (ch.speed ?? DEFAULT_SPEED);
+  const mInfo = movementSpeedInfo(ch, rawSpeed);
+  if (mInfo.zeroSpeed) return undefined;
+  const standCost = hasCondition(ch, '倒地') && state.turnState?.stoodUp !== true ? Math.floor(mInfo.baseSpeed / 2) : 0;
+  const totalAvail = mInfo.baseSpeed * (dashed ? 2 : 1);
+  const used = (state.moved?.[ch.name] ?? 0) + standCost;
+  const remFeet = totalAvail - used;
+  if (remFeet < CELL_FEET) return undefined;
+
+  const map = mapOf(c, from.room);
+  const others = placedIn(c, from.room).filter(({ ch: o }) => o.name !== ch.name);
+  const foes = others.filter(({ ch: o }) => isHostile(ch, o) && !(ch.kind !== 'monster' && hiddenFromPlayers(o)));
+  if (foes.length === 0) return undefined;
+
+  const weaponReaches = (ch.weapons ?? [])
+    .map((w) => weaponReach(w, true))
+    .filter((r): r is number => r !== undefined);
+  const meleeReach = weaponReaches.length > 0 ? Math.max(...weaponReaches) : MELEE_REACH_FEET;
+  const highAlt = fromZ >= 15;
+  const blocked = (at: Cell): boolean =>
+    others.some(({ ch: o, cell }) => isHostile(ch, o) && cell.x === at.x && cell.y === at.y && Math.abs((cell.z ?? 0) - fromZ) < CELL_FEET);
+  const taken = (at: Cell): boolean =>
+    others.some(({ cell }) => cell.x === at.x && cell.y === at.y && (cell.z ?? 0) === fromZ);
+  const cellCostMult = (at: Cell): number => extraCellCostMultiplier(c, ch, { ...at, z: fromZ }, from.room, globalEffects);
+  const entersHazard = (a: Cell, b: Cell): boolean =>
+    stepHazardNamesAt(c, ch, { ...a, z: fromZ }, { ...b, z: fromZ }, from.room, globalEffects).length > 0;
+
+  const safeReached = walk(map, from, {
+    blocked,
+    costFactor: 1,
+    highAltitude: highAlt,
+    cellCostMultiplier: cellCostMult,
+    avoid: entersHazard,
+    maxFeet: remFeet,
+  });
+  const anyReached = walk(map, from, {
+    blocked,
+    costFactor: 1,
+    highAltitude: highAlt,
+    cellCostMultiplier: cellCostMult,
+    maxFeet: remFeet,
+  });
+
+  const minFeetToFoe = (reachedMap: Map<string, Reach>, foeCell: BattleCell): number | undefined => {
+    let best: number | undefined;
+    for (const [k, r] of reachedMap) {
+      const at = parseKey(k);
+      if (taken(at) && !(at.x === from.x && at.y === from.y)) continue;
+      if (distanceFeet({ ...at, z: fromZ }, foeCell) > meleeReach) continue;
+      if (wallBetween(map, at, foeCell) !== undefined) continue;
+      if (best === undefined || r.feet < best) best = r.feet;
+    }
+    return best;
+  };
+
+  const reachable: string[] = [];
+  for (const foe of foes) {
+    if (distanceFeet(from, foe.cell) <= meleeReach && wallBetween(map, from, foe.cell) === undefined) continue;
+    const safeFeet = minFeetToFoe(safeReached, foe.cell);
+    const anyFeet = minFeetToFoe(anyReached, foe.cell);
+    if (safeFeet !== undefined) {
+      const detouredAroundHazard = anyFeet !== undefined && safeFeet > anyFeet;
+      reachable.push(`${foe.ch.name}(${safeFeet}尺${detouredAroundHazard ? '无伤绕开区域可达' : '可达'})`);
+    } else if (anyFeet !== undefined) {
+      reachable.push(`${foe.ch.name}(${anyFeet}尺需穿行领域)`);
+    }
+  }
+
+  if (reachable.length > 0) {
+    return `本回合剩余移动 ${remFeet}/${totalAvail} 尺，可拆分移动近战触及：${reachable.join('、')}（直接调用 dnd_position action="move" to="目标名"，寻路会自动绕开危险区域；5e 允许在多次攻击或动作前后拆分移动）`;
+  }
+  if (options.always === true) {
+    return `本回合还剩 ${remFeet}/${totalAvail} 尺移动力（当前速度内暂无其他近战可达目标；5e 允许先 dnd_position move 调整站位或改用远程/投掷武器继续剩余攻击）`;
+  }
+  return undefined;
+}
+
 /** 轮到某人时随回合提示给的一句：他在哪、贴着谁、最近的敌人多远，省得模型再算 */
-export function turnPositionNote(c: Campaign, name: string): string {
+export function turnPositionNote(c: Campaign, name: string, globalEffects?: Record<string, CustomEffectDef>): string {
   const missing = unplaced(c);
   const hint = missing.length > 0 ? `【站位】还没摆位：${missing.join('、')}。先 dnd_position set 再裁定距离。` : '';
   const ch = findCharacter(c, name);
@@ -888,9 +1927,11 @@ export function turnPositionNote(c: Campaign, name: string): string {
     const nearest = foes.map((f) => ({ name: f.ch.name, feet: distanceFeet(cell, f.cell) })).sort((a, b) => a.feet - b.feet)[0]!;
     where += `，最近的敌人 ${nearest.name} ${nearest.feet} 尺`;
   }
+  const reachHint = combatReachabilityHint(c, ch, globalEffects);
+  const reachSuffix = reachHint !== undefined ? `；${reachHint}` : '';
   // 打到一半才上线这功能的战斗没有开战提示，在回合提示里补要
   const noMap = map === undefined ? '这间还没有场地图：先 dnd_position terrain 照现有站位把墙、门、门外走廊、障碍画上。' : '';
-  return `${where}。${hint}${noMap}`;
+  return `${where}${reachSuffix}。${hint}${noMap}`;
 }
 
 /** 玩家看站位时要藏起来的：隐形、躲着的怪。位置正是它们要瞒的东西（被妖火照出形迹的不再藏） */

@@ -28,7 +28,13 @@ import { chatKeyOf, planNoteInjection, type NoteHit, type NoteQueryContext, type
 import type { MediaReviewCoordinator } from '../features/media-review-coordinator.ts';
 import { boundedRecall, noteRevisionKey, operationQueryTerms, RecallTurnState, toolOperationEvidence } from '../notes/operation-recall.ts';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { QQBOT_MESSAGE_SOURCE } from '../shared/message-source.ts';
+import {
+  createNotesRecallMessage,
+  createPersonaHandoffMessage,
+  isPersonaHandoffSource,
+  QQBOT_MESSAGE_SOURCE,
+  summarizeNotesHint,
+} from '../shared/message-source.ts';
 import { deriveProjectsFromCwd } from '../notes/note-metadata.ts';
 import type { NoteMetricsStore } from '../notes/note-metrics.ts';
 import type { NoteJudge } from '../features/note-judge.ts';
@@ -38,11 +44,11 @@ import { collectHandoffInput, generatePersonaHandoff } from '../features/persona
 import type { JudgeLine, JudgeLlm } from '../features/reply-judge.ts';
 import { collectJudgeLines } from '../middleware/reply-decider.ts';
 import { sanitizePseudoToolText } from '../media/pseudo-sticker-call.ts';
-import { createPersonaHandoffMessage, isPersonaHandoffSource } from '../shared/message-source.ts';
 import type { ToolAccess } from '../features/tool-access.ts';
-import type { DndService } from '../dnd/dnd-service.ts';
+import { DndSnapshotGate, type DndService } from '../dnd/dnd-service.ts';
 import type { DndCombatAgents } from '../dnd/combat-agent.ts';
 import type { DndToolScope } from '../dnd/tool-scope.ts';
+import type { SessionToolScope } from '../features/session-tool-scope.ts';
 import { PromptLatch } from '../features/prompt-latch.ts';
 import type { DndTurnButtons } from '../dnd/turn-buttons.ts';
 import { resolveTmpDir } from '../media/tmp-dir.ts';
@@ -122,11 +128,25 @@ export interface NoteTurnSummary {
   toolsUsed?: readonly string[];
 }
 
+/** 入站暂存的共享笔记召回参数，由 agent/pre-step 在真正进入模型步骤时独立注入 */
+export interface StagedNoteRecall {
+  query: string;
+  operations: readonly string[];
+  scope: ChatScope;
+  peerId: string;
+  messageId?: string;
+  steered: boolean;
+}
+
 function cleanUserEventText(raw: string): string {
   const currentIdx = raw.lastIndexOf('[Current message]');
   const body = currentIdx >= 0 ? raw.slice(currentIdx + '[Current message]'.length) : raw;
-  const noteTail = '要看更多用 qqbot_notes_search。）';
-  const afterNotes = body.includes(noteTail) ? body.slice(body.lastIndexOf(noteTail) + noteTail.length) : body;
+  let afterNotes = body;
+  for (const noteTail of ['更多用 qqbot_notes(action="search")。）', '要看更多用 qqbot_notes_search。）']) {
+    if (afterNotes.includes(noteTail)) {
+      afterNotes = afterNotes.slice(afterNotes.lastIndexOf(noteTail) + noteTail.length);
+    }
+  }
   return afterNotes
     .split('\n')
     .filter((line) => {
@@ -256,20 +276,66 @@ export function promptEpoch(record: Pick<SessionRecord, 'agent'>): string {
   return `${session.id}:${session.surface?.contentGeneration ?? 0}`;
 }
 
+/**
+ * 计算当前会话最新的真实用户发言轮次标识（忽略宿主的 runtime-context 与笔记召回消息）。
+ * 同一轮工具循环（move → attack → attack → next）期间该标识恒定不变，用于锁定单轮内零重发团况快照。
+ */
+export function agentUserTurnTag(record: Pick<SessionRecord, 'agent'>): string | undefined {
+  const session = record.agent?.session;
+  if (session === undefined) return undefined;
+  const events = session.snapshotEvents?.() ?? session.events;
+  if (!Array.isArray(events)) return undefined;
+  let userCount = 0;
+  let lastTag = '0';
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.type !== 'user/message' || isRuntimeContextEvent(ev)) continue;
+    const body = (ev.data ?? ev.message ?? ev) as { source?: { kind?: unknown }; message?: { source?: { kind?: unknown } } };
+    const kind = body.message?.source?.kind ?? body.source?.kind;
+    if (kind !== undefined && kind !== 'user') continue;
+    userCount += 1;
+    lastTag = String((ev as { seq?: unknown }).seq ?? i);
+  }
+  return `${promptEpoch(record)}#u${userCount}:${lastTag}`;
+}
+
+export interface DndStateThrottleOptions {
+  gate?: DndSnapshotGate;
+  intervalTurns?: number;
+}
+
 /** 这个 agent 所在会话的团况快照文字；不是 QQ 会话、战斗子代理（改由回合前增量注入）、没开团或读取失败都返回空串 */
 export function dndStateText(
   agent: DshAgent | undefined,
   findRecord: (agent: DshAgent) => SessionRecord | undefined,
-  dnd: (Pick<DndService, 'stateSnapshot'> & Partial<Pick<DndService, 'combatStateSnapshot'>>) | undefined,
+  dnd: (Pick<DndService, 'stateSnapshot'> & Partial<Pick<DndService, 'combatStateSnapshot' | 'snapshotStructuralKey' | 'snapshotForceSeq' | 'isExternallyDirty' | 'recordAgentToolSync'>>) | undefined,
   logger: Logger,
   isCombatChild?: (agent: DshAgent) => boolean,
+  throttle?: DndStateThrottleOptions,
 ): string {
   if (agent === undefined || dnd === undefined) return '';
   if (isCombatChild?.(agent)) return '';
   const record = findRecord(agent);
   if (record === undefined) return '';
   try {
-    return dnd.stateSnapshot(record.sessionKey);
+    const fresh = dnd.stateSnapshot(record.sessionKey);
+    if (throttle?.gate === undefined) return fresh;
+    const epoch = record.agent?.session !== undefined ? promptEpoch(record) : '';
+    const turnTag = record.agent?.session !== undefined ? agentUserTurnTag(record) : undefined;
+    const structKey = dnd.snapshotStructuralKey?.(record.sessionKey, epoch) ?? epoch;
+    const forceSeq = dnd.snapshotForceSeq?.(record.sessionKey) ?? 0;
+    const externallyDirty = dnd.isExternallyDirty?.(record.sessionKey, 'main', fresh) === true;
+    const resolved = throttle.gate.resolve({
+      agentKey: agent,
+      fresh,
+      ...(turnTag !== undefined ? { turnTag } : {}),
+      structKey,
+      forceSeq,
+      externallyDirty,
+      intervalTurns: throttle.intervalTurns ?? 4,
+    });
+    if (resolved === fresh && fresh !== '') dnd.recordAgentToolSync?.(record.sessionKey);
+    return resolved;
   } catch (err) {
     logger.warn(`im-qqbot: 注入团况失败: ${err instanceof Error ? err.message : String(err)}`);
     return '';
@@ -386,6 +452,7 @@ export class SessionManager {
   public noteJudge?: NoteJudge;
   private readonly pendingNoteInjections = new Map<string, PendingNoteInjection>();
   private readonly operationRecalls = new Map<string, RecallTurnState>();
+  private readonly stagedNoteRecalls = new Map<string, StagedNoteRecall & { stagedAt: number }>();
   /** 会话 key → /new 时旧会话的压缩摘要（可能还在压缩）；新会话的第一条消息取走 */
   private readonly pendingHandoffs = new Map<string, Promise<string | undefined>>();
   /** 切换先完成落盘；期间到来的 QQ 消息等待，不得进入即将离开的人格历史。 */
@@ -393,6 +460,8 @@ export class SessionManager {
   private personaRoutes = new Map<string, ModelRoute>();
   /** 多步关键事务/切换/待决交互期间阻止后台自动压缩与空闲压缩的锁表 */
   public contextLocks = new ContextLockManager();
+  /** 正在进行手动/空闲/交接压缩的会话 key（防重入） */
+  private activeCompactions?: Set<string> = new Set<string>();
   private disposing = false;
   /** 由 bootstrap 注入的工具权限（终端白名单） */
   public toolAccess?: ToolAccess;
@@ -401,8 +470,12 @@ export class SessionManager {
   public combatAgents?: DndCombatAgents;
   /** 按团的状态隐藏用不上的 dnd_* 工具（由 bootstrap 注入） */
   public dndToolScope?: DndToolScope;
+  /** 按会话与权限范围隐藏确定不可用的非跑团工具（由 bootstrap 注入） */
+  public sessionToolScope?: SessionToolScope;
   /** 一段对话内锁住的 system prompt 文字（表情清单、本群笔记目录），见 PromptLatch */
   private readonly promptLatch = new PromptLatch();
+  /** 跑团团况 runtime-context 单轮锁定与跨轮次节流门控 */
+  private readonly dndSnapshotGate = new DndSnapshotGate();
   /** 短时入站自动 steer 阶段跟踪器（与出站事件、流式帧同步） */
   public readonly turnSteer = new TurnSteerTracker();
   public mediaReview?: MediaReviewCoordinator;
@@ -450,6 +523,7 @@ export class SessionManager {
     this.registerRuntimeContexts();
     this.registerVoiceReplyDelivery();
     this.registerOperationRecall();
+    this.registerPreStepNotesRecall();
   }
 
   /** 语音后的文字继续生成，出站层改用独立静态消息，投递队列负责发送间隔。 */
@@ -553,7 +627,7 @@ export class SessionManager {
           text: [
             '【工具权限】',
             '本会话不在终端白名单里：没有 pwsh/bash/终端，不能派生子 agent；文件工具默认只能用在 bot 的媒体、表情和临时目录。若本群有跑团存档，可用 read/read_image/glob/grep 只读查阅当前模组目录用于 DM 备团（禁止修改、禁止用 qqbot_send_file 发给玩家）。被拦就直接告诉用户做不到，别换工具绕，也别说出本机路径。',
-            '只有 bot 主人能把本群加入白名单：主人明确要求时调用 qqbot_tool_access(action="grant")，它会发确认按钮，主人点了才生效。',
+            '只有 bot 主人能把本群加入白名单：主人明确要求时调用 qqbot_access(capability="terminal", action="grant")，它会发确认按钮，主人点了才生效。',
           ].join('\n'),
         });
       }
@@ -565,10 +639,10 @@ export class SessionManager {
           text: [
             '【共享笔记】',
             '你有一个带适用范围的长期记忆库。消息前出现「[共享笔记 · 可能相关]」时，会附带来源日期、适用范围、触发依据与冲突提醒；相关就自然用上，遇到过期或新旧冲突以更新证据为准，无关则忽略。',
-            '想不起来时用 qqbot_notes_search 查；保存时通用工程教训与写作偏好走默认共享，特定项目实验条件/代码约定传 projects，角色演绎设定传 personas/scenes，本群私事传 scope="chat"；推翻旧结论传 supersedes 关联旧记录（别记隐私和闲聊）。',
+            '想不起来时用 qqbot_notes(action="search") 查；保存时通用工程教训与写作偏好走默认共享，特定项目实验条件/代码约定传 projects，角色演绎设定传 personas/scenes，本群私事传 scope="chat"；推翻旧结论传 supersedes 关联旧记录（别记隐私和闲聊）。',
             '跑团进度、物品、任务线头和待办用 dnd_progress 写进团档，不写笔记；进度以 dnd_* 工具查到的为准。DC、怪物数值、DM 笔记、没揭示的东西任何时候都不写进笔记。',
             '记笔记是你自己的事，不用每次都告诉用户「我记下了」。',
-            '另外有一本《人类观察日记》，所有群和私聊共用：遇到人类的回复和你预测的不一样，就往里追加一条，用 qqbot_notes_save(file="人类观察日记.md")，格式固定「预测 / 实际 / 差在哪」，编号取文末最后一个 +1。只记判断失误，不记流水账。',
+            '另外有一本《人类观察日记》，所有群和私聊共用：遇到人类的回复和你预测的不一样，就往里追加一条，用 qqbot_notes(action="save", file="人类观察日记.md")，格式固定「预测 / 实际 / 差在哪」，编号取文末最后一个 +1。只记判断失误，不记流水账。',
           ].join('\n'),
         });
       }
@@ -585,7 +659,7 @@ export class SessionManager {
             sections.push({
               name: 'qqbot:dnd-chat-notes',
               order: 98,
-              text: this.promptLatch.hold(`${record.sessionKey}|qqbot:dnd-chat-notes`, epoch, `本群笔记（开团期间不自动注入，需要时用 qqbot_notes_search 查，进度以【团况】为准）：${titles.join('；')}`),
+              text: this.promptLatch.hold(`${record.sessionKey}|qqbot:dnd-chat-notes`, epoch, `本群笔记（开团期间不自动注入，需要时用 qqbot_notes(action="search") 查，进度以【团况】为准）：${titles.join('；')}`),
             });
           }
         } catch (err) {
@@ -604,8 +678,8 @@ export class SessionManager {
           `临时文件一律写到 ${tmpDir} 下（一次性脚本、截图、抽帧、下载的素材、pip/npm 依赖、转写音频等），按任务建子目录，例如 ${join(tmpDir, 'asr-video')}。不要写在工作目录 ${this.config.cwd || process.cwd()} 的根下。`,
           '定时任务每次运行用的脚本和下载的图片也是临时文件，同样写进临时目录，不要每次在别处另存一份新脚本；只有需要跨次保留的状态（已发记录、游标、日志）才写到固定的状态文件里（json/log/txt/md）。',
           ttl > 0
-            ? `${tmpDir} 里 ${ttl} 小时没动过的东西会被自动清理；要长期保留的成果（用户要的文件、笔记）放到用户指定的位置，或用 qqbot_notes_save 记进笔记。`
-            : '要长期保留的成果（用户要的文件、笔记）放到用户指定的位置，或用 qqbot_notes_save 记进笔记。',
+            ? `${tmpDir} 里 ${ttl} 小时没动过的东西会被自动清理；要长期保留的成果（用户要的文件、笔记）放到用户指定的位置，或用 qqbot_notes(action="save") 记进笔记。`
+            : '要长期保留的成果（用户要的文件、笔记）放到用户指定的位置，或用 qqbot_notes(action="save") 记进笔记。',
           ...(this.ffmpegPath !== undefined
             ? [`本机有 ffmpeg/ffprobe：${this.ffmpegPath}（同目录还有 ffprobe），终端里直接用这个路径，不用再找或重装。`]
             : []),
@@ -705,6 +779,10 @@ export class SessionManager {
           this.dndService,
           this.logger,
           (agent) => Boolean(this.combatAgents?.isCombatAgent(agent)),
+          {
+            gate: this.dndSnapshotGate,
+            intervalTurns: this.config.dnd?.snapshotIntervalTurns ?? 4,
+          },
         ),
       });
       scope.systemPrompt.context({
@@ -1042,9 +1120,32 @@ export class SessionManager {
     }, scope, peerId, { ...options, record });
   }
 
+  /** 暂存一条入站消息的笔记召回参数，等待 agent/pre-step 进入模型步骤时检索并独立注入 */
+  stageNoteRecall(messageId: string, spec: StagedNoteRecall): void {
+    const now = Date.now();
+    const map = this.ensureStagedNoteRecalls();
+    for (const [id, entry] of map) {
+      if (now - entry.stagedAt > NOTE_INJECTION_TTL_MS) map.delete(id);
+    }
+    if (!messageId || (spec.query.trim() === '' && spec.operations.length === 0)) return;
+    map.set(messageId, { ...spec, stagedAt: now });
+  }
+
+  /** 提交前取消或失败时撤销已暂存的笔记召回 */
+  unstageNoteRecall(messageId: string): void {
+    if (!messageId) return;
+    this.ensureStagedNoteRecalls().delete(messageId);
+  }
+
+  private ensureStagedNoteRecalls(): Map<string, StagedNoteRecall & { stagedAt: number }> {
+    const self = this as unknown as { stagedNoteRecalls?: Map<string, StagedNoteRecall & { stagedAt: number }> };
+    self.stagedNoteRecalls ??= new Map();
+    return self.stagedNoteRecalls;
+  }
+
   /** All recall routes share scope checks, revision dedup and a turn-wide rendered-character budget. */
   async notesHint(query: string, scope: ChatScope, peerId: string, messageId?: string, preservePending = false,
-    operations: readonly string[] = []): Promise<string> {
+    operations: readonly string[] = [], signal?: AbortSignal): Promise<string> {
     const key = this.sessionKey(scope, peerId);
     if (!preservePending || !this.operationRecalls.has(key)) {
       this.operationRecalls.set(key, new RecallTurnState(query, operations));
@@ -1052,7 +1153,7 @@ export class SessionManager {
     }
     const state = this.operationRecalls.get(key)!;
     const operationQuery = [query, operationQueryTerms(operations)].filter(Boolean).join('\n');
-    return this.recallAtOperation(operationQuery, operations, scope, peerId, state, messageId, undefined, operations.length && state.usedChars === 0 ? 0.6 : 1);
+    return this.recallAtOperation(operationQuery, operations, scope, peerId, state, messageId, signal, operations.length && state.usedChars === 0 ? 0.6 : 1);
   }
 
   private async recallAtOperation(query: string, operations: readonly string[], scope: ChatScope, peerId: string,
@@ -1120,10 +1221,81 @@ export class SessionManager {
       const facts = `[媒体操作结果 · 执行事实]\n${evidence.facts.join('；')}\n`.slice(0, Math.min(220, factsBudget));
       state.factChars += facts.length;
       if (!facts && !hint) return decision;
-      return { ...decision, additionalContexts: [...(decision.additionalContexts ?? []), createUserMessage({
-        content: [{ type: 'text', text: facts + hint }], source: QQBOT_MESSAGE_SOURCE })] };
+      const contextMessage = hint
+        ? createNotesRecallMessage(facts + hint, summarizeNotesHint(hint))
+        : createUserMessage({ content: [{ type: 'text', text: facts }], source: QQBOT_MESSAGE_SOURCE });
+      return { ...decision, additionalContexts: [...(decision.additionalContexts ?? []), contextMessage] };
     };
     (this.ctx as unknown as { on(event: 'tools/post-execute', listener: typeof handler, options?: { global: boolean }): void }).on('tools/post-execute', handler, { global: true });
+  }
+
+  /**
+   * 在 agent/pre-step 进入模型步骤时按入站消息 ID 消费暂存召回，并以独立 `qqbot-notes-recall`
+   * 上下文消息插在对应用户消息之前，不再污染 `user/message` 正文。
+   */
+  private registerPreStepNotesRecall(): void {
+    interface StepMessage {
+      id?: string;
+      [key: string]: unknown;
+    }
+    interface PreStepPayload {
+      agent?: unknown;
+      signal: AbortSignal;
+      messages?: StepMessage[];
+    }
+    interface PreStepDecision {
+      kind: string;
+      messages?: StepMessage[];
+      [key: string]: unknown;
+    }
+    const on = (this.ctx as unknown as {
+      on?: (
+        event: 'agent/pre-step',
+        listener: (payload: PreStepPayload, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>,
+        options?: { global: boolean },
+      ) => void;
+    }).on;
+    if (typeof on !== 'function') return;
+
+    const handler = async (payload: PreStepPayload, next: () => Promise<PreStepDecision>): Promise<PreStepDecision> => {
+      const decision = await next();
+      if (decision.kind === 'reject' || payload.signal.aborted || !Array.isArray(decision.messages) || decision.messages.length === 0) {
+        return decision;
+      }
+      const record = payload.agent ? this.findByAgent(payload.agent as DshAgent) : undefined;
+      if (!record) return decision;
+
+      const map = this.ensureStagedNoteRecalls();
+      let changed = false;
+      const nextMessages: StepMessage[] = [];
+      for (const msg of decision.messages) {
+        const msgId = typeof msg.id === 'string' ? msg.id : '';
+        const spec = msgId ? map.get(msgId) : undefined;
+        if (spec !== undefined) {
+          map.delete(msgId);
+          if (Date.now() - spec.stagedAt <= NOTE_INJECTION_TTL_MS) {
+            const hint = await this.notesHint(
+              spec.query,
+              spec.scope,
+              spec.peerId,
+              spec.messageId,
+              spec.steered,
+              spec.operations,
+              payload.signal,
+            );
+            if (payload.signal.aborted) return decision;
+            if (hint) {
+              nextMessages.push(createNotesRecallMessage(hint, summarizeNotesHint(hint)) as unknown as StepMessage);
+              changed = true;
+            }
+          }
+        }
+        nextMessages.push(msg);
+      }
+      return changed ? { ...decision, messages: nextMessages } : decision;
+    };
+
+    on.call(this.ctx, 'agent/pre-step', handler, { global: true });
   }
 
   /** 账本概览保留历史；只让低分清单跟随当前索引和静音策略。 */
@@ -1341,15 +1513,17 @@ export class SessionManager {
     const record = this.getSessionRecord(scope, peerId);
     const stats: TokenUsageStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
-    const events = record?.agent.session.events;
-    if (!events) return stats;
+    const events = sessionEventsOf(record);
+    if (events.length === 0) return stats;
 
     for (const event of events) {
-      if (event.type !== 'assistant/message' || !event.usage) continue;
-      stats.input += event.usage.input ?? 0;
-      stats.output += event.usage.output ?? 0;
-      stats.cacheRead += event.usage.cacheRead ?? 0;
-      stats.cacheWrite += event.usage.cacheWrite ?? 0;
+      if (event.type !== 'assistant/message') continue;
+      const usage = extractEventUsage(event);
+      if (!usage) continue;
+      stats.input += usage.input;
+      stats.output += usage.output;
+      stats.cacheRead += usage.cacheRead;
+      stats.cacheWrite += usage.cacheWrite;
     }
 
     return stats;
@@ -1359,8 +1533,8 @@ export class SessionManager {
     const record = this.getSessionRecord(scope, peerId);
     if (!record) return '';
 
-    const events = record.agent.session.events;
-    if (!events || events.length === 0) return '';
+    const events = sessionEventsOf(record);
+    if (events.length === 0) return '';
 
     const lines: string[] = [`# QQ 会话导出\n`, `> session: ${record.sessionId}\n`];
 
@@ -1368,10 +1542,10 @@ export class SessionManager {
       if (event.type === 'user/message') {
         // 团况快照带 DM 机密（DC、怪物 HP、DM 笔记），不能跟着导出发到群里
         if (isRuntimeContextEvent(event)) continue;
-        const text = extractMessageText(event.message);
+        const text = extractEventMessageText(event);
         if (text) lines.push(`## 用户\n\n${text}\n`);
       } else if (event.type === 'assistant/message') {
-        const text = extractMessageText(event.message);
+        const text = extractEventMessageText(event);
         if (text) lines.push(`## 助手\n\n${text}\n`);
       }
     }
@@ -1380,8 +1554,8 @@ export class SessionManager {
   }
 
   private countMessages(record: SessionRecord | undefined): number {
-    const events = record?.agent.session.events;
-    if (!events) return 0;
+    const events = sessionEventsOf(record);
+    if (events.length === 0) return 0;
 
     let count = 0;
     for (const event of events) {
@@ -1606,7 +1780,8 @@ export class SessionManager {
     noteSender(record, senderId);
 
     this.sessions.set(key, record);
-    // 在第一条消息交给 agent 之前定好它看得到哪些跑团工具
+    // 在第一条消息交给 agent 之前定好它看得到哪些工具与跑团工具
+    this.sessionToolScope?.sync(record);
     this.dndToolScope?.sync(record);
     // 活会话的 Web 选择已经在宿主生效。旧 per-chat 偏好只用于 resume/create，
     // 不在插件重组后重新安装竞争选择器、也不把旧偏好当成一次新的切换。
@@ -1620,6 +1795,12 @@ export class SessionManager {
     if (record !== undefined) this.dndToolScope?.sync(record);
     const child = this.combatAgents?.current(sessionKey);
     if (child !== undefined) this.dndToolScope?.sync(child);
+  }
+
+  /** 权限白名单变更后同步目标会话可见工具；会话不在内存里时等下次创建再定 */
+  syncSessionTools(scope: ChatScope, peerId: string): void {
+    const record = this.sessions.get(this.sessionKey(scope, peerId));
+    if (record !== undefined) this.sessionToolScope?.sync(record);
   }
 
   findBySessionId(sessionId: string): SessionRecord | undefined {
@@ -1938,55 +2119,151 @@ export class SessionManager {
   /**
    * 原地压缩当前会话历史（保留 sessionId，用摘要替换旧历史）。
    *
-   * 需通过 agentPresets.serviceFor(agent, 'compaction') 解析；未挂载时优雅降级。
+   * 会话未驻留内存时尝试仅从磁盘 resume 现有历史并压缩（绝不 create 空会话），压缩完若未被激活则释放句柄。
+   * 需通过 agentPresets.serviceFor(agent, 'compaction') / agent.ctx / 根 ctx 解析；未挂载时优雅降级。
    * 这是「压缩上下文」的语义，区别于 remove() 的「换新会话」。
    */
   async compact(scope: ChatScope, peerId: string): Promise<CompactOutcome> {
-    const key = this.sessionKey(scope, peerId);
+    const key = this.sessionKey?.(scope, peerId) ?? `qqbot:${this.config?.appId ?? ''}:${scope}:${peerId}`;
     if (this.personaTransitions?.has(key)) return { ok: false, reason: 'busy' };
-    const record = this.sessions.get(key);
-    if (!record) return { ok: false, reason: 'no-session' };
-    return this.compactRecord(key, record);
+    const record = this.sessions?.get(key);
+    if (record) return this.compactRecord(key, record);
+
+    const rawSessionId = this.currentSessionId?.(key) ?? this.deriveSessionId?.(key);
+    if (!rawSessionId || !this.agents) return { ok: false, reason: 'no-session' };
+    const sessionId = SessionId(rawSessionId);
+
+    const live = this.agents.get?.(sessionId);
+    if (live) {
+      const transient: SessionRecord = {
+        sessionKey: key,
+        sessionId: live.session.id,
+        agent: live,
+        handle: { agent: live, dispose: async () => {} },
+        replyTarget: { scope, targetId: peerId, msgId: '' },
+        scope,
+        peerId,
+        senderId: '',
+        lastActivity: Date.now(),
+      };
+      return this.compactRecord(key, transient);
+    }
+
+    if (typeof this.agents.resume !== 'function') return { ok: false, reason: 'no-session' };
+
+    const presetId = (await this.resolvePersistedPreset?.(sessionId)) ?? this.getEffectivePresetByKey?.(key);
+    const composed = (await this.composePreset?.(presetId)) ?? {};
+    const resumeRoute = this.modelResolver?.getResumeRoute?.(key);
+    let tempHandle: DshAgentHandle;
+    try {
+      tempHandle = await this.agents.resume({
+        resumeSessionId: sessionId,
+        ...(resumeRoute ? { agentOptions: resumeRoute } : {}),
+        ...(composed.setup ? { setup: composed.setup } : {}),
+      });
+    } catch (err) {
+      this.logger?.debug?.(
+        `compact resume skipped: key=${key} sessionId=${sessionId} err=${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { ok: false, reason: 'no-session' };
+    }
+
+    const transient: SessionRecord = {
+      sessionKey: key,
+      sessionId: tempHandle.agent.session.id,
+      agent: tempHandle.agent,
+      handle: tempHandle,
+      replyTarget: { scope, targetId: peerId, msgId: '' },
+      scope,
+      peerId,
+      senderId: '',
+      lastActivity: Date.now(),
+      agentPreset: composed.agentPreset,
+    };
+    try {
+      return await this.compactRecord(key, transient);
+    } finally {
+      if (this.sessions?.get(key)?.agent !== tempHandle.agent && tempHandle.agent.status === 'idle') {
+        await tempHandle.dispose().catch(() => {});
+      }
+    }
   }
 
   /** 压缩一条会话记录；/new 交接时这条记录已经不在会话表里了，所以不按 key 查 */
   private async compactRecord(key: string, record: SessionRecord): Promise<CompactOutcome> {
+    const active = this.activeCompactions ?? (this.activeCompactions = new Set<string>());
+    if (active.has(key)) return { ok: false, reason: 'busy' };
     if (record.agent.status !== 'idle') return { ok: false, reason: 'busy' };
 
-    let compaction: CompactionServiceLike | undefined;
-    try {
-      const presets = this.getPresetsService();
-      compaction = (presets?.serviceFor(record.agent, 'compaction') ?? this.ctx.get('compaction')) as CompactionServiceLike | undefined;
-    } catch {
-      compaction = undefined;
-    }
+    const tryGet = <T>(fn: () => T): T | undefined => {
+      try {
+        return fn();
+      } catch {
+        return undefined;
+      }
+    };
+    const presets = tryGet(() => this.getPresetsService?.());
+    const compaction = (
+      tryGet(() => presets?.serviceFor(record.agent, 'compaction'))
+      ?? tryGet(() => (record.agent.ctx as { get?(name: string): unknown } | undefined)?.get?.('compaction'))
+      ?? tryGet(() => this.ctx?.get('compaction'))
+    ) as CompactionServiceLike | undefined;
     if (!compaction) return { ok: false, reason: 'unavailable' };
 
-    const route = this.modelResolver.getEffectiveRoute(key);
-    const agentCtx = {
-      session: record.agent.session,
-      options: { provider: route?.provider, model: route?.model },
-      runMaintenance: record.agent.runMaintenance.bind(record.agent),
-    };
+    const headerConfig = record.agent.session.requestHeader?.()?.config;
+    const hasHeaderRoute = Boolean(headerConfig?.provider && headerConfig?.model);
+    const hasAgentOptions = Boolean(record.agent.options?.provider && record.agent.options?.model);
+    const route = hasHeaderRoute || hasAgentOptions
+      ? undefined
+      : (this.personaModelRoute?.(record) ?? this.modelResolver?.getEffectiveRoute?.(key));
+    const targetAgent =
+      record.agent.options !== undefined && (hasHeaderRoute || hasAgentOptions || !route?.provider || !route?.model)
+        ? record.agent
+        : {
+            id: record.agent.id,
+            ctx: record.agent.ctx,
+            session: record.agent.session,
+            options: {
+              provider: route?.provider ?? record.agent.options?.provider,
+              model: route?.model ?? record.agent.options?.model,
+            },
+            runMaintenance: record.agent.runMaintenance.bind(record.agent),
+          };
 
+    active.add(key);
     try {
-      const result = await compaction.compactNow(agentCtx, new AbortController().signal);
+      const result = await compaction.compactNow(targetAgent, new AbortController().signal);
       if (result === null) return { ok: true, shadowed: 0, tokens: 0 };
       return { ok: true, shadowed: result.shadowedSeqs.length, tokens: result.shadowedTokenCount };
     } catch (err) {
       const code = (err as { code?: string } | null)?.code;
-      // summary = 摘要没有更小 = 历史不足以压缩，属正常结果而非失败
+      const { message: causeDetail, isNotSmaller } = extractCompactionCause(err);
       if (code === 'summary') {
-        return { ok: true, shadowed: 0, tokens: 0 };
+        if (isNotSmaller) {
+          this.logger?.debug?.(`compact skipped (summary not smaller): key=${key}`);
+          return { ok: true, shadowed: 0, tokens: 0 };
+        }
+        const summaryErr = causeDetail || (err instanceof Error ? err.message : String(err));
+        this.logger?.warn?.(`compact summary failed: key=${key} cause=${summaryErr}`);
+        return { ok: false, reason: 'failed', message: `摘要生成失败: ${summaryErr.slice(0, 200)}` };
       }
-      // 其他 ManualCompactionError 预期失败，给友好文案（debug 记录，不 warn 刷屏）
+      // 其他 ManualCompactionError 预期失败，给友好文案（除 cancelled 外记 warn 以便排查）
       if (code !== undefined && code in COMPACTION_ERROR_HINTS) {
-        this.logger.debug(`compact declined: key=${key} code=${code}`);
-        return { ok: false, reason: 'failed', message: COMPACTION_ERROR_HINTS[code] };
+        const logDetail = `compact declined: key=${key} code=${code}${causeDetail ? ` cause=${causeDetail}` : ''}`;
+        if (code === 'cancelled') this.logger?.debug?.(logDetail);
+        else this.logger?.warn?.(logDetail);
+        const hint = COMPACTION_ERROR_HINTS[code];
+        return {
+          ok: false,
+          reason: 'failed',
+          message: causeDetail ? `${hint}（${causeDetail.slice(0, 160)}）` : hint,
+        };
       }
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger.warn(`compact failed: key=${key} err=${message}`);
+      const message = causeDetail || (err instanceof Error ? err.message : String(err));
+      this.logger?.warn?.(`compact failed: key=${key} err=${message}`);
       return { ok: false, reason: 'failed', message };
+    } finally {
+      active.delete(key);
     }
   }
 
@@ -2043,7 +2320,7 @@ export class SessionManager {
       autoCompactPrivateRatio: this.config.autoCompactPrivateRatio ?? 0,
       autoCompactDeferOnTools: this.config.autoCompactDeferOnTools ?? false,
     });
-    const usedTools = lastTurnUsedTools(record.agent.session.events);
+    const usedTools = lastTurnUsedTools(sessionEventsOf(record));
     const lock = this.getContextLockStatus?.(record)
       ?? SessionManager.prototype.getContextLockStatus.call(this, record);
     const decision = decideAutoCompact({
@@ -2162,6 +2439,7 @@ export class SessionManager {
     this.evictor.dispose();
     clearInterval(this.idleCompactTimer);
     this.contextLocks?.clearAll();
+    this.stagedNoteRecalls.clear();
     const records = [...this.sessions.values()];
     this.sessions.clear();
     for (const record of records) {
@@ -2175,6 +2453,54 @@ export class SessionManager {
   get size(): number {
     return this.sessions.size;
   }
+}
+
+function sessionEventsOf(record: SessionRecord | undefined): readonly SessionEventLike[] {
+  return record?.agent?.session?.snapshotEvents?.() ?? record?.agent?.session?.events ?? [];
+}
+
+function extractCompactionCause(err: unknown): { message: string; isNotSmaller: boolean } {
+  const seen = new Set<unknown>();
+  const causes: string[] = [];
+  let cursor = err instanceof Error
+    ? err.cause
+    : (err !== null && typeof err === 'object' && 'cause' in err ? (err as { cause?: unknown }).cause : undefined);
+  while (cursor !== null && cursor !== undefined && !seen.has(cursor)) {
+    seen.add(cursor);
+    const msg = cursor instanceof Error ? cursor.message : typeof cursor === 'string' ? cursor : String(cursor);
+    if (msg) causes.push(msg);
+    cursor = cursor instanceof Error
+      ? cursor.cause
+      : (typeof cursor === 'object' && 'cause' in cursor ? (cursor as { cause?: unknown }).cause : undefined);
+  }
+  const message = causes[causes.length - 1] ?? '';
+  const isNotSmaller = causes.length === 0 || /not smaller|no compactable/i.test(causes.join(' | '));
+  return { message, isNotSmaller };
+}
+
+function extractEventUsage(event: SessionEventLike): TokenUsageStats | undefined {
+  const dataUsage = (event.data as { usage?: Record<string, unknown> } | undefined)?.usage;
+  const legacyUsage = event.usage as Record<string, unknown> | undefined;
+  const raw = dataUsage ?? legacyUsage;
+  if (!raw || typeof raw !== 'object') return undefined;
+  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  return {
+    input: num(raw.inputTokens ?? raw.input),
+    output: num(raw.outputTokens ?? raw.output),
+    cacheRead: num(raw.cacheReadTokens ?? raw.cacheRead),
+    cacheWrite: num(raw.cacheWriteTokens ?? raw.cacheWrite),
+  };
+}
+
+function extractEventMessageText(event: SessionEventLike): string {
+  const data = event.data as {
+    message?: SessionEventLike['message'];
+    content?: Array<{ type: string; text?: string }>;
+  } | undefined;
+  const message = data?.message
+    ?? (Array.isArray(data?.content) ? { content: data.content } : undefined)
+    ?? event.message;
+  return extractMessageText(message);
 }
 
 /** 从消息对象中提取纯文本（用于导出/统计） */

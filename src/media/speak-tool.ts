@@ -10,13 +10,12 @@
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, rm, stat, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import { parseEnv, promisify } from 'node:util';
 import type { Context } from '@deepseek-ai/cordis';
 import type { ContentBlock } from '@deepseek-ai/dsh-llm';
+import { defaultEnvFiles } from '../shared/paths.ts';
 import {
   DEEPSEEK_SPEAK_DEFAULTS,
   ELEVENLABS_SPEAK_DEFAULTS,
@@ -80,7 +79,6 @@ const MAX_QQ_VOICE_BYTES = 20 * 1024 * 1024;
 const ELEVENLABS_VOICE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const DEEPSEEK_VOICE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const NO_LANGUAGE_CODE_MODEL_RE = /^eleven_(?:multilingual_v[12]|monolingual_v1)$/i;
-const PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 interface SpeakArgs {
   text: string;
@@ -638,7 +636,7 @@ export function registerSpeakTool(
   const envFiles = options?.envFiles ?? (
     process.env.VITEST
       ? []
-      : [resolve(PLUGIN_ROOT, '.env.local'), resolve(PLUGIN_ROOT, '.env'), resolve(homedir(), '.dsh', '.env')]
+      : defaultEnvFiles()
   );
   const customRoles = [
     ...Object.entries(elevenlabsConfig?.roleVoices ?? {}),

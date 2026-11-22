@@ -8,10 +8,9 @@
  *
  * 手写 ToolDefinition（标准 JSON Schema），避免引入 dsh-tools 的 8 个 peer 依赖。
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { basename } from 'node:path';
 import yaml from 'js-yaml';
 import type { Context } from '@deepseek-ai/cordis';
 import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -24,7 +23,12 @@ import type {
 } from '@deepseek-ai/dsh-llm';
 import type { VisionConfig } from '../config.ts';
 import type { Logger } from '../types.ts';
+import { fetchSafe } from '../transport/attachment.ts';
 import { QQBOT_MESSAGE_SOURCE } from '../shared/message-source.ts';
+import { writeTextAtomic } from '../shared/atomic-fs.ts';
+import { dshSettingsPath } from '../shared/paths.ts';
+import { buildGifSheetNote, isGifBytes, makeGifSheet } from './gif-sheet.ts';
+import { isMediaRef, mediaRefStore, type MediaRefStore } from './media-ref-store.ts';
 
 /** 通过 dsh-llm 的 ImageBlock 间接引用 dsh-attachment 类型，避免直接依赖 dsh-attachment */
 type ImageAttachmentRef = ImageBlock['attachment'];
@@ -38,6 +42,22 @@ export interface AttachmentStoreLike {
 /** llm 服务最小接口 */
 export interface LlmRuntimeLike {
   stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
+  resolveModelInfo?(
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<{ inputModalities?: readonly string[] } | undefined>;
+}
+
+/** 传给 tool.execute 的执行上下文最小结构（对齐 dsh-tool-fs 的 agent 路由探测） */
+export interface ToolExecContextLike {
+  signal: AbortSignal;
+  agent?: {
+    options?: { provider?: string; model?: string };
+    session?: {
+      requestHeader?: () => { config?: { provider?: string; model?: string } } | undefined;
+    };
+  };
 }
 
 /** tools 服务最小接口 */
@@ -55,16 +75,37 @@ interface DescribeImageArgs {
 export const DESCRIBE_IMAGE_TOOL_NAME = 'qqbot_describe_image';
 
 const DESCRIPTION =
-  'Inspect one image that is NOT in the current message and return what the task needs. '
-  + '`image` is a local absolute path (downloaded by the QQ bot) or an http(s) URL. '
+  'Inspect one image that is NOT in the current message and return it into context (native multimodal '
+  + 'models read the image directly without an extra captioning call; text-only models fall back to the vision model). '
+  + '`image` is a local absolute path (downloaded by the QQ bot), a short `qqref:<id>` handle, or an http(s) URL. '
   + 'Images attached to the current message are already visible to you as pixels — read them '
   + 'yourself, including any text, and do not call this tool for those. '
-  + 'Pass an explicit `prompt` with a precise instruction instead of relying on the default.';
+  + 'On text-only models, pass an explicit `prompt` with a precise instruction instead of relying on the default.';
 
-/** vision.native 时追加：主模型已直接看到本轮图片，这个工具只做兜底 */
+/** vision.native 时追加：主模型已直接看到本轮图片，这个工具只负责补查旧图/引用图 */
 const NATIVE_NOTE =
   ' Images in the current message are already given to you natively (unless the message says '
   + '"[图片未原生注入"); read them directly, text included — this tool is not for those.';
+
+/** 探测当前会话路由的主模型是否原生声明 image 输入（对齐宿主 read_image 模态检查） */
+export async function resolveNativeImageRoute(
+  llm: Pick<LlmRuntimeLike, 'resolveModelInfo'> | undefined,
+  vision: Pick<VisionConfig, 'native'>,
+  agent: ToolExecContextLike['agent'],
+  signal?: AbortSignal,
+): Promise<{ provider: string; model: string } | undefined> {
+  if (!vision.native) return undefined;
+  const routed = agent?.session?.requestHeader?.()?.config;
+  const provider = routed?.provider || agent?.options?.provider;
+  const model = routed?.model || agent?.options?.model;
+  if (!provider || !model || llm?.resolveModelInfo === undefined) return undefined;
+  try {
+    const info = await llm.resolveModelInfo(provider, model, signal);
+    return info?.inputModalities?.includes('image') === true ? { provider, model } : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /** 图片 magic bytes 嗅探 → 标准 MIME（不信声明，安全底线） */
 export function sniffImageMediaType(bytes: Uint8Array): ImageMediaType | null {
@@ -81,29 +122,76 @@ export function sniffImageMediaType(bytes: Uint8Array): ImageMediaType | null {
   return null;
 }
 
-/** 加载图片字节（本地路径 / http URL），校验大小 + 嗅探 MIME */
-async function loadImageBytes(
+export interface LoadImageBytesDeps {
+  refs?: MediaRefStore;
+  fetchUrl?: (url: string, maxBytes: number, opts?: { signal?: AbortSignal }) => Promise<Buffer>;
+}
+
+/** 加载图片字节（本地路径 / qqref:<id> 短引用 / http URL），校验大小 + 嗅探 MIME */
+export async function loadImageBytes(
   image: string,
   maxBytes: number,
   signal: AbortSignal,
-): Promise<{ data: Uint8Array; mediaType: ImageMediaType }> {
+  deps?: LoadImageBytesDeps,
+): Promise<{ data: Uint8Array; mediaType: ImageMediaType; filename?: string; localPath?: string }> {
   let data: Uint8Array;
-  if (/^https?:\/\//i.test(image)) {
-    const resp = await fetch(image, { signal, redirect: 'error' });
-    if (!resp.ok) throw new Error(`qqbot_describe_image: download failed (HTTP ${resp.status})`);
-    const buf = Buffer.from(await resp.arrayBuffer());
-    if (buf.length > maxBytes) throw new Error(`qqbot_describe_image: image too large (${buf.length} bytes)`);
-    data = new Uint8Array(buf);
+  let filename: string | undefined;
+  let localPath: string | undefined;
+
+  if (isMediaRef(image)) {
+    const entry = (deps?.refs ?? mediaRefStore).resolve(image);
+    if (entry === undefined) {
+      throw new Error(`qqbot_describe_image: image ref not found or expired: ${image.trim()}`);
+    }
+    filename = entry.filename;
+    if (entry.localPath !== undefined && existsSync(entry.localPath)) {
+      const info = await stat(entry.localPath).catch(() => null);
+      if (info?.isFile()) {
+        if (info.size > maxBytes) throw new Error(`qqbot_describe_image: image too large (${info.size} bytes)`);
+        data = new Uint8Array(await readFile(entry.localPath));
+        localPath = entry.localPath;
+        filename ??= basename(entry.localPath);
+      } else {
+        const fetcher = deps?.fetchUrl ?? fetchSafe;
+        const buf = await fetcher(entry.url, maxBytes, { signal });
+        if (buf.length > maxBytes) throw new Error(`qqbot_describe_image: image too large (${buf.length} bytes)`);
+        data = new Uint8Array(buf);
+      }
+    } else {
+      const fetcher = deps?.fetchUrl ?? fetchSafe;
+      const buf = await fetcher(entry.url, maxBytes, { signal });
+      if (buf.length > maxBytes) throw new Error(`qqbot_describe_image: image too large (${buf.length} bytes)`);
+      data = new Uint8Array(buf);
+    }
+  } else if (/^https?:\/\//i.test(image)) {
+    if (deps?.fetchUrl !== undefined) {
+      const buf = await deps.fetchUrl(image, maxBytes, { signal });
+      if (buf.length > maxBytes) throw new Error(`qqbot_describe_image: image too large (${buf.length} bytes)`);
+      data = new Uint8Array(buf);
+    } else {
+      const resp = await fetch(image, { signal, redirect: 'error' });
+      if (!resp.ok) throw new Error(`qqbot_describe_image: download failed (HTTP ${resp.status})`);
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.length > maxBytes) throw new Error(`qqbot_describe_image: image too large (${buf.length} bytes)`);
+      data = new Uint8Array(buf);
+    }
   } else {
     const info = await stat(image).catch(() => null);
     if (!info?.isFile()) throw new Error(`qqbot_describe_image: image file not found: ${image}`);
     if (info.size > maxBytes) throw new Error(`qqbot_describe_image: image too large (${info.size} bytes)`);
     data = new Uint8Array(await readFile(image));
+    localPath = image;
+    filename = basename(image);
   }
 
   const mediaType = sniffImageMediaType(data);
   if (mediaType === null) throw new Error('qqbot_describe_image: unrecognized image format (png/jpeg/gif/webp only)');
-  return { data, mediaType };
+  return {
+    data,
+    mediaType,
+    ...(filename !== undefined ? { filename } : {}),
+    ...(localPath !== undefined ? { localPath } : {}),
+  };
 }
 
 /** 将终端 finish reason 转成辅助调用失败 */
@@ -157,25 +245,6 @@ export async function callVision(
   return text;
 }
 
-/** 展开 `~`/`~/`/`~\` 前缀 */
-function expandHomePath(path: string): string {
-  if (path === '~') return homedir();
-  if (path.startsWith('~/') || path.startsWith('~\\')) return join(homedir(), path.slice(2));
-  return path;
-}
-
-/**
- * 解析 DSH_HOME 的优先级与跨平台处理：
- * 显式配置 > `$DSH_HOME`（空/空白视为未设置）> `~/.dsh`，展开 `~` 后 resolve 为绝对路径。
- */
-function resolveDshHome(): string {
-  const fromEnv = process.env.DSH_HOME;
-  const selected = fromEnv !== undefined && fromEnv.trim().length > 0
-    ? fromEnv
-    : join(homedir(), '.dsh');
-  return resolve(expandHomePath(selected));
-}
-
 /**
  * 启动时检查 settings.yaml 里 vision 模型的 input 模态是否声明了 image。
  *
@@ -186,7 +255,7 @@ function resolveDshHome(): string {
 export function ensureVisionInputModal(vision: VisionConfig, logger: Logger): void {
   if (!vision.enabled || !vision.provider || !vision.model) return;
 
-  const settingsPath = resolve(resolveDshHome(), 'settings.yaml');
+  const settingsPath = dshSettingsPath();
 
   try {
     if (!existsSync(settingsPath)) return;
@@ -218,25 +287,41 @@ export function ensureVisionInputModal(vision: VisionConfig, logger: Logger): vo
     if (Array.isArray(input) && input.includes('image')) return; // 已声明，幂等跳过
 
     model.input = ['text', 'image'];
-    writeFileSync(settingsPath, yaml.dump(doc), 'utf8');
+    writeTextAtomic(settingsPath, yaml.dump(doc));
     logger.info(`im-qqbot: 已为 vision 模型补充 input: [text, image] (${vision.provider}/${vision.model})`);
   } catch (err) {
     logger.warn(`im-qqbot: 检查 settings.yaml vision input 失败: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
-/** 注册 qqbot_describe_image 工具（服务缺失时优雅降级，不阻断插件启动） */
-export function registerDescribeImageTool(ctx: Context, vision: VisionConfig, logger: Logger): void {
+export interface RegisterDescribeImageOptions extends LoadImageBytesDeps {
+  getFfmpegPath?: () => string | undefined;
+}
+
+/** 注册 qqbot_describe_image 工具（原生优先 + 辅助视觉模型兜底，服务缺失时优雅降级） */
+export function registerDescribeImageTool(
+  ctx: Context,
+  vision: VisionConfig,
+  logger: Logger,
+  options?: RegisterDescribeImageOptions,
+): void {
   if (!vision.enabled) return;
-  if (!vision.provider || !vision.model) {
-    logger.warn('im-qqbot: vision.provider/model 未配置，qqbot_describe_image 工具未注册');
+  const hasFallback = Boolean(vision.provider && vision.model);
+  if (!vision.native && !hasFallback) {
+    logger.warn('im-qqbot: vision.provider/model 未配置且未启用 native，qqbot_describe_image 工具未注册');
     return;
   }
 
   const tools = ctx.get('tools') as ToolsRegistryLike | undefined;
-  const llm = ctx.get('llm') as LlmRuntimeLike | undefined;
+  const llm = ctx.get('llm') as Partial<LlmRuntimeLike> | undefined;
   const attachments = ctx.get('attachments') as AttachmentStoreLike | undefined;
-  if (!tools?.register || !llm?.stream || !attachments?.saveImage) {
+  if (
+    !tools?.register
+    || !attachments?.saveImage
+    || !llm
+    || (!hasFallback && typeof llm.resolveModelInfo !== 'function')
+    || (hasFallback && typeof llm.stream !== 'function')
+  ) {
     logger.warn('im-qqbot: tools/llm/attachments 服务不可用，qqbot_describe_image 工具未注册');
     return;
   }
@@ -249,11 +334,11 @@ export function registerDescribeImageTool(ctx: Context, vision: VisionConfig, lo
       properties: {
         image: {
           type: 'string',
-          description: 'Absolute path to a local image file, or an http(s) URL of the image.',
+          description: 'Absolute path to a local image file, a short `qqref:<id>` handle, or an http(s) URL of the image.',
         },
         prompt: {
           type: 'string',
-          description: 'Your precise instruction for the vision model about this image.',
+          description: 'Instruction for the fallback vision model on text-only routes (optional when the active model supports native image input).',
         },
       },
       required: ['image'],
@@ -263,36 +348,112 @@ export function registerDescribeImageTool(ctx: Context, vision: VisionConfig, lo
       schema: {
         type: 'object',
         properties: {
+          mode: { type: 'string', enum: ['native', 'vision'] },
           text: { type: 'string' },
           model: { type: 'string' },
           image: { type: 'string' },
           mimeType: { type: 'string', enum: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'] },
           bytes: { type: 'integer' },
+          attachment: { type: 'object', additionalProperties: true },
         },
-        required: ['text', 'model', 'image', 'mimeType', 'bytes'],
+        required: ['mode', 'text', 'model', 'image', 'mimeType', 'bytes'],
         additionalProperties: false,
       },
-      render: (_args: unknown, value: unknown): ContentBlock[] => [
-        { type: 'text', text: (value as { text: string }).text },
-      ],
+      render: (_args: unknown, value: unknown): ContentBlock[] => {
+        const out = value as { mode?: string; text: string; attachment?: ImageAttachmentRef };
+        if (out.mode === 'native' && out.attachment !== undefined) {
+          return [
+            { type: 'text', text: out.text },
+            { type: 'image', attachment: out.attachment },
+          ];
+        }
+        return [{ type: 'text', text: out.text }];
+      },
     },
-    async execute(args: unknown, exec: { signal: AbortSignal }): Promise<Record<string, unknown>> {
+    async execute(args: unknown, exec: ToolExecContextLike): Promise<Record<string, unknown>> {
       const { image, prompt } = args as DescribeImageArgs;
       if (typeof image !== 'string' || image.length === 0) {
         throw new Error('qqbot_describe_image: `image` must be a non-empty string');
       }
 
-      const loaded = await loadImageBytes(image, vision.maxBytes, exec.signal);
+      const loaded = await loadImageBytes(image, vision.maxBytes, exec.signal, options);
+      const nativeRoute = await resolveNativeImageRoute(llm, vision, exec.agent, exec.signal);
+
+      let saveData = loaded.data;
+      let saveMediaType = loaded.mediaType;
+      let saveName = loaded.filename;
+      let gifNote: string | undefined;
+
+      if (
+        nativeRoute !== undefined
+        && loaded.mediaType === 'image/gif'
+        && loaded.localPath !== undefined
+        && isGifBytes(loaded.data)
+      ) {
+        const sheet = await makeGifSheet(loaded.localPath, options?.getFfmpegPath?.() ?? '').catch(() => undefined);
+        if (sheet !== undefined) {
+          const sheetBytes = await readFile(sheet.path).catch(() => undefined);
+          if (
+            sheetBytes !== undefined
+            && sheetBytes.length <= vision.maxBytes
+            && sniffImageMediaType(sheetBytes) === 'image/png'
+          ) {
+            saveData = new Uint8Array(sheetBytes);
+            saveMediaType = 'image/png';
+            saveName = basename(sheet.path);
+            gifNote = buildGifSheetNote(sheet);
+          }
+        }
+      }
+
       const ref = await attachments.saveImage({
-        data: loaded.data,
-        mediaType: loaded.mediaType,
-        name: /^https?:\/\//i.test(image) ? undefined : basename(image),
+        data: saveData,
+        mediaType: saveMediaType,
+        name: saveName,
       });
-      const text = await callVision(llm, vision, prompt ?? vision.defaultPrompt, ref, exec.signal);
-      return { text, model: vision.model, image, mimeType: loaded.mediaType, bytes: loaded.data.length };
+
+      if (nativeRoute !== undefined) {
+        const note = `Image loaded (${loaded.mediaType}, ${loaded.data.length} bytes).`;
+        return {
+          mode: 'native',
+          text: gifNote
+            ? `${note} ${gifNote} Read the attached image directly.`
+            : `${note} Read the attached image directly.`,
+          model: `${nativeRoute.provider}/${nativeRoute.model}`,
+          image,
+          mimeType: saveMediaType,
+          bytes: saveData.length,
+          attachment: ref,
+        };
+      }
+
+      if (!hasFallback || typeof llm.stream !== 'function') {
+        throw new Error(
+          'qqbot_describe_image: current model does not support image input and no fallback vision.provider/model is configured',
+        );
+      }
+
+      const text = await callVision(
+        llm as LlmRuntimeLike,
+        vision,
+        prompt ?? vision.defaultPrompt,
+        ref,
+        exec.signal,
+      );
+      return {
+        mode: 'vision',
+        text,
+        model: vision.model,
+        image,
+        mimeType: saveMediaType,
+        bytes: saveData.length,
+      };
     },
   };
 
   tools.register(definition);
-  logger.info(`im-qqbot: qqbot_describe_image 工具已注册 (provider=${vision.provider} model=${vision.model})`);
+  const modeLabel = hasFallback
+    ? `native-first=${vision.native} fallback=${vision.provider}/${vision.model}`
+    : 'native-only';
+  logger.info(`im-qqbot: qqbot_describe_image 工具已注册 (${modeLabel})`);
 }

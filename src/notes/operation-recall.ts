@@ -9,6 +9,7 @@ export interface OperationEvidence {
 }
 const TOOL_OPERATIONS: Record<string, string> = {
   qqbot_describe_video: 'media.video.inspect', qqbot_video_fetch: 'media.video.fetch',
+  qqbot_bili: 'media.video.fetch',
   qqbot_transcribe: 'media.audio.transcribe', qqbot_describe_image: 'media.image.inspect',
   qqbot_reverse_image: 'media.image.origin', qqbot_video_frames: 'media.video.frames',
 };
@@ -35,9 +36,12 @@ export function inboundOperations(text: string, mediaTypes: readonly string[]): 
 export function toolOperationEvidence(name: string, result: { isError?: boolean; value?: unknown; error?: unknown }): OperationEvidence | undefined {
   const operation = TOOL_OPERATIONS[name];
   if (!operation) return undefined;
+  const failed = result.isError === true;
+  if (name === 'qqbot_bili' && !failed && (typeof result.value !== 'string' || !result.value.includes('已下载《'))) {
+    return undefined;
+  }
   const value = result.value && typeof result.value === 'object' ? result.value as Record<string, unknown> : {};
   const error = result.error && typeof result.error === 'object' ? result.error as Record<string, unknown> : {};
-  const failed = result.isError === true;
   const partial = value.partial === true || value.truncated === true || value.textTruncated === true;
   const facts = [`工具:${name}`, `结果:${failed ? '失败' : partial ? '部分完成' : '成功'}`];
   if (typeof value.analyzedStart === 'number' && typeof value.analyzedEnd === 'number') facts.push(`实际覆盖:${value.analyzedStart}–${value.analyzedEnd}秒`);
