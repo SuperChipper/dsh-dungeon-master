@@ -6,6 +6,20 @@ This file records significant `dsh-dungeon-master` updates from a product perspe
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.8.0] - 2026-11-22
+
+### Added
+
+- **D&D 5e combat completeness (transferable concentration, swap, auto-layout & status ring rendering)**: `Hex` and `Hunter's Mark` persist across target kills and short rests and can be reassigned at zero slot cost via `dnd_resource(action="transfer")`; `dnd_position(action="swap")` swaps ally positions upon confirmation without spending reactions; `dnd_position(action="auto")` auto-places units by front/mid/back rank priorities; battlemaps draw blue/red/dual-tone status rings and bottom condition badges; movement paths crossing hazardous zones emit split/detour hints.
+- **Conditional combat passives & richer declarative `dnd_rule` hooks**: natively settles Colossus Slayer, Sneak Attack, Savage Attacks, Improved/Superior Critical, Divine Fury, Improved Divine Smite, Blessed Strikes, War Caster, Pack Tactics, and Blood Frenzy alongside unregistered passive reminders; adds `class_level`, `target_hp`, and `target_max_hp` formula variables plus `passive` / `class_filter` and target/turn-scoped hook filters, with matching updates to the bundled `dnd-rule-extension` skill.
+- **End-to-end Counterspell & Shield reactions with DM-only enemy caster hints**: `reactionsOf` infers reaction spells from `spells` with higher-slot fallback; hostile save spells, damageless spell attacks, Magic Missile, spell zones, and leveled buff spells auto-hold within 60 ft for deterministic Counterspell checks (`DC 10 + spell level`) and `Shield` (`+5 AC` default / Magic Missile immunity); PC spells and non-crit hits on enemy casters append DM-only `【DM战术提醒】` hints.
+- **Platform, diagnostics & multimodal additions**: added `/bot-doctor` runtime self-checks, `qqbot_image_gen` with bundled `qqbot-image-studio` skill, online TTS backends and configurable ASR/video gateways, unified group trigger modes and expanded config panel UI, bundled personas with transactional switching, scoped memory recall/media review, and archiving of bot outbound group messages.
+
+### Changed & Fixed
+
+- **Turn-throttled runtime context & resource synchronization**: `runtime-context` battle state injection is throttled by dialogue turn so multi-attack turns avoid repeated re-injections while room changes/compaction/undo/end bypass immediately; fixed multiclass/level-up spell slot `0/N` initialization and same-name resource collisions, automatically syncing hit dice and 5e spell slot maximums.
+- **Modularization & hardening**: split `gateway` wiring, `client/config-panel` UI, and `atomic-fs`/`paths` helpers; tightened group access control and session tool scopes; and hardened check-in recovery, spell links, and read-only module access.
+
 ## [0.7.0] - 2026-11-18
 
 ### Added

@@ -1,6 +1,6 @@
 {
   "name": "dsh-dungeon-master",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "QQ Bot IM channel and D&D 5e Dungeon Master plugin for DeepSeek Harness (dsh)",
   "type": "module",
   "main": "./dist/index.js",
