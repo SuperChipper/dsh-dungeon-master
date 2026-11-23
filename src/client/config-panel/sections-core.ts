@@ -6,21 +6,19 @@ import {
   MODE_OPTIONS,
   REPLY_JUDGE_DEFAULTS,
   type AccessControlWire,
+  type CleanupWire,
   type ConfigWire,
   type PatchFn,
   type PersonasWire,
   type ReplyDesireWire,
   type ReplyJudgeWire,
   type StickersWire,
+  type ToolAccessWire,
 } from './types.ts';
 
-export function CoreConfigSections({ form, patch }: { form: ConfigWire; patch: PatchFn }): ReactNode {
+/** 首屏必看区：访问范围、主人 openid（含 /bot-me 指引）与群触发方式。 */
+export function QuickStartCoreSection({ form, patch }: { form: ConfigWire; patch: PatchFn }): ReactNode {
   const access: AccessControlWire = form.access ?? { c2cMode: 'open', c2cAllow: [], groupMode: 'open', groupAllow: [] };
-  const fileAccess = form.fileAccess ?? { sensitivePaths: [] };
-  const stickers: StickersWire = form.stickers ?? {
-    enabled: true, root: '', extraRoots: [], maxBytes: 8 * 1024 * 1024, maxAutoEntries: 200,
-  };
-  const personas: PersonasWire = { root: '', ...form.personas };
   const replyDesire: ReplyDesireWire = {
     enabled: false, threshold: 0.6, names: [], engagedMs: 90000, engagedMaxTurns: 8,
     ...form.replyDesire,
@@ -40,9 +38,9 @@ export function CoreConfigSections({ form, patch }: { form: ConfigWire; patch: P
   );
 
   return createElement(Fragment, null,
-    createElement('div', { className: 'imqb2-group-title' }, '服务范围'),
+    createElement('div', { className: 'imqb2-group-title' }, '快速上手'),
     createElement(SegmentedRow, {
-      label: '私聊', value: access.c2cMode, options: MODE_OPTIONS,
+      label: '私聊权限', value: access.c2cMode, options: MODE_OPTIONS,
       onChange: (v) => { patch('access', { ...access, c2cMode: v }); },
     }),
     access.c2cMode === 'allowlist'
@@ -53,35 +51,22 @@ export function CoreConfigSections({ form, patch }: { form: ConfigWire; patch: P
         })
       : null,
     createElement(SegmentedRow, {
-      label: '群聊', value: access.groupMode, options: MODE_OPTIONS,
+      label: '群聊权限', value: access.groupMode, options: MODE_OPTIONS,
       onChange: (v) => { patch('access', { ...access, groupMode: v }); },
     }),
     access.groupMode === 'allowlist'
       ? createElement(AreaRow, {
-          label: '群聊白名单', help: '请输入群 openid，多个请换行输入', rows: 3,
+          label: '群聊白名单', help: '请输入群 openid（给群里机器人发 /bot-me 获取），多个请换行输入', rows: 3,
           value: access.groupAllow.join('\n'),
           onChange: (v) => { patch('access', { ...access, groupAllow: v.split('\n').map((s) => s.trim()) }); },
         })
       : null,
-
-    createElement('div', { className: 'imqb2-group-title' }, '主人与文件访问'),
     createElement(FieldRow, {
-      label: '主人 openid', value: form.ownerOpenid ?? '', placeholder: '留空表示未设置主人',
-      help: '用于识别私聊主人：主人私聊不受工具限制，也只有主人能批准权限申请',
+      label: '主人 openid', value: form.ownerOpenid ?? '',
+      placeholder: '私聊或群里给机器人发 /bot-me 获取，留空表示未设置',
+      help: '给机器人发 /bot-me 可查看自己的 openid（群里同时返回群 openid）；主人私聊不受工具限制，也只有主人能批准权限申请',
       onChange: (v) => { patch('ownerOpenid', v); },
     }),
-    createElement(AreaRow, {
-      label: '管理员 openid', help: '每行一个；除主人外，允许修改模型/preset 和点击审批按钮', rows: 2,
-      value: (form.adminOpenids ?? []).join('\n'),
-      onChange: (v) => { patch('adminOpenids', v.split('\n').map((s) => s.trim())); },
-    }),
-    createElement(AreaRow, {
-      label: '敏感路径（拦截）', help: '每行一个目录或文件前缀；受限会话命中后禁止访问/发送，主人私聊和白名单会话不拦', rows: 3,
-      value: fileAccess.sensitivePaths.join('\n'),
-      onChange: (v) => { patch('fileAccess', { sensitivePaths: v.split('\n').map((s) => s.trim()) }); },
-    }),
-
-    createElement('div', { className: 'imqb2-group-title' }, '基础设置'),
     createElement(SelectRow, {
       label: '群聊触发模式', value: effectiveTriggerMode, options: GROUP_TRIGGER_OPTIONS,
       help: '统一控制群里未 @ 机器人时如何决定是否接话（私聊始终直接回复）',
@@ -95,6 +80,120 @@ export function CoreConfigSections({ form, patch }: { form: ConfigWire; patch: P
           onChange: (v) => { patch('groupReplyProbability', v); },
         })
       : null,
+    ...(effectiveTriggerMode === 'desire' ? [
+      createElement('div', { className: 'imqb2-group-title' }, '回复欲望'),
+      createElement(NumberRow, {
+        label: '放行阈值（0-1）', value: replyDesire.threshold, min: 0, max: 1, step: 0.05,
+        help: '越高越安静：点名 bot 得 0.7、窗口内的人 0.6、像提问再 +0.2；默认 0.6',
+        onChange: (v) => { patchDesire({ threshold: v }); },
+      }),
+      createElement(ListRow, {
+        label: 'bot 的昵称/别名', help: '每行一个；群里提到这些词就算在叫 bot（大小写不敏感）',
+        value: replyDesire.names, rows: 2,
+        onChange: (v) => { patchDesire({ names: v }); },
+      }),
+      createElement(NumberRow, {
+        label: '对话窗口时长（毫秒）', value: replyDesire.engagedMs, min: 5000, max: 600000, step: 5000,
+        help: '被 @ 或接话后开窗；没开模型打分时，窗口内刚聊过的人再说话基本都会被接，默认 90000（90 秒）',
+        onChange: (v) => { patchDesire({ engagedMs: v }); },
+      }),
+      createElement(NumberRow, {
+        label: '窗口内连续接话轮数上限', value: replyDesire.engagedMaxTurns, min: 0, max: 50, step: 1,
+        help: '靠打分接的轮数到上限就关窗（这一条仍接）；0 = 不进入对话窗口，默认 8',
+        onChange: (v) => { patchDesire({ engagedMaxTurns: v }); },
+      }),
+      createElement(SwitchRow, {
+        label: '规则拿不准时让模型打分', checked: judge.enabled,
+        help: '没点名的普通文字交给模型判断要不要接，打开后文字不再靠对话窗口直接放行；语气词、表情包、开团期间不调模型',
+        onChange: (v) => { patchJudge({ enabled: v }); },
+      }),
+      ...(judge.enabled ? [
+        createElement(FieldRow, {
+          label: '打分 provider', value: judge.provider, placeholder: '留空 = 这个群的主模型',
+          onChange: (v) => { patchJudge({ provider: v.trim() }); },
+        }),
+        createElement(FieldRow, {
+          label: '打分模型', value: judge.model, placeholder: '留空 = 这个群的主模型',
+          onChange: (v) => { patchJudge({ model: v.trim() }); },
+        }),
+        createElement(FieldRow, {
+          label: '推理档位', value: judge.reasoningEffort, placeholder: '留空 = 自动选最低档',
+          help: '启动后第一次打分会在日志里列出这个模型支持的档位',
+          onChange: (v) => { patchJudge({ reasoningEffort: v.trim() }); },
+        }),
+        createElement(NumberRow, {
+          label: '安静多久才打分（毫秒）', value: judge.debounceMs, min: 0, max: 60000, step: 500,
+          help: '连着说的几条只给最后一条打一次分，默认 2500',
+          onChange: (v) => { patchJudge({ debounceMs: v }); },
+        }),
+        createElement(NumberRow, {
+          label: '最多攒多久也要打分（毫秒）', value: judge.maxWaitMs, min: 0, max: 300000, step: 1000,
+          help: '群里一直有人说话时的上限，默认 15000',
+          onChange: (v) => { patchJudge({ maxWaitMs: v }); },
+        }),
+        createElement(NumberRow, {
+          label: '给模型看的消息条数', value: judge.contextMessages, min: 1, max: 100, step: 1,
+          help: '越多越准也越贵，默认 20',
+          onChange: (v) => { patchJudge({ contextMessages: v }); },
+        }),
+        createElement(NumberRow, {
+          label: '打分超时（毫秒）', value: judge.timeoutMs, min: 1000, max: 120000, step: 1000,
+          help: '超时按不接处理，默认 15000',
+          onChange: (v) => { patchJudge({ timeoutMs: v }); },
+        }),
+      ] : []),
+    ] : []),
+  );
+}
+
+/** 折叠抽屉 2：管理员、会话工具权限、上下文压缩、表情/人设、模型覆写与清理策略。 */
+export function AdvancedSessionSection({ form, patch }: { form: ConfigWire; patch: PatchFn }): ReactNode {
+  const fileAccess = form.fileAccess ?? { sensitivePaths: [] };
+  const toolAccess: ToolAccessWire = form.toolAccess ?? {
+    enabled: true, fullAccessGroups: [], fullAccessUsers: [], readRoots: [],
+  };
+  const stickers: StickersWire = form.stickers ?? {
+    enabled: true, root: '', extraRoots: [], maxBytes: 8 * 1024 * 1024, maxAutoEntries: 200,
+  };
+  const personas: PersonasWire = { root: '', ...form.personas };
+  const cleanup: CleanupWire = form.cleanup ?? { dryRun: false };
+
+  return createElement(Fragment, null,
+    createElement('div', { className: 'imqb2-group-title' }, '管理员与文件访问'),
+    createElement(AreaRow, {
+      label: '管理员 openid', help: '每行一个；除主人外，允许修改模型/preset 和点击审批按钮', rows: 2,
+      value: (form.adminOpenids ?? []).join('\n'),
+      onChange: (v) => { patch('adminOpenids', v.split('\n').map((s) => s.trim())); },
+    }),
+    createElement(AreaRow, {
+      label: '敏感路径（拦截）', help: '每行一个目录或文件前缀；受限会话命中后禁止访问/发送，主人私聊和白名单会话不拦', rows: 3,
+      value: fileAccess.sensitivePaths.join('\n'),
+      onChange: (v) => { patch('fileAccess', { sensitivePaths: v.split('\n').map((s) => s.trim()) }); },
+    }),
+
+    createElement('div', { className: 'imqb2-group-title' }, '工具权限'),
+    createElement(SwitchRow, {
+      label: '按会话限制工具', checked: toolAccess.enabled,
+      help: '关闭后所有 QQ 会话都能用终端、读写任意路径',
+      onChange: (v) => { patch('toolAccess', { ...toolAccess, enabled: v }); },
+    }),
+    createElement(ListRow, {
+      label: '可完全访问的群 openid', help: '每行一个；这些群里能用终端、读写任意路径',
+      value: toolAccess.fullAccessGroups, rows: 2,
+      onChange: (v) => { patch('toolAccess', { ...toolAccess, fullAccessGroups: v }); },
+    }),
+    createElement(ListRow, {
+      label: '可完全访问的用户 openid', help: '每行一个；主人私聊始终可以',
+      value: toolAccess.fullAccessUsers, rows: 2,
+      onChange: (v) => { patch('toolAccess', { ...toolAccess, fullAccessUsers: v }); },
+    }),
+    createElement(ListRow, {
+      label: '受限会话可读目录', help: '每行一个；media、表情库、临时目录始终允许',
+      value: toolAccess.readRoots, rows: 3,
+      onChange: (v) => { patch('toolAccess', { ...toolAccess, readRoots: v }); },
+    }),
+
+    createElement('div', { className: 'imqb2-group-title' }, '会话与上下文压缩'),
     createElement(SwitchRow, {
       label: '流式输出', checked: form.streaming ?? true,
       help: '回复内容分段实时推送到聊天',
@@ -188,70 +287,6 @@ export function CoreConfigSections({ form, patch }: { form: ConfigWire; patch: P
       onChange: (v) => { patch('debug', v); },
     }),
 
-    ...(effectiveTriggerMode === 'desire' ? [
-      createElement('div', { className: 'imqb2-group-title' }, '回复欲望'),
-      createElement(NumberRow, {
-        label: '放行阈值（0-1）', value: replyDesire.threshold, min: 0, max: 1, step: 0.05,
-        help: '越高越安静：点名 bot 得 0.7、窗口内的人 0.6、像提问再 +0.2；默认 0.6',
-        onChange: (v) => { patchDesire({ threshold: v }); },
-      }),
-      createElement(ListRow, {
-        label: 'bot 的昵称/别名', help: '每行一个；群里提到这些词就算在叫 bot（大小写不敏感）',
-        value: replyDesire.names, rows: 2,
-        onChange: (v) => { patchDesire({ names: v }); },
-      }),
-      createElement(NumberRow, {
-        label: '对话窗口时长（毫秒）', value: replyDesire.engagedMs, min: 5000, max: 600000, step: 5000,
-        help: '被 @ 或接话后开窗；没开模型打分时，窗口内刚聊过的人再说话基本都会被接，默认 90000（90 秒）',
-        onChange: (v) => { patchDesire({ engagedMs: v }); },
-      }),
-      createElement(NumberRow, {
-        label: '窗口内连续接话轮数上限', value: replyDesire.engagedMaxTurns, min: 0, max: 50, step: 1,
-        help: '靠打分接的轮数到上限就关窗（这一条仍接）；0 = 不进入对话窗口，默认 8',
-        onChange: (v) => { patchDesire({ engagedMaxTurns: v }); },
-      }),
-      createElement(SwitchRow, {
-        label: '规则拿不准时让模型打分', checked: judge.enabled,
-        help: '没点名的普通文字交给模型判断要不要接，打开后文字不再靠对话窗口直接放行；语气词、表情包、开团期间不调模型',
-        onChange: (v) => { patchJudge({ enabled: v }); },
-      }),
-      ...(judge.enabled ? [
-        createElement(FieldRow, {
-          label: '打分 provider', value: judge.provider, placeholder: '留空 = 这个群的主模型',
-          onChange: (v) => { patchJudge({ provider: v.trim() }); },
-        }),
-        createElement(FieldRow, {
-          label: '打分模型', value: judge.model, placeholder: '留空 = 这个群的主模型',
-          onChange: (v) => { patchJudge({ model: v.trim() }); },
-        }),
-        createElement(FieldRow, {
-          label: '推理档位', value: judge.reasoningEffort, placeholder: '留空 = 自动选最低档',
-          help: '启动后第一次打分会在日志里列出这个模型支持的档位',
-          onChange: (v) => { patchJudge({ reasoningEffort: v.trim() }); },
-        }),
-        createElement(NumberRow, {
-          label: '安静多久才打分（毫秒）', value: judge.debounceMs, min: 0, max: 60000, step: 500,
-          help: '连着说的几条只给最后一条打一次分，默认 2500',
-          onChange: (v) => { patchJudge({ debounceMs: v }); },
-        }),
-        createElement(NumberRow, {
-          label: '最多攒多久也要打分（毫秒）', value: judge.maxWaitMs, min: 0, max: 300000, step: 1000,
-          help: '群里一直有人说话时的上限，默认 15000',
-          onChange: (v) => { patchJudge({ maxWaitMs: v }); },
-        }),
-        createElement(NumberRow, {
-          label: '给模型看的消息条数', value: judge.contextMessages, min: 1, max: 100, step: 1,
-          help: '越多越准也越贵，默认 20',
-          onChange: (v) => { patchJudge({ contextMessages: v }); },
-        }),
-        createElement(NumberRow, {
-          label: '打分超时（毫秒）', value: judge.timeoutMs, min: 1000, max: 120000, step: 1000,
-          help: '超时按不接处理，默认 15000',
-          onChange: (v) => { patchJudge({ timeoutMs: v }); },
-        }),
-      ] : []),
-    ] : []),
-
     createElement('div', { className: 'imqb2-group-title' }, '表情收藏'),
     createElement(SwitchRow, {
       label: '允许 bot 自动收藏表情', checked: stickers.enabled,
@@ -278,7 +313,7 @@ export function CoreConfigSections({ form, patch }: { form: ConfigWire; patch: P
       onChange: (v) => { patch('stickers', { ...stickers, maxAutoEntries: v }); },
     }),
 
-    createElement('div', { className: 'imqb2-group-title' }, '模型'),
+    createElement('div', { className: 'imqb2-group-title' }, '模型与人设'),
     createElement(FieldRow, {
       label: 'Provider', value: form.provider ?? '', placeholder: '留空继承宿主默认',
       onChange: (v) => { patch('provider', v); },
@@ -291,8 +326,6 @@ export function CoreConfigSections({ form, patch }: { form: ConfigWire; patch: P
       label: 'Preset', value: form.preset ?? '', placeholder: 'Agent preset id',
       onChange: (v) => { patch('preset', v); },
     }),
-
-    createElement('div', { className: 'imqb2-group-title' }, '聊天人设'),
     createElement(FieldRow, {
       label: '人设目录',
       value: personas.root,
@@ -300,8 +333,6 @@ export function CoreConfigSections({ form, patch }: { form: ConfigWire; patch: P
       help: '存放 <id>.md / <id>.group.md / <id>.direct.md（相对路径按工作目录解析）；运行态会话绑定仍保存在 ~/.dsh-qqbot/persona-state.json',
       onChange: (v) => { patch('personas', { ...personas, root: v }); },
     }),
-
-    createElement('div', { className: 'imqb2-group-title' }, '个性化提示词'),
     createElement(AreaRow, {
       label: '群聊额外 system prompt', value: form.groupPrompt ?? '',
       onChange: (v) => { patch('groupPrompt', v); },
@@ -309,6 +340,28 @@ export function CoreConfigSections({ form, patch }: { form: ConfigWire; patch: P
     createElement(AreaRow, {
       label: '私聊额外 system prompt', value: form.directPrompt ?? '',
       onChange: (v) => { patch('directPrompt', v); },
+    }),
+
+    createElement('div', { className: 'imqb2-group-title' }, '临时目录与清理'),
+    createElement(FieldRow, {
+      label: '临时目录', value: form.tmpDir ?? '', placeholder: '留空 = 工作目录/tmp',
+      help: '下载、抽帧、截图等中间文件放这里',
+      onChange: (v) => { patch('tmpDir', v); },
+    }),
+    createElement(NumberRow, {
+      label: '临时文件保留（小时）', value: form.tmpTtlHours ?? 72, min: 0, max: 8760, step: 1,
+      help: '0 = 不按时间清理',
+      onChange: (v) => { patch('tmpTtlHours', v); },
+    }),
+    createElement(NumberRow, {
+      label: '临时目录总量上限（MB）', value: form.tmpMaxTotalMB ?? 4096, min: 0, max: 1048576, step: 256,
+      help: '0 = 不限',
+      onChange: (v) => { patch('tmpMaxTotalMB', v); },
+    }),
+    createElement(SwitchRow, {
+      label: '清理只记日志（dry run）', checked: cleanup.dryRun,
+      help: '自定义清理规则（cleanup.rules）只能在 cordis.patch.yml 里配',
+      onChange: (v) => { patch('cleanup', { ...cleanup, dryRun: v }); },
     }),
   );
 }

@@ -34,7 +34,6 @@ export function dispatchInteraction(
   if (button.t === 'dnd') return dndButtons?.handleInteraction(event) ?? ACK.duplicate;
   // 终端白名单确认：只认主人点击，别人点回 denied
   if (button.t === 'access') return toolAccess?.handleInteraction(event) ?? ACK.duplicate;
-  if (button.t === 'browser-access') return groupAccess?.browser?.handleInteraction(event) ?? ACK.duplicate;
   if (button.t === 'image-gen-access') return groupAccess?.imageGen?.handleInteraction(event) ?? ACK.duplicate;
   if (button.t === 'persona') return personaSwitch?.handleInteraction(event) ?? ACK.duplicate;
   const matched = button.t === 'question'

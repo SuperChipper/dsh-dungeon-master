@@ -231,5 +231,8 @@ describe('plugin boundary invariants', () => {
     expect(patchContent).toMatch(/appId:\s*__FROM_ENV__/);
     expect(patchContent).toMatch(/appSecret:\s*__FROM_ENV__/);
     expect(patchContent).not.toMatch(/roleVoices|opencode\.ai|commandcode/i);
+
+    const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as { dependencies?: Record<string, string> };
+    expect(pkg.dependencies).not.toHaveProperty('playwright-core');
   });
 });

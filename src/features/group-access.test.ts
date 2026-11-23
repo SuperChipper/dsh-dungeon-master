@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import yaml from 'js-yaml';
 import type { Context } from '@deepseek-ai/cordis';
 import type { InteractionEvent, InlineKeyboard } from '@tencent-connect/qqbot-nodejs';
-import { BrowserSchema, ImageGenSchema, type ImQQBotConfig } from '../config.ts';
+import { ImageGenSchema, type ImQQBotConfig } from '../config.ts';
 import type { SessionManager } from '../session/index.ts';
 import { updateProfileAllowedGroups } from '../setup/persist.ts';
 import { GroupAccess, type GroupAccessFeature } from './group-access.ts';
@@ -22,8 +22,7 @@ afterEach(() => { vi.restoreAllMocks(); for (const dir of directories.splice(0))
 
 function harness(feature: GroupAccessFeature, allowedGroups: string[] = [], ownerOpenid = 'owner', enabled = true) {
   const config = { ownerOpenid, adminOpenids: ['admin'],
-    browser: BrowserSchema({ enabled, allowedGroups: feature === 'browser' ? allowedGroups : ['browser-only'] }),
-    imageGen: ImageGenSchema({ enabled, allowedGroups: feature === 'imageGen' ? allowedGroups : ['image-only'] }),
+    imageGen: ImageGenSchema({ enabled, allowedGroups }),
   } as ImQQBotConfig;
   const group = { followup: vi.fn() }, owner = {}, other = {};
   const records = new Map<unknown, unknown>([
@@ -55,7 +54,6 @@ function harness(feature: GroupAccessFeature, allowedGroups: string[] = [], owne
 }
 
 describe.each([
-  ['browser', '浏览', 'browser-access', 'qqbot_browser_access'],
   ['imageGen', '生图', 'image-gen-access', 'qqbot_image_gen_access'],
 ] as const)('%s 单群审批', (feature, label, tag, name) => {
   const setup = (allowedGroups?: string[]) => harness(feature, allowedGroups);
@@ -225,12 +223,11 @@ describe('生图专用授权', () => {
     // 空提示词在通过授权后才执行校验，又一定早于凭证、网络与写文件。
     const probe = (agent: unknown) => gen.execute({ prompt: '' }, { signal: new AbortController().signal, agent });
     const otherGroup = {};
-    s.records.set(otherGroup, { scope: 'group', peerId: 'browser-only' });
+    s.records.set(otherGroup, { scope: 'group', peerId: 'other-group' });
     await expect(probe(s.group)).rejects.toThrow('qqbot_access');
     await s.invoke('grant');
     await expect(probe(s.group)).rejects.toThrow('未开通');
     expect(s.click(s.button())).toBe(0);
-    expect(s.config.browser!.allowedGroups).toEqual(['browser-only']);
     expect(s.isFullAccess()).toBe(false);
     await expect(probe(s.group)).rejects.toThrow('`prompt` 不能为空');
     await expect(probe(otherGroup)).rejects.toThrow('未开通');
@@ -239,27 +236,24 @@ describe('生图专用授权', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it('同时申请两种权限：按钮不能互换；点生图按钮不消耗待审的浏览申请', async () => {
-    const image = harness('imageGen'), browser = harness('browser');
-    await image.invoke('grant'); await browser.invoke('grant');
-    expect(browser.click(image.button())).toBeUndefined();
-    expect(image.click(browser.button())).toBeUndefined();
+  it('dispatchInteraction 按 t 隔离：点伪造或过期按钮不会批准生图申请', async () => {
+    const image = harness('imageGen');
+    await image.invoke('grant');
     const reTagged = JSON.stringify({ ...JSON.parse(image.button()), t: 'browser-access' });
     const terminal = { handleInteraction: vi.fn() };
     const route = (data: string) => dispatchInteraction({
       scene: 'group', group_openid: 'g1', group_member_openid: 'owner', data: { resolved: { button_data: data } },
-    } as InteractionEvent, image.manager, undefined, terminal as unknown as ToolAccess, { browser: browser.access, imageGen: image.access });
+    } as InteractionEvent, image.manager, undefined, terminal as unknown as ToolAccess, { imageGen: image.access });
     expect(route(reTagged)).toBe(3);
+    expect(image.persist).not.toHaveBeenCalled();
     expect(route(image.button())).toBe(0);
     expect(route(image.button())).toBe(3);
-    expect(browser.persist).not.toHaveBeenCalled();
-    expect(route(browser.button())).toBe(0);
     expect(image.persist).toHaveBeenCalledTimes(1);
     expect(terminal.handleInteraction).not.toHaveBeenCalled();
   });
 
   it('onChange 仅在实际保存并变更白名单时触发', async () => {
-    const s = harness('browser');
+    const s = harness('imageGen');
     const changed: string[] = [];
     s.access.onChange = (group) => changed.push(group);
 

@@ -7,6 +7,9 @@ import {
   normalizeChangedConfig,
   parseRoleVoices,
   shallowEqual,
+  summarizeDndAdvanced,
+  summarizeExtrasDrawer,
+  summarizeMediaDrawer,
   type ConfigWire,
 } from '../client/config-panel/types.ts';
 
@@ -78,5 +81,23 @@ describe('config-panel helpers', () => {
       dm: 'tide',
     });
     expect(cleanRoleVoicesMap({ ' a ': ' 1 ', b: ' ' })).toEqual({ a: '1' });
+  });
+
+  it('折叠抽屉摘要按当前启用状态准确汇总', () => {
+    expect(summarizeDndAdvanced({})).toBe('数据目录 · 快照间隔 · 战斗代理');
+    expect(summarizeDndAdvanced({ dnd: { enabled: true, root: '', turnButtons: true, interjections: true, combatAgent: { enabled: true, provider: 'p', model: 'm', reasoningEffort: '', contextChars: 8000 } } })).toBe('战斗代理已开启');
+
+    expect(summarizeMediaDrawer({})).toBe('默认仅基础下载');
+    expect(summarizeMediaDrawer({
+      vision: { enabled: false, native: true, provider: '', model: '', defaultPrompt: '', maxBytes: 1, maxTokens: 1, timeoutMs: 1 },
+      speak: { enabled: true, voice: '', rate: '', maxChars: 100, command: '', gsvUrl: '', gsvSpeed: 1 },
+    })).toBe('视觉 · 语音合成');
+
+    expect(summarizeExtrasDrawer({})).toBe('笔记 · 故障切换 · B站/搜图/点歌');
+    expect(summarizeExtrasDrawer({
+      notes: { enabled: true, root: '', autoInject: true, injectTopK: 2, injectMaxChars: 600, injectMinCoverage: 0.4 },
+      bili: { enabled: true },
+      sing: { enabled: true, baseUrl: '' },
+    })).toBe('笔记已开 · 2 项扩展已开启');
   });
 });

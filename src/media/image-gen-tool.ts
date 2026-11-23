@@ -90,7 +90,7 @@ const DESCRIPTION =
   + 'By default (`send=false`), files are saved to disk and their paths are returned so you can inspect '
   + 'or post-process them, or deliver them via qqbot_send_file. Set `send=true` (and optional short `caption`) '
   + 'to immediately send the generated image(s) to the current QQ chat. If a group user asks to enable image generation, '
-  + 'use qqbot_access(capability="image_gen", action="grant") when available and wait for owner approval; do not request terminal or browser access.';
+  + 'use qqbot_access(capability="image_gen", action="grant") when available and wait for owner approval; do not request terminal access.';
 
 const SIZE_RE = /^(\d+)x(\d+)$/;
 

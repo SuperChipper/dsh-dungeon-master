@@ -1,9 +1,13 @@
 # DSH Dungeon Master
 
-**[English](./README_EN.md) | 简体中文**
+**[English](./README_EN.md) | 简体中文** ｜ **[🤖 Agent 安装与版本迁移指引](./docs/AGENT_GUIDE.md)**
 
 **在 QQ 群里跑 D&D 5e 的 AI 地下城主。** 本项目基于 [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot) 二次开发：群里发一句 `/dnd start`，bot 即成为该群 DM——掷骰、检定、先攻、站位、反应与血量全由确定性工具结算，模型专注叙事。
 
+> 🤖 **交给 AI Agent 自动安装 / 从 `0.8.x` 迁移到 `0.9.0`？**
+>
+> 请直接让你的 AI 助手（DSH / Claude Code / Antigravity / Codex）先阅读 **[`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md)**，内含全新安装、上游平滑替换、`0.9.0` 配置迁移检查表与操作红线（本文件已随 npm 包附带）。
+>
 > 基础扫码绑定、通用配置项与整体架构沿用上游，详见 **[上游 README](https://github.com/tencent-connect/dsh-qqbot#readme)**。请勿在同一 profile 中同时启用 `@tencent-connect/dsh-qqbot`（共用 `im-qqbot` 插件 ID）。
 
 ---
@@ -32,9 +36,9 @@ npx @deepseek-ai/dsh --profile qqbot
 
 ### 2. 三步开团
 
-1. 装好插件并将 bot 拉入 QQ 群。
-2. 群内发送 `/dnd start`（自带签到按钮，人齐自动开场，也可点「开始」提前进场）。
-3. `@bot` 描述角色行动，如「卡厄斯用巨剑砍地精 3」「恩佐潜行到门口听动静」。
+1. 运行 `dsh plugin --profile web add dsh-dungeon-master`，打开 DSH Web「插件 → QQ 机器人」扫码绑定（或填好 AppID / AppSecret）。
+2. 把机器人拉入 QQ 群；如需管理权限、审批卡片或主人私聊全权限，给机器人发 `/bot-me` 拿到自己的 `openid`，填入设置页「主人 openid」。
+3. 群内发 `/dnd start`（自带签到按钮，人齐自动开场，也可点「开始」提前进场），随后直接 `@bot` 描述角色行动（如「卡厄斯用巨剑砍地精 3」「恩佐潜行到门口听动静」）。
 
 全程无需切换 preset 或另开会话；开团期间自动注入「DM 守则 + 精简团况」，`/dnd end` 后原子停团并恢复普通聊天。
 
@@ -64,18 +68,19 @@ npx @deepseek-ai/dsh --profile qqbot
 | `/dnd checkin` / `/dnd end [摘要]` | 重发签到按钮 / 原子保存交接并停团 |
 | `/dnd combat` | 查看最近一场独立战斗代理的模型与 Token 用量 |
 | `/dnd dungeons` / `/dnd search <词条>` / `/dnd spells [职业]` | 列模组 / 查[灰机 D&D wiki](https://dnd.huijiwiki.com/wiki/) / 查职业法术表 |
+| `/bot-me` | 查看你自己的 `openid`（群里同时返回群 `openid`，配主人/白名单时使用） |
 | `/bot-doctor` | 检查插件运行时配置与依赖健康状态 |
 
-### 独立战斗代理（可选）
+### 独立战斗代理（可选，默认关闭）
 
-在「设置 → 跑团 → 独立战斗代理」启用后，开战先攻与开场由主 DM 负责，随后自动交棒独立战斗子代理持续结算；战后子代理先在群内完整播报尾轮战况，再将状态变化与账本交回主 DM。
+默认关闭（直接由 DSH 主模型跑完整个战局）；在「设置 → 跑团进阶与战斗代理 → 独立战斗代理」启用后，开战先攻与开场由主 DM 负责，随后自动交棒独立战斗子代理持续结算；战后子代理先在群内完整播报尾轮战况，再将状态变化与账本交回主 DM。
 
 ```yaml
 dnd:
   combatAgent:
     enabled: true
-    provider: opencode-go
-    model: deepseek-v4.1-flash
+    provider: <your-provider-id>   # 需为你已在 DSH 配好的 provider
+    model: <your-model-id>         # 对应模型 ID
     reasoningEffort: high
     contextChars: 8000
 ```
@@ -120,15 +125,15 @@ dnd:
 | 🎭 人设切换 | `/persona`（`/人设`）支持群聊/私聊独立切换与各自历史隔离，跨人格生成增量交接，保留实际选用模型；切换宿主后可用 `node scripts/check-persona-handoff-host.mjs` 离线校对编解码器 |
 | 🧠 共享记忆 | `notes/` Markdown 笔记按 BM25 自动召回，`chat` 作用域仅限本群，主人私聊可用 `/bot-notes` 巡检 |
 | 😺 表情与创作 | 情绪自动收藏（`qqbot_save_sticker`）、哈希匹配（`qqbot_match_sticker`）、[`qqbot-sticker-maker`](./skills/qqbot-sticker-maker/SKILL.md) Q 版透明表情制作与 [`qqbot-image-studio`](./skills/qqbot-image-studio/SKILL.md) 生图工作流 |
-| 🖼 多模态 | 图文同发（`caption`）、`deepseek-native` 原生读图、在线 TTS / 可配置 ASR 与整段视频关键帧理解 |
-| 🔧 实用工具 | 以图搜图、B 站只读工具、同人图挑选、按群白名单授权的 Playwright 浏览器、临时文件定期清理（`/bot-cleanup`） |
+| 🖼 多模态 | 图文同发（`caption`）、原生多模态读图（主模型支持图片输入时）、在线 TTS / 可配置 ASR 与整段视频关键帧理解 |
+| 🔧 实用工具 | B 站只读工具、同人图挑选、以图搜图、外部点歌工具（均可选且默认关闭 `enabled: false`），以及临时文件定期清理（`/bot-cleanup`） |
 | ⏰ 定时与高可用 | `/new` 与人设切换自动迁移定时任务、群聊主动发送失败补发、`modelFailover` 主备模型自动故障转移 |
 
 ### 权限与隐私安全
 
 - **默认拒绝与特权隔离**：`allowlist` 为空时不开放访问（fail-closed）；`/model`、`/preset`、`/persona` 及审批卡片仅限 `ownerOpenid` / `adminOpenids`。
 - **会话工具隔离（`toolAccess`，默认开启）**：受限 QQ 群无终端与子代理权限，文件读写限制在媒体、表情库、临时目录与 `toolAccess.readRoots`，且始终拦截 `fileAccess.sensitivePaths`。
-- **按群精细授权**：生图可经 `qqbot_image_gen_access(action="grant")` 发 10 分钟群审批卡单独授权，仅影响 `imageGen.allowedGroups`；B 站登录/字幕限主人或管理员私聊使用。
+- **按群精细授权**：生图可经 `qqbot_access(capability="image_gen", action="grant")` 发 10 分钟群审批卡单独授权，仅影响 `imageGen.allowedGroups`；B 站登录/字幕限主人或管理员私聊使用。
 - **隐私与仓洁**：凭据仅放配置/环境变量；`notes/` 跨会话共享召回，请勿记录个人隐私；`media/`、`stickers/`、`notes/`、`dnd/`、`tmp/` 均不入库。
 
 ---

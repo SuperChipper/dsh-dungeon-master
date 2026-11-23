@@ -184,11 +184,11 @@ export function updateProfileConfig(
 /** An owner-button approval edits one leaf, not a settings-panel snapshot. Preserve sibling
  * settings (including unmaterialized defaults and credential references) and mixed patch rows. */
 export function updateProfileAllowedGroups(
-  section: 'browser' | 'imageGen', groups: readonly string[], profileDir?: string,
+  section: 'imageGen', groups: readonly string[], profileDir?: string,
   logger: { info(msg: string, ...args: unknown[]): void; warn(msg: string, ...args: unknown[]): void } = console,
   expectedGroups?: readonly string[],
 ): boolean {
-  if (!profileDir || !['browser', 'imageGen'].includes(section)) return false;
+  if (!profileDir || section !== 'imageGen') return false;
   const isMap = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null && !Array.isArray(value) && !(value instanceof Date);
   const validIds = (value: unknown): value is string[] => Array.isArray(value) && value.every((id) => typeof id === 'string' && id.trim() !== '');

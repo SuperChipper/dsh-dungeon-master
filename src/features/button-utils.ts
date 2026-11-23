@@ -50,7 +50,7 @@ export interface DndButtonData {
 
 /** 各权限使用独立的 t 和待审批队列；p=申请 id，d=主人决策。 */
 export interface AccessButtonData {
-  t: 'access' | 'browser-access' | 'image-gen-access';
+  t: 'access' | 'image-gen-access';
   p: string;
   d: 'allow' | 'deny';
 }
@@ -74,7 +74,7 @@ export function encodeButtonData(data: ButtonData): string {
 export function decodeButtonData(raw: string): ButtonData | undefined {
   try {
     const parsed = JSON.parse(raw) as Partial<ButtonData>;
-    if (parsed !== null && typeof parsed === 'object' && (parsed.t === 'question' || parsed.t === 'approval' || parsed.t === 'dnd' || parsed.t === 'access' || parsed.t === 'browser-access' || parsed.t === 'image-gen-access' || parsed.t === 'persona')) {
+    if (parsed !== null && typeof parsed === 'object' && (parsed.t === 'question' || parsed.t === 'approval' || parsed.t === 'dnd' || parsed.t === 'access' || parsed.t === 'image-gen-access' || parsed.t === 'persona')) {
       return parsed as ButtonData;
     }
   } catch {

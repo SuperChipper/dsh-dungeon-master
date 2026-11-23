@@ -10,19 +10,17 @@ import type { ImQQBotConfig } from '../config.ts';
 import type { ChatScope, Logger } from '../types.ts';
 import { AGENT_TOOLS, SHELL_TOOLS, type ToolGuardSession } from '../shared/tool-guard.ts';
 import { biliPermission } from '../bili/permissions.ts';
-import { canUseImageGen, groupOnList } from './group-access-policy.ts';
+import { canUseImageGen } from './group-access-policy.ts';
 
 /** 强依赖 QQ 会话上下文的工具（无 QQ SessionRecord 时必然报错），对非 QQ agent（Web/Desktop）隐藏 */
-export const NON_QQ_ONLY_TOOLS: readonly string[] = [
-  'qqbot_browser',
-];
+export const NON_QQ_ONLY_TOOLS: readonly string[] = [];
 
 /** 仅限特权用户私聊扫码登录的工具 */
 export const BILI_LOGIN_TOOLS: readonly string[] = ['qqbot_bili_auth'];
 
 export type SessionToolScopeConfig = Pick<
   ImQQBotConfig,
-  'ownerOpenid' | 'adminOpenids' | 'toolAccess' | 'browser' | 'imageGen'
+  'ownerOpenid' | 'adminOpenids' | 'toolAccess' | 'imageGen'
 >;
 
 export interface SessionScopeSnapshot {
@@ -47,7 +45,6 @@ export function computeSessionDeniedTools(
 
   const owner = config.ownerOpenid?.trim() ?? '';
   const isOwnerC2c = owner !== '' && session.scope === 'c2c' && session.peerId === owner;
-  const isOwnerStrict = isOwnerC2c && (session.senderId === undefined || session.senderId === owner);
 
   if (!isOwnerC2c) {
     denied.add('qqbot_notes_manage');
@@ -55,11 +52,6 @@ export function computeSessionDeniedTools(
 
   if (!biliPermission(peerSession, 'login', config as ImQQBotConfig).allowed) {
     for (const name of BILI_LOGIN_TOOLS) denied.add(name);
-  }
-
-  const canBrowse = isOwnerStrict || (session.scope === 'group' && groupOnList(session.peerId, config.browser?.allowedGroups));
-  if (!canBrowse) {
-    denied.add('qqbot_browser');
   }
 
   if (!canUseImageGen(peerSession, config as Pick<ImQQBotConfig, 'imageGen'>, isFullAccess)) {
@@ -92,7 +84,7 @@ function getScopeKey(ctx: object): unknown {
 
 /**
  * dsh-tools 的 restrict() 会校验 deny 里每个名字都已全局注册（未知或未启用的工具会抛错，
- * 例如未启用 browser 时的 qqbot_browser 或非 Linux 上的 bash）。这里先按当前全局可限制工具过滤。
+ * 例如未启用 B 站工具时的 qqbot_bili_auth 或非 Linux 上的 bash）。这里先按当前全局可限制工具过滤。
  */
 export function filterRestrictable(
   candidates: readonly string[],

@@ -20,13 +20,6 @@ function makeConfig(overrides: Partial<SessionToolScopeConfig> = {}): SessionToo
       fullAccessUsers: ['FULL_USER'],
       readRoots: [],
     },
-    browser: {
-      enabled: true,
-      allowedGroups: ['BROWSER_GROUP'],
-      userDataDir: '.qqbot-browser',
-      headless: false,
-      timeoutMs: 30_000,
-    },
     imageGen: {
       enabled: true,
       allowAllGroups: false,
@@ -41,7 +34,7 @@ function makeLogger(): Logger {
 }
 
 describe('computeSessionDeniedTools', () => {
-  it('受限未授权群：隐藏终端/子代理、notes_manage、qqbot_bili_auth、browser 与 image_gen，保留 qqbot_access 供群内申请', () => {
+  it('受限未授权群：隐藏终端/子代理、notes_manage、qqbot_bili_auth 与 image_gen，保留 qqbot_access 供群内申请', () => {
     const config = makeConfig();
     const denied = computeSessionDeniedTools(
       { scope: 'group', peerId: 'GROUP_PLAIN', senderId: 'U_1' },
@@ -52,13 +45,12 @@ describe('computeSessionDeniedTools', () => {
       expect(denied).toContain(name);
     }
     expect(denied).toContain('qqbot_notes_manage');
-    expect(denied).toContain('qqbot_browser');
     expect(denied).toContain('qqbot_image_gen');
     expect(denied).not.toContain('qqbot_access');
     expect(denied).not.toContain('qqbot_describe_image');
   });
 
-  it('受限非主人私聊：隐藏终端/子代理、notes_manage、qqbot_bili_auth、browser 与 image_gen', () => {
+  it('受限非主人私聊：隐藏终端/子代理、notes_manage、qqbot_bili_auth 与 image_gen', () => {
     const config = makeConfig();
     const denied = computeSessionDeniedTools(
       { scope: 'c2c', peerId: 'OTHER_USER', senderId: 'OTHER_USER' },
@@ -66,7 +58,6 @@ describe('computeSessionDeniedTools', () => {
       () => false,
     );
     expect(denied).toContain('qqbot_notes_manage');
-    expect(denied).toContain('qqbot_browser');
     expect(denied).toContain('qqbot_image_gen');
     expect(denied).not.toContain('qqbot_access');
     for (const name of [...SHELL_TOOLS, ...AGENT_TOOLS, ...BILI_LOGIN_TOOLS]) {
@@ -84,7 +75,7 @@ describe('computeSessionDeniedTools', () => {
     expect(denied).toEqual([]);
   });
 
-  it('管理员非白名单私聊：保留 qqbot_bili_auth，仍隐藏终端/子代理、notes_manage、browser 与 image_gen', () => {
+  it('管理员非白名单私聊：保留 qqbot_bili_auth，仍隐藏终端/子代理、notes_manage 与 image_gen', () => {
     const config = makeConfig();
     const denied = computeSessionDeniedTools(
       { scope: 'c2c', peerId: 'ADMIN_1', senderId: 'ADMIN_1' },
@@ -94,11 +85,10 @@ describe('computeSessionDeniedTools', () => {
     expect(denied).not.toContain('qqbot_bili_auth');
     for (const name of [...SHELL_TOOLS, ...AGENT_TOOLS]) expect(denied).toContain(name);
     expect(denied).toContain('qqbot_notes_manage');
-    expect(denied).toContain('qqbot_browser');
     expect(denied).toContain('qqbot_image_gen');
   });
 
-  it('终端白名单群（未在浏览白名单）：放开终端/子代理和 qqbot_image_gen，仍隐藏 browser、notes_manage 与 qqbot_bili_auth', () => {
+  it('终端白名单群：放开终端/子代理和 qqbot_image_gen，仍隐藏 notes_manage 与 qqbot_bili_auth', () => {
     const config = makeConfig();
     const denied = computeSessionDeniedTools(
       { scope: 'group', peerId: 'FULL_GROUP', senderId: 'U_1' },
@@ -107,23 +97,8 @@ describe('computeSessionDeniedTools', () => {
     );
     for (const name of [...SHELL_TOOLS, ...AGENT_TOOLS]) expect(denied).not.toContain(name);
     expect(denied).not.toContain('qqbot_image_gen');
-    expect(denied).toContain('qqbot_browser');
     expect(denied).toContain('qqbot_notes_manage');
     expect(denied).toContain('qqbot_bili_auth');
-  });
-
-  it('浏览白名单受限群：放开 qqbot_browser，仍隐藏终端/子代理、image_gen、notes_manage 与 qqbot_bili_auth', () => {
-    const config = makeConfig();
-    const denied = computeSessionDeniedTools(
-      { scope: 'group', peerId: 'BROWSER_GROUP', senderId: 'U_1' },
-      config,
-      () => false,
-    );
-    expect(denied).not.toContain('qqbot_browser');
-    expect(denied).toContain('qqbot_image_gen');
-    expect(denied).toContain('qqbot_notes_manage');
-    expect(denied).toContain('qqbot_bili_auth');
-    for (const name of [...SHELL_TOOLS, ...AGENT_TOOLS]) expect(denied).toContain(name);
   });
 
   it('全群生图开启的受限群：放开 qqbot_image_gen', () => {
@@ -136,7 +111,6 @@ describe('computeSessionDeniedTools', () => {
       () => false,
     );
     expect(denied).not.toContain('qqbot_image_gen');
-    expect(denied).toContain('qqbot_browser');
   });
 });
 
@@ -216,15 +190,12 @@ describe('SessionToolScope', () => {
   it('通过 view(scopeKey).restrictableNames / definitions() / get() 过滤未注册工具名', () => {
     const scopeKey = {};
     const hView = makeHarness({}, false, {
-      restrictableNames: new Set(['pwsh', 'subagent', 'qqbot_notes_manage', 'qqbot_browser']),
+      restrictableNames: new Set(['pwsh', 'subagent', 'qqbot_notes_manage']),
       scopeKey,
     });
-    hView.scope.hideForNonQq(hView.agent);
-    expect(hView.live).toEqual([['qqbot_browser']]);
-    expect((hView.toolsService.view as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(scopeKey);
-
     hView.scope.sync({ sessionKey: 'k1', scope: 'group', peerId: 'G1', senderId: 'U1', agent: hView.agent });
-    expect(hView.live).toEqual([['pwsh', 'qqbot_browser', 'qqbot_notes_manage', 'subagent']]);
+    expect((hView.toolsService.view as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(scopeKey);
+    expect(hView.live).toEqual([['pwsh', 'qqbot_notes_manage', 'subagent']]);
 
     const hDefs = makeHarness({}, false, {
       definitions: [{ name: 'bash' }, { name: 'qqbot_image_gen' }],
@@ -240,16 +211,11 @@ describe('SessionToolScope', () => {
     expect(hGet.live).toEqual([['qqbot_bili_auth', 'qqbot_notes_manage']]);
   });
 
-  it('hideForNonQq：隐藏强 QQ 工具、幂等、空集合不调用 restrict、异常绝不外抛', () => {
+  it('hideForNonQq：NON_QQ_ONLY_TOOLS 为空时安全无副作用、不调用 restrict、异常绝不外抛', () => {
+    expect(NON_QQ_ONLY_TOOLS).toEqual([]);
     const h = makeHarness();
     h.scope.hideForNonQq(h.agent);
-    h.scope.hideForNonQq(h.agent);
-    expect(h.restrict).toHaveBeenCalledTimes(1);
-    expect(h.live).toEqual([[...NON_QQ_ONLY_TOOLS].sort()]);
-
-    const hEmpty = makeHarness({}, false, { restrictableNames: new Set(['read', 'pwsh']) });
-    hEmpty.scope.hideForNonQq(hEmpty.agent);
-    expect(hEmpty.restrict).not.toHaveBeenCalled();
+    expect(h.restrict).not.toHaveBeenCalled();
 
     const hFail = makeHarness({}, false, { failOnRestrict: true });
     expect(() => hFail.scope.hideForNonQq(hFail.agent)).not.toThrow();
@@ -260,11 +226,12 @@ describe('SessionToolScope', () => {
     expect(() => hFail.scope.hideForNonQq({ ctx: { get: () => { throw new Error('boom'); } } })).not.toThrow();
   });
 
-  it('hideForNonQq 之后若绑定为主人私聊，sync 彻底撤掉非 QQ 限制', () => {
-    const h = makeHarness({}, true);
-    h.scope.hideForNonQq(h.agent);
-    expect(h.live).toEqual([[...NON_QQ_ONLY_TOOLS].sort()]);
+  it('受限会话随后绑定为主人私聊时，sync 彻底撤掉限制', () => {
+    const h = makeHarness({}, false);
+    h.scope.sync({ sessionKey: 'k_grp', scope: 'group', peerId: 'G1', senderId: 'U1', agent: h.agent });
+    expect(h.live).toHaveLength(1);
 
+    h.setFullAccess(true);
     h.scope.sync({ sessionKey: 'k_owner', scope: 'c2c', peerId: 'OWNER_1', senderId: 'OWNER_1', agent: h.agent });
     expect(h.live).toEqual([]);
     expect(h.restrict).toHaveBeenCalledTimes(1);
@@ -312,8 +279,8 @@ describe('SessionToolScope', () => {
   it('release 仅清记录不撤限制，disposeAll 撤掉所有存活限制并清空状态', () => {
     const h = makeHarness();
     const gone = { ctx: h.agent.ctx };
-    h.scope.hideForNonQq(h.agent);
-    h.scope.hideForNonQq(gone);
+    h.scope.sync({ sessionKey: 'k_alive', scope: 'group', peerId: 'G1', senderId: 'U1', agent: h.agent });
+    h.scope.sync({ sessionKey: 'k_gone', scope: 'group', peerId: 'G2', senderId: 'U1', agent: gone });
     expect(h.live).toHaveLength(2);
 
     h.scope.release(gone);

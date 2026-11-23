@@ -565,31 +565,6 @@ describe('bind-routes', () => {
     }
   });
 
-  it('POST config：browser 保存合法值，最小写入顶层键', async () => {
-    const updates: Array<Record<string, unknown>> = [];
-    const { routes } = createHarness({ onUpdateConfig: (value) => { updates.push(value); return true; } });
-    const res = fakeRes();
-    await invoke(routes.get(BIND_CONFIG_PATH), fakeReq('POST', { host: '127.0.0.1:3080' },
-      JSON.stringify({ browser: { enabled: true, mode: 'local', channel: 'chrome', allowedGroups: ['g1'] } })), res);
-    expect(res.statusCode).toBe(200);
-    expect(Object.keys(updates[0]!)).toEqual(['browser']);
-    expect(updates[0]?.browser).toMatchObject({ enabled: true, mode: 'local', channel: 'chrome', headless: false, timeoutMs: 30000, allowedGroups: ['g1'] });
-  });
-
-  it.each([
-    { enabled: 'yes' }, { mode: 'stealth' }, { channel: 'unknown' }, { userDataDir: 12 },
-    { timeoutMs: 999 }, { timeoutMs: 120001 }, { timeoutMs: 'fast' },
-    { maxTextChars: 0 }, { maxTextChars: 50001 }, { headless: 'false' },
-    { allowedGroups: 'g1' }, { allowedGroups: [123] },
-  ])('POST config：browser 拒绝非法配置 %j', async (browser) => {
-    const update = vi.fn(() => true);
-    const { routes } = createHarness({ onUpdateConfig: update });
-    const res = fakeRes();
-    await invoke(routes.get(BIND_CONFIG_PATH), fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({ browser })), res);
-    expect(res.statusCode).toBe(400);
-    expect(update).not.toHaveBeenCalled();
-  });
-
   it('POST config：私聊压缩比例与工具链推迟开关通过校验并写入', async () => {
     const updates: Array<Record<string, unknown>> = [];
     const { routes } = createHarness({ onUpdateConfig: (value) => { updates.push(value); return true; } });

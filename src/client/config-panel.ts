@@ -16,14 +16,17 @@
  */
 import { createElement, useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { BIND_CONFIG_PATH } from '../shared/bind-protocol.ts';
-import { useConfigPanelStyles } from './config-panel/controls.ts';
-import { CoreConfigSections } from './config-panel/sections-core.ts';
-import { FeatureConfigSections } from './config-panel/sections-features.ts';
+import { CollapsibleSection, useConfigPanelStyles } from './config-panel/controls.ts';
+import { AdvancedSessionSection, QuickStartCoreSection } from './config-panel/sections-core.ts';
+import { DndAdvancedSection, DndCoreSection, NotesAndExtrasSection } from './config-panel/sections-features.ts';
 import { MediaConfigSections } from './config-panel/sections-media.ts';
 import {
   formatRoleVoices,
   normalizeChangedConfig,
   shallowEqual,
+  summarizeDndAdvanced,
+  summarizeExtrasDrawer,
+  summarizeMediaDrawer,
   type ConfigWire,
   type PatchFn,
 } from './config-panel/types.ts';
@@ -105,16 +108,31 @@ export function ConfigPanel(): ReactNode {
   const dirty = (Object.keys(form) as Array<keyof ConfigWire>).some((key) => !shallowEqual(form[key], initial[key]));
 
   return createElement('form', { className: 'imqb2-form', onSubmit: submit },
-    createElement(CoreConfigSections, { form, patch }),
-    createElement(MediaConfigSections, {
+    createElement(QuickStartCoreSection, { form, patch }),
+    createElement(DndCoreSection, { form, patch }),
+    createElement(CollapsibleSection, {
+      title: '跑团进阶与战斗代理',
+      summary: summarizeDndAdvanced(form),
+    }, createElement(DndAdvancedSection, { form, patch })),
+    createElement(CollapsibleSection, {
+      title: '会话、权限与人设进阶',
+      summary: '权限 · 压缩 · 人设 · 清理',
+    }, createElement(AdvancedSessionSection, { form, patch })),
+    createElement(CollapsibleSection, {
+      title: '富媒体、视觉、语音与生图',
+      summary: summarizeMediaDrawer(form),
+    }, createElement(MediaConfigSections, {
       form,
       patch,
       extraRoleVoicesText,
       setExtraRoleVoicesText,
       extraDsRoleVoicesText,
       setExtraDsRoleVoicesText,
-    }),
-    createElement(FeatureConfigSections, { form, patch }),
+    })),
+    createElement(CollapsibleSection, {
+      title: '共享笔记、上游监测与扩展工具',
+      summary: summarizeExtrasDrawer(form),
+    }, createElement(NotesAndExtrasSection, { form, patch })),
 
     form.cwd !== undefined
       ? createElement('div', { className: 'imqb2-field' },

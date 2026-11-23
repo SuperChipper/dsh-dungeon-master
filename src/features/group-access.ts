@@ -10,8 +10,7 @@ import { accessKeyboard, decodeButtonData } from './button-utils.ts';
 import { groupOnList, implicitImageGroupAccess } from './group-access-policy.ts';
 
 const FEATURES = {
-  browser: { tool: 'qqbot_browser_access', button: 'browser-access', label: '浏览', subject: 'browsing', scope: '仅涉及网页浏览、搜索、提取和截图，不授予生图或终端/文件权限。' },
-  imageGen: { tool: 'qqbot_image_gen_access', button: 'image-gen-access', label: '生图', subject: 'image generation/editing', scope: '仅涉及本群生成、编辑图片（会使用生图额度），不授予浏览器或终端/文件权限。' },
+  imageGen: { tool: 'qqbot_image_gen_access', button: 'image-gen-access', label: '生图', subject: 'image generation/editing', scope: '仅涉及本群生成、编辑图片（会使用生图额度），不授予终端/文件权限。' },
 } as const;
 export type GroupAccessFeature = keyof typeof FEATURES;
 const TTL_MS = 10 * 60 * 1000;
@@ -153,7 +152,7 @@ export class GroupAccess {
     if (args.group !== undefined && args.group.trim() !== group) return `这里只能申请把本群加入/移出${label}白名单，不能申请其他群。`;
     if (args.action === 'status') {
       const status = this.listStatus(group, '本群');
-      const capability = this.feature === 'imageGen' ? 'image_gen' : 'browser';
+      const capability = 'image_gen';
       return this.isAllowedGroup(group) || this.otherAccess(group)
         ? status
         : `${status}可调用 qqbot_access(capability="${capability}", action="grant")（或兼容入口 ${tool}(action="grant")）申请。`;

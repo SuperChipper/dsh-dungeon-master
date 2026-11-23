@@ -1,9 +1,13 @@
 # DSH Dungeon Master
 
-**[简体中文](./README.md) | English**
+**[简体中文](./README.md) | English** ｜ **[🤖 Agent Install & Migration Guide](./docs/AGENT_GUIDE.md)**
 
 **An AI dungeon master that runs D&D 5e in QQ groups.** Forked from [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot): send `/dnd start` in a group and the bot becomes that group's DM—dice, checks, initiative, grid positions, reactions, and HP are resolved deterministically by tools while the model focuses on narration.
 
+> 🤖 **Using an AI Agent to install, troubleshoot, or upgrade from `0.8.x` to `0.9.0`?**
+>
+> Have your assistant (DSH / Claude Code / Antigravity / Codex) read **[`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md)** first—it covers fresh installation, migrating from upstream, the `0.9.0` migration checklist, and profile-editing guardrails (also bundled in the npm package).
+>
 > QR binding, base configuration, and overall architecture follow upstream: see the **[upstream README](https://github.com/tencent-connect/dsh-qqbot#readme)**. Do not enable `@tencent-connect/dsh-qqbot` alongside this package in the same profile (both share the `im-qqbot` plugin ID).
 
 ---
@@ -32,9 +36,9 @@ npx @deepseek-ai/dsh --profile qqbot
 
 ### 2. Start a Game in Three Steps
 
-1. Install the plugin and invite the bot to your QQ group.
-2. Send `/dnd start` (posts check-in buttons; opens automatically once everyone checks in, or click **Start** to begin early).
-3. `@bot` and state your character's action—e.g. *"Kaes swings his greatsword at Goblin 3"* or *"Enzo sneaks to the door and listens"*.
+1. Run `dsh plugin --profile web add dsh-dungeon-master`, then open DSH Web **Plugins → QQ Bot** to bind via QR scan (or AppID / AppSecret).
+2. Invite the bot to your QQ group. If you need owner approvals or full private-chat access, send `/bot-me` to the bot to copy your `openid` into **Owner openid** in Settings.
+3. Send `/dnd start` in the group (posts check-in buttons; opens automatically once everyone checks in, or click **Start** to begin early), then `@bot` with your action—e.g. *"Kaes swings his greatsword at Goblin 3"* or *"Enzo sneaks to the door and listens"*.
 
 No preset switch or separate session is needed: active campaigns inject compact DM rules + live state per turn, and `/dnd end` atomically pauses the campaign back into normal chat.
 
@@ -64,18 +68,19 @@ No preset switch or separate session is needed: active campaigns inject compact 
 | `/dnd checkin` / `/dnd end [recap]` | Re-send check-in buttons / atomically pause campaign & hand off |
 | `/dnd combat` | Show dedicated combat agent route and cached/uncached token usage |
 | `/dnd dungeons` / `/dnd search <term>` / `/dnd spells [class]` | List modules / query [Huiji D&D wiki](https://dnd.huijiwiki.com/wiki/) / list class spells |
+| `/bot-me` | Show your `openid` (plus the group `openid` when sent in a group) for owner/allowlist setup |
 | `/bot-doctor` | Run runtime diagnostics and dependency checks |
 
-### Dedicated Combat Agent (Optional)
+### Dedicated Combat Agent (Optional, Off by Default)
 
-Enable **Settings → D&D → Dedicated combat agent** to delegate active combat turns to a separate model; the main DM handles initiative and opening narration, while the child resolves turns and narrates the closing round before handing updated state and ledger facts back.
+Disabled by default (runs on your main DSH model). Enable **Settings → Advanced D&D & Combat Agent → Dedicated combat agent** to delegate active combat turns to a separate model; the main DM handles initiative and opening narration, while the child resolves turns and narrates the closing round before handing updated state and ledger facts back.
 
 ```yaml
 dnd:
   combatAgent:
     enabled: true
-    provider: opencode-go
-    model: deepseek-v4.1-flash
+    provider: <your-provider-id>   # Must match a provider configured in DSH
+    model: <your-model-id>         # Target model ID
     reasoningEffort: high
     contextChars: 8000
 ```
@@ -120,15 +125,15 @@ Configurable in the DSH Web **Plugins** settings panel:
 | 🎭 Personas | Per-chat `/persona` switching with isolated per-persona history, incremental handoffs, preserved source model, and `scripts/check-persona-handoff-host.mjs` codec check |
 | 🧠 Shared notes | Markdown memory library under `notes/` with BM25 recall, group-scoped `chat` notes, and owner `/bot-notes` inspection |
 | 😺 Stickers & Art | Emotion-based saving (`qqbot_save_sticker`), hash matching, [`qqbot-sticker-maker`](./skills/qqbot-sticker-maker/SKILL.md), and [`qqbot-image-studio`](./skills/qqbot-image-studio/SKILL.md) |
-| 🖼 Multimodal | Caption + media sending, native `deepseek-native` image input, online TTS / configurable ASR, and whole-video keyframe review |
-| 🔧 Utilities | Reverse image search, read-only Bilibili lookup, fanart fetcher, per-group Playwright browser, `/bot-cleanup` |
+| 🖼 Multimodal | Caption + media sending, native multimodal image input (when the main model supports image input), online TTS / configurable ASR, and whole-video keyframe review |
+| 🔧 Utilities | Optional Bilibili read-only tools, fanart fetcher, reverse image search, external sing service (all `enabled: false` by default), plus `/bot-cleanup` |
 | ⏰ Reliability | Scheduled-task migration on `/new` & persona switch, proactive retry queue, and `modelFailover` primary/backup failover |
 
 ### Permissions & Privacy
 
 - **Fail-closed defaults**: Empty `allowlist` blocks everyone; `/model`, `/preset`, `/persona`, and approvals require `ownerOpenid` / `adminOpenids`.
 - **Scoped chat tools (`toolAccess`, on by default)**: Restricted QQ groups have no shell or subagents; file access stays inside media, stickers, temp, and `toolAccess.readRoots`, always blocking `fileAccess.sensitivePaths`.
-- **Granular group grants**: `qqbot_image_gen_access(action="grant")` issues 10-minute owner approval cards per group (`imageGen.allowedGroups`); Bilibili login/subtitles stay private-owner/admin only.
+- **Granular group grants**: `qqbot_access(capability="image_gen", action="grant")` issues 10-minute owner approval cards per group (`imageGen.allowedGroups`); Bilibili login/subtitles stay private-owner/admin only.
 - **Privacy hygiene**: Keep secrets in profile configs/env vars, avoid storing private data in shared `notes/`, and never commit `media/`, `stickers/`, `notes/`, `dnd/`, or `tmp/`.
 
 ---

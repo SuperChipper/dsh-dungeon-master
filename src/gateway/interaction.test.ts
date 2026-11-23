@@ -14,26 +14,22 @@ function eventWithData(buttonData: unknown): InteractionEvent {
 }
 
 describe('gateway/dispatchInteraction', () => {
-  it('按顶层 t 字段精准分发到 dnd / access / browser-access / image-gen-access / persona / question / approval', () => {
+  it('按顶层 t 字段精准分发到 dnd / access / image-gen-access / persona / question / approval', () => {
     const manager = {
       questionChannel: { handleInteraction: vi.fn(() => true) },
       approvalChannel: { handleInteraction: vi.fn(() => false) },
     };
     const dndButtons = { handleInteraction: vi.fn(() => 4) };
     const toolAccess = { handleInteraction: vi.fn(() => 0) };
-    const browserAccess = { handleInteraction: vi.fn(() => 0) };
     const imageGenAccess = { handleInteraction: vi.fn(() => 4) };
     const personaSwitch = { handleInteraction: vi.fn(() => 0) };
-    const groupAccess = { browser: browserAccess, imageGen: imageGenAccess };
+    const groupAccess = { imageGen: imageGenAccess };
 
     expect(dispatchInteraction(eventWithData(JSON.stringify({ t: 'dnd', a: 'end' })), manager as never, dndButtons as never, toolAccess as never, groupAccess as never, personaSwitch as never)).toBe(4);
     expect(dndButtons.handleInteraction).toHaveBeenCalledTimes(1);
 
     expect(dispatchInteraction(eventWithData(JSON.stringify({ t: 'access', op: 'grant' })), manager as never, dndButtons as never, toolAccess as never, groupAccess as never, personaSwitch as never)).toBe(0);
     expect(toolAccess.handleInteraction).toHaveBeenCalledTimes(1);
-
-    expect(dispatchInteraction(eventWithData(JSON.stringify({ t: 'browser-access' })), manager as never, dndButtons as never, toolAccess as never, groupAccess as never, personaSwitch as never)).toBe(0);
-    expect(browserAccess.handleInteraction).toHaveBeenCalledTimes(1);
 
     expect(dispatchInteraction(eventWithData(JSON.stringify({ t: 'image-gen-access' })), manager as never, dndButtons as never, toolAccess as never, groupAccess as never, personaSwitch as never)).toBe(4);
     expect(imageGenAccess.handleInteraction).toHaveBeenCalledTimes(1);

@@ -352,19 +352,6 @@ export interface PersonasConfig {
   root: string;
 }
 
-export interface BrowserConfig {
-  enabled: boolean;
-  allowedGroups: string[];
-  mode: 'local' | 'cdp';
-  channel: 'chrome' | 'msedge' | 'chromium';
-  userDataDir: string;
-  headless: boolean;
-  locale: string;
-  timezoneId: string;
-  timeoutMs: number;
-  maxTextChars: number;
-}
-
 export interface BiliConfig {
   /** 是否注册 qqbot_bili / qqbot_bili_auth B 站只读工具 */
   enabled: boolean;
@@ -616,7 +603,6 @@ export interface ImQQBotConfig {
   reverseImage?: ReverseImageConfig;
   /** 搜图工具（qqbot_fanart，默认关闭） */
   fanart: FanartConfig;
-  browser?: BrowserConfig;
   /** 跑团（/dnd + dnd_* 工具） */
   dnd: DndConfig;
 }
@@ -732,23 +718,6 @@ export const NotesSchema: Schema<NotesConfig> = Schema.object({
   injectMinCoverage: Schema.number().default(0.4).description('自动注入最低查询词覆盖率(0-1)'),
   semantic: NotesSemanticSchema.description('向量语义检索'),
   judge: NoteJudgeSchema.description('注入相关性打分'),
-});
-
-/** 浏览器子 Schema */
-export const BrowserSchema: Schema<BrowserConfig> = Schema.object({
-  enabled: Schema.boolean().default(false).description('启用主人私聊和授权群的浏览工具'),
-  allowedGroups: Schema.array(Schema.string()).default([]).description('允许浏览的群 openid；空=仅主人私聊'),
-  mode: Schema.union(['local', 'cdp']).default('local'),
-  channel: Schema.union(['chrome', 'msedge', 'chromium']).default('chrome'),
-  userDataDir: Schema.string().default('').description('独立浏览器目录；空=工作目录/.qqbot-browser'),
-  headless: Schema.boolean().default(false),
-  locale: Schema.string().default('zh-CN'),
-  timezoneId: Schema.string().default('Asia/Shanghai'),
-  timeoutMs: Schema.number().min(1000).max(120000).step(1).default(30000),
-  maxTextChars: Schema.number().min(1000).max(50000).step(1).default(12000),
-}).default({
-  enabled: false, allowedGroups: [], mode: 'local', channel: 'chrome', userDataDir: '', headless: false,
-  locale: 'zh-CN', timezoneId: 'Asia/Shanghai', timeoutMs: 30000, maxTextChars: 12000,
 });
 
 export const BiliSchema: Schema<BiliConfig> = Schema.object({
@@ -1177,7 +1146,6 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
     },
     judge: NOTE_JUDGE_DEFAULTS,
   }).description('共享笔记库配置'),
-  browser: BrowserSchema.description('Playwright 浏览器（CDP 地址用 QQBOT_BROWSER_CDP_ENDPOINT 环境变量）'),
   bili: BiliSchema.description('B 站只读工具开关（默认关闭）'),
   sing: SingSchema.description('点歌工具配置（默认关闭，需外部唱歌 HTTP 服务）'),
   reverseImage: ReverseImageSchema.description('以图搜图工具开关（默认关闭）'),

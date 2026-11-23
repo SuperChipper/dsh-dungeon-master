@@ -85,6 +85,33 @@ export function useConfigPanelStyles(): void {
   outline: var(--dsw-focus-ring-width, 2px) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
   outline-offset: -2px;
 }
+/* 折叠抽屉（原生 details + summary，保持 DSW 分隔线和层次） */
+.imqb2-drawer {
+  margin-top: 12px; border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md, 8px);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+}
+.imqb2-drawer-summary {
+  list-style: none; display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px; cursor: pointer; user-select: none;
+}
+.imqb2-drawer-summary::-webkit-details-marker { display: none; }
+.imqb2-drawer-chevron {
+  display: inline-block; font-size: 11px; line-height: 1;
+  color: var(--dsw-alias-label-tertiary); transition: transform 140ms ease;
+}
+.imqb2-drawer[open] .imqb2-drawer-chevron { transform: rotate(90deg); }
+.imqb2-drawer-title {
+  flex: 1; min-width: 0; font-size: 13px; font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+.imqb2-drawer-badge {
+  font-size: 12px; color: var(--dsw-alias-label-tertiary); white-space: nowrap;
+}
+.imqb2-drawer-body {
+  padding: 0 12px 6px; border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+.imqb2-drawer-body > .imqb2-group-title:first-child { padding-top: 10px; }
 /* 底栏（官方 SettingsForm.footer 复刻） */
 .imqb2-footer { display: flex; align-items: center; gap: 8px; padding-top: 16px; }
 .imqb2-note { flex: 1; min-width: 0; margin: 0; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); }
@@ -236,9 +263,17 @@ export function SelectRow({ label, help, value, options, onChange }: {
   );
 }
 
-export function BrowserSelectRow({ label, value, options, onChange }: {
-  label: string; value: string; options: Array<{ value: string; label: string }>;
-  onChange: (value: string) => void;
+export function CollapsibleSection({ title, summary, defaultOpen = false, children }: {
+  title: string; summary?: string; defaultOpen?: boolean; children?: ReactNode;
 }): ReactNode {
-  return SelectRow({ label, value, options, onChange });
+  return createElement('details', { className: 'imqb2-drawer', open: defaultOpen },
+    createElement('summary', { className: 'imqb2-drawer-summary' },
+      createElement('span', { className: 'imqb2-drawer-chevron', 'aria-hidden': true }, '▸'),
+      createElement('span', { className: 'imqb2-drawer-title' }, title),
+      summary === undefined || summary === ''
+        ? null
+        : createElement('span', { className: 'imqb2-drawer-badge' }, summary),
+    ),
+    createElement('div', { className: 'imqb2-drawer-body' }, children),
+  );
 }

@@ -1,5 +1,5 @@
 /**
- * 网关内置媒体与扩展工具注册（视觉、视频、转写、浏览器、文件发送、语音、生图、B 站、点歌、搜图、表情、笔记、历史）
+ * 网关内置媒体与扩展工具注册（视觉、视频、转写、文件发送、语音、生图、B 站、点歌、搜图、表情、笔记、历史）
  */
 import type { Context } from '@deepseek-ai/cordis';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -10,7 +10,6 @@ import { PLUGIN_ROOT } from '../shared/index.ts';
 import { BiliClient } from '../bili/client.ts';
 import { registerBiliTools } from '../bili/tools.ts';
 import { biliPermission } from '../bili/permissions.ts';
-import { registerBrowserTool } from '../browser/browser-tool.ts';
 import { registerFanartTool } from '../fanart/fanart-tool.ts';
 import { createHttpGet } from '../fanart/http.ts';
 import { FanartSeenStore, markSentCandidate } from '../fanart/seen.ts';
@@ -51,7 +50,6 @@ export async function registerGatewayTools(deps: RegisterGatewayToolsDeps): Prom
   registerDescribeImageTool(ctx, config.vision, logger, {
     getFfmpegPath: () => manager.ffmpegPath,
   });
-  registerBrowserTool(ctx, config, manager, logger);
 
   // ── 视频理解工具（qqbot_describe_video：抽帧宫格 + 音轨 ASR；ffmpeg 不可用时跳过） ──
   // 先找 ffmpeg：winget 装的不在 PATH 里时，把它的目录补进本进程 PATH（终端工具会继承），并在 prompt 里点名路径

@@ -26,7 +26,6 @@ import {
   CleanupSchema,
   DndSchema,
   FanartSchema,
-  BrowserSchema,
   FileAccessSchema,
   GroupTriggerModeSchema,
   IMAGE_GEN_COMPLEXITIES,
@@ -130,7 +129,7 @@ const EDITABLE_CONFIG_KEYS = new Set([
   'steerWindowMs', 'processingTimeoutMs', 'askTimeoutMs',
   'tmpDir', 'tmpTtlHours', 'tmpMaxTotalMB',
   'access', 'fileAccess', 'stickers', 'personas', 'notes', 'toolAccess', 'modelFailover',
-  'media', 'vision', 'asr', 'video', 'imageGen', 'sendFile', 'speak', 'cleanup', 'bili', 'sing', 'reverseImage', 'fanart', 'dnd', 'browser',
+  'media', 'vision', 'asr', 'video', 'imageGen', 'sendFile', 'speak', 'cleanup', 'bili', 'sing', 'reverseImage', 'fanart', 'dnd',
 ]);
 
 /** 白名单键的子 Schema（服务端校验：客户端校验仅为体验，安全边界在宿主） */
@@ -207,8 +206,6 @@ const EDITABLE_CONFIG_SCHEMAS: Record<string, (value: unknown) => unknown> = {
   sing: (v) => SingSchema(v as never),
   reverseImage: (v) => ReverseImageSchema(v as never),
   fanart: (v) => FanartSchema(v as never),
-  // allowedGroups 与其余浏览参数共用唯一真源校验，群权限不继承终端白名单。
-  browser: (v) => BrowserSchema(v as never),
   // combatAgent 与跑团共用顶层键，仍由唯一真源校验模型路由和交接字数。
   dnd: (v) => DndSchema(v as never),
   replyDesire: (v) => ReplyDesireSchema(v as never),

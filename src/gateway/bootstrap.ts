@@ -215,8 +215,8 @@ export async function bootstrapGateway(
     access.onChange = (group) => manager.syncSessionTools('group', group);
     return access;
   };
-  const groupAccess = { browser: registerGroupAccess('browser'), imageGen: registerGroupAccess('imageGen') };
-  registerAccessTool(ctx, { terminal: toolAccess, browser: groupAccess.browser, imageGen: groupAccess.imageGen }, logger);
+  const groupAccess = { imageGen: registerGroupAccess('imageGen') };
+  registerAccessTool(ctx, { terminal: toolAccess, imageGen: groupAccess.imageGen }, logger);
 
   bindInteractionHandler(bot, manager, dndButtons, toolAccess, groupAccess, personaSwitch);
 

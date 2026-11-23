@@ -1,9 +1,7 @@
 import { createElement, Fragment, type ReactNode } from 'react';
-import type { BrowserConfig } from '../../config.ts';
-import { BrowserSelectRow, FieldRow, ListRow, NumberRow, SwitchRow } from './controls.ts';
+import { FieldRow, NumberRow, SwitchRow } from './controls.ts';
 import type {
   BiliWire,
-  CleanupWire,
   ConfigWire,
   DndWire,
   FanartWire,
@@ -14,25 +12,85 @@ import type {
   PatchFn,
   ReverseImageWire,
   SingWire,
-  ToolAccessWire,
 } from './types.ts';
 
-export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch: PatchFn }): ReactNode {
+function readDndWire(form: ConfigWire): DndWire {
+  return form.dnd ?? { enabled: true, root: '', turnButtons: true, interjections: true };
+}
+
+/** 首屏跑团基础开关。 */
+export function DndCoreSection({ form, patch }: { form: ConfigWire; patch: PatchFn }): ReactNode {
+  const dnd = readDndWire(form);
+  return createElement(Fragment, null,
+    createElement('div', { className: 'imqb2-group-title' }, '跑团'),
+    createElement(SwitchRow, {
+      label: '启用跑团', checked: dnd.enabled,
+      help: '/dnd 命令与 dnd_* 工具',
+      onChange: (v) => { patch('dnd', { ...dnd, enabled: v }); },
+    }),
+    createElement(SwitchRow, {
+      label: '回合按钮', checked: dnd.turnButtons,
+      help: '轮到 PC 时发「结束回合 / 查看状态」按钮',
+      onChange: (v) => { patch('dnd', { ...dnd, turnButtons: v }); },
+    }),
+    createElement(SwitchRow, {
+      label: '开团后允许随机插嘴', checked: dnd.interjections,
+      help: '只吐槽、不结算；关闭后开团后只回 @',
+      onChange: (v) => { patch('dnd', { ...dnd, interjections: v }); },
+    }),
+  );
+}
+
+/** 折叠抽屉 1：跑团数据目录、快照节流与独立战斗代理。 */
+export function DndAdvancedSection({ form, patch }: { form: ConfigWire; patch: PatchFn }): ReactNode {
+  const dnd = readDndWire(form);
+  const combatAgent = dnd.combatAgent ?? { enabled: false, provider: '', model: '', reasoningEffort: '', contextChars: 8000 };
+  return createElement(Fragment, null,
+    createElement(FieldRow, {
+      label: '跑团数据目录', value: dnd.root, placeholder: '留空 = 工作目录/dnd',
+      onChange: (v) => { patch('dnd', { ...dnd, root: v }); },
+    }),
+    createElement(NumberRow, {
+      label: '团况快照注入轮数间隔', value: dnd.snapshotIntervalTurns ?? 4, min: 1, max: 20, step: 1,
+      help: '默认每 4 轮对话同步 1 次完整团况（1 = 每轮对话最多 1 次）；单轮内多次攻击/移动工具调用始终锁定零重发，换房间/开战结战/撤销/压缩时自动立即刷新',
+      onChange: (v) => { patch('dnd', { ...dnd, snapshotIntervalTurns: v }); },
+    }),
+    createElement(SwitchRow, {
+      label: '独立战斗代理', checked: combatAgent.enabled,
+      help: '开战后的下一次回复交给战斗模型，战后把团况交回主 DM；每场独立上下文，用量可用 /dnd combat 查看',
+      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, enabled: v } }); },
+    }),
+    createElement(FieldRow, {
+      label: '战斗 Provider', value: combatAgent.provider, placeholder: '填写已配置的 provider id',
+      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, provider: v.trim() } }); },
+    }),
+    createElement(FieldRow, {
+      label: '战斗模型', value: combatAgent.model, placeholder: '填写模型 id（如 deepseek-chat / deepseek-v4.1-flash）',
+      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, model: v.trim() } }); },
+    }),
+    createElement(NumberRow, {
+      label: '战斗交接字数', value: combatAgent.contextChars, min: 1000, max: 30000, step: 1000,
+      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, contextChars: v } }); },
+    }),
+    createElement(FieldRow, {
+      label: '战斗推理强度', value: combatAgent.reasoningEffort, placeholder: '留空使用模型默认',
+      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, reasoningEffort: v.trim() } }); },
+    }),
+  );
+}
+
+/** 折叠抽屉 4：共享笔记、上游模型故障切换与默认关闭的扩展工具。 */
+export function NotesAndExtrasSection({ form, patch }: { form: ConfigWire; patch: PatchFn }): ReactNode {
   const notes: NotesWire = form.notes ?? {
     enabled: true, root: '', autoInject: true, injectTopK: 2, injectMaxChars: 600, injectPerNoteChars: 0, groupInjectMaxChars: 0, injectMinCoverage: 0.4,
   };
   const injectPerNoteChars = notes.injectPerNoteChars ?? 0;
   const groupInjectMaxChars = notes.groupInjectMaxChars ?? 0;
-  // 旧配置没有 semantic 组时按默认值显示
   const semantic: NotesSemanticWire = notes.semantic ?? {
     enabled: false, baseUrl: 'https://api.siliconflow.cn/v1', model: 'BAAI/bge-m3', minSimilarity: 0.5, minMargin: 0.16, timeoutMs: 3000,
   };
-  // 旧配置没有 judge 组时按默认值显示
   const noteJudge: NoteJudgeWire = notes.judge ?? {
     enabled: false, timeoutMs: 15000, sampleRate: 1, minSamples: 8, muteBelow: 0,
-  };
-  const toolAccess: ToolAccessWire = form.toolAccess ?? {
-    enabled: true, fullAccessGroups: [], fullAccessUsers: [], readRoots: [],
   };
   const failover: ModelFailoverWire = form.modelFailover ?? {
     enabled: false,
@@ -48,17 +106,10 @@ export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch
     ttftThresholdMs: 8000,
     notify: true,
   };
-  const cleanup: CleanupWire = form.cleanup ?? { dryRun: false };
   const bili: BiliWire = form.bili ?? { enabled: false };
   const reverseImage: ReverseImageWire = form.reverseImage ?? { enabled: false };
   const sing: SingWire = form.sing ?? { enabled: false, baseUrl: '' };
   const fanart: FanartWire = form.fanart ?? { enabled: false, proxy: '', poolDir: '' };
-  const browser: BrowserConfig = form.browser ?? {
-    enabled: false, allowedGroups: [], mode: 'local', channel: 'chrome', userDataDir: '', headless: false,
-    locale: 'zh-CN', timezoneId: 'Asia/Shanghai', timeoutMs: 30000, maxTextChars: 12000,
-  };
-  const dnd: DndWire = form.dnd ?? { enabled: true, root: '', turnButtons: true, interjections: true };
-  const combatAgent = dnd.combatAgent ?? { enabled: false, provider: '', model: '', reasoningEffort: '', contextChars: 8000 };
 
   return createElement(Fragment, null,
     createElement('div', { className: 'imqb2-group-title' }, '共享笔记'),
@@ -151,28 +202,6 @@ export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch
       onChange: (v) => { patch('notes', { ...notes, judge: { ...noteJudge, timeoutMs: v } }); },
     }),
 
-    createElement('div', { className: 'imqb2-group-title' }, '工具权限'),
-    createElement(SwitchRow, {
-      label: '按会话限制工具', checked: toolAccess.enabled,
-      help: '关闭后所有 QQ 会话都能用终端、读写任意路径',
-      onChange: (v) => { patch('toolAccess', { ...toolAccess, enabled: v }); },
-    }),
-    createElement(ListRow, {
-      label: '可完全访问的群 openid', help: '每行一个；这些群里能用终端、读写任意路径',
-      value: toolAccess.fullAccessGroups, rows: 2,
-      onChange: (v) => { patch('toolAccess', { ...toolAccess, fullAccessGroups: v }); },
-    }),
-    createElement(ListRow, {
-      label: '可完全访问的用户 openid', help: '每行一个；主人私聊始终可以',
-      value: toolAccess.fullAccessUsers, rows: 2,
-      onChange: (v) => { patch('toolAccess', { ...toolAccess, fullAccessUsers: v }); },
-    }),
-    createElement(ListRow, {
-      label: '受限会话可读目录', help: '每行一个；media、表情库、临时目录始终允许',
-      value: toolAccess.readRoots, rows: 3,
-      onChange: (v) => { patch('toolAccess', { ...toolAccess, readRoots: v }); },
-    }),
-
     createElement('div', { className: 'imqb2-group-title' }, '上游监测'),
     createElement(SwitchRow, {
       label: '监测 upstream 状态并自动切模型', checked: failover.enabled,
@@ -216,76 +245,6 @@ export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch
       onChange: (v) => { patch('modelFailover', { ...failover, notify: v }); },
     }),
 
-    createElement('div', { className: 'imqb2-group-title' }, '临时目录与清理'),
-    createElement(FieldRow, {
-      label: '临时目录', value: form.tmpDir ?? '', placeholder: '留空 = 工作目录/tmp',
-      help: '下载、抽帧、截图等中间文件放这里',
-      onChange: (v) => { patch('tmpDir', v); },
-    }),
-    createElement(NumberRow, {
-      label: '临时文件保留（小时）', value: form.tmpTtlHours ?? 72, min: 0, max: 8760, step: 1,
-      help: '0 = 不按时间清理',
-      onChange: (v) => { patch('tmpTtlHours', v); },
-    }),
-    createElement(NumberRow, {
-      label: '临时目录总量上限（MB）', value: form.tmpMaxTotalMB ?? 4096, min: 0, max: 1048576, step: 256,
-      help: '0 = 不限',
-      onChange: (v) => { patch('tmpMaxTotalMB', v); },
-    }),
-    createElement(SwitchRow, {
-      label: '清理只记日志（dry run）', checked: cleanup.dryRun,
-      help: '自定义清理规则（cleanup.rules）只能在 cordis.patch.yml 里配',
-      onChange: (v) => { patch('cleanup', { ...cleanup, dryRun: v }); },
-    }),
-
-    createElement('div', { className: 'imqb2-group-title' }, '浏览器'),
-    createElement(SwitchRow, {
-      label: '启用 Playwright 浏览', checked: browser.enabled,
-      help: '主人私聊及白名单群可用，请先配置 ownerOpenid。第一次打开网站后在浏览器中手动登录。',
-      onChange: (v) => { patch('browser', { ...browser, enabled: v }); },
-    }),
-    createElement(ListRow, {
-      label: '浏览群白名单', value: browser.allowedGroups ?? [], rows: 3,
-      help: '每行一个群 openid（不是 QQ 群号）；留空仅主人私聊可用。授权群内所有成员均可调用，各群登录态与主人私聊隔离。',
-      onChange: (v) => { patch('browser', { ...browser, allowedGroups: v }); },
-    }),
-    createElement(BrowserSelectRow, {
-      label: '连接方式', value: browser.mode,
-      options: [{ value: 'local', label: '本机浏览器' }, { value: 'cdp', label: '指纹浏览器 CDP' }],
-      onChange: (v) => { patch('browser', { ...browser, mode: v as BrowserConfig['mode'] }); },
-    }),
-    createElement('p', { className: 'imqb2-help' }, 'CDP 地址请设环境变量 QQBOT_BROWSER_CDP_ENDPOINT；代理可设 QQBOT_BROWSER_PROXY_SERVER。本机模式保存登录态，指纹由外接浏览器管理。'),
-    createElement(BrowserSelectRow, {
-      label: '本机浏览器', value: browser.channel,
-      options: [{ value: 'chrome', label: 'Chrome' }, { value: 'msedge', label: 'Edge' }, { value: 'chromium', label: 'Chromium' }],
-      onChange: (v) => { patch('browser', { ...browser, channel: v as BrowserConfig['channel'] }); },
-    }),
-    createElement(FieldRow, {
-      label: '独立配置目录', value: browser.userDataDir, placeholder: '留空 = 工作目录/.qqbot-browser',
-      help: '不要填写日常使用的 Chrome 用户目录；此目录包含登录凭据，请勿提交或共享。',
-      onChange: (v) => { patch('browser', { ...browser, userDataDir: v }); },
-    }),
-    createElement(SwitchRow, {
-      label: '无头模式', checked: browser.headless, help: '首次登录请关闭，以便在窗口中扫码或验证。',
-      onChange: (v) => { patch('browser', { ...browser, headless: v }); },
-    }),
-    createElement(FieldRow, {
-      label: '语言', value: browser.locale,
-      onChange: (v) => { patch('browser', { ...browser, locale: v }); },
-    }),
-    createElement(FieldRow, {
-      label: '时区', value: browser.timezoneId,
-      onChange: (v) => { patch('browser', { ...browser, timezoneId: v }); },
-    }),
-    createElement(NumberRow, {
-      label: '操作超时（毫秒）', value: browser.timeoutMs, min: 1000, max: 120000, step: 1000,
-      onChange: (v) => { patch('browser', { ...browser, timeoutMs: v }); },
-    }),
-    createElement(NumberRow, {
-      label: '返回文本上限', value: browser.maxTextChars, min: 1000, max: 50000, step: 1000,
-      onChange: (v) => { patch('browser', { ...browser, maxTextChars: v }); },
-    }),
-
     createElement('div', { className: 'imqb2-group-title' }, '扩展工具（默认关闭）'),
     createElement(SwitchRow, {
       label: '启用 B 站只读工具', checked: bili.enabled,
@@ -319,53 +278,6 @@ export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch
     createElement(FieldRow, {
       label: '标签池目录', value: fanart.poolDir, placeholder: '留空 = 插件根目录/scripts',
       onChange: (v) => { patch('fanart', { ...fanart, poolDir: v }); },
-    }),
-
-    createElement('div', { className: 'imqb2-group-title' }, '跑团'),
-    createElement(SwitchRow, {
-      label: '启用跑团', checked: dnd.enabled,
-      help: '/dnd 命令与 dnd_* 工具',
-      onChange: (v) => { patch('dnd', { ...dnd, enabled: v }); },
-    }),
-    createElement(FieldRow, {
-      label: '跑团数据目录', value: dnd.root, placeholder: '留空 = 工作目录/dnd',
-      onChange: (v) => { patch('dnd', { ...dnd, root: v }); },
-    }),
-    createElement(SwitchRow, {
-      label: '回合按钮', checked: dnd.turnButtons,
-      help: '轮到 PC 时发「结束回合 / 查看状态」按钮',
-      onChange: (v) => { patch('dnd', { ...dnd, turnButtons: v }); },
-    }),
-    createElement(SwitchRow, {
-      label: '开团后允许随机插嘴', checked: dnd.interjections,
-      help: '只吐槽、不结算；关闭后开团后只回 @',
-      onChange: (v) => { patch('dnd', { ...dnd, interjections: v }); },
-    }),
-    createElement(NumberRow, {
-      label: '团况快照注入轮数间隔', value: dnd.snapshotIntervalTurns ?? 4, min: 1, max: 20, step: 1,
-      help: '默认每 4 轮对话同步 1 次完整团况（1 = 每轮对话最多 1 次）；单轮内多次攻击/移动工具调用始终锁定零重发，换房间/开战结战/撤销/压缩时自动立即刷新',
-      onChange: (v) => { patch('dnd', { ...dnd, snapshotIntervalTurns: v }); },
-    }),
-    createElement(SwitchRow, {
-      label: '独立战斗代理', checked: combatAgent.enabled,
-      help: '开战后的下一次回复交给战斗模型，战后把团况交回主 DM；每场独立上下文，用量可用 /dnd combat 查看',
-      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, enabled: v } }); },
-    }),
-    createElement(FieldRow, {
-      label: '战斗 Provider', value: combatAgent.provider, placeholder: '填写已配置的 provider id',
-      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, provider: v.trim() } }); },
-    }),
-    createElement(FieldRow, {
-      label: '战斗模型', value: combatAgent.model, placeholder: '填写模型 id（如 deepseek-chat / deepseek-v4.1-flash）',
-      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, model: v.trim() } }); },
-    }),
-    createElement(NumberRow, {
-      label: '战斗交接字数', value: combatAgent.contextChars, min: 1000, max: 30000, step: 1000,
-      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, contextChars: v } }); },
-    }),
-    createElement(FieldRow, {
-      label: '战斗推理强度', value: combatAgent.reasoningEffort, placeholder: '留空使用模型默认',
-      onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, reasoningEffort: v.trim() } }); },
     }),
   );
 }

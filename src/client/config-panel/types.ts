@@ -1,4 +1,4 @@
-import type { BrowserConfig, ElevenLabsOutputFormat, GroupTriggerMode, ImageGenComplexity, ImageGenQuality } from '../../config.ts';
+import type { ElevenLabsOutputFormat, GroupTriggerMode, ImageGenComplexity, ImageGenQuality } from '../../config.ts';
 
 /** 访问控制配置（与 src/config.ts 的 AccessControlConfig 对应的局部投影） */
 export interface AccessControlWire {
@@ -318,7 +318,6 @@ export type ConfigWire = {
   sing?: SingWire;
   reverseImage?: ReverseImageWire;
   fanart?: FanartWire;
-  browser?: BrowserConfig;
   dnd?: DndWire;
   replyDesire?: ReplyDesireWire;
   cwd?: string;
@@ -522,4 +521,37 @@ export function normalizeChangedConfig(form: ConfigWire, initial: ConfigWire): R
   }
 
   return changed;
+}
+
+/** 折叠抽屉徽标：跑团进阶与战斗代理 */
+export function summarizeDndAdvanced(form: ConfigWire): string {
+  return form.dnd?.combatAgent?.enabled ? '战斗代理已开启' : '数据目录 · 快照间隔 · 战斗代理';
+}
+
+/** 折叠抽屉徽标：富媒体、视觉、语音与生图 */
+export function summarizeMediaDrawer(form: ConfigWire): string {
+  const active: string[] = [];
+  if (form.vision?.enabled || form.vision?.native) active.push('视觉');
+  if (form.asr?.enabled) active.push('语音识别');
+  if (form.speak?.enabled) active.push('语音合成');
+  if (form.imageGen?.enabled) active.push('生图');
+  return active.length > 0 ? active.join(' · ') : '默认仅基础下载';
+}
+
+/** 折叠抽屉徽标：共享笔记、上游监测与扩展工具 */
+export function summarizeExtrasDrawer(form: ConfigWire): string {
+  const extCount = [
+    form.bili?.enabled,
+    form.reverseImage?.enabled,
+    form.sing?.enabled,
+    form.fanart?.enabled,
+  ].filter(Boolean).length;
+  const failoverEnabled = form.modelFailover?.enabled === true;
+  if (extCount === 0 && !failoverEnabled) {
+    return '笔记 · 故障切换 · B站/搜图/点歌';
+  }
+  const parts = [form.notes?.enabled !== false ? '笔记已开' : '笔记已关'];
+  if (failoverEnabled) parts.push('故障切换已开');
+  if (extCount > 0) parts.push(`${extCount} 项扩展已开启`);
+  return parts.join(' · ');
 }

@@ -15,17 +15,18 @@ describe('owner-approved per-group profile edits', () => {
   it('edits just one list, preserves mixed rows, unrelated permissions, credential fields, and defaults', () => {
     const opaque = { insert: [{ id: 'other-plugin', config: { enabled: false } }] };
     const imageGen = { apiKeyEnv: 'CUSTOM_KEY_REFERENCE', apiKey: 'test-fixture', model: 'custom-model', allowedGroups: ['A'] };
-    const rest = { appId: 'fixture', browser: { allowedGroups: ['B'] }, toolAccess: { allowedGroups: ['C'] } };
+    const rest = { appId: 'fixture', notes: { root: 'notes' }, toolAccess: { allowedGroups: ['C'] } };
     writeFileSync(path, yaml.dump([opaque, { id: 'im-qqbot', config: { ...rest, imageGen } }, { id: 'untouched' }]));
     expect(updateProfileAllowedGroups('imageGen', ['A', ' D ', 'D'], dir, log, ['A'])).toBe(true);
     expect(contents()).toEqual([opaque, { id: 'im-qqbot', config: { ...rest, imageGen: { ...imageGen, allowedGroups: ['A', 'D'] } } }, { id: 'untouched' }]);
     expect(readdirSync(dir)).toEqual(['cordis.patch.yml']);
   });
-  it('can bootstrap and remove the final group without touching a sibling permission', () => {
+  it('can bootstrap and remove the final group without touching sibling config, and rejects unknown section', () => {
+    writeFileSync(path, yaml.dump([{ id: 'im-qqbot', config: { historyLimit: 7 } }]));
     expect(updateProfileAllowedGroups('imageGen', ['A'], dir, log)).toBe(true);
-    expect(updateProfileAllowedGroups('browser', ['B'], dir, log)).toBe(true);
+    expect(updateProfileAllowedGroups('browser' as never, ['B'], dir, log)).toBe(false);
     expect(updateProfileAllowedGroups('imageGen', [], dir, log, ['A'])).toBe(true);
-    expect(contents()).toEqual([{ id: 'im-qqbot', config: { imageGen: { allowedGroups: [] }, browser: { allowedGroups: ['B'] } } }]);
+    expect(contents()).toEqual([{ id: 'im-qqbot', config: { historyLimit: 7, imageGen: { allowedGroups: [] } } }]);
   });
   it('declines a stale approval instead of replacing a newer settings edit', () => {
     expect(updateProfileAllowedGroups('imageGen', ['A', 'B'], dir, log)).toBe(true);
