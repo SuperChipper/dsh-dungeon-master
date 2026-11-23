@@ -18,6 +18,7 @@ import type { Logger } from '../types.ts';
 import type { ModelRoute, ModelEntry } from './types.ts';
 import { PrefsStore } from './prefs-store.ts';
 import { SettingsReader } from './settings-reader.ts';
+import { getHostService } from '../host-adapter/index.ts';
 
 /** ctx.llm 服务的最小接口（listProviders 同步，listModels 异步） */
 interface LlmServiceLike {
@@ -279,12 +280,7 @@ export class ModelResolver {
 
   /** 统一的 Cordis 服务访问（可选获取：服务未注入时静默返回 undefined，避免 Proxy 抛错） */
   private getService(name: string): unknown {
-    try {
-      const ctxAny = this.ctx as unknown as { get?: (key: string) => unknown };
-      return typeof ctxAny.get === 'function' ? ctxAny.get(name) : undefined;
-    } catch {
-      return undefined;
-    }
+    return getHostService(this.ctx, name);
   }
 
   /** 获取 ctx.llm 服务（最小接口收窄，不可用时返回 undefined） */

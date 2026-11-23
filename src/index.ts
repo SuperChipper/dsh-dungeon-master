@@ -10,6 +10,7 @@ import { ConfigSchema, type ImQQBotConfig } from './config.ts';
 import { bootstrapGateway } from './gateway/index.ts';
 import type { DshAgentRegistry } from './session/index.ts';
 import { resolveProfileDir, resolveEnv } from './shared/index.ts';
+import { readHostContextProp } from './host-adapter/index.ts';
 import { ensureCredentials, persistCredentialsToProfile, registerBoundCredentialRoutes } from './setup/index.ts';
 import type { Logger } from './types.ts';
 import { installFileLog } from './shared/file-log.ts';
@@ -23,8 +24,8 @@ export type { ImQQBotConfig } from './config.ts';
 
 // ── 插件主体 ──
 export async function apply(ctx: Context, config: ImQQBotConfig): Promise<void> {
-  const agents = (ctx as unknown as Record<string, unknown>).agents as DshAgentRegistry;
-  const logger: Logger = ((ctx as unknown as Record<string, unknown>).logger as Logger) ?? console;
+  const agents = readHostContextProp<DshAgentRegistry>(ctx, 'agents')!;
+  const logger: Logger = readHostContextProp<Logger>(ctx, 'logger') ?? console;
   installFileLog(logger, config.debug === true);
   // Cordis Loader 根（profile 的 cordis.yml 所在目录）：链接安装下比
   // 插件源码路径更可靠，扫码/配置写入据此落到正确 profile。

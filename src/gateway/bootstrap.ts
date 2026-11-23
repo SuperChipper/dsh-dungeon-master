@@ -15,7 +15,7 @@ import { isAutoSteerTurnEnd } from '../transport/turn-steer.ts';
 import { cacheMsgId } from '../transport/msgid-cache.ts';
 import type { ToolsRegistryLike } from '../transport/tool-presenter.ts';
 import { QuestionChannel } from '../features/question-channel.ts';
-import { ApprovalChannel, type ApprovalChannelContext } from '../features/approval-channel.ts';
+import { ApprovalChannel } from '../features/approval-channel.ts';
 import { singingWaitGuard } from '../features/singing-wait-guard.ts';
 import { MediaReviewCoordinator } from '../features/media-review-coordinator.ts';
 import { PersonaStore, resolvePersonasDir } from '../features/persona-store.ts';
@@ -165,7 +165,7 @@ export async function bootstrapGateway(
     (senderId) => isPrivilegedSender(senderId, config),
   );
   manager.approvalChannel = approvalChannel;
-  approvalChannel.install(ctx as unknown as ApprovalChannelContext);
+  approvalChannel.install(ctx);
 
   const dndButtons = dndService !== undefined && config.dnd?.turnButtons !== false
     ? new DndTurnButtons(dndService, manager, sender, logger)

@@ -8,9 +8,9 @@
  * 协议的闭合集合，无 allow-always，只提供「允许一次 / 拒绝」两个按钮。
  */
 import { randomUUID } from 'node:crypto';
-import type { EventOptions } from '@deepseek-ai/cordis';
+import type { Context, EventOptions } from '@deepseek-ai/cordis';
 import type { InteractionEvent } from '@tencent-connect/qqbot-nodejs';
-import { readSessionEvents } from '../host-adapter/index.ts';
+import { onHostApprovalRequest, readSessionEvents } from '../host-adapter/index.ts';
 import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
 import { decodeButtonData } from './button-utils.ts';
 import { buildApprovalKeyboard, buildApprovalText } from './approval-renderer.ts';
@@ -145,15 +145,15 @@ export class ApprovalChannel {
    * `global` 是必需的：approval/request 按 agent 作用域派发，根作用域注册的
    * 监听器不带 global 会被作用域过滤掉。
    */
-  public install(ctx: ApprovalChannelContext): void {
+  public install(ctx: Context | ApprovalChannelContext): void {
     const self = this;
-    ctx.on('approval/request', (req: unknown, next: unknown) => {
+    onHostApprovalRequest(ctx, (req: unknown, next: unknown) => {
       const request = req as ApprovalRequest;
       const nextFn = next as () => Promise<ApprovalOutcome>;
       const record = self.manager.findBySessionId(request.agent.id);
       if (record) return self.park(record, request);
       return nextFn();
-    }, { global: true, prepend: true });
+    });
     this.logger.info('im-qqbot: QQ approval channel installed');
   }
 

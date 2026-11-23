@@ -19,7 +19,16 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { ImageBlock } from '@deepseek-ai/dsh-llm';
 import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
 import type { ImQQBotConfig } from '../config.ts';
-import { readSessionContentGeneration, readSessionEvents, tryReadSessionEvents } from '../host-adapter/index.ts';
+import {
+  injectHostService,
+  onHostAgentPreStep,
+  onHostSystemPromptAssemble,
+  onHostToolsExecute,
+  onHostToolsPostExecute,
+  readSessionContentGeneration,
+  readSessionEvents,
+  tryReadSessionEvents,
+} from '../host-adapter/index.ts';
 import { loadNativeImageBlock, type AttachmentStoreLike } from '../media/native-image.ts';
 import { ModelResolver } from '../model/model-resolver.ts';
 import type { ModelRoute, ModelEntry } from '../model/types.ts';
@@ -563,9 +572,7 @@ export class SessionManager {
       this.logger.info(`im-qqbot: 语音已送达，后续文字单独投递 key=${record.sessionKey}`);
       return result;
     };
-    (this.ctx as unknown as {
-      on(event: 'tools/execute', listener: typeof handler): void;
-    }).on('tools/execute', handler);
+    onHostToolsExecute(this.ctx, handler);
     this.logger.info('im-qqbot: 语音后文字独立发送已启用（保留模型续写）');
   }
 
@@ -766,9 +773,7 @@ export class SessionManager {
       return { ...assembled, sections };
     };
 
-    (this.ctx as unknown as {
-      on(event: 'system-prompt/assemble', handler: typeof assemble): void;
-    }).on('system-prompt/assemble', assemble);
+    onHostSystemPromptAssemble(this.ctx, assemble);
   }
 
   /**
@@ -777,10 +782,8 @@ export class SessionManager {
    * required：宿主关掉可选 runtime context 时也要留着，否则模型既看不到团况，也看不到新表情。
    */
   private registerRuntimeContexts(): void {
-    (this.ctx as unknown as {
-      inject?(deps: string[], callback: (scope: { systemPrompt: SystemPromptLike }) => void): void;
-    }).inject?.(['systemPrompt'], (scope) => {
-      scope.systemPrompt.context({
+    injectHostService<SystemPromptLike>(this.ctx, 'systemPrompt', (systemPrompt) => {
+      systemPrompt.context({
         name: 'qqbot:dnd-state',
         order: DND_STATE_CONTEXT_ORDER,
         required: true,
@@ -797,7 +800,7 @@ export class SessionManager {
           },
         ),
       });
-      scope.systemPrompt.context({
+      systemPrompt.context({
         name: 'qqbot:sticker-additions',
         order: STICKER_ADDITIONS_CONTEXT_ORDER,
         required: true,
@@ -1238,7 +1241,7 @@ export class SessionManager {
         : createUserMessage({ content: [{ type: 'text', text: facts }], source: QQBOT_MESSAGE_SOURCE });
       return { ...decision, additionalContexts: [...(decision.additionalContexts ?? []), contextMessage] };
     };
-    (this.ctx as unknown as { on(event: 'tools/post-execute', listener: typeof handler, options?: { global: boolean }): void }).on('tools/post-execute', handler, { global: true });
+    onHostToolsPostExecute(this.ctx, handler);
   }
 
   /**
@@ -1260,14 +1263,6 @@ export class SessionManager {
       messages?: StepMessage[];
       [key: string]: unknown;
     }
-    const on = (this.ctx as unknown as {
-      on?: (
-        event: 'agent/pre-step',
-        listener: (payload: PreStepPayload, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>,
-        options?: { global: boolean },
-      ) => void;
-    }).on;
-    if (typeof on !== 'function') return;
 
     const handler = async (payload: PreStepPayload, next: () => Promise<PreStepDecision>): Promise<PreStepDecision> => {
       const decision = await next();
@@ -1307,7 +1302,7 @@ export class SessionManager {
       return changed ? { ...decision, messages: nextMessages } : decision;
     };
 
-    on.call(this.ctx, 'agent/pre-step', handler, { global: true });
+    onHostAgentPreStep(this.ctx, handler);
   }
 
   /** 账本概览保留历史；只让低分清单跟随当前索引和静音策略。 */

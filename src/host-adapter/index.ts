@@ -26,8 +26,12 @@ interface HostCompactionTarget<TAgent> {
   compactIfNeeded?(agent: TAgent, trigger: string, signal?: AbortSignal): Promise<unknown>;
 }
 
-interface HostEventsContextLike {
-  on(event: string, handler: (...args: unknown[]) => unknown, options?: { global?: boolean }): unknown;
+export interface HostEventsContextLike {
+  on(
+    event: string,
+    handler: (...args: unknown[]) => unknown,
+    options?: { global?: boolean; prepend?: boolean },
+  ): unknown;
 }
 
 interface HostEffectContextLike {
@@ -40,6 +44,37 @@ interface HostInjectContextLike {
     callback: (scoped: Context & Record<string, unknown>) => void,
   ): { dispose?(): unknown } | void;
   get?(name: string): unknown;
+}
+
+function registerHostEvent(
+  ctx: Context | HostEventsContextLike,
+  event: string,
+  handler: (...args: unknown[]) => unknown,
+  options?: { global?: boolean; prepend?: boolean },
+): boolean {
+  const on = (ctx as unknown as Partial<HostEventsContextLike>).on;
+  if (typeof on !== 'function') return false;
+  if (options === undefined) {
+    on.call(ctx, event, handler);
+  } else {
+    on.call(ctx, event, handler, options);
+  }
+  return true;
+}
+
+/** 读取宿主 Context 根对象上的注入属性（如 `agents`、`logger`）。 */
+export function readHostContextProp<T = unknown>(ctx: Context, key: string): T | undefined {
+  return (ctx as unknown as Record<string, unknown>)[key] as T | undefined;
+}
+
+/** 安全按名获取可选宿主服务；服务未注入或访问抛错时返回 `undefined`。 */
+export function getHostService<T = unknown>(ctx: Context, name: string): T | undefined {
+  try {
+    const get = (ctx as unknown as HostInjectContextLike).get;
+    return typeof get === 'function' ? (get.call(ctx, name) as T | undefined) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** 尝试读取 Session 事件序列；未暴露任何事件源时返回 `undefined`。 */
@@ -84,7 +119,7 @@ export function onHostSessionEvent<TSession = unknown, TEvent = unknown>(
   ctx: Context,
   handler: (session: TSession, event: TEvent) => void,
 ): void {
-  (ctx as unknown as HostEventsContextLike).on('session/event', handler as (...args: unknown[]) => unknown);
+  registerHostEvent(ctx, 'session/event', handler as (...args: unknown[]) => unknown);
 }
 
 /** 全局监听宿主 `agent/turn-stopping` 钩子。 */
@@ -92,11 +127,7 @@ export function onHostAgentTurnStopping<TAgent = unknown>(
   ctx: Context,
   handler: (payload: { agent: TAgent; signal: AbortSignal }) => Promise<void> | void,
 ): void {
-  (ctx as unknown as HostEventsContextLike).on(
-    'agent/turn-stopping',
-    handler as (...args: unknown[]) => unknown,
-    { global: true },
-  );
+  registerHostEvent(ctx, 'agent/turn-stopping', handler as (...args: unknown[]) => unknown, { global: true });
 }
 
 /** 全局监听宿主 `agent/assistant-stream` 瞬态流式帧。 */
@@ -104,7 +135,7 @@ export function onHostAssistantStream(
   ctx: Context,
   handler: (payload: unknown) => void,
 ): void {
-  (ctx as unknown as HostEventsContextLike).on('agent/assistant-stream', handler, { global: true });
+  registerHostEvent(ctx, 'agent/assistant-stream', handler, { global: true });
 }
 
 /** 全局监听宿主 `agent/created` / `agent/disposed` 生命周期事件。 */
@@ -113,11 +144,47 @@ export function onHostAgentLifecycle<TAgent = unknown>(
   event: 'agent/created' | 'agent/disposed',
   handler: (payload: { agent?: TAgent }) => void,
 ): void {
-  (ctx as unknown as HostEventsContextLike).on(
-    event,
-    handler as (...args: unknown[]) => unknown,
-    { global: true },
-  );
+  registerHostEvent(ctx, event, handler as (...args: unknown[]) => unknown, { global: true });
+}
+
+/** 以全局前置瀑布监听宿主 `approval/request` 审批请求。 */
+export function onHostApprovalRequest(
+  ctx: Context | HostEventsContextLike,
+  handler: (req: unknown, next: unknown) => unknown,
+): void {
+  registerHostEvent(ctx, 'approval/request', handler, { global: true, prepend: true });
+}
+
+/** 监听宿主 `tools/execute` 工具执行瀑布。 */
+export function onHostToolsExecute<TExec = unknown, TResult = unknown>(
+  ctx: Context,
+  handler: (exec: TExec, next: () => Promise<TResult>) => Promise<TResult>,
+): void {
+  registerHostEvent(ctx, 'tools/execute', handler as (...args: unknown[]) => unknown);
+}
+
+/** 全局监听宿主 `tools/post-execute` 工具后处理瀑布。 */
+export function onHostToolsPostExecute<TExec = unknown, TResult = unknown, TDecision = unknown>(
+  ctx: Context,
+  handler: (exec: TExec, result: TResult, next: () => Promise<TDecision>) => Promise<TDecision>,
+): void {
+  registerHostEvent(ctx, 'tools/post-execute', handler as (...args: unknown[]) => unknown, { global: true });
+}
+
+/** 监听宿主 `system-prompt/assemble` 组装瀑布。 */
+export function onHostSystemPromptAssemble<TContext = unknown, TAssembled = unknown>(
+  ctx: Context,
+  handler: (assembly: unknown, context: TContext, next: () => Promise<TAssembled>) => Promise<TAssembled>,
+): void {
+  registerHostEvent(ctx, 'system-prompt/assemble', handler as (...args: unknown[]) => unknown);
+}
+
+/** 全局监听宿主 `agent/pre-step` 步前瀑布；宿主未暴露 `.on` 时返回 `false`。 */
+export function onHostAgentPreStep<TPayload = unknown, TDecision = unknown>(
+  ctx: Context,
+  handler: (payload: TPayload, next: () => Promise<TDecision>) => Promise<TDecision>,
+): boolean {
+  return registerHostEvent(ctx, 'agent/pre-step', handler as (...args: unknown[]) => unknown, { global: true });
 }
 
 /** 若子代理 `systemPrompt` 暴露了 `suppressRuntimeContext()`，则关闭其自动全量 runtime-context 注入。 */
