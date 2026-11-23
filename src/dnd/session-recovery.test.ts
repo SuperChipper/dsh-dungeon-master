@@ -362,7 +362,7 @@ describe('DM 私有备团', () => {
     const combatAgents = new DndCombatAgents(
       agents as never,
       service,
-      () => ({ ...DND_COMBAT_AGENT_DEFAULTS, enabled: true }),
+      () => ({ ...DND_COMBAT_AGENT_DEFAULTS, enabled: true, provider: 'opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high' }),
       vi.fn(),
       logger,
       join(root, 'combat-runs'),

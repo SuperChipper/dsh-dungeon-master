@@ -19,6 +19,7 @@ import { createElement, type ReactNode } from 'react';
 import { BIND_STATE_PATH } from '../shared/bind-protocol.ts';
 import { BindPanelBody } from './bind-page.ts';
 import { ConfigPanel } from './config-panel.ts';
+import { readClientHostServices, registerClientEffect, type SidebarRightLike } from './host-adapter.ts';
 
 export const name = 'im-qqbot-client';
 export const inject = ['slots', 'sidebarRight', 'sidebarRightTabs'];
@@ -27,33 +28,6 @@ export const inject = ['slots', 'sidebarRight', 'sidebarRightTabs'];
 const TAB_KIND = 'qqbot-bind';
 /** 席位注册 key（Tab 类型 id，席位按其分发；只需全局唯一，与包名解耦） */
 const TAB_ID = 'im-qqbot/bind';
-
-/** ui-sidebar-right 的 Tab 注册表服务（局部投影） */
-interface TabRegistryLike {
-  register(definition: {
-    id: string;
-    kind: string;
-    title: (address: string) => string;
-    guide?: ReadonlyArray<{
-      id: string;
-      order: number;
-      title: () => string;
-      description: () => string;
-      icon: unknown;
-    }>;
-  }): () => void;
-}
-
-/** ui-sidebar-right 的导航控制器服务（局部投影） */
-interface SidebarRightLike {
-  openTab(kind: string, options?: Record<string, unknown>): unknown;
-}
-
-/** ui-slots 的席位系统服务（局部投影） */
-interface SlotsLike {
-  inject(slotName: string, register: () => (() => void)): () => void;
-  register(spec: Record<string, unknown>, component: unknown): () => void;
-}
 
 /** 绑定入口图标（QQ 机器人，跟随主题图标色变量） */
 function BindGuideIcon(): ReactNode {
@@ -86,9 +60,7 @@ function QQBotSettingsSection(): ReactNode {
 }
 
 export function apply(ctx: Context): void {
-  const tabs = (ctx as unknown as { sidebarRightTabs?: TabRegistryLike }).sidebarRightTabs;
-  const right = (ctx as unknown as { sidebarRight?: SidebarRightLike }).sidebarRight;
-  const slots = (ctx as unknown as { slots?: SlotsLike }).slots;
+  const { tabs, right, slots } = readClientHostServices(ctx);
 
   const disposers: Array<() => void> = [];
 
@@ -131,7 +103,7 @@ export function apply(ctx: Context): void {
     disposers.push(watchAndPrompt(right));
   }
 
-  (ctx as unknown as { effect(fn: () => () => void, name?: string): void }).effect(() => () => {
+  registerClientEffect(ctx, () => () => {
     for (const dispose of disposers.reverse()) dispose();
   }, 'im-qqbot-client.binding');
 }

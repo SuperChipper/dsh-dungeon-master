@@ -185,13 +185,13 @@ export function NumberRow({ label, help, value, min, max, step, onChange }: {
 }
 
 /** 多行文本行 */
-export function AreaRow({ label, help, value, rows, onChange }: {
-  label: string; help?: string; value: string; rows?: number; onChange: (next: string) => void;
+export function AreaRow({ label, help, value, placeholder, rows, onChange }: {
+  label: string; help?: string; value: string; placeholder?: string; rows?: number; onChange: (next: string) => void;
 }): ReactNode {
   return createElement('div', { className: 'imqb2-field' },
     createElement('span', { className: 'imqb2-label' }, label),
     createElement('textarea', {
-      className: 'imqb2-input imqb2-textarea', value, rows: rows ?? 3,
+      className: 'imqb2-input imqb2-textarea', value, placeholder, rows: rows ?? 3,
       onChange: (event: ChangeEvent<HTMLTextAreaElement>) => { onChange(event.currentTarget.value); },
     }),
     help === undefined ? null : createElement('p', { className: 'imqb2-hint' }, help),

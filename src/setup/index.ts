@@ -14,6 +14,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { Logger } from '../types.ts';
+import { injectHostService, registerHostEffect } from '../host-adapter/index.ts';
 import { BindingService } from './binding-service.ts';
 import { registerBindRoutes, type WebServerLike } from './bind-routes.ts';
 import { createBrowserPresenter, createTerminalPresenter, isDesktopHost } from './presenters.ts';
@@ -65,7 +66,7 @@ export async function ensureCredentials(
   activeService = service;
 
   // 生命周期：fiber dispose 时 abort 轮询
-  (ctx as unknown as { effect(fn: () => () => void, name?: string): void }).effect(() => () => {
+  registerHostEffect(ctx, () => () => {
     service.dispose();
     if (activeService === service) activeService = null;
   }, 'im-qqbot.binding');
@@ -84,11 +85,8 @@ export async function ensureCredentials(
   // cordis 访问守卫要求服务经 inject 声明后方可访问；deps 未就绪时
   // 回调不运行但插件照常加载（CLI profile），服务就绪/替换时回调
   // 重跑（自动清理旧路由、注册新路由），与 webserver 的注入生命周期对齐。
-  (ctx as unknown as {
-    inject(deps: readonly string[], callback: (scoped: Context) => void): unknown;
-  }).inject(['webServer'], (scoped) => {
-    const webServer = (scoped as unknown as { webServer?: unknown }).webServer as WebServerLike | undefined;
-    if (webServer === undefined || typeof webServer.register !== 'function') return;
+  injectHostService<WebServerLike>(ctx, 'webServer', (webServer, scoped) => {
+    if (typeof webServer.register !== 'function') return;
     const disposeRoutes = registerBindRoutes(webServer, service, logger, {
       // 未绑定流程中的手动提交：终止扫码轮询，走同一持久化路径
       onManualCredentials: (credentials) => {
@@ -99,9 +97,7 @@ export async function ensureCredentials(
       profileDir: options.profileDir,
     });
     // 回调作用域（服务卸载/替换、插件卸载）连带注销路由
-    (scoped as unknown as { effect(fn: () => () => void, name?: string): void }).effect(() => {
-      return disposeRoutes;
-    }, 'im-qqbot.bind-routes');
+    registerHostEffect(scoped, () => disposeRoutes, 'im-qqbot.bind-routes');
   });
 
   return service.start();
@@ -120,20 +116,15 @@ export function registerBoundCredentialRoutes(
   config: Record<string, unknown>,
   profileDir?: string | null,
 ): void {
-  (ctx as unknown as {
-    inject(deps: readonly string[], callback: (scoped: Context) => void): unknown;
-  }).inject(['webServer'], (scoped) => {
-    const webServer = (scoped as unknown as { webServer?: unknown }).webServer as WebServerLike | undefined;
-    if (webServer === undefined || typeof webServer.register !== 'function') return;
+  injectHostService<WebServerLike>(ctx, 'webServer', (webServer, scoped) => {
+    if (typeof webServer.register !== 'function') return;
     const disposeRoutes = registerBindRoutes(webServer, null, logger, {
       boundAppId: () => appId,
       onManualCredentials: (credentials) => persistCredentials(credentials, logger, profileDir),
       currentConfig: () => config,
       profileDir,
     });
-    (scoped as unknown as { effect(fn: () => () => void, name?: string): void }).effect(() => {
-      return disposeRoutes;
-    }, 'im-qqbot.bind-routes');
+    registerHostEffect(scoped, () => disposeRoutes, 'im-qqbot.bind-routes');
   });
 }
 

@@ -4,9 +4,7 @@ import { AreaRow, FieldRow, ListRow, NumberRow, SelectRow, SwitchRow } from './c
 import {
   DEEPSEEK_SPEAK_WIRE_DEFAULTS,
   ELEVENLABS_SPEAK_WIRE_DEFAULTS,
-  getRoleVoiceValue,
-  mergeExtraRoleVoices,
-  setBuiltinRoleVoice,
+  parseRoleVoices,
   type AsrFallbackWire,
   type AsrWire,
   type ConfigWire,
@@ -228,17 +226,17 @@ export function MediaConfigSections({
     }),
     asr.mode === 'chat' ? createElement(FieldRow, {
       label: 'chat 转写网关地址', value: asr.chatBaseUrl ?? '',
-      placeholder: '留空 = QQBOT_TRANSCRIBE_BASE_URL 或 opencode-go 默认网关',
+      placeholder: '留空 = QQBOT_TRANSCRIBE_BASE_URL',
       onChange: (v) => { patch('asr', { ...asr, chatBaseUrl: v.trim() }); },
     }) : null,
     asr.mode === 'chat' ? createElement(FieldRow, {
       label: 'chat 转写模型', value: asr.chatModel ?? '',
-      placeholder: '留空 = QQBOT_TRANSCRIBE_MODEL 或 mimo-v2.6-flash',
+      placeholder: '留空 = QQBOT_TRANSCRIBE_MODEL',
       onChange: (v) => { patch('asr', { ...asr, chatModel: v.trim() }); },
     }) : null,
     asr.mode === 'chat' ? createElement(FieldRow, {
       label: 'chat 转写凭证环境变量', value: asr.chatApiKeyEnv ?? '',
-      placeholder: '留空 = QQBOT_TRANSCRIBE_KEY_REF 或 OPENCODE_GO_API_KEY',
+      placeholder: '留空 = QQBOT_TRANSCRIBE_KEY_REF',
       help: '支持 credentials 凭证名或环境变量名；直填密钥仅可在 cordis.patch.yml 中配置',
       onChange: (v) => { patch('asr', { ...asr, chatApiKeyEnv: v.trim() }); },
     }) : null,
@@ -438,35 +436,18 @@ export function MediaConfigSections({
         onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, outputFormat: v as ElevenLabsOutputFormat } }); },
       }),
       createElement(FieldRow, {
-        label: '大肥鱼 (feiyu) Voice ID', value: getRoleVoiceValue(elevenlabs.roleVoices, 'feiyu'), placeholder: '留空 = 走默认 Voice ID 或回退本地嗓子',
-        onChange: (v) => {
-          patch('speak', { ...speak, elevenlabs: { ...elevenlabs, roleVoices: setBuiltinRoleVoice(elevenlabs.roleVoices, 'feiyu', v) } });
-        },
-      }),
-      createElement(FieldRow, {
-        label: '大肥龙 (dragon) Voice ID', value: getRoleVoiceValue(elevenlabs.roleVoices, 'dragon'), placeholder: 'white-dragon 人设使用的 voice_id',
-        onChange: (v) => {
-          patch('speak', { ...speak, elevenlabs: { ...elevenlabs, roleVoices: setBuiltinRoleVoice(elevenlabs.roleVoices, 'dragon', v) } });
-        },
-      }),
-      createElement(FieldRow, {
-        label: '哈基米 (hakimi) Voice ID', value: getRoleVoiceValue(elevenlabs.roleVoices, 'hakimi'), placeholder: 'Gemini 人设使用的 voice_id',
-        onChange: (v) => {
-          patch('speak', { ...speak, elevenlabs: { ...elevenlabs, roleVoices: setBuiltinRoleVoice(elevenlabs.roleVoices, 'hakimi', v) } });
-        },
-      }),
-      createElement(FieldRow, {
         label: '默认兜底 Voice ID', value: elevenlabs.defaultVoiceId, placeholder: '留空 = 未映射人设直接回退本地/edge-tts',
         onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, defaultVoiceId: v.trim() } }); },
       }),
       createElement(AreaRow, {
-        label: '额外人设音色映射',
+        label: '人设音色映射',
         value: extraRoleVoicesText,
-        rows: 2,
-        help: '每行一条 personaId=voiceId（可覆盖具体人设如 soft-whale=xxx；也可以直接写到人设 .md 的 voiceId 头字段）',
+        placeholder: 'persona-a=<your-voice-id>\npersona-b=<your-voice-id>',
+        rows: 3,
+        help: '每行一条 personaId=voiceId（请填写你自己 ElevenLabs 账号下的 voice_id；也可写到人设 .md 的 voiceId 头字段）',
         onChange: (raw) => {
           setExtraRoleVoicesText(raw);
-          patch('speak', { ...speak, elevenlabs: { ...elevenlabs, roleVoices: mergeExtraRoleVoices(elevenlabs.roleVoices, raw) } });
+          patch('speak', { ...speak, elevenlabs: { ...elevenlabs, roleVoices: parseRoleVoices(raw) } });
         },
       }),
       createElement(NumberRow, {
@@ -511,35 +492,18 @@ export function MediaConfigSections({
         onChange: (v) => { patch('speak', { ...speak, deepseek: { ...deepseek, apiKeyEnv: v.trim() } }); },
       }),
       createElement(FieldRow, {
-        label: 'DeepSeek 大肥鱼 (feiyu) 音色', value: getRoleVoiceValue(deepseek.roleVoices, 'feiyu'), placeholder: 'stella（海星）',
-        onChange: (v) => {
-          patch('speak', { ...speak, deepseek: { ...deepseek, roleVoices: setBuiltinRoleVoice(deepseek.roleVoices, 'feiyu', v) } });
-        },
-      }),
-      createElement(FieldRow, {
-        label: 'DeepSeek 大肥龙 (dragon) 音色', value: getRoleVoiceValue(deepseek.roleVoices, 'dragon'), placeholder: '留空 = 交给 ElevenLabs 或本地',
-        onChange: (v) => {
-          patch('speak', { ...speak, deepseek: { ...deepseek, roleVoices: setBuiltinRoleVoice(deepseek.roleVoices, 'dragon', v) } });
-        },
-      }),
-      createElement(FieldRow, {
-        label: 'DeepSeek 哈基米 (hakimi) 音色', value: getRoleVoiceValue(deepseek.roleVoices, 'hakimi'), placeholder: '留空 = 交给 ElevenLabs 或本地',
-        onChange: (v) => {
-          patch('speak', { ...speak, deepseek: { ...deepseek, roleVoices: setBuiltinRoleVoice(deepseek.roleVoices, 'hakimi', v) } });
-        },
-      }),
-      createElement(FieldRow, {
-        label: 'DeepSeek 默认兜底音色', value: deepseek.defaultVoiceId, placeholder: '留空 = 仅显式匹配角色时走 DeepSeek',
+        label: 'DeepSeek 默认兜底音色', value: deepseek.defaultVoiceId, placeholder: '留空 = 仅显式匹配人设时走 DeepSeek',
         onChange: (v) => { patch('speak', { ...speak, deepseek: { ...deepseek, defaultVoiceId: v.trim() } }); },
       }),
       createElement(AreaRow, {
-        label: 'DeepSeek 额外人设映射',
+        label: 'DeepSeek 人设音色映射',
         value: extraDsRoleVoicesText,
-        rows: 2,
-        help: '每行一条 personaId=voiceId（如 soft-whale=stella）',
+        placeholder: 'persona-a=stella\npersona-b=tide',
+        rows: 3,
+        help: '每行一条 personaId=voiceId（如内置 stella / tide 或你自己的音色 ID）',
         onChange: (raw) => {
           setExtraDsRoleVoicesText(raw);
-          patch('speak', { ...speak, deepseek: { ...deepseek, roleVoices: mergeExtraRoleVoices(deepseek.roleVoices, raw) } });
+          patch('speak', { ...speak, deepseek: { ...deepseek, roleVoices: parseRoleVoices(raw) } });
         },
       }),
       createElement(NumberRow, {

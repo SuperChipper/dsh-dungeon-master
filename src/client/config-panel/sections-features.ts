@@ -2,6 +2,7 @@ import { createElement, Fragment, type ReactNode } from 'react';
 import type { BrowserConfig } from '../../config.ts';
 import { BrowserSelectRow, FieldRow, ListRow, NumberRow, SwitchRow } from './controls.ts';
 import type {
+  BiliWire,
   CleanupWire,
   ConfigWire,
   DndWire,
@@ -11,6 +12,8 @@ import type {
   NotesSemanticWire,
   NotesWire,
   PatchFn,
+  ReverseImageWire,
+  SingWire,
   ToolAccessWire,
 } from './types.ts';
 
@@ -39,20 +42,23 @@ export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch
     primaryProvider: '',
     primaryModel: '',
     primaryApiKeyEnv: '',
-    backupProvider: 'commandcode',
-    backupModel: 'deepseek/deepseek-v4.1-flash',
-    backupApiKeyEnv: 'COMMANDCODE_API_KEY',
+    backupProvider: '',
+    backupModel: '',
+    backupApiKeyEnv: '',
     ttftThresholdMs: 8000,
     notify: true,
   };
   const cleanup: CleanupWire = form.cleanup ?? { dryRun: false };
-  const fanart: FanartWire = form.fanart ?? { enabled: true, proxy: '', poolDir: '' };
+  const bili: BiliWire = form.bili ?? { enabled: false };
+  const reverseImage: ReverseImageWire = form.reverseImage ?? { enabled: false };
+  const sing: SingWire = form.sing ?? { enabled: false, baseUrl: '' };
+  const fanart: FanartWire = form.fanart ?? { enabled: false, proxy: '', poolDir: '' };
   const browser: BrowserConfig = form.browser ?? {
     enabled: false, allowedGroups: [], mode: 'local', channel: 'chrome', userDataDir: '', headless: false,
     locale: 'zh-CN', timezoneId: 'Asia/Shanghai', timeoutMs: 30000, maxTextChars: 12000,
   };
   const dnd: DndWire = form.dnd ?? { enabled: true, root: '', turnButtons: true, interjections: true };
-  const combatAgent = dnd.combatAgent ?? { enabled: false, provider: 'opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high', contextChars: 8000 };
+  const combatAgent = dnd.combatAgent ?? { enabled: false, provider: '', model: '', reasoningEffort: '', contextChars: 8000 };
 
   return createElement(Fragment, null,
     createElement('div', { className: 'imqb2-group-title' }, '共享笔记'),
@@ -170,7 +176,7 @@ export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch
     createElement('div', { className: 'imqb2-group-title' }, '上游监测'),
     createElement(SwitchRow, {
       label: '监测 upstream 状态并自动切模型', checked: failover.enabled,
-      help: '走 opencode 时每几分钟查一次状态接口；主用降级就切到备用，恢复后再切回',
+      help: '支持自动查询上游状态接口或测试首 token 时延；主用降级就切到备用，恢复后再切回',
       onChange: (v) => { patch('modelFailover', { ...failover, enabled: v }); },
     }),
     createElement(NumberRow, {
@@ -187,11 +193,11 @@ export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch
     }),
     createElement(FieldRow, {
       label: '备用 provider', help: '留空则不启用；切换后所有活跃会话都走这里',
-      value: failover.backupProvider,
+      value: failover.backupProvider, placeholder: '填写备用 provider id',
       onChange: (v) => { patch('modelFailover', { ...failover, backupProvider: v }); },
     }),
     createElement(FieldRow, {
-      label: '备用模型 id', value: failover.backupModel,
+      label: '备用模型 id', value: failover.backupModel, placeholder: '填写备用模型 id',
       onChange: (v) => { patch('modelFailover', { ...failover, backupModel: v }); },
     }),
     createElement(NumberRow, {
@@ -201,7 +207,8 @@ export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch
     }),
     createElement(FieldRow, {
       label: '备用凭据环境变量', value: failover.backupApiKeyEnv,
-      help: '如 COMMANDCODE_API_KEY；从 ~/.dsh/.env 或凭证库读取，不填则只认环境里已有的',
+      placeholder: '环境变量名，如 BACKUP_API_KEY',
+      help: '从 ~/.dsh/.env 或凭证库读取，不填则只认环境里已有的',
       onChange: (v) => { patch('modelFailover', { ...failover, backupApiKeyEnv: v }); },
     }),
     createElement(SwitchRow, {
@@ -279,6 +286,27 @@ export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch
       onChange: (v) => { patch('browser', { ...browser, maxTextChars: v }); },
     }),
 
+    createElement('div', { className: 'imqb2-group-title' }, '扩展工具（默认关闭）'),
+    createElement(SwitchRow, {
+      label: '启用 B 站只读工具', checked: bili.enabled,
+      help: 'qqbot_bili / qqbot_bili_auth（搜索、视频信息、评论、字幕及主人私聊扫码）',
+      onChange: (v) => { patch('bili', { ...bili, enabled: v }); },
+    }),
+    createElement(SwitchRow, {
+      label: '启用以图搜图工具', checked: reverseImage.enabled,
+      help: 'qqbot_reverse_image（trace.moe + SauceNAO，上传图片查出处）',
+      onChange: (v) => { patch('reverseImage', { ...reverseImage, enabled: v }); },
+    }),
+    createElement(SwitchRow, {
+      label: '启用点歌工具', checked: sing.enabled,
+      help: 'qqbot_sing（对接外部唱歌 HTTP 服务，异步下载唱完成品发回会话）',
+      onChange: (v) => { patch('sing', { ...sing, enabled: v }); },
+    }),
+    sing.enabled ? createElement(FieldRow, {
+      label: '唱歌服务地址', value: sing.baseUrl, placeholder: '留空 = QQBOT_SING_URL 或 http://127.0.0.1:8766',
+      onChange: (v) => { patch('sing', { ...sing, baseUrl: v }); },
+    }) : null,
+
     createElement('div', { className: 'imqb2-group-title' }, '搜图'),
     createElement(SwitchRow, {
       label: '启用 qqbot_fanart 搜图', checked: fanart.enabled,
@@ -289,7 +317,7 @@ export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch
       onChange: (v) => { patch('fanart', { ...fanart, proxy: v }); },
     }),
     createElement(FieldRow, {
-      label: 'CP 池目录', value: fanart.poolDir, placeholder: '留空 = 插件根目录/scripts',
+      label: '标签池目录', value: fanart.poolDir, placeholder: '留空 = 插件根目录/scripts',
       onChange: (v) => { patch('fanart', { ...fanart, poolDir: v }); },
     }),
 
@@ -324,11 +352,11 @@ export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch
       onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, enabled: v } }); },
     }),
     createElement(FieldRow, {
-      label: '战斗 Provider', value: combatAgent.provider, placeholder: 'opencode-go',
+      label: '战斗 Provider', value: combatAgent.provider, placeholder: '填写已配置的 provider id',
       onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, provider: v.trim() } }); },
     }),
     createElement(FieldRow, {
-      label: '战斗模型', value: combatAgent.model, placeholder: 'deepseek-v4.1-flash',
+      label: '战斗模型', value: combatAgent.model, placeholder: '填写模型 id（如 deepseek-chat / deepseek-v4.1-flash）',
       onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, model: v.trim() } }); },
     }),
     createElement(NumberRow, {
@@ -336,7 +364,7 @@ export function FeatureConfigSections({ form, patch }: { form: ConfigWire; patch
       onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, contextChars: v } }); },
     }),
     createElement(FieldRow, {
-      label: '战斗推理强度', value: combatAgent.reasoningEffort, placeholder: 'high（留空使用模型默认）',
+      label: '战斗推理强度', value: combatAgent.reasoningEffort, placeholder: '留空使用模型默认',
       onChange: (v) => { patch('dnd', { ...dnd, combatAgent: { ...combatAgent, reasoningEffort: v.trim() } }); },
     }),
   );

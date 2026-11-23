@@ -3,11 +3,9 @@ import {
   cleanRoleVoicesMap,
   DEEPSEEK_SPEAK_WIRE_DEFAULTS,
   ELEVENLABS_SPEAK_WIRE_DEFAULTS,
-  formatExtraRoleVoices,
-  getRoleVoiceValue,
-  mergeExtraRoleVoices,
+  formatRoleVoices,
   normalizeChangedConfig,
-  setBuiltinRoleVoice,
+  parseRoleVoices,
   shallowEqual,
   type ConfigWire,
 } from '../client/config-panel/types.ts';
@@ -28,6 +26,7 @@ describe('config-panel helpers', () => {
       adminOpenids: [' U1 ', '', 'U2 '],
       access: { c2cMode: 'open', c2cAllow: [], groupMode: 'allowlist', groupAllow: [' G1 ', ' ', 'G2'] },
       personas: { root: '  custom-personas  ' },
+      sing: { enabled: true, baseUrl: ' http://127.0.0.1:8766/ ' },
       speak: {
         enabled: true,
         voice: ' zh-CN-XiaoyiNeural ',
@@ -40,12 +39,12 @@ describe('config-panel helpers', () => {
           ...ELEVENLABS_SPEAK_WIRE_DEFAULTS,
           enabled: true,
           defaultVoiceId: ' v-default ',
-          roleVoices: { ' feiyu ': ' v1 ', empty: '  ' },
+          roleVoices: { ' narrator ': ' v1 ', empty: '  ' },
         },
         deepseek: {
           ...DEEPSEEK_SPEAK_WIRE_DEFAULTS,
           enabled: true,
-          roleVoices: { hakimi: ' tide ', blank: '' },
+          roleVoices: { dm: ' tide ', blank: '' },
         },
       },
     };
@@ -55,6 +54,7 @@ describe('config-panel helpers', () => {
     expect(changed.adminOpenids).toEqual(['U1', 'U2']);
     expect(changed.access).toEqual({ c2cMode: 'open', c2cAllow: [], groupMode: 'allowlist', groupAllow: ['G1', 'G2'] });
     expect(changed.personas).toEqual({ root: 'custom-personas' });
+    expect(changed.sing).toEqual({ enabled: true, baseUrl: 'http://127.0.0.1:8766/' });
     expect(changed.speak).toMatchObject({
       voice: 'zh-CN-XiaoyiNeural',
       rate: '+5%',
@@ -62,29 +62,20 @@ describe('config-panel helpers', () => {
       gsvUrl: 'http://127.0.0.1:8765',
       elevenlabs: {
         defaultVoiceId: 'v-default',
-        roleVoices: { feiyu: 'v1' },
+        roleVoices: { narrator: 'v1' },
       },
       deepseek: {
-        roleVoices: { hakimi: 'tide' },
+        roleVoices: { dm: 'tide' },
       },
     });
   });
 
-  it('roleVoices 读写、格式化与额外人设合并保持内置/自定义隔离', () => {
-    let map: Record<string, string> = { Feiyu: 'v-feiyu', 'soft-whale': 'v-whale' };
-    expect(getRoleVoiceValue(map, 'feiyu')).toBe('v-feiyu');
-    expect(getRoleVoiceValue(map, 'dragon')).toBe('');
-
-    map = setBuiltinRoleVoice(map, 'dragon', ' v-dragon ');
-    expect(map).toEqual({ Feiyu: 'v-feiyu', 'soft-whale': 'v-whale', dragon: 'v-dragon' });
-
-    map = setBuiltinRoleVoice(map, 'feiyu', '   ');
-    expect(map).toEqual({ 'soft-whale': 'v-whale', dragon: 'v-dragon' });
-
-    expect(formatExtraRoleVoices(map)).toBe('soft-whale=v-whale');
-    expect(mergeExtraRoleVoices(map, 'feiyu=ignored\nnew-role = v-new\nbadline')).toEqual({
-      dragon: 'v-dragon',
-      'new-role': 'v-new',
+  it('roleVoices 格式化、解析与空白清洗保持任意 personaId 通用映射', () => {
+    const map: Record<string, string> = { ' narrator ': ' v-narrator ', dm: 'v-dm', empty: '   ' };
+    expect(formatRoleVoices(map)).toBe('narrator=v-narrator\ndm=v-dm');
+    expect(parseRoleVoices('narrator = v1\ndm=tide\nbadline\nemptyValue=\n=emptyKey')).toEqual({
+      narrator: 'v1',
+      dm: 'tide',
     });
     expect(cleanRoleVoicesMap({ ' a ': ' 1 ', b: ' ' })).toEqual({ a: '1' });
   });

@@ -21,7 +21,7 @@ import { CoreConfigSections } from './config-panel/sections-core.ts';
 import { FeatureConfigSections } from './config-panel/sections-features.ts';
 import { MediaConfigSections } from './config-panel/sections-media.ts';
 import {
-  formatExtraRoleVoices,
+  formatRoleVoices,
   normalizeChangedConfig,
   shallowEqual,
   type ConfigWire,
@@ -53,8 +53,8 @@ export function ConfigPanel(): ReactNode {
         if (stopped) return;
         setInitial(body.config);
         setForm(body.config);
-        setExtraRoleVoicesText(formatExtraRoleVoices(body.config.speak?.elevenlabs?.roleVoices ?? {}));
-        setExtraDsRoleVoicesText(formatExtraRoleVoices(body.config.speak?.deepseek?.roleVoices ?? {}));
+        setExtraRoleVoicesText(formatRoleVoices(body.config.speak?.elevenlabs?.roleVoices ?? {}));
+        setExtraDsRoleVoicesText(formatRoleVoices(body.config.speak?.deepseek?.roleVoices ?? {}));
       })
       .catch((err: unknown) => {
         if (!stopped) setLoadError(err instanceof Error ? err.message : String(err));

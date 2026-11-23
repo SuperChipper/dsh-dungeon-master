@@ -228,9 +228,9 @@ export interface ElevenLabsSpeakConfig {
   modelId: string;
   /** 输出音频格式（需 MP3 以便直接作为 QQ 语音发送） */
   outputFormat: ElevenLabsOutputFormat;
-  /** 默认兜底 voice_id（当角色/人设未单独映射时使用） */
+  /** 默认兜底 voice_id（当人设未单独映射时使用） */
   defaultVoiceId: string;
-  /** 角色/人设 ID 到 ElevenLabs voice_id 的映射（如 feiyu / dragon / hakimi 或具体 personaId） */
+  /** 人设 ID 到 ElevenLabs voice_id 的映射（如 persona-a -> <voice_id>） */
   roleVoices: Record<string, string>;
   /** 语速倍率（0.7 ~ 1.2，1.0 = 原速） */
   speed: number;
@@ -258,7 +258,7 @@ export interface DeepSeekSpeakConfig {
   apiKeyEnv: string;
   /** 默认兜底 voice_id（如 stella / tide；留空则仅按 roleVoices 命中时走 DeepSeek） */
   defaultVoiceId: string;
-  /** 角色/人设 ID 到 DeepSeek voice_id 的映射（如 feiyu -> stella） */
+  /** 人设 ID 到 DeepSeek voice_id 的映射（如 persona-a -> stella） */
   roleVoices: Record<string, string>;
   /** 语速倍率（0.5 ~ 2.0，1.0 = 原速，非 1.0 时用 ffmpeg atempo 调整） */
   speed: number;
@@ -365,12 +365,29 @@ export interface BrowserConfig {
   maxTextChars: number;
 }
 
+export interface BiliConfig {
+  /** 是否注册 qqbot_bili / qqbot_bili_auth B 站只读工具 */
+  enabled: boolean;
+}
+
+export interface SingConfig {
+  /** 是否注册 qqbot_sing 点歌工具（对接外部唱歌 HTTP 服务） */
+  enabled: boolean;
+  /** 唱歌服务地址（空 = QQBOT_SING_URL 或 http://127.0.0.1:8766） */
+  baseUrl: string;
+}
+
+export interface ReverseImageConfig {
+  /** 是否注册 qqbot_reverse_image 以图搜图工具 */
+  enabled: boolean;
+}
+
 export interface FanartConfig {
-  /** 是否注册 qqbot_fanart_pick 搜图工具 */
+  /** 是否注册 qqbot_fanart 搜图工具 */
   enabled: boolean;
   /** 访问 pixiv / safebooru 的 HTTP 代理（空 = 环境变量 HTTPS_PROXY，再退到 Windows 系统代理） */
   proxy: string;
-  /** CP 池目录（pixiv-tags.json / fanart-tags.json）；空 = 插件根目录下的 scripts/ */
+  /** 标签池目录（pixiv-tags.json / fanart-tags.json）；空 = 插件根目录下的 scripts/ */
   poolDir: string;
 }
 
@@ -583,7 +600,7 @@ export interface ImQQBotConfig {
   /** 工具权限：哪些会话能用终端、文件工具能碰哪些目录 */
   toolAccess: ToolAccessConfig;
 
-  /** 上游状态监测与主备模型切换（走 opencode 时才有意义） */
+  /** 上游状态监测与主备模型切换 */
   modelFailover: ModelFailoverConfig;
   /** 表情自动收藏（qqbot_save_sticker + 动态表情清单） */
   stickers: StickersConfig;
@@ -591,7 +608,13 @@ export interface ImQQBotConfig {
   personas?: PersonasConfig;
   /** 共享笔记库（qqbot_notes_search / qqbot_notes_save + 自动召回） */
   notes: NotesConfig;
-  /** 搜图工具（qqbot_fanart_pick） */
+  /** B 站只读工具（qqbot_bili / qqbot_bili_auth，默认关闭） */
+  bili?: BiliConfig;
+  /** 外部唱歌服务工具（qqbot_sing，默认关闭） */
+  sing?: SingConfig;
+  /** 以图搜图工具（qqbot_reverse_image，默认关闭） */
+  reverseImage?: ReverseImageConfig;
+  /** 搜图工具（qqbot_fanart，默认关闭） */
   fanart: FanartConfig;
   browser?: BrowserConfig;
   /** 跑团（/dnd + dnd_* 工具） */
@@ -641,9 +664,9 @@ export const ModelFailoverSchema: Schema<ModelFailoverConfig> = Schema.object({
   primaryProvider: Schema.string().default('').description('主用 provider（空=跟随当前配置）'),
   primaryModel: Schema.string().default('').description('主用模型 id'),
   primaryApiKeyEnv: Schema.string().default('').description('主用探测凭据的环境变量名（状态接口方式不需要）'),
-  backupProvider: Schema.string().default('commandcode').description('备用 provider'),
-  backupModel: Schema.string().default('deepseek/deepseek-v4.1-flash').description('备用模型 id'),
-  backupApiKeyEnv: Schema.string().default('COMMANDCODE_API_KEY').description('备用探测凭据的环境变量名'),
+  backupProvider: Schema.string().default('').description('备用 provider'),
+  backupModel: Schema.string().default('').description('备用模型 id'),
+  backupApiKeyEnv: Schema.string().default('').description('备用探测凭据的环境变量名'),
   ttftThresholdMs: Schema.number().default(8000).description('首 token 时延阈值（毫秒），超过判降级'),
   notify: Schema.boolean().default(true).description('切换时在群里说一句'),
 });
@@ -728,21 +751,34 @@ export const BrowserSchema: Schema<BrowserConfig> = Schema.object({
   locale: 'zh-CN', timezoneId: 'Asia/Shanghai', timeoutMs: 30000, maxTextChars: 12000,
 });
 
+export const BiliSchema: Schema<BiliConfig> = Schema.object({
+  enabled: Schema.boolean().default(false).description('是否注册 qqbot_bili / qqbot_bili_auth B 站只读工具'),
+}).default({ enabled: false });
+
+export const SingSchema: Schema<SingConfig> = Schema.object({
+  enabled: Schema.boolean().default(false).description('是否注册 qqbot_sing 点歌工具'),
+  baseUrl: Schema.string().default('').description('点歌服务 HTTP 地址（空=QQBOT_SING_URL 或 http://127.0.0.1:8766）'),
+}).default({ enabled: false, baseUrl: '' });
+
+export const ReverseImageSchema: Schema<ReverseImageConfig> = Schema.object({
+  enabled: Schema.boolean().default(false).description('是否注册 qqbot_reverse_image 以图搜图工具'),
+}).default({ enabled: false });
+
 export const FanartSchema: Schema<FanartConfig> = Schema.object({
-  enabled: Schema.boolean().default(true).description('是否启用 qqbot_fanart 搜图工具'),
+  enabled: Schema.boolean().default(false).description('是否启用 qqbot_fanart 搜图工具'),
   proxy: Schema.string().default('').description('pixiv/safebooru 用的 HTTP 代理（空=HTTPS_PROXY 或系统代理）'),
-  poolDir: Schema.string().default('').description('CP 池目录（空=插件根目录/scripts）'),
+  poolDir: Schema.string().default('').description('标签池目录（空=插件根目录/scripts）'),
 });
 
 export const DND_COMBAT_AGENT_DEFAULTS: DndCombatAgentConfig = {
-  enabled: false, provider: 'opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high', contextChars: 8000,
+  enabled: false, provider: '', model: '', reasoningEffort: '', contextChars: 8000,
 };
 
 export const DndCombatAgentSchema: Schema<DndCombatAgentConfig> = Schema.object({
   enabled: Schema.boolean().default(false).description('使用独立战斗代理，战后交回主 DM'),
-  provider: Schema.string().default('opencode-go').description('战斗模型 Provider'),
-  model: Schema.string().default('deepseek-v4.1-flash').description('战斗模型 ID'),
-  reasoningEffort: Schema.string().default('high').description('战斗推理强度（空=模型默认）'),
+  provider: Schema.string().default('').description('战斗模型 Provider'),
+  model: Schema.string().default('').description('战斗模型 ID'),
+  reasoningEffort: Schema.string().default('').description('战斗推理强度（空=模型默认）'),
   contextChars: Schema.number().min(1000).max(30000).step(1).default(8000).description('开战交接的最近对话字数上限'),
 });
 
@@ -847,9 +883,9 @@ export const AsrSchema: Schema<AsrConfig> = Schema.object({
   apiKey: Schema.string().default('').description('OpenAI 接口直填密钥（不上表单回显）'),
   apiKeyEnv: Schema.string().default('').description('OpenAI 兼容接口密钥环境变量名（空=QQBOT_ASR_API_KEY）'),
   model: Schema.string().default('Qwen/Qwen3-ASR-1.7B').description('OpenAI 转写模型 id'),
-  chatBaseUrl: Schema.string().default('').description('chat 转写网关地址（空=QQBOT_TRANSCRIBE_BASE_URL 或默认网关）'),
-  chatModel: Schema.string().default('').description('chat 转写模型 id（空=QQBOT_TRANSCRIBE_MODEL 或 mimo-v2.6-flash）'),
-  chatApiKeyEnv: Schema.string().default('').description('chat 转写凭证名/环境变量（空=QQBOT_TRANSCRIBE_KEY_REF 或 OPENCODE_GO_API_KEY）'),
+  chatBaseUrl: Schema.string().default('').description('chat 转写网关地址（空=读取环境变量 QQBOT_TRANSCRIBE_BASE_URL）'),
+  chatModel: Schema.string().default('').description('chat 转写模型 id（空=读取环境变量 QQBOT_TRANSCRIBE_MODEL）'),
+  chatApiKeyEnv: Schema.string().default('').description('chat 转写凭证名/环境变量（空=读取环境变量 QQBOT_TRANSCRIBE_KEY_REF）'),
   chatApiKey: Schema.string().default('').description('chat 转写直填密钥（优先于环境变量，不上表单回显）'),
   chatReasoningEffort: Schema.string().default('none').description('chat 转写 reasoning_effort（默认 none 防思考耗尽 token；填 omit 表示不传）'),
   preferQQ: Schema.boolean().default(true).description('QQ 自带识别文本存在时优先使用'),
@@ -1109,12 +1145,12 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
     primaryProvider: '',
     primaryModel: '',
     primaryApiKeyEnv: '',
-    backupProvider: 'commandcode',
-    backupModel: 'deepseek/deepseek-v4.1-flash',
-    backupApiKeyEnv: 'COMMANDCODE_API_KEY',
+    backupProvider: '',
+    backupModel: '',
+    backupApiKeyEnv: '',
     ttftThresholdMs: 8000,
     notify: true,
-  }).description('上游状态监测：走 opencode 时按状态接口自动切到备用模型'),
+  }).description('上游状态监测：异常时自动切到备用模型'),
   stickers: StickersSchema.default({
     enabled: true,
     root: '',
@@ -1142,11 +1178,14 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
     judge: NOTE_JUDGE_DEFAULTS,
   }).description('共享笔记库配置'),
   browser: BrowserSchema.description('Playwright 浏览器（CDP 地址用 QQBOT_BROWSER_CDP_ENDPOINT 环境变量）'),
+  bili: BiliSchema.description('B 站只读工具开关（默认关闭）'),
+  sing: SingSchema.description('点歌工具配置（默认关闭，需外部唱歌 HTTP 服务）'),
+  reverseImage: ReverseImageSchema.description('以图搜图工具开关（默认关闭）'),
   fanart: FanartSchema.default({
-    enabled: true,
+    enabled: false,
     proxy: '',
     poolDir: '',
-  }).description('搜图工具配置'),
+  }).description('搜图工具配置（默认关闭）'),
   dnd: DndSchema.default({
     enabled: true,
     root: '',

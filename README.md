@@ -122,7 +122,7 @@ dnd:
 | 😺 表情与创作 | 情绪自动收藏（`qqbot_save_sticker`）、哈希匹配（`qqbot_match_sticker`）、[`qqbot-sticker-maker`](./skills/qqbot-sticker-maker/SKILL.md) Q 版透明表情制作与 [`qqbot-image-studio`](./skills/qqbot-image-studio/SKILL.md) 生图工作流 |
 | 🖼 多模态 | 图文同发（`caption`）、`deepseek-native` 原生读图、在线 TTS / 可配置 ASR 与整段视频关键帧理解 |
 | 🔧 实用工具 | 以图搜图、B 站只读工具、同人图挑选、按群白名单授权的 Playwright 浏览器、临时文件定期清理（`/bot-cleanup`） |
-| ⏰ 定时与高可用 | `/new` 与人设切换自动迁移定时任务、群聊主动发送失败补发、`modelFailover` 主备模型自动故障转移与桌宠余额适配 |
+| ⏰ 定时与高可用 | `/new` 与人设切换自动迁移定时任务、群聊主动发送失败补发、`modelFailover` 主备模型自动故障转移 |
 
 ### 权限与隐私安全
 

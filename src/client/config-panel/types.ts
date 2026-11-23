@@ -213,6 +213,22 @@ export interface CleanupWire {
   dryRun: boolean;
 }
 
+/** B 站只读工具（与 src/config.ts 的 BiliConfig 对应） */
+export interface BiliWire {
+  enabled: boolean;
+}
+
+/** 点歌工具（与 src/config.ts 的 SingConfig 对应） */
+export interface SingWire {
+  enabled: boolean;
+  baseUrl: string;
+}
+
+/** 以图搜图工具（与 src/config.ts 的 ReverseImageConfig 对应） */
+export interface ReverseImageWire {
+  enabled: boolean;
+}
+
 /** 搜图（与 src/config.ts 的 FanartConfig 对应） */
 export interface FanartWire {
   enabled: boolean;
@@ -298,6 +314,9 @@ export type ConfigWire = {
   sendFile?: SendFileWire;
   speak?: SpeakWire;
   cleanup?: CleanupWire;
+  bili?: BiliWire;
+  sing?: SingWire;
+  reverseImage?: ReverseImageWire;
   fanart?: FanartWire;
   browser?: BrowserConfig;
   dnd?: DndWire;
@@ -351,46 +370,21 @@ export const GROUP_TRIGGER_OPTIONS: Array<{ value: GroupTriggerMode; label: stri
   { value: 'all', label: '回复全部群消息（all）' },
 ];
 
-const BUILTIN_SPEAK_ROLES = new Set(['feiyu', 'dragon', 'hakimi']);
-
-export function getRoleVoiceValue(roleVoices: Record<string, string>, key: string): string {
-  const needle = key.toLowerCase();
-  for (const [k, v] of Object.entries(roleVoices)) {
-    if (k.trim().toLowerCase() === needle) return v;
-  }
-  return '';
-}
-
-export function setBuiltinRoleVoice(roleVoices: Record<string, string>, role: string, voiceId: string): Record<string, string> {
-  const next: Record<string, string> = {};
-  for (const [k, v] of Object.entries(roleVoices)) {
-    if (k.trim().toLowerCase() !== role) next[k] = v;
-  }
-  const trimmed = voiceId.trim();
-  if (trimmed !== '') next[role] = trimmed;
-  return next;
-}
-
-export function formatExtraRoleVoices(roleVoices: Record<string, string>): string {
+export function formatRoleVoices(roleVoices: Record<string, string>): string {
   return Object.entries(roleVoices)
-    .filter(([k, v]) => !BUILTIN_SPEAK_ROLES.has(k.trim().toLowerCase()) && v.trim() !== '')
-    .map(([k, v]) => `${k}=${v}`)
+    .filter(([k, v]) => k.trim() !== '' && v.trim() !== '')
+    .map(([k, v]) => `${k.trim()}=${v.trim()}`)
     .join('\n');
 }
 
-export function mergeExtraRoleVoices(current: Record<string, string>, raw: string): Record<string, string> {
+export function parseRoleVoices(raw: string): Record<string, string> {
   const next: Record<string, string> = {};
-  for (const [k, v] of Object.entries(current)) {
-    if (BUILTIN_SPEAK_ROLES.has(k.trim().toLowerCase()) && v.trim() !== '') {
-      next[k.trim().toLowerCase()] = v.trim();
-    }
-  }
   for (const line of raw.split('\n')) {
     const idx = line.indexOf('=');
     if (idx <= 0) continue;
     const key = line.slice(0, idx).trim();
     const val = line.slice(idx + 1).trim();
-    if (key === '' || val === '' || BUILTIN_SPEAK_ROLES.has(key.toLowerCase())) continue;
+    if (key === '' || val === '') continue;
     next[key] = val;
   }
   return next;
@@ -478,6 +472,10 @@ export function normalizeChangedConfig(form: ConfigWire, initial: ConfigWire): R
   if (changed.replyDesire !== undefined) {
     const r = changed.replyDesire as ReplyDesireWire;
     changed.replyDesire = { ...r, names: cleanLines(r.names) };
+  }
+  if (changed.sing !== undefined) {
+    const s = changed.sing as SingWire;
+    changed.sing = { ...s, baseUrl: s.baseUrl.trim() };
   }
   if (changed.imageGen !== undefined) {
     const g = changed.imageGen as ImageGenWire;

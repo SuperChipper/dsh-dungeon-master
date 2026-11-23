@@ -122,7 +122,7 @@ Configurable in the DSH Web **Plugins** settings panel:
 | 😺 Stickers & Art | Emotion-based saving (`qqbot_save_sticker`), hash matching, [`qqbot-sticker-maker`](./skills/qqbot-sticker-maker/SKILL.md), and [`qqbot-image-studio`](./skills/qqbot-image-studio/SKILL.md) |
 | 🖼 Multimodal | Caption + media sending, native `deepseek-native` image input, online TTS / configurable ASR, and whole-video keyframe review |
 | 🔧 Utilities | Reverse image search, read-only Bilibili lookup, fanart fetcher, per-group Playwright browser, `/bot-cleanup` |
-| ⏰ Reliability | Scheduled-task migration on `/new` & persona switch, proactive retry queue, `modelFailover`, pet balance for `deepseek-native` |
+| ⏰ Reliability | Scheduled-task migration on `/new` & persona switch, proactive retry queue, and `modelFailover` primary/backup failover |
 
 ### Permissions & Privacy
 

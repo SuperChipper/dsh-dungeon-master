@@ -1,5 +1,5 @@
 /**
- * 网关内置媒体与扩展工具注册（视觉、视频、转写、浏览器、文件发送、语音、生图、B 站、点歌、搜图、表情、笔记、历史、桌宠余额）
+ * 网关内置媒体与扩展工具注册（视觉、视频、转写、浏览器、文件发送、语音、生图、B 站、点歌、搜图、表情、笔记、历史）
  */
 import type { Context } from '@deepseek-ai/cordis';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -29,7 +29,6 @@ import { registerReverseImageTool } from '../media/reverse-image-tool.ts';
 import type { StickerStore } from '../media/sticker-store.ts';
 import type { NotesStore } from '../notes/notes-store.ts';
 import { registerNotesTools } from '../notes/notes-tools.ts';
-import { registerPetNativeBalance } from '../pet/native-balance.ts';
 import type { GatewaySenders } from './senders.ts';
 
 export interface RegisterGatewayToolsDeps {
@@ -111,36 +110,42 @@ export async function registerGatewayTools(deps: RegisterGatewayToolsDeps): Prom
     registerImageGenTool(ctx, mediaSender, manager, config, logger);
   }
 
-  // ── Bilibili 只读工具（搜索/视频/评论/字幕/取片 + 扫码登录） ──
-  const biliTools = ctx.get('tools') as { register(definition: unknown): unknown } | undefined;
-  if (biliTools !== undefined) {
-    const biliClient = new BiliClient();
-    registerBiliTools(biliTools, {
-      client: biliClient,
-      logger,
-      ffmpegPath: ffmpegBins !== undefined && isAbsolute(ffmpegBins.ffmpeg) ? ffmpegBins.ffmpeg : undefined,
-      permission: (agent, kind = 'login') => biliPermission(
-        manager.findByAgent(agent as never), kind, config,
-      ),
-      sendQr: async (agent, qrPath, caption) => {
-        const record = manager.findByAgent(agent as never);
-        if (record === undefined) return false;
-        await mediaSender.sendImage(record.replyTarget, { localPath: qrPath }, { content: caption });
-        return true;
-      },
-    });
+  // ── Bilibili 只读工具（按 config.bili.enabled 显式开启） ──
+  if (config.bili?.enabled === true) {
+    const biliTools = ctx.get('tools') as { register(definition: unknown): unknown } | undefined;
+    if (biliTools !== undefined) {
+      const biliClient = new BiliClient();
+      registerBiliTools(biliTools, {
+        client: biliClient,
+        logger,
+        ffmpegPath: ffmpegBins !== undefined && isAbsolute(ffmpegBins.ffmpeg) ? ffmpegBins.ffmpeg : undefined,
+        permission: (agent, kind = 'login') => biliPermission(
+          manager.findByAgent(agent as never), kind, config,
+        ),
+        sendQr: async (agent, qrPath, caption) => {
+          const record = manager.findByAgent(agent as never);
+          if (record === undefined) return false;
+          await mediaSender.sendImage(record.replyTarget, { localPath: qrPath }, { content: caption });
+          return true;
+        },
+      });
+    }
   }
 
-  // ── 点歌（qqbot_sing）：走本地唱歌服务的 HTTP，不再需要命令行 ──
-  registerSingTool(ctx, mediaSender, manager, logger);
+  // ── 点歌（qqbot_sing，按 config.sing.enabled 显式开启） ──
+  if (config.sing?.enabled === true) {
+    registerSingTool(ctx, mediaSender, manager, logger, config.sing.baseUrl);
+  }
 
   // ── 表情收藏工具注册（qqbot_sticker：收藏/匹配） ──
   if (stickerStore !== undefined) {
     registerStickerTool(ctx, stickerStore, logger);
   }
 
-  // ── 以图搜图（trace.moe + SauceNAO）：本地库没命中时查出处 ──
-  registerReverseImageTool(ctx, logger);
+  // ── 以图搜图（trace.moe + SauceNAO，按 config.reverseImage.enabled 显式开启） ──
+  if (config.reverseImage?.enabled === true) {
+    registerReverseImageTool(ctx, logger);
+  }
 
   // ── 共享笔记工具注册（qqbot_notes_search / qqbot_notes_save） ──
   if (notesStore !== undefined) {
@@ -149,7 +154,4 @@ export async function registerGatewayTools(deps: RegisterGatewayToolsDeps): Prom
 
   // ── 历史归档检索（qqbot_history_search）：归档写得多、读得少，这里补一个查询口 ──
   registerHistorySearchTool(ctx, config.appId, manager, logger);
-
-  // ── 桌宠余额：自定义 deepseek-native 不在 dsh-pet 内置表里，补一个同接口 provider ──
-  registerPetNativeBalance(ctx, logger);
 }

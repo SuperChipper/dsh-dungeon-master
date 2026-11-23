@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   chatCompletion,
   chatEndpointFromConfig,
@@ -17,6 +17,12 @@ function stubFetch(content: string | null, status = 200, finishReason?: string) 
   vi.stubGlobal('fetch', mock);
   return mock;
 }
+
+beforeEach(() => {
+  vi.stubEnv('QQBOT_TRANSCRIBE_BASE_URL', 'https://opencode.ai/inference/go/openai/v1');
+  vi.stubEnv('QQBOT_TRANSCRIBE_MODEL', 'mimo-v2.6-flash');
+  vi.stubEnv('QQBOT_TRANSCRIBE_KEY_REF', 'OPENCODE_GO_API_KEY');
+});
 
 afterEach(() => {
   setChatKeyResolver(undefined);
@@ -248,5 +254,16 @@ describe('多模态端点解耦与兼容性', () => {
     expect(headers['user-agent']).toBeUndefined();
     const body = JSON.parse(init.body as string);
     expect('reasoning_effort' in body).toBe(false);
+  });
+
+  it('未配置 chat 网关地址或模型时给出明确配置提示；未配置 keyRef 时不静默回退', async () => {
+    vi.stubEnv('QQBOT_TRANSCRIBE_BASE_URL', '');
+    vi.stubEnv('QQBOT_TRANSCRIBE_MODEL', '');
+    vi.stubEnv('QQBOT_TRANSCRIBE_KEY_REF', '');
+    await expect(chatCompletion([{ type: 'text', text: 'hi' }])).rejects.toThrow(/未配置多模态 chat 网关地址或模型/);
+
+    await expect(chatCompletion([{ type: 'text', text: 'hi' }], {
+      endpoint: { baseUrl: 'https://custom.example/v1', model: 'test-model', keyRef: '' },
+    })).rejects.toThrow(/未配置多模态网关凭证名/);
   });
 });

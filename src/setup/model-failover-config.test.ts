@@ -32,14 +32,15 @@ describe('ModelFailoverSchema', () => {
     expect(parsed.backupModel).toBe('deepseek/deepseek-v4.1-flash');
   });
 
-  it('空对象补默认值', () => {
+  it('空对象补默认值（不包含写死的个人备用渠道）', () => {
     const parsed = ModelFailoverSchema({}) as typeof valid;
     expect(parsed.enabled).toBe(false);
     expect(parsed.intervalMinutes).toBe(10);
     expect(parsed.failThreshold).toBe(1);
     expect(parsed.recoverThreshold).toBe(3);
-    expect(parsed.backupProvider).toBe('commandcode');
-    expect(parsed.backupModel).toBe('deepseek/deepseek-v4.1-flash');
+    expect(parsed.backupProvider).toBe('');
+    expect(parsed.backupModel).toBe('');
+    expect(parsed.backupApiKeyEnv).toBe('');
     expect(parsed.notify).toBe(true);
   });
 

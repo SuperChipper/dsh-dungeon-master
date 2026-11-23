@@ -14,9 +14,9 @@
 import type { AsrConfig, VideoConfig } from '../config.ts';
 import type { Logger } from '../types.ts';
 
-export const DEFAULT_CHAT_BASE_URL = 'https://opencode.ai/inference/go/openai/v1';
-export const DEFAULT_CHAT_MODEL = 'mimo-v2.6-flash';
-export const DEFAULT_CHAT_KEY_REF = 'OPENCODE_GO_API_KEY';
+export const DEFAULT_CHAT_BASE_URL = '';
+export const DEFAULT_CHAT_MODEL = '';
+export const DEFAULT_CHAT_KEY_REF = '';
 
 /** 单次请求的音频上限（base64 后约 4/3）。wav 16k 单声道 ≈ 32 KB/s，16MB ≈ 8 分钟 */
 export const DEFAULT_CHAT_MAX_BYTES = 16 * 1024 * 1024;
@@ -68,11 +68,12 @@ export function chatEndpointFromConfig(asr?: Partial<AsrConfig>): ChatEndpoint {
  * 实测（2026-11-05，20 次/4 个片子）：mimo 20/20 都能看到视频，deepseek-v4.1-flash 有约 1/4 的请求
  * 会静默丢掉 video_url、回一段寒暄（"您可能还没有输入"）或者整段无关内容。宁可慢（12-55s）也不能瞎答。
  */
-export const DEFAULT_VIDEO_MODEL = 'mimo-v2.6-flash';
+export const DEFAULT_VIDEO_MODEL = '';
 
 /** 视频端点：网关和凭证同 chatEndpointFromEnv，只把模型换掉 */
 export function videoEndpointFromEnv(): ChatEndpoint {
-  return { ...chatEndpointFromEnv(), model: process.env.QQBOT_VIDEO_MODEL ?? DEFAULT_VIDEO_MODEL };
+  const chat = chatEndpointFromEnv();
+  return { ...chat, model: process.env.QQBOT_VIDEO_MODEL ?? (DEFAULT_VIDEO_MODEL || chat.model) };
 }
 
 /** 结合视频配置、ASR chat 配置与环境变量解析视频直传端点 */
@@ -81,7 +82,7 @@ export function videoEndpointFromConfig(video?: Partial<VideoConfig>, asr?: Part
   const directKey = video?.apiKey?.trim() || chat.apiKey;
   return {
     baseUrl: (video?.baseUrl?.trim() || process.env.QQBOT_VIDEO_BASE_URL || chat.baseUrl).replace(/\/+$/, ''),
-    model: video?.model?.trim() || process.env.QQBOT_VIDEO_MODEL || asr?.chatModel?.trim() || DEFAULT_VIDEO_MODEL,
+    model: video?.model?.trim() || process.env.QQBOT_VIDEO_MODEL || asr?.chatModel?.trim() || DEFAULT_VIDEO_MODEL || chat.model,
     keyRef: video?.apiKeyEnv?.trim() || process.env.QQBOT_VIDEO_KEY_REF || chat.keyRef,
     ...(directKey ? { apiKey: directKey } : {}),
     reasoningEffort: video?.reasoningEffort?.trim() || chat.reasoningEffort || 'none',
@@ -112,6 +113,9 @@ export async function resolveOptionalKey(ref: string): Promise<string | undefine
 }
 
 export async function resolveChatKey(ref: string): Promise<string> {
+  if (ref.trim() === '') {
+    throw new Error('未配置多模态网关凭证名（请在 chatApiKeyEnv / video.apiKeyEnv / QQBOT_TRANSCRIBE_KEY_REF 指定环境变量或直填 apiKey）');
+  }
   const resolved = await resolveOptionalKey(ref);
   if (resolved !== undefined) return resolved;
   throw new Error(`未配置多模态凭证 ${ref}（credentials 服务和环境变量均未找到）`);
@@ -132,6 +136,9 @@ export interface ChatCompletionOptions {
 export async function chatCompletion(content: unknown[], options: ChatCompletionOptions = {}): Promise<string> {
   options.signal?.throwIfAborted();
   const endpoint = options.endpoint ?? chatEndpointFromEnv();
+  if (endpoint.baseUrl.trim() === '' || endpoint.model.trim() === '') {
+    throw new Error('未配置多模态 chat 网关地址或模型（请填写 asr.chatBaseUrl / asr.chatModel、video.baseUrl / video.model 或对应环境变量）');
+  }
   const key = endpoint.apiKey?.trim() ? endpoint.apiKey.trim() : await resolveChatKey(endpoint.keyRef);
   options.signal?.throwIfAborted();
   const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? 300000);

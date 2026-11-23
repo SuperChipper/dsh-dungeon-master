@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { CleanupRuleConfig, ImQQBotConfig } from '../config.ts';
+import { registerHostEffect } from '../host-adapter/index.ts';
 import type { Logger } from '../types.ts';
 import { PLUGIN_ROOT } from '../shared/index.ts';
 import { MEDIA_ROOT } from './media-cleaner.ts';
@@ -335,13 +336,12 @@ export function startCleanup(ctx: Context, config: ImQQBotConfig, logger: Logger
   };
   run();
 
-  (ctx as unknown as { effect(fn: () => (() => Promise<void>) | void, name?: string): void })
-    .effect(() => {
-      const timer = setInterval(run, CLEANUP_INTERVAL_MS);
-      return async () => {
-        clearInterval(timer);
-        if (service === current) service = undefined;
-      };
-    }, 'im-qqbot.cleanup');
+  registerHostEffect(ctx, () => {
+    const timer = setInterval(run, CLEANUP_INTERVAL_MS);
+    return async () => {
+      clearInterval(timer);
+      if (service === current) service = undefined;
+    };
+  }, 'im-qqbot.cleanup');
   return current;
 }

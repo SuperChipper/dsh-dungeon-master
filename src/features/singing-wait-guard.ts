@@ -1,3 +1,5 @@
+import { readSessionEvents, type SessionEventsHostLike } from '../host-adapter/index.ts';
+
 interface Execution {
   name: string;
   arguments: unknown;
@@ -13,8 +15,8 @@ const SING_WAIT = /\bsing_client\.py["']?\s+(?:(?:--ensure|--url\s+(?:"[^"]*"|'[
 const BACKGROUND_HINT = '唱歌已交给独立服务，前台等待会阻塞本聊天。请用 pwsh(run_in_background=true) 执行 sing_client.py wait <id>，拿到后台 job ID 后结束当前回合；完成通知到达后再取输出和发送成品，不要立即 job_output(wait=true)。';
 
 function isPendingSingingWait(agent: unknown, id: string): boolean {
-  const session = (agent as { session?: { events?: readonly JobEvent[]; snapshotEvents?: () => readonly JobEvent[] } }).session;
-  const events = session?.events ?? session?.snapshotEvents?.() ?? [];
+  const session = (agent as { session?: SessionEventsHostLike<JobEvent> } | undefined)?.session;
+  const events = readSessionEvents(session);
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index]!;
     if (event.data?.jobId !== id) continue;

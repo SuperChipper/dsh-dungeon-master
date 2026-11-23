@@ -72,12 +72,11 @@ export interface RegisterSpeakToolOptions {
   onSent?: (target: ReplyTarget, spoken: string, result: unknown) => void;
 }
 
-const LOCAL_VOICE_ROLES = ['feiyu', 'dragon', 'hakimi'] as const;
-type LocalVoiceRole = typeof LOCAL_VOICE_ROLES[number];
 const MAX_STYLE_CODE_POINTS = 160;
 const MAX_QQ_VOICE_BYTES = 20 * 1024 * 1024;
 const ELEVENLABS_VOICE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const DEEPSEEK_VOICE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const EXPLICIT_ROLE_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const NO_LANGUAGE_CODE_MODEL_RE = /^eleven_(?:multilingual_v[12]|monolingual_v1)$/i;
 
 interface SpeakArgs {
@@ -88,25 +87,6 @@ interface SpeakArgs {
   lang?: string;
   role?: string;
   style?: string;
-}
-
-function isLocalVoiceRole(role: string): role is LocalVoiceRole {
-  return (LOCAL_VOICE_ROLES as readonly string[]).includes(role);
-}
-
-function roleForPersona(id: string | undefined): LocalVoiceRole | undefined {
-  switch (id?.toLowerCase()) {
-    case 'default':
-    case 'soft-whale':
-    case 'tieba-whale':
-      return 'feiyu';
-    case 'white-dragon':
-      return 'dragon';
-    case 'gemini':
-      return 'hakimi';
-    default:
-      return undefined;
-  }
 }
 
 function lookupRoleVoice(roleVoices: Record<string, string> | undefined, key: string | undefined): string | undefined {
@@ -187,67 +167,34 @@ function resolveOnlineCandidates(
 
   if (options.isQqCaller) {
     const personaId = options.personaId?.trim();
-    const mappedRole = roleForPersona(personaId);
+    const label = personaId || 'default';
 
-    // 第一梯队 1：精确 personaId 映射与人设 frontmatter voiceId
+    // 第一梯队：精确 personaId 映射与人设 frontmatter voiceId
     if (elEnabled) {
       const byPersona = lookupRoleVoice(el.roleVoices, personaId);
       if (byPersona !== undefined) {
-        pushUniqueCandidate(candidates, seen, { provider: 'elevenlabs', voiceId: byPersona, label: personaId || 'default' });
+        pushUniqueCandidate(candidates, seen, { provider: 'elevenlabs', voiceId: byPersona, label });
       } else if (options.personaVoiceId?.trim()) {
         pushUniqueCandidate(candidates, seen, {
           provider: 'elevenlabs',
           voiceId: options.personaVoiceId.trim(),
-          label: personaId || 'default',
+          label,
         });
       }
     }
     if (dsEnabled) {
       const byPersona = lookupRoleVoice(ds.roleVoices, personaId);
       if (byPersona !== undefined) {
-        pushUniqueCandidate(candidates, seen, { provider: 'deepseek', voiceId: byPersona, label: personaId || 'default' });
+        pushUniqueCandidate(candidates, seen, { provider: 'deepseek', voiceId: byPersona, label });
       }
     }
 
-    // 第一梯队 2：规范角色映射（feiyu / dragon / hakimi）
-    if (mappedRole !== undefined) {
-      if (elEnabled) {
-        const byRole = lookupRoleVoice(el.roleVoices, mappedRole);
-        if (byRole !== undefined) {
-          pushUniqueCandidate(candidates, seen, { provider: 'elevenlabs', voiceId: byRole, label: mappedRole });
-        }
-      }
-      if (dsEnabled) {
-        const byRole = lookupRoleVoice(ds.roleVoices, mappedRole);
-        if (byRole !== undefined) {
-          pushUniqueCandidate(candidates, seen, { provider: 'deepseek', voiceId: byRole, label: mappedRole });
-        }
-      }
+    // 第二梯队：defaultVoiceId 兜底
+    if (elEnabled && el.defaultVoiceId?.trim()) {
+      pushUniqueCandidate(candidates, seen, { provider: 'elevenlabs', voiceId: el.defaultVoiceId.trim(), label });
     }
-
-    // 第二梯队：默认兜底（defaultVoiceId；仅当当前人设未映射到三角色之一时才参考 roleVoices.feiyu）
-    const defaultLabel = mappedRole ?? (personaId || 'default');
-    if (elEnabled) {
-      const elDefault = el.defaultVoiceId?.trim();
-      if (elDefault) {
-        pushUniqueCandidate(candidates, seen, { provider: 'elevenlabs', voiceId: elDefault, label: defaultLabel });
-      } else if (mappedRole === undefined) {
-        const elFeiyu = lookupRoleVoice(el.roleVoices, 'feiyu');
-        if (elFeiyu !== undefined) {
-          pushUniqueCandidate(candidates, seen, { provider: 'elevenlabs', voiceId: elFeiyu, label: 'feiyu' });
-        }
-      }
-    }
-    if (dsEnabled) {
-      const dsDefault = ds.defaultVoiceId?.trim();
-      if (dsDefault) {
-        pushUniqueCandidate(candidates, seen, { provider: 'deepseek', voiceId: dsDefault, label: defaultLabel });
-      } else if (mappedRole === undefined) {
-        const dsFeiyu = lookupRoleVoice(ds.roleVoices, 'feiyu');
-        if (dsFeiyu !== undefined) {
-          pushUniqueCandidate(candidates, seen, { provider: 'deepseek', voiceId: dsFeiyu, label: 'feiyu' });
-        }
-      }
+    if (dsEnabled && ds.defaultVoiceId?.trim()) {
+      pushUniqueCandidate(candidates, seen, { provider: 'deepseek', voiceId: ds.defaultVoiceId.trim(), label });
     }
     return candidates;
   }
@@ -275,25 +222,11 @@ function resolveOnlineCandidates(
     return candidates;
   }
 
-  if (elEnabled) {
-    const elDefault = el.defaultVoiceId?.trim();
-    if (elDefault) {
-      pushUniqueCandidate(candidates, seen, { provider: 'elevenlabs', voiceId: elDefault, label: 'default' });
-    }
-    const elFeiyu = lookupRoleVoice(el.roleVoices, 'feiyu');
-    if (elFeiyu !== undefined) {
-      pushUniqueCandidate(candidates, seen, { provider: 'elevenlabs', voiceId: elFeiyu, label: 'feiyu' });
-    }
+  if (elEnabled && el.defaultVoiceId?.trim()) {
+    pushUniqueCandidate(candidates, seen, { provider: 'elevenlabs', voiceId: el.defaultVoiceId.trim(), label: 'default' });
   }
-  if (dsEnabled) {
-    const dsDefault = ds.defaultVoiceId?.trim();
-    if (dsDefault) {
-      pushUniqueCandidate(candidates, seen, { provider: 'deepseek', voiceId: dsDefault, label: 'default' });
-    }
-    const dsFeiyu = lookupRoleVoice(ds.roleVoices, 'feiyu');
-    if (dsFeiyu !== undefined) {
-      pushUniqueCandidate(candidates, seen, { provider: 'deepseek', voiceId: dsFeiyu, label: 'feiyu' });
-    }
+  if (dsEnabled && ds.defaultVoiceId?.trim()) {
+    pushUniqueCandidate(candidates, seen, { provider: 'deepseek', voiceId: ds.defaultVoiceId.trim(), label: 'default' });
   }
   return candidates;
 }
@@ -435,7 +368,7 @@ async function synthesizeLocal(
   config: SpeakConfig,
   text: string,
   outPath: string,
-  { lang, role, style }: { lang?: string; role?: LocalVoiceRole; style?: string },
+  { lang, role, style }: { lang?: string; role?: string; style?: string },
   signal?: AbortSignal,
 ): Promise<void> {
   signal?.throwIfAborted();
@@ -638,14 +571,17 @@ export function registerSpeakTool(
       ? []
       : defaultEnvFiles()
   );
-  const customRoles = [
-    ...Object.entries(elevenlabsConfig?.roleVoices ?? {}),
-    ...Object.entries(deepseekConfig?.roleVoices ?? {}),
-  ]
-    .filter(([, value]) => typeof value === 'string' && value.trim() !== '')
-    .map(([key]) => key.trim())
-    .filter(Boolean);
-  const allowedRoles = [...new Set<string>([...LOCAL_VOICE_ROLES, ...customRoles])];
+  const configuredRoles = [...new Set<string>(
+    [
+      ...Object.entries(elevenlabsConfig?.roleVoices ?? {}),
+      ...Object.entries(deepseekConfig?.roleVoices ?? {}),
+    ]
+      .filter(([, value]) => typeof value === 'string' && value.trim() !== '')
+      .map(([key]) => key.trim())
+      .filter(Boolean),
+  )];
+  const hasLocalService = (speak.gsvUrl ?? '').trim() !== '';
+  const strictConfiguredRoles = configuredRoles.length > 0 && !hasLocalService;
   const outDir = join(resolveTmpDir(config), 'voice');
 
   const definition = {
@@ -676,7 +612,7 @@ export function registerSpeakTool(
         },
         role: {
           type: 'string',
-          enum: allowedRoles,
+          ...(strictConfiguredRoles ? { enum: configuredRoles } : {}),
           description: 'Optional voice role only outside QQ sessions (e.g. Web with an explicit target). '
             + 'In QQ, omit it: the current conversation persona chooses the voice. Ignored by edge-tts.',
         },
@@ -744,17 +680,22 @@ export function registerSpeakTool(
       const caller = exec.agent === undefined ? undefined : manager.findByAgent(exec.agent as DshAgent);
       let normalizedExplicitRole: string | undefined;
       if (role !== undefined) {
-        if (typeof role !== 'string') {
-          throw new Error(`qqbot_speak: \`role\` 只接受 ${allowedRoles.join('、')}`);
+        if (typeof role !== 'string' || !EXPLICIT_ROLE_RE.test(role.trim())) {
+          throw new Error('qqbot_speak: `role` 必须是非空字母/数字/下划线/短横线标识');
         }
-        const matchedRole = allowedRoles.find((candidate) => candidate.toLowerCase() === role.trim().toLowerCase());
-        if (matchedRole === undefined) {
-          throw new Error(`qqbot_speak: \`role\` 只接受 ${allowedRoles.join('、')}`);
+        const trimmedRole = role.trim();
+        if (strictConfiguredRoles) {
+          const matchedRole = configuredRoles.find((candidate) => candidate.toLowerCase() === trimmedRole.toLowerCase());
+          if (matchedRole === undefined) {
+            throw new Error(`qqbot_speak: \`role\` 只接受 ${configuredRoles.join('、')}`);
+          }
+          normalizedExplicitRole = matchedRole;
+        } else {
+          normalizedExplicitRole = trimmedRole;
         }
         if (caller !== undefined) {
           throw new Error('qqbot_speak: QQ 会话的音色由当前人设决定，请省略 `role`');
         }
-        normalizedExplicitRole = matchedRole;
       }
 
       // 1. 解析发送目标：显式 target > 当前会话；音色不随发送目标变化。
@@ -829,11 +770,12 @@ export function registerSpeakTool(
       const onlineSucceeded = backend === 'elevenlabs' || backend === 'deepseek';
       if (!onlineSucceeded && (speak.gsvUrl ?? '').trim() !== '') {
         try {
+          const qqPersonaRole = personaId?.trim();
           const localRole = caller === undefined
-            ? (normalizedExplicitRole !== undefined && isLocalVoiceRole(normalizedExplicitRole)
-              ? normalizedExplicitRole
-              : undefined)
-            : roleForPersona(personaId);
+            ? normalizedExplicitRole
+            : (qqPersonaRole !== undefined && qqPersonaRole !== '' && qqPersonaRole.toLowerCase() !== 'default'
+              ? qqPersonaRole
+              : undefined);
           await synthesizeLocal(speak, spoken, outPath, {
             lang: langHint,
             role: localRole,

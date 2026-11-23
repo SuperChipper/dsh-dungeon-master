@@ -1051,6 +1051,42 @@ describe('bind-routes', () => {
     expect(updates).toHaveLength(1);
   });
 
+  it('POST config：bili / sing / reverseImage 扩展工具开关校验合法与非法入参', async () => {
+    const updates: Array<Record<string, unknown>> = [];
+    const { routes } = createHarness({ onUpdateConfig: (cfg) => { updates.push(cfg); return true; } });
+    const okRes = fakeRes();
+    await invoke(
+      routes.get(BIND_CONFIG_PATH),
+      fakeReq('POST', { host: '127.0.0.1:3080', 'content-type': 'application/json' }, JSON.stringify({
+        bili: { enabled: true },
+        sing: { enabled: true, baseUrl: 'http://127.0.0.1:8766' },
+        reverseImage: { enabled: true },
+      })),
+      okRes,
+    );
+    expect(okRes.statusCode).toBe(200);
+    expect(updates[0]).toEqual({
+      bili: { enabled: true },
+      sing: { enabled: true, baseUrl: 'http://127.0.0.1:8766' },
+      reverseImage: { enabled: true },
+    });
+
+    for (const badPayload of [
+      { bili: { enabled: 'yes' } },
+      { sing: { enabled: true, baseUrl: 123 } },
+      { reverseImage: { enabled: 'no' } },
+    ]) {
+      const badRes = fakeRes();
+      await invoke(
+        routes.get(BIND_CONFIG_PATH),
+        fakeReq('POST', { host: '127.0.0.1:3080', 'content-type': 'application/json' }, JSON.stringify(badPayload)),
+        badRes,
+      );
+      expect(badRes.statusCode, JSON.stringify(badPayload)).toBe(400);
+    }
+    expect(updates).toHaveLength(1);
+  });
+
   it('跨站 Origin：403（state 与 manual 均拦截）', async () => {
     const { routes } = createHarness();
     const res1 = fakeRes();

@@ -19,6 +19,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { ImageBlock } from '@deepseek-ai/dsh-llm';
 import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
 import type { ImQQBotConfig } from '../config.ts';
+import { readSessionContentGeneration, readSessionEvents, tryReadSessionEvents } from '../host-adapter/index.ts';
 import { loadNativeImageBlock, type AttachmentStoreLike } from '../media/native-image.ts';
 import { ModelResolver } from '../model/model-resolver.ts';
 import type { ModelRoute, ModelEntry } from '../model/types.ts';
@@ -175,7 +176,7 @@ function cleanUserEventText(raw: string): string {
 /** 私聊没有群记忆文件，从会话历史里取本轮之前的最近几句对话作为打分背景 */
 function recentSessionLines(agent: DshAgent | undefined, limit: number): JudgeLine[] {
   try {
-    const events = agent?.session?.snapshotEvents?.() ?? agent?.session?.events ?? [];
+    const events = readSessionEvents(agent?.session);
     if (events.length === 0 || limit <= 0) return [];
     const readMsg = (event: SessionEventLike) => {
       const data = (event.data ?? event) as {
@@ -280,7 +281,7 @@ export function isRuntimeContextEvent(event: SessionEventLike): boolean {
  */
 export function promptEpoch(record: Pick<SessionRecord, 'agent'>): string {
   const session = record.agent.session;
-  return `${session.id}:${session.surface?.contentGeneration ?? 0}`;
+  return `${session.id}:${readSessionContentGeneration(session)}`;
 }
 
 /**
@@ -290,7 +291,7 @@ export function promptEpoch(record: Pick<SessionRecord, 'agent'>): string {
 export function agentUserTurnTag(record: Pick<SessionRecord, 'agent'>): string | undefined {
   const session = record.agent?.session;
   if (session === undefined) return undefined;
-  const events = session.snapshotEvents?.() ?? session.events;
+  const events = tryReadSessionEvents(session);
   if (!Array.isArray(events)) return undefined;
   let userCount = 0;
   let lastTag = '0';
@@ -1990,7 +1991,7 @@ export class SessionManager {
           sourceSessionId = record.sessionId;
           if (!ensureTransitionBegun()) return 'failed';
           sourceRoute = this.personaModelRoute(record);
-          const events = [...(record.agent.session.snapshotEvents?.() ?? record.agent.session.events ?? [])];
+          const events = [...readSessionEvents(record.agent.session)];
           const previous = store.handoffs.read(key);
           const input = collectHandoffInput(record.sessionId, events, record.agent.session.surface?.nodes, previous.covered[record.sessionId]);
           input.schedules = readScheduleMigrations(scheduleStorageHome(), record.sessionId);
@@ -2006,7 +2007,7 @@ export class SessionManager {
                 signal,
                 { resume: attempt.progress, source: { fromPersona: attempt.fromPersona, at: attempt.at, cursor: attempt.cursor }, save: (chars, draft) => store.handoffs.checkpoint(key, attempt.id, chars, draft) },
               ));
-              const after = record.agent.session.snapshotEvents?.() ?? record.agent.session.events ?? [];
+              const after = readSessionEvents(record.agent.session);
               if (after.length !== events.length || after.at(-1)?.seq !== events.at(-1)?.seq || record.agent.status !== 'idle') {
                 store.handoffs.fail(key, attempt.id, '生成期间历史发生变化，请重新切换');
                 abortTransition();
@@ -2086,7 +2087,7 @@ export class SessionManager {
     const controller = this.ctx?.get('sessionController') as { agents?: { selectionFor?(agent: DshAgent): ModelSelectionRef } } | undefined;
     const selected = controller?.agents?.selectionFor?.(record.agent)?.current ?? this.modelSelections?.get(record.agent)?.current;
     if (selected?.provider && selected.model) return { provider: selected.provider, model: selected.model };
-    const events = record.agent.session.snapshotEvents?.() ?? record.agent.session.events ?? [];
+    const events = readSessionEvents(record.agent.session);
     for (let i = events.length - 1; i >= 0; i -= 1) {
       const event = events[i]!;
       if (event.type === 'request/header') break;
@@ -2105,7 +2106,7 @@ export class SessionManager {
     if (!store?.handoffs || this.dndService?.active(record.sessionKey) !== undefined) return;
     const persona = store.currentId(record.peerId, record.scope);
     const session = record.agent.session;
-    const events = session.snapshotEvents?.() ?? session.events ?? [];
+    const events = readSessionEvents(session);
     const receipt = store.handoffs.read(record.sessionKey).received[persona];
     // 旧版曾在真正持久化前记接收；加载后没有交接事件时要补送，不能只信账本。
     // 收件箱的 inserted 是持久化输入；宿主在消费它时先建立 system head，
@@ -2155,7 +2156,7 @@ export class SessionManager {
     void this.remove(scope, peerId, undefined, async (old) => {
       // 压缩被拒（历史太短、服务没挂）也照样往下读：会话以前压缩过的话还有旧摘要可用
       const outcome = await this.compactRecord(key, old);
-      const summary = latestCompactionSummary(old.agent.session.snapshotEvents?.() ?? old.agent.session.events);
+      const summary = latestCompactionSummary(tryReadSessionEvents(old.agent.session));
       this.logger.info(`session handoff: key=${key} compact=${outcome.ok ? `ok(${outcome.shadowed ?? 0})` : outcome.reason} summary=${summary?.length ?? 0} chars`);
       settle(summary);
     }).finally(() => settle(undefined));
@@ -2408,7 +2409,7 @@ export class SessionManager {
     if (this.approvalChannel?.hasPending?.(record.sessionKey) && !reasons.includes('pending-approval')) {
       reasons.push('pending-approval');
     }
-    const events = record.agent?.session?.snapshotEvents?.() ?? record.agent?.session?.events;
+    const events = tryReadSessionEvents(record.agent?.session);
     if (hasOpenBackgroundJobs(events) && !reasons.includes('background-job')) {
       reasons.push('background-job');
     }
@@ -2560,7 +2561,7 @@ export class SessionManager {
 }
 
 function sessionEventsOf(record: SessionRecord | undefined): readonly SessionEventLike[] {
-  return record?.agent?.session?.snapshotEvents?.() ?? record?.agent?.session?.events ?? [];
+  return readSessionEvents(record?.agent?.session);
 }
 
 function extractCompactionCause(err: unknown): { message: string; isNotSmaller: boolean } {

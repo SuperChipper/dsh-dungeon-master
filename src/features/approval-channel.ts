@@ -10,6 +10,7 @@
 import { randomUUID } from 'node:crypto';
 import type { EventOptions } from '@deepseek-ai/cordis';
 import type { InteractionEvent } from '@tencent-connect/qqbot-nodejs';
+import { readSessionEvents } from '../host-adapter/index.ts';
 import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
 import { decodeButtonData } from './button-utils.ts';
 import { buildApprovalKeyboard, buildApprovalText } from './approval-renderer.ts';
@@ -92,8 +93,8 @@ function commandOf(req: ApprovalRequest): string | undefined {
   if (req.callId === undefined) return undefined;
   // 审批请求可能来自没有 live session 的上下文（例如跨进程/投影后的 Agent），
   // 此时只是拿不到命令原文，不能因此让整个审批失败。
-  const events = req.agent.session?.snapshotEvents?.() ?? req.agent.session?.events;
-  if (!Array.isArray(events)) return undefined;
+  const events = readSessionEvents(req.agent.session);
+  if (events.length === 0) return undefined;
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const event = events[i];
     if (!event || event.type !== 'tool/call') continue;

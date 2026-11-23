@@ -45,20 +45,21 @@ interface SingJob {
   [key: string]: unknown;
 }
 
-function baseUrl(): string {
-  return (process.env.QQBOT_SING_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
+function resolveBaseUrl(configured?: string): string {
+  const raw = configured?.trim() || process.env.QQBOT_SING_URL?.trim() || DEFAULT_BASE_URL;
+  return raw.replace(/\/+$/, '');
 }
 
 function token(): string {
   return process.env.QQBOT_SING_TOKEN ?? process.env.SING_SERVICE_TOKEN ?? '';
 }
 
-async function rpc<T>(path: string, init: { method?: string; body?: unknown; timeoutMs?: number } = {}): Promise<T> {
+async function rpc<T>(base: string, path: string, init: { method?: string; body?: unknown; timeoutMs?: number } = {}): Promise<T> {
   const headers: Record<string, string> = { accept: 'application/json' };
   const value = token();
   if (value !== '') headers.authorization = `Bearer ${value}`;
   if (init.body !== undefined) headers['content-type'] = 'application/json';
-  const response = await fetch(baseUrl() + path, {
+  const response = await fetch(base + path, {
     method: init.method ?? (init.body === undefined ? 'GET' : 'POST'),
     headers,
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
@@ -79,11 +80,11 @@ async function rpc<T>(path: string, init: { method?: string; body?: unknown; tim
 }
 
 /** 结果落盘：Content-Type 决定扩展名，不靠调用方猜 */
-async function downloadResult(jobId: string, hint?: string): Promise<string> {
+async function downloadResult(base: string, jobId: string, hint?: string): Promise<string> {
   const headers: Record<string, string> = {};
   const value = token();
   if (value !== '') headers.authorization = `Bearer ${value}`;
-  const response = await fetch(`${baseUrl()}/jobs/${encodeURIComponent(jobId)}/result`, {
+  const response = await fetch(`${base}/jobs/${encodeURIComponent(jobId)}/result`, {
     headers,
     signal: AbortSignal.timeout(600_000),
   });
@@ -123,12 +124,14 @@ export function registerSingTool(
   sender: MediaSenderLike,
   manager: SessionManager,
   logger: Logger,
+  configuredBaseUrl?: string,
 ): void {
   const tools = ctx.get('tools') as ToolsRegistryLike | undefined;
   if (!tools?.register) {
     logger.warn('im-qqbot: tools 服务不可用，qqbot_sing 未注册');
     return;
   }
+  const singBaseUrl = resolveBaseUrl(configuredBaseUrl);
 
   /** 正在等结果的单子：jobId → 定时器，同一个单子不重复挂 */
   const watching = new Map<string, NodeJS.Timeout>();
@@ -145,7 +148,7 @@ export function registerSingTool(
           return;
         }
         try {
-          const job = await rpc<SingJob>(`/jobs/${encodeURIComponent(jobId)}`);
+          const job = await rpc<SingJob>(singBaseUrl, `/jobs/${encodeURIComponent(jobId)}`);
           if (!TERMINAL_STATES.has(String(job.state))) return;
           clearInterval(timer);
           watching.delete(jobId);
@@ -157,7 +160,7 @@ export function registerSingTool(
             logger.info(`im-qqbot: 唱歌任务 ${jobId} 完成（本机会话，不自动发送）`);
             return;
           }
-          const file = await downloadResult(jobId, job.result_format);
+          const file = await downloadResult(singBaseUrl, jobId, job.result_format);
           const caption = `${song} 唱好了`;
           if (file.endsWith('.mp4')) await sender.sendVideo(target, { localPath: file }, { content: caption });
           else await sender.sendFile(target, { localPath: file }, { fileName: `${song}.mp3`, content: caption });
@@ -207,12 +210,12 @@ export function registerSingTool(
       const jobId = typeof args.job === 'string' ? args.job.trim() : '';
 
       if (action === 'health') {
-        const value = await rpc<Record<string, unknown>>('/health', { timeoutMs: 5_000 });
+        const value = await rpc<Record<string, unknown>>(singBaseUrl, '/health', { timeoutMs: 5_000 });
         return `唱歌服务：${String(value.service ?? '?')}；ready=${String(value.ready ?? '?')}`;
       }
 
       if (action === 'list') {
-        const value = await rpc<{ jobs?: SingJob[] }>('/jobs');
+        const value = await rpc<{ jobs?: SingJob[] }>(singBaseUrl, '/jobs');
         const jobs = value.jobs ?? [];
         if (jobs.length === 0) return '唱歌服务现在没有任务。';
         return jobs.slice(0, 10).map((job) => `${job.id}  ${job.state ?? '?'}  ${job.stage ?? ''}`).join('\n');
@@ -220,21 +223,21 @@ export function registerSingTool(
 
       if (action === 'status') {
         if (jobId === '') throw new Error('qqbot_sing: status 需要 job');
-        const job = await rpc<SingJob>(`/jobs/${encodeURIComponent(jobId)}`);
+        const job = await rpc<SingJob>(singBaseUrl, `/jobs/${encodeURIComponent(jobId)}`);
         return JSON.stringify(job, null, 2).slice(0, 1500);
       }
 
       if (action === 'cancel') {
         if (jobId === '') throw new Error('qqbot_sing: cancel 需要 job');
-        const job = await rpc<SingJob>(`/jobs/${encodeURIComponent(jobId)}/cancel`, { body: {} });
+        const job = await rpc<SingJob>(singBaseUrl, `/jobs/${encodeURIComponent(jobId)}/cancel`, { body: {} });
         return `已请求取消 ${jobId}，当前状态 ${String(job.state ?? '?')}。`;
       }
 
       if (action === 'result') {
         if (jobId === '') throw new Error('qqbot_sing: result 需要 job');
-        const job = await rpc<SingJob>(`/jobs/${encodeURIComponent(jobId)}`);
+        const job = await rpc<SingJob>(singBaseUrl, `/jobs/${encodeURIComponent(jobId)}`);
         if (!SUCCESS_STATES.has(String(job.state))) return `任务 ${jobId} 还没成功（state=${job.state ?? '?'}），先别取成品。`;
-        const file = await downloadResult(jobId, job.result_format);
+        const file = await downloadResult(singBaseUrl, jobId, job.result_format);
         const size = (await stat(file)).size;
         return `成品已下载：${file}（${(size / (1024 * 1024)).toFixed(1)} MB）\n要发出去就用 qqbot_send_file。`;
       }
@@ -257,7 +260,7 @@ export function registerSingTool(
         options,
         idempotency_key: typeof args.idempotency_key === 'string' ? args.idempotency_key : '',
       };
-      const job = await rpc<SingJob>('/jobs', { body: payload, timeoutMs: 30_000 });
+      const job = await rpc<SingJob>(singBaseUrl, '/jobs', { body: payload, timeoutMs: 30_000 });
       const id = String(job.id ?? '');
       if (id === '') throw new Error('唱歌服务没有返回任务 id');
 
@@ -274,5 +277,5 @@ export function registerSingTool(
   };
 
   tools.register(definition);
-  logger.info(`im-qqbot: qqbot_sing 已注册（${baseUrl()}）`);
+  logger.info(`im-qqbot: qqbot_sing 已注册（${singBaseUrl}）`);
 }

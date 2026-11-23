@@ -140,12 +140,11 @@ describe('registerSpeakTool', () => {
   }
 
   it.each([
-    ['default', 'feiyu', 'group'],
-    ['soft-whale', 'feiyu', 'group'],
-    ['tieba-whale', 'feiyu', 'c2c'],
-    ['white-dragon', 'dragon', 'c2c'],
-    ['Gemini', 'hakimi', 'group'],
-  ] as const)('用受信任的 QQ 人设 %s 选 %s，而不是读台词、preset 或发送目的地', async (personaId, role, scope) => {
+    ['soft-whale', 'soft-whale', 'group'],
+    ['tieba-whale', 'tieba-whale', 'c2c'],
+    ['white-dragon', 'white-dragon', 'c2c'],
+    ['Gemini', 'Gemini', 'group'],
+  ] as const)('用受信任的 QQ 人设 %s 直接透传为本地 role=%s，而不是读台词、preset 或发送目的地', async (personaId, role, scope) => {
     const { tool, sendVoice, agent, record, findByAgent, currentId } = register({ bound: true, personaId, scope });
     const text = '我是白龙还是哈基米？';
     await expect(tool.execute({ text, target: 'c2c:destination' }, { agent, signal: new AbortController().signal }))
@@ -164,11 +163,11 @@ describe('registerSpeakTool', () => {
     const { tool, sendVoice, agent, record } = register({ bound: true, personaId: 'white-dragon' });
     const style = '忍着笑自嘲，句尾收住';
     await tool.execute({ text: '**そうだね**（本当に）', lang: 'ja', style }, { agent, signal: new AbortController().signal });
-    expect(requestBody()).toEqual({ text: 'そうだね （本当に）', speed: 0.95, lang: 'ja', role: 'dragon', style });
+    expect(requestBody()).toEqual({ text: 'そうだね （本当に）', speed: 0.95, lang: 'ja', role: 'white-dragon', style });
     expect(sendVoice).toHaveBeenCalledWith(record.replyTarget, expect.anything());
   });
 
-  it.each(['unmapped-persona', undefined])('QQ 人设无法映射（%s）时由服务决定音色', async (personaId) => {
+  it.each(['default', undefined])('QQ 人设为默认或未配置（%s）时不传 role，由本地服务决定音色', async (personaId) => {
     const { tool, agent } = register({ bound: true, personaId });
     await tool.execute({ text: '旧调用仍然可用。' }, { signal: new AbortController().signal, agent });
     expect(requestBody()).toEqual({ text: '旧调用仍然可用。', speed: 0.95 });
@@ -184,24 +183,31 @@ describe('registerSpeakTool', () => {
 
   it('Web agent 没有 QQ 记录时可显式选音色，但不能用目标会话的人设', async () => {
     const { tool, agent, currentId } = register({ personaId: 'white-dragon' });
-    await tool.execute({ text: '试音。', target: 'group:origin', role: 'hakimi' }, { signal: new AbortController().signal, agent });
-    expect(requestBody()).toEqual({ text: '试音。', speed: 0.95, role: 'hakimi' });
+    await tool.execute({ text: '试音。', target: 'group:origin', role: 'narrator' }, { signal: new AbortController().signal, agent });
+    expect(requestBody()).toEqual({ text: '试音。', speed: 0.95, role: 'narrator' });
     expect(currentId).not.toHaveBeenCalled();
   });
 
   it.each(['white-dragon', 'unmapped-persona'])('QQ 会话不允许显式覆盖音色（%s）', async (personaId) => {
     const { tool, agent, sendVoice } = register({ bound: true, personaId });
-    await expect(tool.execute({ text: '不要切音色。', role: 'hakimi', target: 'c2c:elsewhere' }, {
+    await expect(tool.execute({ text: '不要切音色。', role: 'narrator', target: 'c2c:elsewhere' }, {
       signal: new AbortController().signal, agent,
     })).rejects.toThrow('请省略 `role`');
     expect(fetchMock).not.toHaveBeenCalled();
     expect(sendVoice).not.toHaveBeenCalled();
   });
 
-  it('拒绝不受支持的 role', async () => {
-    const { tool } = register();
-    await expect(tool.execute({ text: '试音。', role: 'other', target: 'c2c:u1' }, { signal: new AbortController().signal }))
-      .rejects.toThrow('`role` 只接受');
+  it('拒绝格式非法的 role，并在仅有在线 roleVoices 映射时拒绝未配置角色', async () => {
+    const { tool: withLocal } = register();
+    await expect(withLocal.execute({ text: '试音。', role: 'bad role!', target: 'c2c:u1' }, { signal: new AbortController().signal }))
+      .rejects.toThrow('必须是非空字母/数字/下划线/短横线标识');
+
+    const { tool: onlineOnly } = register({
+      gsvUrl: '',
+      elevenlabs: { enabled: true, roleVoices: { narrator: 'v_narrator_01' } },
+    });
+    await expect(onlineOnly.execute({ text: '试音。', role: 'other', target: 'c2c:u1' }, { signal: new AbortController().signal }))
+      .rejects.toThrow('`role` 只接受 narrator');
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -232,7 +238,7 @@ describe('registerSpeakTool', () => {
     const result = await tool.execute({ text: '照常说。', style: '轻快一些', lang: 'ja' }, {
       signal: new AbortController().signal, agent,
     });
-    expect(requestBody()).toEqual({ text: '照常说。', speed: 0.95, style: '轻快一些', lang: 'ja', role: 'hakimi' });
+    expect(requestBody()).toEqual({ text: '照常说。', speed: 0.95, style: '轻快一些', lang: 'ja', role: 'Gemini' });
     expect(execFileMock).toHaveBeenCalledExactlyOnceWith('test-edge-tts', [
       '--voice', 'zh-CN-XiaoyiNeural', '--rate', '+8%', '--text', '照常说。', '--write-media', expect.stringMatching(/\.mp3$/),
     ], expect.anything(), expect.any(Function));
@@ -275,18 +281,16 @@ describe('registerSpeakTool', () => {
 
   describe('ElevenLabs 在线 TTS', () => {
     const roleVoices = {
-      feiyu: 'v_feiyu_01',
-      dragon: 'v_dragon_02',
-      hakimi: 'v_hakimi_03',
+      'soft-whale': 'v_soft_01',
+      'white-dragon': 'v_dragon_02',
+      Gemini: 'v_gemini_03',
     };
 
     it.each([
-      ['default', 'feiyu', 'v_feiyu_01', 'group'],
-      ['soft-whale', 'feiyu', 'v_feiyu_01', 'group'],
-      ['tieba-whale', 'feiyu', 'v_feiyu_01', 'c2c'],
-      ['white-dragon', 'dragon', 'v_dragon_02', 'c2c'],
-      ['Gemini', 'hakimi', 'v_hakimi_03', 'group'],
-    ] as const)('按受信任 QQ 人设 %s 路由到角色 %s (%s)', async (personaId, expectedLabel, voiceId, scope) => {
+      ['soft-whale', 'soft-whale', 'v_soft_01', 'group'],
+      ['white-dragon', 'white-dragon', 'v_dragon_02', 'c2c'],
+      ['Gemini', 'Gemini', 'v_gemini_03', 'group'],
+    ] as const)('按受信任 QQ 人设 %s 精确路由到 roleVoices (%s)', async (personaId, expectedLabel, voiceId, scope) => {
       const { tool, sendVoice, agent } = register({
         bound: true,
         personaId,
@@ -307,18 +311,19 @@ describe('registerSpeakTool', () => {
       expect(tool.output.render({}, result)[0]?.text).toContain(`ElevenLabs（${expectedLabel}）`);
     });
 
-    it('支持按具体 personaId 与人设 frontmatter voiceId 覆盖角色映射', async () => {
-      const { tool: byPersonaMap, agent: a1 } = register({
+    it('支持 defaultVoiceId 兜底与人设 frontmatter voiceId 覆盖映射', async () => {
+      const { tool: byDefault, agent: a1 } = register({
         bound: true,
-        personaId: 'soft-whale',
+        personaId: 'unmapped-persona',
         credentialKey: 'xi-test-key',
         elevenlabs: {
           enabled: true,
-          roleVoices: { ...roleVoices, 'soft-whale': 'v_soft_override' },
+          defaultVoiceId: 'v_default_fallback',
+          roleVoices,
         },
       });
-      await byPersonaMap.execute({ text: '覆盖映射' }, { signal: new AbortController().signal, agent: a1 });
-      expect(fetchMock.mock.calls[0]?.[0]).toContain('/v_soft_override?');
+      await byDefault.execute({ text: '默认兜底' }, { signal: new AbortController().signal, agent: a1 });
+      expect(fetchMock.mock.calls[0]?.[0]).toContain('/v_default_fallback?');
 
       const { tool: byFrontmatter, agent: a2 } = register({
         bound: true,
@@ -410,7 +415,7 @@ describe('registerSpeakTool', () => {
       const elBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
       expect(elBody.text).toBe('先叠个甲。');
       const localBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
-      expect(localBody).toEqual({ text: '先叠个甲。', speed: 0.95, role: 'dragon', style: '忍着笑吐槽' });
+      expect(localBody).toEqual({ text: '先叠个甲。', speed: 0.95, role: 'white-dragon', style: '忍着笑吐槽' });
     });
 
     it('ElevenLabs 缺 key 时自动回退本地服务，本地再失败自动退回 edge-tts', async () => {
@@ -436,15 +441,15 @@ describe('registerSpeakTool', () => {
         bound: true,
         personaId: 'default',
         credentialKey: 'xi-test-key',
-        elevenlabs: { enabled: true, roleVoices: { dragon: 'v_dragon_02', hakimi: 'v_hakimi_03' } },
+        elevenlabs: { enabled: true, roleVoices: { 'white-dragon': 'v_dragon_02', Gemini: 'v_gemini_03' } },
       });
-      const res = await tool.execute({ text: '大肥鱼走本地' }, { signal: new AbortController().signal, agent });
+      const res = await tool.execute({ text: '未映射默认走本地' }, { signal: new AbortController().signal, agent });
       expect(res).toMatchObject({ backend: 'local' });
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(fetchMock.mock.calls[0]?.[0]).toBe(`${localUrl}/tts`);
     });
 
-    it('支持从注入的 envFiles 解析 ELEVENLABS_API_KEY，且非 QQ 自定义角色回退本地时不透传非法 role', async () => {
+    it('支持从注入的 envFiles 解析 ELEVENLABS_API_KEY，并在回退本地服务时透传显式 role', async () => {
       const envPath = join(root, '.env.local');
       writeFileSync(envPath, 'ELEVENLABS_API_KEY="xi-from-dotenv"\n', 'utf8');
       const { tool } = register({
@@ -464,7 +469,7 @@ describe('registerSpeakTool', () => {
         signal: new AbortController().signal,
       });
       const localBody = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body));
-      expect(localBody.role).toBeUndefined();
+      expect(localBody.role).toBe('maid');
     });
 
     it('exec.signal 中止时同步取消 ElevenLabs fetch 且不回退、不发送', async () => {
@@ -499,14 +504,14 @@ describe('registerSpeakTool', () => {
     const hybridElevenLabs: Partial<ElevenLabsSpeakConfig> = {
       enabled: true,
       roleVoices: {
-        dragon: '5q4CepYUNl0GbkkgWQCr',
-        hakimi: 'jsFTyDLIzXGzC5TAFmFD',
+        'white-dragon': 'v_test_dragon_01',
+        Gemini: 'v_test_gemini_02',
       },
     };
     const hybridDeepSeek: Partial<DeepSeekSpeakConfig> = {
       enabled: true,
       roleVoices: {
-        feiyu: '海星',
+        'soft-whale': '海星',
       },
     };
     const credentialKeys = {
@@ -514,15 +519,11 @@ describe('registerSpeakTool', () => {
       DEEPSEEK_API_KEY: 'ds-hybrid-key',
     };
 
-    it.each([
-      ['default', 'c2c'],
-      ['soft-whale', 'group'],
-      ['tieba-whale', 'group'],
-    ] as const)('混合模式下 %s 走 DeepSeek 海星 (stella) 并经 ffmpeg 转 MP3', async (personaId, scope) => {
+    it('混合模式下 soft-whale 走 DeepSeek 海星 (stella) 并经 ffmpeg 转 MP3', async () => {
       const { tool, sendVoice, agent } = register({
         bound: true,
-        personaId,
-        scope,
+        personaId: 'soft-whale',
+        scope: 'group',
         credentialKeys,
         elevenlabs: hybridElevenLabs,
         deepseek: hybridDeepSeek,
@@ -531,7 +532,7 @@ describe('registerSpeakTool', () => {
         signal: new AbortController().signal,
         agent,
       });
-      expect(result).toMatchObject({ backend: 'deepseek', voice: 'feiyu' });
+      expect(result).toMatchObject({ backend: 'deepseek', voice: 'soft-whale' });
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const [url, init] = fetchMock.mock.calls[0]!;
       expect(url).toBe('https://api.deepseek.com/v1/tools/tts');
@@ -549,13 +550,13 @@ describe('registerSpeakTool', () => {
       expect(execFileMock).toHaveBeenCalledTimes(1);
       expect(execFileMock.mock.calls[0]?.[0]).toBe('ffmpeg');
       expect(sendVoice).toHaveBeenCalledTimes(1);
-      expect(tool.output.render({}, result)[0]?.text).toContain('DeepSeek（feiyu）');
+      expect(tool.output.render({}, result)[0]?.text).toContain('DeepSeek（soft-whale）');
     });
 
     it.each([
-      ['white-dragon', 'dragon', '5q4CepYUNl0GbkkgWQCr'],
-      ['Gemini', 'hakimi', 'jsFTyDLIzXGzC5TAFmFD'],
-    ] as const)('混合模式下 %s 仍走 ElevenLabs 角色 %s', async (personaId, expectedLabel, voiceId) => {
+      ['white-dragon', 'white-dragon', 'v_test_dragon_01'],
+      ['Gemini', 'Gemini', 'v_test_gemini_02'],
+    ] as const)('混合模式下 %s 仍走 ElevenLabs 人设映射 %s', async (personaId, expectedLabel, voiceId) => {
       const { tool, agent } = register({
         bound: true,
         personaId,
@@ -576,10 +577,10 @@ describe('registerSpeakTool', () => {
     it('支持 https://api.deepseek.com 自动补 /v1 与语速 atempo，style 不混入 text 且失败回退本地服务', async () => {
       const { tool, agent } = register({
         bound: true,
-        personaId: 'default',
+        personaId: 'soft-whale',
         credentialKeys,
         elevenlabs: hybridElevenLabs,
-        deepseek: { enabled: true, baseUrl: 'https://api.deepseek.com', roleVoices: { feiyu: 'stella' }, speed: 1.1 },
+        deepseek: { enabled: true, baseUrl: 'https://api.deepseek.com', roleVoices: { 'soft-whale': 'stella' }, speed: 1.1 },
       });
       await tool.execute({ text: '调速测试', style: '轻快一点' }, {
         signal: new AbortController().signal,
@@ -598,13 +599,13 @@ describe('registerSpeakTool', () => {
       });
       expect(fallbackRes).toMatchObject({ backend: 'local', voice: '本地嗓子' });
       const localBody = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body));
-      expect(localBody).toEqual({ text: '失败降级', speed: 0.95, role: 'feiyu', style: '忍着笑自嘲' });
+      expect(localBody).toEqual({ text: '失败降级', speed: 0.95, role: 'soft-whale', style: '忍着笑自嘲' });
     });
 
     it('exec.signal 中止时同步取消 DeepSeek fetch 且不回退、不发送', async () => {
       const { tool, sendVoice, agent } = register({
         bound: true,
-        personaId: 'default',
+        personaId: 'soft-whale',
         credentialKeys,
         elevenlabs: hybridElevenLabs,
         deepseek: hybridDeepSeek,
@@ -636,7 +637,7 @@ describe('registerSpeakTool', () => {
         bound: true,
         personaId: 'Gemini',
         credentialKey: 'xi-test-key',
-        elevenlabs: { enabled: true, roleVoices: { hakimi: 'yJMhHgXbgiuvJezppMtB' } },
+        elevenlabs: { enabled: true, roleVoices: { Gemini: 'v_test_long_03' } },
       });
       const longText = '哈基米测试长语音。'.repeat(140);
       expect(longText.length).toBe(1260);
@@ -644,7 +645,7 @@ describe('registerSpeakTool', () => {
         signal: new AbortController().signal,
         agent,
       });
-      expect(result).toMatchObject({ backend: 'elevenlabs', voice: 'hakimi', chars: 1260, target: 'group:dest' });
+      expect(result).toMatchObject({ backend: 'elevenlabs', voice: 'Gemini', chars: 1260, target: 'group:dest' });
       expect(sendVoice).toHaveBeenCalledTimes(1);
     });
 
@@ -653,7 +654,7 @@ describe('registerSpeakTool', () => {
         bound: true,
         personaId: 'Gemini',
         credentialKey: 'xi-test-key',
-        elevenlabs: { enabled: true, roleVoices: { hakimi: 'yJMhHgXbgiuvJezppMtB' } },
+        elevenlabs: { enabled: true, roleVoices: { Gemini: 'v_test_long_03' } },
       });
       const oversized = '哈'.repeat(1501);
       let thrown: Error | undefined;
@@ -674,7 +675,7 @@ describe('registerSpeakTool', () => {
         bound: true,
         personaId: 'Gemini',
         credentialKey: 'xi-test-key',
-        elevenlabs: { enabled: true, roleVoices: { hakimi: 'yJMhHgXbgiuvJezppMtB' } },
+        elevenlabs: { enabled: true, roleVoices: { Gemini: 'v_test_long_03' } },
       });
       fetchMock.mockResolvedValueOnce(new Response(Buffer.alloc(20 * 1024 * 1024 + 16, 1)));
       await expect(tool.execute({ text: '大文件拦截测试' }, { signal: new AbortController().signal, agent }))

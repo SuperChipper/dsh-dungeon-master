@@ -38,7 +38,7 @@ function harness() {
     scope: 'group', peerId: 'G1', senderId: 'P1', recentSenders: [{ id: 'P1', at: Date.now() }], lastActivity: Date.now(),
     replyTarget: { scope: 'group', targetId: 'G1', msgId: 'M1' },
   };
-  const settings = { ...DND_COMBAT_AGENT_DEFAULTS, enabled: true };
+  const settings = { ...DND_COMBAT_AGENT_DEFAULTS, enabled: true, provider: 'opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high' };
   const restrictions: unknown[] = [], prompts: Array<{ text: string; complete: boolean; interpolate: boolean }> = [];
   const contexts: Array<{ text: string; interpolate: boolean }> = [];
   const guards: Array<(exec: { name: string; arguments?: unknown }) => string | undefined> = [];

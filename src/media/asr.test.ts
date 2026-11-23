@@ -166,7 +166,13 @@ describe('requestTranscription', () => {
 });
 
 describe('chat 协议（mode: chat）', () => {
-  const chatAsr: AsrConfig = { ...asr, mode: 'chat' };
+  const chatAsr: AsrConfig = {
+    ...asr,
+    mode: 'chat',
+    chatBaseUrl: 'https://chat-gw.example/v1',
+    chatModel: 'chat-asr-model',
+    chatApiKeyEnv: 'CHAT_ASR_KEY',
+  };
 
   afterEach(() => {
     setChatKeyResolver(undefined);
@@ -185,7 +191,7 @@ describe('chat 协议（mode: chat）', () => {
     expect(text).toBe('你好呀');
 
     const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toContain('/chat/completions');
+    expect(url).toBe('https://chat-gw.example/v1/chat/completions');
     const body = JSON.parse(init.body as string);
     expect(body.reasoning_effort).toBe('none');
     expect(body.messages[0].content[0].input_audio.format).toBe('wav');
@@ -213,6 +219,9 @@ describe('ASR cancellation', () => {
   const audio = { data: Buffer.from('RIFF'), name: 'v.wav' };
   const withFallback: AsrConfig = {
     ...asr,
+    chatBaseUrl: 'https://chat-gw.example/v1',
+    chatModel: 'chat-asr-model',
+    chatApiKeyEnv: 'CHAT_ASR_KEY',
     fallback: { enabled: true, baseUrl: 'https://fallback.example.com/v1', apiKey: 'fallback-key', model: 'whisper', timeoutMs: 5000 },
   };
 

@@ -35,6 +35,13 @@ import { PLUGIN_ROOT, buildUserAgent, isPrivilegedSender, privilegedOpenids, res
 import { createToolGuard } from '../shared/tool-guard.ts';
 import { updateProfileAllowedGroups } from '../setup/persist.ts';
 import { NOTE_JUDGE_DEFAULTS, type ImQQBotConfig } from '../config.ts';
+import {
+  onHostAgentLifecycle,
+  onHostAgentTurnStopping,
+  onHostAssistantStream,
+  onHostSessionEvent,
+  registerHostEffect,
+} from '../host-adapter/index.ts';
 import type { Logger } from '../types.ts';
 import { setupMiddlewares } from './middleware-setup.ts';
 import { bindInteractionHandler, dispatchInteraction } from './interaction.ts';
@@ -128,23 +135,23 @@ export async function bootstrapGateway(
   const outbound = createOutboundHandler(manager, sender, config, logger, toolsRegistry, stickerStore);
   const mediaReview = new MediaReviewCoordinator(outbound, (message) => logger.warn(message));
   manager.mediaReview = mediaReview;
-  (ctx as unknown as { on(event: string, handler: (...args: unknown[]) => void): void })
-    .on('session/event', ((session: Parameters<typeof outbound.routeSessionEvent>[0], event: Parameters<typeof outbound.routeSessionEvent>[1]) => {
-      outbound.routeSessionEvent(session, event);
-      if (event.type === 'turn/end' && !isAutoSteerTurnEnd((event as unknown as { data?: { reason?: unknown }; reason?: unknown }).data?.reason
-        ?? (event as unknown as { reason?: unknown }).reason)) mediaReview.ended(session.header.id);
-    }) as (...args: unknown[]) => void);
-  (ctx as unknown as { on(event: string, listener: (payload: { agent: DshAgent; signal: AbortSignal }) => Promise<void>, options: { global: boolean }): void })
-    .on('agent/turn-stopping', async ({ agent, signal }) => {
-      if (manager.findByAgent(agent)) await mediaReview.stopping(agent, signal);
-    }, { global: true });
+  onHostSessionEvent<
+    Parameters<typeof outbound.routeSessionEvent>[0],
+    Parameters<typeof outbound.routeSessionEvent>[1]
+  >(ctx, (session, event) => {
+    outbound.routeSessionEvent(session, event);
+    if (event.type === 'turn/end' && !isAutoSteerTurnEnd((event as unknown as { data?: { reason?: unknown }; reason?: unknown }).data?.reason
+      ?? (event as unknown as { reason?: unknown }).reason)) mediaReview.ended(session.header.id);
+  });
+  onHostAgentTurnStopping<DshAgent>(ctx, async ({ agent, signal }) => {
+    if (manager.findByAgent(agent)) await mediaReview.stopping(agent, signal);
+  });
 
   // ── 出站流式：agent/assistant-stream → 流式帧路由 ──
-  (ctx as unknown as { on(event: string, handler: (...args: unknown[]) => void, options?: { global?: boolean }): void })
-    .on('agent/assistant-stream', (payload: unknown) => {
-      const parsed = parseStreamFrame(payload);
-      if (parsed !== undefined) outbound.routeStreamFrame(parsed.agentId, parsed.delta);
-    }, { global: true });
+  onHostAssistantStream(ctx, (payload: unknown) => {
+    const parsed = parseStreamFrame(payload);
+    if (parsed !== undefined) outbound.routeStreamFrame(parsed.agentId, parsed.delta);
+  });
 
   // ── 互动通道（问答 / 审批 / 跑团回合 / 人设 / 权限授权） ──
   const questionChannel = new QuestionChannel(manager, sender, config, logger);
@@ -254,11 +261,8 @@ export async function bootstrapGateway(
     logger,
   });
   manager.sessionToolScope = sessionToolScope;
-  const scopeEvents = ctx as unknown as {
-    on(event: string, handler: (payload: { agent?: DshAgent }) => void, options?: { global?: boolean }): void;
-  };
-  scopeEvents.on('agent/created', ({ agent }) => { if (agent !== undefined) sessionToolScope.hideForNonQq(agent); }, { global: true });
-  scopeEvents.on('agent/disposed', ({ agent }) => { if (agent !== undefined) sessionToolScope.release(agent); }, { global: true });
+  onHostAgentLifecycle<DshAgent>(ctx, 'agent/created', ({ agent }) => { if (agent !== undefined) sessionToolScope.hideForNonQq(agent); });
+  onHostAgentLifecycle<DshAgent>(ctx, 'agent/disposed', ({ agent }) => { if (agent !== undefined) sessionToolScope.release(agent); });
   try {
     for (const agent of (agents as { list?(): DshAgent[] }).list?.() ?? []) sessionToolScope.hideForNonQq(agent);
   } catch (err) {
@@ -266,25 +270,24 @@ export async function bootstrapGateway(
   }
 
   // ── 生命周期 ──
-  (ctx as unknown as { effect(fn: () => (() => Promise<void>) | void, name?: string): void })
-    .effect(() => {
-      logger.info(`Starting bot (appId=${config.appId})`);
-      bot.start().catch((err: unknown) => {
-        logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
-      });
+  registerHostEffect(ctx, () => {
+    logger.info(`Starting bot (appId=${config.appId})`);
+    bot.start().catch((err: unknown) => {
+      logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
 
-      return async () => {
-        logger.info('Shutting down');
-        senders.dispose();
-        modelWatch?.stop();
-        // 待答问题挂在旧实例上，重载后没人能答：先让它们以 ASK_ABORTED 结束
-        questionChannel.uninstall();
-        manager.sessionToolScope?.disposeAll();
-        manager.dndToolScope?.disposeAll();
-        await manager.disposeAll();
-        // 停掉账本的定时器并把最后一分钟刷盘，否则每次重组都留下一个还在写同一个文件的旧实例
-        manager.noteMetrics?.dispose();
-        bot.stop();
-      };
-    }, 'im-qqbot.lifecycle');
+    return async () => {
+      logger.info('Shutting down');
+      senders.dispose();
+      modelWatch?.stop();
+      // 待答问题挂在旧实例上，重载后没人能答：先让它们以 ASK_ABORTED 结束
+      questionChannel.uninstall();
+      manager.sessionToolScope?.disposeAll();
+      manager.dndToolScope?.disposeAll();
+      await manager.disposeAll();
+      // 停掉账本的定时器并把最后一分钟刷盘，否则每次重组都留下一个还在写同一个文件的旧实例
+      manager.noteMetrics?.dispose();
+      bot.stop();
+    };
+  }, 'im-qqbot.lifecycle');
 }

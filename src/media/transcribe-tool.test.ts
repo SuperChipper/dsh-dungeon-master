@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // transcribe-tool 在模块顶层 promisify(execFile)，所以必须在 import 之前 mock
 vi.mock('node:child_process', () => ({ execFile: vi.fn() }));
@@ -58,8 +58,15 @@ function stubFetch(content: string | null) {
   return mock;
 }
 
+beforeEach(() => {
+  vi.stubEnv('QQBOT_TRANSCRIBE_BASE_URL', 'https://opencode.ai/inference/go/openai/v1');
+  vi.stubEnv('QQBOT_TRANSCRIBE_MODEL', 'mimo-v2.6-flash');
+  vi.stubEnv('QQBOT_TRANSCRIBE_KEY_REF', 'OPENCODE_GO_API_KEY');
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   vi.clearAllMocks();
 });
 
@@ -71,7 +78,7 @@ describe('qqbot_transcribe', () => {
   });
 
   it('凭证服务晚于工具注册启动，转写时仍能读取；服务卸载后回退环境变量', async () => {
-    vi.stubEnv('QQBOT_TRANSCRIBE_KEY_REF', undefined);
+    vi.stubEnv('QQBOT_TRANSCRIBE_KEY_REF', 'OPENCODE_GO_API_KEY');
     vi.stubEnv('OPENCODE_GO_API_KEY', undefined);
     stubMediaBinaries();
     const fetchMock = stubFetch('0.00-1.00 | SPEAKER_00: 测试');

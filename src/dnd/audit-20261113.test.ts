@@ -118,7 +118,7 @@ function createAuditHarness() {
     replyTarget: { scope: 'group', targetId: 'AUDIT', msgId: 'M1' },
   };
 
-  const settings = { ...DND_COMBAT_AGENT_DEFAULTS, enabled: true };
+  const settings = { ...DND_COMBAT_AGENT_DEFAULTS, enabled: true, provider: 'opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high' };
   const prompts: Array<{ text: string; complete: boolean; interpolate: boolean }> = [];
   const guards: Array<(exec: { name: string; arguments?: unknown }) => string | undefined> = [];
   const agents = {

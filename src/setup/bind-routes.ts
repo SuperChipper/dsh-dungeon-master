@@ -22,6 +22,7 @@ import { getProfileDir } from '../shared/index.ts';
 import {
   AccessControlSchema,
   AsrSchema,
+  BiliSchema,
   CleanupSchema,
   DndSchema,
   FanartSchema,
@@ -36,7 +37,9 @@ import {
   NotesSchema,
   PersonasSchema,
   ReplyDesireSchema,
+  ReverseImageSchema,
   SendFileSchema,
+  SingSchema,
   SpeakSchema,
   StickersSchema,
   ToolAccessSchema,
@@ -127,7 +130,7 @@ const EDITABLE_CONFIG_KEYS = new Set([
   'steerWindowMs', 'processingTimeoutMs', 'askTimeoutMs',
   'tmpDir', 'tmpTtlHours', 'tmpMaxTotalMB',
   'access', 'fileAccess', 'stickers', 'personas', 'notes', 'toolAccess', 'modelFailover',
-  'media', 'vision', 'asr', 'video', 'imageGen', 'sendFile', 'speak', 'cleanup', 'fanart', 'dnd', 'browser',
+  'media', 'vision', 'asr', 'video', 'imageGen', 'sendFile', 'speak', 'cleanup', 'bili', 'sing', 'reverseImage', 'fanart', 'dnd', 'browser',
 ]);
 
 /** 白名单键的子 Schema（服务端校验：客户端校验仅为体验，安全边界在宿主） */
@@ -200,6 +203,9 @@ const EDITABLE_CONFIG_SCHEMAS: Record<string, (value: unknown) => unknown> = {
   sendFile: (v) => SendFileSchema(v as never),
   speak: (v) => SpeakSchema(v as never),
   cleanup: (v) => CleanupSchema(v as never),
+  bili: (v) => BiliSchema(v as never),
+  sing: (v) => SingSchema(v as never),
+  reverseImage: (v) => ReverseImageSchema(v as never),
   fanart: (v) => FanartSchema(v as never),
   // allowedGroups 与其余浏览参数共用唯一真源校验，群权限不继承终端白名单。
   browser: (v) => BrowserSchema(v as never),

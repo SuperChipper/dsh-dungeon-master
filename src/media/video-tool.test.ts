@@ -274,36 +274,34 @@ describe.runIf(hasFfmpeg())('qqbot_describe_video with real ffmpeg', () => {
     const longClip = join(dir, 'long.mp4');
     execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=red:s=64x64:r=1:d=302',
       '-c:v', 'libx264', '-pix_fmt', 'yuv420p', longClip]);
-    vi.stubEnv('OPENCODE_GO_API_KEY', 'test');
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: '红色画面' }, finish_reason: 'stop' }] })));
     vi.stubGlobal('fetch', fetchMock);
-    try {
-      const { tool } = await register({ ...asr, enabled: false });
-      const out = await tool!.execute({ video: longClip }, { signal: new AbortController().signal });
-      expect(out).toMatchObject({ mode: 'segmented', partial: false, truncated: false, frames: 0 });
-      expect(out.segments).toEqual([
-        { start: 0, end: 300, visualStatus: 'video', speechStatus: 'no-audio' },
-        { start: 300, end: 302, visualStatus: 'video', speechStatus: 'no-audio' },
-      ]);
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      const body = JSON.parse((fetchMock.mock.calls[1] as unknown as [string, RequestInit])[1].body as string);
-      expect(body.messages[0].content[0].video_url.url).toMatch(/^data:video\/mp4;base64,/);
-      expect(body.messages[0].content[1].text).toContain('00:05:00.0');
-    } finally { vi.unstubAllEnvs(); }
+    const { tool } = await register(
+      { ...asr, enabled: false },
+      { ...video, baseUrl: 'https://video-gw.example/v1', model: 'test-video-model', apiKey: 'test-key' },
+    );
+    const out = await tool!.execute({ video: longClip }, { signal: new AbortController().signal });
+    expect(out).toMatchObject({ mode: 'segmented', partial: false, truncated: false, frames: 0 });
+    expect(out.segments).toEqual([
+      { start: 0, end: 300, visualStatus: 'video', speechStatus: 'no-audio' },
+      { start: 300, end: 302, visualStatus: 'video', speechStatus: 'no-audio' },
+    ]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = JSON.parse((fetchMock.mock.calls[1] as unknown as [string, RequestInit])[1].body as string);
+    expect(body.messages[0].content[0].video_url.url).toMatch(/^data:video\/mp4;base64,/);
+    expect(body.messages[0].content[1].text).toContain('00:05:00.0');
   }, 30_000);
 
   it('directEnabled=false 时跳过整段视频直传，直接抽帧宫格分析', async () => {
-    vi.stubEnv('OPENCODE_GO_API_KEY', 'test');
     const fetchMock = vi.fn(async () => new Response('should not call direct video endpoint', { status: 500 }));
     vi.stubGlobal('fetch', fetchMock);
-    try {
-      const { tool } = await register({ ...asr, enabled: false }, { ...video, directEnabled: false });
-      const out = await tool!.execute({ video: clip }, { signal: new AbortController().signal });
-      expect(out).toMatchObject({ mode: 'frames', frames: 3 });
-      expect(fetchMock).not.toHaveBeenCalled();
-    } finally {
-      vi.unstubAllEnvs();
-    }
+    const { tool } = await register(
+      { ...asr, enabled: false },
+      { ...video, directEnabled: false, baseUrl: 'https://video-gw.example/v1', model: 'test-video-model', apiKey: 'test-key' },
+    );
+    const out = await tool!.execute({ video: clip }, { signal: new AbortController().signal });
+    expect(out).toMatchObject({ mode: 'frames', frames: 3 });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('aborted execution does not start media/model work', async () => {
