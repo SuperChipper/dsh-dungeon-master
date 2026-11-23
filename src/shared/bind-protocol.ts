@@ -22,6 +22,12 @@ export const BIND_UNBIND_PATH = '/qqbot/im-qqbot/bind/unbind';
 /** 配置读写（设置面板表单） */
 export const BIND_CONFIG_PATH = '/qqbot/im-qqbot/config';
 
+/** 人设清单与创建自定义人设（设置面板人设管理） */
+export const BIND_PERSONAS_PATH = '/qqbot/im-qqbot/personas';
+
+/** 在宿主系统文件管理器打开当前人设目录 */
+export const BIND_PERSONAS_OPEN_PATH = '/qqbot/im-qqbot/personas/open';
+
 /** 线上协议（HTTP 路由序列化形态） */
 export type BindStateWire =
   | { phase: 'starting' }
@@ -33,6 +39,31 @@ export type BindStateWire =
 /** manual / unbind 操作的统一响应 */
 export interface BindActionResponse {
   ok: boolean;
+  message?: string;
+  error?: string;
+}
+
+export type PersonaScopeKind = 'both' | 'group' | 'direct';
+
+export interface PersonaSummaryWire {
+  id: string;
+  name: string;
+  scopes: PersonaScopeKind[];
+  files: string[];
+}
+
+export interface PersonasListResponse {
+  dir: string;
+  isBundledDir: boolean;
+  personas: PersonaSummaryWire[];
+}
+
+export interface PersonaCreateResponse {
+  ok: boolean;
+  id?: string;
+  fileName?: string;
+  filePath?: string;
+  dir?: string;
   message?: string;
   error?: string;
 }

@@ -130,6 +130,28 @@ export function useConfigPanelStyles(): void {
 }
 /* cwd 只读行 */
 .imqb2-readonly { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--dsw-alias-label-secondary); word-break: break-all; margin: 0; }
+/* 人设目录操作与列表 */
+.imqb2-btn-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.imqb2-btn-secondary {
+  appearance: none; border: 0.5px solid var(--dsw-alias-border-l4);
+  border-radius: var(--dsw-radius-md, 8px); padding: 5px 12px;
+  font: inherit; font-size: 12px; line-height: 1.5; cursor: pointer;
+  background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary);
+}
+.imqb2-btn-secondary:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
+.imqb2-btn-secondary:disabled { opacity: 0.5; cursor: default; }
+.imqb2-chip-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.imqb2-chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px;
+  border: 0.5px solid var(--dsw-alias-border-l3); border-radius: 999px;
+  font-size: 12px; line-height: 1.5;
+  background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-secondary);
+}
+.imqb2-subcard {
+  display: flex; flex-direction: column; gap: 8px; margin-top: 4px; padding: 10px 12px;
+  border: 0.5px solid var(--dsw-alias-border-l3); border-radius: var(--dsw-radius-md, 8px);
+  background: var(--dsw-alias-bg-layer-1, transparent);
+}
     `;
     document.head.appendChild(style);
     return () => { style.remove(); };

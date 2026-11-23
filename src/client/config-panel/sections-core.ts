@@ -1,6 +1,7 @@
 import { createElement, Fragment, type ReactNode } from 'react';
 import type { GroupTriggerMode } from '../../config.ts';
 import { AreaRow, FieldRow, ListRow, NumberRow, SegmentedRow, SelectRow, SwitchRow } from './controls.ts';
+import { PersonasManager } from './personas-manager.ts';
 import {
   GROUP_TRIGGER_OPTIONS,
   MODE_OPTIONS,
@@ -333,14 +334,7 @@ export function AdvancedSessionSection({ form, patch }: { form: ConfigWire; patc
       help: '存放 <id>.md / <id>.group.md / <id>.direct.md（相对路径按工作目录解析）；运行态会话绑定仍保存在 ~/.dsh-qqbot/persona-state.json',
       onChange: (v) => { patch('personas', { ...personas, root: v }); },
     }),
-    createElement(AreaRow, {
-      label: '群聊额外 system prompt', value: form.groupPrompt ?? '',
-      onChange: (v) => { patch('groupPrompt', v); },
-    }),
-    createElement(AreaRow, {
-      label: '私聊额外 system prompt', value: form.directPrompt ?? '',
-      onChange: (v) => { patch('directPrompt', v); },
-    }),
+    createElement(PersonasManager, null),
 
     createElement('div', { className: 'imqb2-group-title' }, '临时目录与清理'),
     createElement(FieldRow, {

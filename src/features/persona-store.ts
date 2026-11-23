@@ -57,7 +57,7 @@ interface PersonaState {
 }
 
 const FRONT_MATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)([\s\S]*)$/;
-const PERSONA_FILE_RE = /^(.+?)(?:\.(group|direct))?\.md$/;
+export const PERSONA_FILE_RE = /^(.+?)(?:\.(group|direct))?\.md$/;
 type PersonaVariant = 'base' | 'group' | 'direct';
 
 /**

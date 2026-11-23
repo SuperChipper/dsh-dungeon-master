@@ -9,7 +9,12 @@
  * appSecret 绝不出现在任何响应中。manual 提交走与扫码一致的
  * persist 路径（写入 profile patch → HMR 重载生效）。
  */
+import { execFile } from 'node:child_process';
+import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { dirname, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import yaml from 'js-yaml';
 import type { Logger } from '../types.ts';
 import type { BindingService } from './binding-service.ts';
 import {
@@ -18,7 +23,8 @@ import {
   updateProfileConfig,
   type SetupCredentials,
 } from './persist.ts';
-import { getProfileDir } from '../shared/index.ts';
+import { getProfileDir, PLUGIN_ROOT, writeTextAtomic } from '../shared/index.ts';
+import { parsePersona, PERSONA_FILE_RE, resolvePersonasDir } from '../features/persona-store.ts';
 import {
   AccessControlSchema,
   AsrSchema,
@@ -48,15 +54,27 @@ import {
 import {
   BIND_CONFIG_PATH,
   BIND_MANUAL_PATH,
+  BIND_PERSONAS_OPEN_PATH,
+  BIND_PERSONAS_PATH,
   BIND_REFRESH_PATH,
   BIND_STATE_PATH,
   BIND_UNBIND_PATH,
   type BindStateWire,
+  type PersonaScopeKind,
+  type PersonaSummaryWire,
 } from '../shared/bind-protocol.ts';
 
 // 协议单一来源：shared/bind-protocol.ts（类型 + 路径常量，客户端共用）
-export { BIND_CONFIG_PATH, BIND_MANUAL_PATH, BIND_REFRESH_PATH, BIND_STATE_PATH, BIND_UNBIND_PATH };
-export type { BindStateWire };
+export {
+  BIND_CONFIG_PATH,
+  BIND_MANUAL_PATH,
+  BIND_PERSONAS_OPEN_PATH,
+  BIND_PERSONAS_PATH,
+  BIND_REFRESH_PATH,
+  BIND_STATE_PATH,
+  BIND_UNBIND_PATH,
+};
+export type { BindStateWire, PersonaScopeKind, PersonaSummaryWire };
 
 /** dsh-host-webserver 的具名路由注册形状（局部投影，避免硬依赖） */
 export interface WebRoute {
@@ -116,6 +134,16 @@ export interface BindRoutesOptions {
    * 配置写入处理（默认：最小合并写入 profile patch）。
    */
   onUpdateConfig?: (config: Record<string, unknown>) => boolean;
+  /**
+   * 解析当前生效的人设目录（默认按 currentConfig.personas.root / cwd / PLUGIN_ROOT 推导）。
+   */
+  resolvePersonasDir?: (currentConfig: Record<string, unknown>) => string;
+  /**
+   * 在宿主系统文件管理器打开指定目录（测试可注入替身，避免真实拉起系统窗口）。
+   */
+  openDirectory?: (
+    dir: string,
+  ) => { ok: boolean; error?: string } | Promise<{ ok: boolean; error?: string }>;
 }
 
 /** 可经 UI 编辑的配置键（白名单：只收用户必要的字段，其余走 patch/env） */
@@ -292,6 +320,16 @@ export function registerBindRoutes(
       kind: 'exact',
       path: BIND_CONFIG_PATH,
       handler: (req, res) => handleConfig(req, res, options),
+    }),
+    webServer.register({
+      kind: 'exact',
+      path: BIND_PERSONAS_PATH,
+      handler: (req, res) => handlePersonas(req, res, options),
+    }),
+    webServer.register({
+      kind: 'exact',
+      path: BIND_PERSONAS_OPEN_PATH,
+      handler: (req, res) => handlePersonasOpen(req, res, options, logger),
     }),
   ];
   logger.info(`im-qqbot: 端内绑定页已就绪: ${BIND_STATE_PATH}`);
@@ -633,4 +671,334 @@ async function handleConfig(req: IncomingMessage, res: ServerResponse, options: 
     return;
   }
   sendJson(res, 200, { ok: true, message: '配置已保存，插件将自动重载（进行中的机器人会话将重置）' });
+}
+
+const PERSONA_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
+const PERSONA_SCOPE_ORDER: Record<PersonaScopeKind, number> = { both: 0, group: 1, direct: 2 };
+
+function resolveActivePersonasDir(options: BindRoutesOptions): string {
+  const current = options.currentConfig?.() ?? {};
+  if (options.resolvePersonasDir !== undefined) {
+    return options.resolvePersonasDir(current);
+  }
+  const personasCfg = current.personas as { root?: unknown } | undefined;
+  return resolvePersonasDir({
+    root: typeof personasCfg?.root === 'string' ? personasCfg.root : undefined,
+    cwd: typeof current.cwd === 'string' ? current.cwd : undefined,
+    pluginRoot: PLUGIN_ROOT,
+  });
+}
+
+function listPersonasSummary(dir: string): PersonaSummaryWire[] {
+  let files: string[];
+  try {
+    files = readdirSync(dir).filter((file) => !file.startsWith('_')).sort();
+  } catch {
+    return [];
+  }
+  const grouped = new Map<string, { name: string; namePriority: number; scopes: Set<PersonaScopeKind>; files: string[] }>();
+  for (const file of files) {
+    const match = PERSONA_FILE_RE.exec(file);
+    if (match === null) continue;
+    const id = match[1]!;
+    const rawVariant = match[2];
+    const scope: PersonaScopeKind = rawVariant === 'group' || rawVariant === 'direct' ? rawVariant : 'both';
+    let displayName = id;
+    try {
+      displayName = parsePersona(id, readFileSync(resolve(dir, file), 'utf8')).name;
+    } catch {
+      /* 损坏或未写完的文件仍列出 id 兜底 */
+    }
+    const scopePriority = displayName === id ? 99 : PERSONA_SCOPE_ORDER[scope];
+    const existing = grouped.get(id);
+    if (existing === undefined) {
+      grouped.set(id, { name: displayName, namePriority: scopePriority, scopes: new Set([scope]), files: [file] });
+    } else {
+      if (scopePriority < existing.namePriority) {
+        existing.name = displayName;
+        existing.namePriority = scopePriority;
+      }
+      existing.scopes.add(scope);
+      existing.files.push(file);
+    }
+  }
+  return [...grouped.entries()]
+    .sort(([a], [b]) => {
+      if (a === 'default' && b !== 'default') return -1;
+      if (b === 'default' && a !== 'default') return 1;
+      return a.localeCompare(b);
+    })
+    .map(([id, entry]) => ({
+      id,
+      name: entry.name,
+      scopes: [...entry.scopes].sort((a, b) => PERSONA_SCOPE_ORDER[a] - PERSONA_SCOPE_ORDER[b]),
+      files: entry.files.sort(),
+    }));
+}
+
+/** 将本机目录转为 Windows Explorer 安全 URI（保留中文、转义 `,` 与 `=` 防止被当作选项或列表分隔符）。 */
+export function formatWindowsExplorerTarget(dir: string): string {
+  const href = pathToFileURL(dir).href;
+  return href
+    .replace(/(?:%[89A-F][0-9A-F])+/gi, (escaped) => {
+      try {
+        return decodeURIComponent(escaped);
+      } catch {
+        return escaped;
+      }
+    })
+    .replaceAll(',', '%2C')
+    .replaceAll('=', '%3D');
+}
+
+function resolveWindowsPowerShell(): string {
+  const root = process.env.SystemRoot || process.env.windir;
+  if (root) {
+    const candidate = resolve(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    if (existsSync(candidate)) return candidate;
+  }
+  return 'powershell.exe';
+}
+
+function runExecFile(
+  execFileImpl: typeof execFile,
+  command: string,
+  args: string[],
+  options: { encoding: 'utf8'; timeout: number; windowsHide?: boolean; env?: NodeJS.ProcessEnv },
+): Promise<{ err: (Error & { code?: unknown; killed?: boolean }) | null; stderr: string }> {
+  return new Promise((resolvePromise) => {
+    execFileImpl(command, args, options, (err, _stdout, stderr) => {
+      resolvePromise({
+        err: (err as (Error & { code?: unknown; killed?: boolean }) | null) ?? null,
+        stderr: typeof stderr === 'string' ? stderr : '',
+      });
+    });
+  });
+}
+
+function formatExecError(err: Error | null, stderr: string): string {
+  const trimmed = stderr.trim();
+  if (trimmed !== '') return trimmed;
+  return err instanceof Error ? err.message : String(err);
+}
+
+export async function openDirectoryInOs(
+  dir: string,
+  logger: Logger,
+  internals: { platform?: NodeJS.Platform; execFileFn?: typeof execFile } = {},
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    mkdirSync(dir, { recursive: true });
+    const platform = internals.platform ?? process.platform;
+    const execFileImpl = internals.execFileFn ?? execFile;
+
+    if (platform === 'win32') {
+      // 主路径：走 PowerShell Start-Process 调用 Win32 ShellExecuteExW，兼容后台启动/第三方文件管理器并通过 env 安全传参。
+      const psCommand = "$ErrorActionPreference='Stop'; Start-Process -FilePath $env:IMQQBOT_OPEN_DIR -WindowStyle Normal";
+      const psRes = await runExecFile(
+        execFileImpl,
+        resolveWindowsPowerShell(),
+        ['-NoProfile', '-NonInteractive', '-Command', psCommand],
+        {
+          encoding: 'utf8',
+          timeout: 8000,
+          windowsHide: true,
+          env: { ...process.env, IMQQBOT_OPEN_DIR: dir },
+        },
+      );
+      if (!psRes.err) {
+        logger.info(`im-qqbot: 已打开人设目录 (shell-execute): ${dir}`);
+        return { ok: true };
+      }
+      const psDetail = formatExecError(psRes.err, psRes.stderr);
+      logger.warn(`im-qqbot: PowerShell 打开人设目录失败，尝试降级 explorer.exe: ${psDetail}`);
+
+      // Explorer 对普通 Windows 路径传原生路径即可；仅含 `,` 或 `=` 时走 file:/// 转义以防参数解析歧义。
+      const target = /[,=]/.test(dir) ? formatWindowsExplorerTarget(dir) : dir;
+      const expRes = await runExecFile(
+        execFileImpl,
+        'explorer.exe',
+        [target],
+        { encoding: 'utf8', timeout: 8000, windowsHide: false },
+      );
+      // Windows explorer.exe 把打开目录转交给已有桌面外壳进程后会以 exit code 1 退出，这属于正常打开。
+      if (!expRes.err || (expRes.err.code === 1 && !expRes.err.killed)) {
+        logger.info(`im-qqbot: 已打开人设目录 (explorer-fallback): ${dir}`);
+        return { ok: true };
+      }
+      const expDetail = formatExecError(expRes.err, expRes.stderr);
+      const combined = `${psDetail}; explorer fallback: ${expDetail}`;
+      logger.warn(`im-qqbot: 打开人设目录失败: ${combined}`);
+      return { ok: false, error: combined };
+    }
+
+    const command = platform === 'darwin' ? 'open' : 'xdg-open';
+    const res = await runExecFile(
+      execFileImpl,
+      command,
+      [dir],
+      { encoding: 'utf8', timeout: 8000 },
+    );
+    if (!res.err) {
+      logger.info(`im-qqbot: 已打开人设目录 (${command}): ${dir}`);
+      return { ok: true };
+    }
+    const detail = formatExecError(res.err, res.stderr);
+    logger.warn(`im-qqbot: 打开人设目录失败: ${detail}`);
+    return { ok: false, error: detail };
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    logger.warn(`im-qqbot: 打开人设目录失败: ${detail}`);
+    return { ok: false, error: detail };
+  }
+}
+
+/** 人设清单读取与新建自定义人设 */
+async function handlePersonas(req: IncomingMessage, res: ServerResponse, options: BindRoutesOptions): Promise<void> {
+  if (!trusted(req)) {
+    sendJson(res, 403, { error: 'forbidden' });
+    return;
+  }
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
+
+  const dir = resolveActivePersonasDir(options);
+  if (req.method === 'GET') {
+    const isBundledDir = resolve(dir) === resolve(PLUGIN_ROOT, 'personas');
+    const personas = existsSync(dir) ? listPersonasSummary(dir) : [];
+    sendJson(res, 200, { dir, isBundledDir, personas });
+    return;
+  }
+
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    sendJson(res, 400, { ok: false, error: `invalid request body: ${err instanceof Error ? err.message : String(err)}` });
+    return;
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    sendJson(res, 400, { ok: false, error: '请求体必须是 JSON 对象' });
+    return;
+  }
+  const input = body as Record<string, unknown>;
+  const id = typeof input.id === 'string' ? input.id.trim() : '';
+  if (!PERSONA_ID_RE.test(id) || id.toLowerCase() === 'default') {
+    sendJson(res, 400, {
+      ok: false,
+      error: '人设 ID 仅限 1~48 位字母/数字/下划线/短横线（须以字母或数字开头，且不能为 default）',
+    });
+    return;
+  }
+
+  if (input.name !== undefined && typeof input.name !== 'string') {
+    sendJson(res, 400, { ok: false, error: '显示名称必须是字符串' });
+    return;
+  }
+  const trimmedName = typeof input.name === 'string' ? input.name.trim() : '';
+  if (trimmedName.length > 64) {
+    sendJson(res, 400, { ok: false, error: '显示名称不能超过 64 个字符' });
+    return;
+  }
+  const displayName = trimmedName !== '' ? trimmedName : id;
+
+  const rawScope = input.scope;
+  if (rawScope !== undefined && rawScope !== 'both' && rawScope !== 'group' && rawScope !== 'direct') {
+    sendJson(res, 400, { ok: false, error: 'scope 仅支持 both / group / direct' });
+    return;
+  }
+  const scope: PersonaScopeKind = rawScope ?? 'both';
+
+  if (input.prompt !== undefined && typeof input.prompt !== 'string') {
+    sendJson(res, 400, { ok: false, error: 'prompt 必须是字符串' });
+    return;
+  }
+  const rawPrompt = typeof input.prompt === 'string' ? input.prompt : '';
+  if (rawPrompt.length > 20000) {
+    sendJson(res, 400, { ok: false, error: 'prompt 不能超过 20000 个字符' });
+    return;
+  }
+  const promptBody = rawPrompt.trim() !== ''
+    ? rawPrompt.trim()
+    : `你现在扮演「${displayName}」。请保持鲜明自然的对话风格，回复简洁直接。`;
+
+  const fileName = scope === 'both' ? `${id}.md` : `${id}.${scope}.md`;
+  const resolvedDir = resolve(dir);
+  const filePath = resolve(resolvedDir, fileName);
+  if (dirname(filePath) !== resolvedDir) {
+    sendJson(res, 400, { ok: false, error: '非法人设文件名' });
+    return;
+  }
+  if (existsSync(filePath)) {
+    sendJson(res, 409, { ok: false, error: `人设文件已存在: ${fileName}` });
+    return;
+  }
+
+  try {
+    mkdirSync(resolvedDir, { recursive: true });
+    const frontmatter = yaml.dump({ name: displayName }).trim();
+    const content = `---\n${frontmatter}\n---\n\n${promptBody}\n`;
+    writeTextAtomic(filePath, content);
+    sendJson(res, 201, {
+      ok: true,
+      id,
+      fileName,
+      filePath,
+      dir: resolvedDir,
+      message: `已创建人设文件 ${fileName}，无需重启即可使用 /persona 切换`,
+    });
+  } catch (err) {
+    sendJson(res, 500, {
+      ok: false,
+      error: `写入人设文件失败: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
+}
+
+/** 在宿主系统文件管理器打开当前人设目录 */
+async function handlePersonasOpen(
+  req: IncomingMessage,
+  res: ServerResponse,
+  options: BindRoutesOptions,
+  logger: Logger,
+): Promise<void> {
+  if (!trusted(req)) {
+    sendJson(res, 403, { error: 'forbidden' });
+    return;
+  }
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
+  req.resume();
+
+  const dir = resolve(resolveActivePersonasDir(options));
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch (err) {
+    sendJson(res, 500, {
+      ok: false,
+      error: `创建人设目录失败: ${err instanceof Error ? err.message : String(err)}`,
+    });
+    return;
+  }
+
+  const openFn = options.openDirectory ?? ((target) => openDirectoryInOs(target, logger));
+  let result: { ok: boolean; error?: string };
+  try {
+    result = await openFn(dir);
+  } catch (err) {
+    sendJson(res, 500, {
+      ok: false,
+      error: `打开人设目录失败: ${err instanceof Error ? err.message : String(err)}`,
+    });
+    return;
+  }
+  if (!result.ok) {
+    sendJson(res, 500, { ok: false, error: result.error ?? '无法打开人设目录' });
+    return;
+  }
+  sendJson(res, 200, { ok: true, dir, message: `已打开人设目录: ${dir}` });
 }

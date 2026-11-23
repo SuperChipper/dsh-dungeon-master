@@ -14,14 +14,19 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   BIND_CONFIG_PATH,
   BIND_MANUAL_PATH,
+  BIND_PERSONAS_OPEN_PATH,
+  BIND_PERSONAS_PATH,
   BIND_REFRESH_PATH,
   BIND_STATE_PATH,
   BIND_UNBIND_PATH,
+  formatWindowsExplorerTarget,
+  openDirectoryInOs,
   registerBindRoutes,
   type BindRoutesOptions,
   type WebRoute,
 } from './bind-routes.ts';
 import type { BindingService } from './binding-service.ts';
+import { parsePersona } from '../features/persona-store.ts';
 
 /** 默认 unbind/persist 实现依赖 getProfileDir：用可控 mock 替换（其余导出保留） */
 const profileDirState = vi.hoisted(() => ({ dir: undefined as string | undefined }));
@@ -1094,5 +1099,265 @@ describe('bind-routes', () => {
     const resNone = fakeRes();
     await invoke(routes.get(BIND_STATE_PATH), fakeReq('GET', { host: '127.0.0.1:3080' }), resNone);
     expect(resNone.statusCode).toBe(200);
+  });
+
+  it('GET /personas：汇总目录人设、合并 group/direct 变体、忽略 _ 前缀并防跨站', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'im-qqbot-personas-list-'));
+    try {
+      writeFileSync(join(dir, 'default.group.md'), '---\nname: 默认群聊\n---\n\n群默认内容\n');
+      writeFileSync(join(dir, 'default.direct.md'), '---\nname: 默认私聊\n---\n\n私聊默认内容\n');
+      writeFileSync(join(dir, 'cat-dm.md'), '---\nname: 毒舌猫猫\n---\n\n通用猫猫正文\n');
+      writeFileSync(join(dir, '_shared.md'), '忽略共享片段');
+      const { routes } = createHarness({ resolvePersonasDir: () => dir });
+
+      const forbidden = fakeRes();
+      await invoke(routes.get(BIND_PERSONAS_PATH), fakeReq('GET', { host: '127.0.0.1:3080', origin: 'https://evil.example.com' }), forbidden);
+      expect(forbidden.statusCode).toBe(403);
+
+      const res = fakeRes();
+      await invoke(routes.get(BIND_PERSONAS_PATH), fakeReq('GET', { host: '127.0.0.1:3080' }), res);
+      expect(res.statusCode).toBe(200);
+      expect(json(res)).toEqual({
+        dir,
+        isBundledDir: false,
+        personas: [
+          {
+            id: 'default',
+            name: '默认群聊',
+            scopes: ['group', 'direct'],
+            files: ['default.direct.md', 'default.group.md'],
+          },
+          {
+            id: 'cat-dm',
+            name: '毒舌猫猫',
+            scopes: ['both'],
+            files: ['cat-dm.md'],
+          },
+        ],
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /personas：创建 .md / .group.md / .direct.md，防路径穿越/保留字/重名与跨站', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'im-qqbot-personas-create-'));
+    try {
+      const { routes } = createHarness({ resolvePersonasDir: () => dir });
+
+      // 1. 创建通用人设（未填 prompt 自动生成模板）
+      const resBoth = fakeRes();
+      await invoke(
+        routes.get(BIND_PERSONAS_PATH),
+        fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({ id: 'cat-dm', name: '毒舌猫猫' })),
+        resBoth,
+      );
+      expect(resBoth.statusCode).toBe(201);
+      expect(json(resBoth)).toMatchObject({ ok: true, id: 'cat-dm', fileName: 'cat-dm.md', dir });
+      const parsedBoth = parsePersona('cat-dm', readFileSync(join(dir, 'cat-dm.md'), 'utf8'));
+      expect(parsedBoth.name).toBe('毒舌猫猫');
+      expect(parsedBoth.prompt).toContain('毒舌猫猫');
+
+      // 2. 创建 group / direct 变体
+      const resGroup = fakeRes();
+      await invoke(
+        routes.get(BIND_PERSONAS_PATH),
+        fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({ id: 'knight', scope: 'group', prompt: '严格骑士法则' })),
+        resGroup,
+      );
+      expect(resGroup.statusCode).toBe(201);
+      expect(parsePersona('knight', readFileSync(join(dir, 'knight.group.md'), 'utf8'))).toMatchObject({
+        id: 'knight',
+        name: 'knight',
+        prompt: '严格骑士法则',
+      });
+
+      const resDirect = fakeRes();
+      await invoke(
+        routes.get(BIND_PERSONAS_PATH),
+        fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({ id: 'knight', name: '骑士私聊', scope: 'direct', prompt: '温柔回复' })),
+        resDirect,
+      );
+      expect(resDirect.statusCode).toBe(201);
+      expect(parsePersona('knight', readFileSync(join(dir, 'knight.direct.md'), 'utf8'))).toMatchObject({
+        id: 'knight',
+        name: '骑士私聊',
+        prompt: '温柔回复',
+      });
+
+      // 3. 重复同名同作用域 -> 409
+      const dupRes = fakeRes();
+      await invoke(
+        routes.get(BIND_PERSONAS_PATH),
+        fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({ id: 'cat-dm' })),
+        dupRes,
+      );
+      expect(dupRes.statusCode).toBe(409);
+
+      // 4. 非法 ID / 路径穿越 / 保留字 default / 非法 scope -> 400
+      for (const badPayload of [
+        { id: '../escape' },
+        { id: 'foo/bar' },
+        { id: 'default' },
+        { id: 'cat-dm', scope: 'invalid' },
+        { id: 'cat-dm', name: 123 },
+      ]) {
+        const badRes = fakeRes();
+        await invoke(
+          routes.get(BIND_PERSONAS_PATH),
+          fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify(badPayload)),
+          badRes,
+        );
+        expect(badRes.statusCode, JSON.stringify(badPayload)).toBe(400);
+      }
+
+      // 5. 跨站 Origin -> 403
+      const evilRes = fakeRes();
+      await invoke(
+        routes.get(BIND_PERSONAS_PATH),
+        fakeReq('POST', { host: '127.0.0.1:3080', origin: 'https://evil.example.com' }, JSON.stringify({ id: 'other' })),
+        evilRes,
+      );
+      expect(evilRes.statusCode).toBe(403);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /personas/open：打开服务端推导的生效人设目录并防 GET 与跨站', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'im-qqbot-personas-open-'));
+    try {
+      const openDirectory = vi.fn(async () => ({ ok: true }));
+      const { routes } = createHarness({
+        resolvePersonasDir: () => dir,
+        openDirectory,
+      });
+
+      const forbidden = fakeRes();
+      await invoke(routes.get(BIND_PERSONAS_OPEN_PATH), fakeReq('POST', { host: '127.0.0.1:3080', origin: 'https://evil.example.com' }), forbidden);
+      expect(forbidden.statusCode).toBe(403);
+
+      const badMethod = fakeRes();
+      await invoke(routes.get(BIND_PERSONAS_OPEN_PATH), fakeReq('GET', { host: '127.0.0.1:3080' }), badMethod);
+      expect(badMethod.statusCode).toBe(405);
+
+      const res = fakeRes();
+      await invoke(routes.get(BIND_PERSONAS_OPEN_PATH), fakeReq('POST', { host: '127.0.0.1:3080' }), res);
+      expect(res.statusCode).toBe(200);
+      expect(openDirectory).toHaveBeenCalledTimes(1);
+      expect(openDirectory).toHaveBeenCalledWith(dir);
+      expect(json(res)).toMatchObject({ ok: true, dir });
+
+      openDirectory.mockResolvedValueOnce({ ok: false, error: 'explorer failed' });
+      const failRes = fakeRes();
+      await invoke(routes.get(BIND_PERSONAS_OPEN_PATH), fakeReq('POST', { host: '127.0.0.1:3080' }), failRes);
+      expect(failRes.statusCode).toBe(500);
+      expect(json(failRes)).toEqual({ ok: false, error: 'explorer failed' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('openDirectoryInOs：win32 优先走 PowerShell Start-Process，失败降级 explorer.exe（含逗号/等号走安全 URI），全失败返回 error', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'im-qqbot-open-dir-'));
+    try {
+      // 1. win32 主路径成功（PowerShell Start-Process）
+      const psOkExecFile = vi.fn(
+        (
+          _cmd: string,
+          _args: readonly string[],
+          _opts: Record<string, unknown>,
+          cb: (err: (Error & { code?: number | string; killed?: boolean }) | null, stdout?: string, stderr?: string) => void,
+        ) => {
+          cb(null, '', '');
+        },
+      );
+      const logger1 = { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() };
+      const resPrimary = await openDirectoryInOs(dir, logger1, { platform: 'win32', execFileFn: psOkExecFile as never });
+      expect(resPrimary).toEqual({ ok: true });
+      expect(psOkExecFile).toHaveBeenCalledTimes(1);
+      const [psCmd, psArgs, psOpts] = psOkExecFile.mock.calls[0]!;
+      expect(psCmd).toMatch(/powershell\.exe$/i);
+      expect(psArgs).toContain('-NoProfile');
+      expect(psArgs).toContain('-NonInteractive');
+      expect(psArgs.join(' ')).toContain('Start-Process -FilePath $env:IMQQBOT_OPEN_DIR -WindowStyle Normal');
+      expect(psOpts.windowsHide).toBe(true);
+      expect((psOpts.env as Record<string, string | undefined>).IMQQBOT_OPEN_DIR).toBe(dir);
+      expect(logger1.info).toHaveBeenCalledTimes(1);
+      expect(logger1.warn).not.toHaveBeenCalled();
+
+      // 2. win32 主路径失败时降级 explorer.exe（容忍 exit code 1；含逗号/等号走 file:/// 转义）
+      const specialDir = join(dir, '测试,a=b');
+      const fallbackExecFile = vi.fn(
+        (
+          cmd: string,
+          _args: readonly string[],
+          _opts: Record<string, unknown>,
+          cb: (err: (Error & { code?: number | string; killed?: boolean }) | null, stdout?: string, stderr?: string) => void,
+        ) => {
+          if (/powershell\.exe$/i.test(cmd)) {
+            cb(Object.assign(new Error('ps failed'), { code: 1, killed: false }), '', 'Start-Process failed');
+            return;
+          }
+          cb(Object.assign(new Error('Command failed'), { code: 1, killed: false }), '', '');
+        },
+      );
+      const logger2 = { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() };
+      const resFallbackSpecial = await openDirectoryInOs(specialDir, logger2, {
+        platform: 'win32',
+        execFileFn: fallbackExecFile as never,
+      });
+      expect(resFallbackSpecial).toEqual({ ok: true });
+      expect(fallbackExecFile).toHaveBeenCalledTimes(2);
+      const [expCmd, expArgs, expOpts] = fallbackExecFile.mock.calls[1]!;
+      expect(expCmd).toBe('explorer.exe');
+      expect(expArgs[0]).toMatch(/^file:\/\/\//);
+      expect(expArgs[0]).toContain('测试');
+      expect(expArgs[0]).toContain('%2C');
+      expect(expArgs[0]).toContain('%3D');
+      expect(expOpts.windowsHide).toBe(false);
+      expect(expOpts.detached).toBeUndefined();
+      expect(logger2.warn).toHaveBeenCalledTimes(1);
+      expect(logger2.info).toHaveBeenCalledTimes(1);
+
+      const resFallbackNormal = await openDirectoryInOs(dir, logger2, {
+        platform: 'win32',
+        execFileFn: fallbackExecFile as never,
+      });
+      expect(resFallbackNormal).toEqual({ ok: true });
+      expect(fallbackExecFile.mock.calls[3]![1][0]).toBe(dir);
+
+      // 3. 两条路径均失败返回 error 并记录告警
+      const bothFailExecFile = vi.fn(
+        (
+          cmd: string,
+          _args: readonly string[],
+          _opts: Record<string, unknown>,
+          cb: (err: (Error & { code?: number | string; killed?: boolean }) | null, stdout?: string, stderr?: string) => void,
+        ) => {
+          if (/powershell\.exe$/i.test(cmd)) {
+            cb(Object.assign(new Error('ps error'), { code: 1, killed: false }), '', 'ps blocked');
+            return;
+          }
+          cb(Object.assign(new Error('Command failed'), { code: 2, killed: false }), '', 'access denied');
+        },
+      );
+      const logger3 = { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() };
+      const resFail = await openDirectoryInOs(dir, logger3, { platform: 'win32', execFileFn: bothFailExecFile as never });
+      expect(resFail.ok).toBe(false);
+      expect(resFail.error).toContain('ps blocked');
+      expect(resFail.error).toContain('access denied');
+      expect(logger3.warn).toHaveBeenCalledTimes(2);
+
+      const samplePath = process.platform === 'win32'
+        ? 'C:\\Users\\测试,a=b\\personas'
+        : '/tmp/测试,a=b/personas';
+      const target = formatWindowsExplorerTarget(samplePath);
+      expect(target).toContain('测试');
+      expect(target).toContain('%2C');
+      expect(target).toContain('%3D');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -516,15 +516,15 @@ export interface ImQQBotConfig {
   cleanup?: CleanupConfig;
   /** 群聊触发门控模式：mention=仅@回复，probability=随机概率，desire=回复欲望打分，all=全部回复 */
   groupTriggerMode?: GroupTriggerMode;
-  /** 是否启用群消息 @mention 门控 */
+  /** @deprecated 已被 `groupTriggerMode` 取代，仅作历史配置兼容读取 */
   requireMention: boolean;
   /** 群聊未 @bot 时随机回复概率（0-1），0=关闭 */
   groupReplyProbability?: number;
   /** 群聊回复欲望门控（规则打分 + 对话窗口） */
   replyDesire: ReplyDesireConfig;
-  /** 群聊额外 system prompt */
+  /** @deprecated 已被外置人设目录（`personas/default.group.md`）取代，仅作兼容兜底与 `/bot-doctor` 迁移提醒 */
   groupPrompt?: string;
-  /** 私聊额外 system prompt */
+  /** @deprecated 已被外置人设目录（`personas/default.direct.md`）取代，仅作兼容兜底与 `/bot-doctor` 迁移提醒 */
   directPrompt?: string;
   /** 群聊默认 provider（留空=跟随全局 provider） */
   groupProvider?: string;
