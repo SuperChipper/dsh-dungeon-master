@@ -16,7 +16,7 @@ import { mapCaption, renderPartyMap } from './map-view.ts';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { Adventure } from './adventure.ts';
-import { type Campaign, type ReactionWindow, describePending, findCharacter, isAbsent, nextTurn, playerStatus, reactionWindow, setCharacterAbsent } from './campaign.ts';
+import { type Campaign, type ReactionWindow, describePending, findCharacter, isAbsent, isControlledBy, isDmDelegated, nextTurn, playerStatus, reactionWindow, setCharacterAbsent } from './campaign.ts';
 import { chooseReaction, reactionsOf, reactionReplyNote, waitingOn } from './pending-attack.ts';
 import { type CheckIn, arrivalNotice, checkInHint, createCheckIn, isComplete, kickoffMessage, lateReturnNotice, markArrived, rehydrateCheckIn, rosterOf, rosterText } from './check-in.ts';
 import type { DndService } from './dnd-service.ts';
@@ -96,7 +96,7 @@ export function reactionOptionKey(option: { character: string; reaction: string 
 }
 
 export function buildReactionKeyboard(p: ReactionWindow): InlineKeyboard {
-  const options = p.reactors.flatMap((r, i) => r.npc === true ? [] : [callbackButton(`dnd-react-${i}`, buttonLabel(`${shortName(r.character)}·${r.reaction}`), 1, encodeButtonData({ t: 'dnd', a: 'react', r: p.seq, i, o: reactionOptionKey(r) }))]);
+  const options = p.reactors.flatMap((r, i) => r.npc === true || r.dmManaged === true ? [] : [callbackButton(`dnd-react-${i}`, buttonLabel(`${shortName(r.character)}·${r.reaction}`), 1, encodeButtonData({ t: 'dnd', a: 'react', r: p.seq, i, o: reactionOptionKey(r) }))]);
   // 挤在一行里名字会被截断 → 默认竖着排；QQ 键盘最多 5 行，选项太多才退回两列，宁可挤也别整条发不出去
   const perRow = options.length + 1 > MAX_KEYBOARD_ROWS ? BUTTONS_PER_ROW : 1;
   const rows: InlineKeyboard['content']['rows'] = [];
@@ -120,14 +120,17 @@ export function buildCheckInKeyboard(): InlineKeyboard {
   };
 }
 
-/** 当前回合的 PC（活着、有意识）；不是 PC 回合时返回 undefined */
+/** 当前回合的 PC（活着、有意识；DM 托管中时不发玩家「结束回合」按钮）；不是 PC 回合时返回 undefined */
 function currentPc(c: Campaign): { name: string; player?: string; round: number; turn: number } | undefined {
   const state = c.initiative;
   const entry = state?.order[state.turn];
   if (state === undefined || entry === undefined) return undefined;
   const ch = findCharacter(c, entry.name);
-  if (ch === undefined || ch.kind !== 'pc' || ch.hp === 0 || ch.conditions.includes('死亡')) return undefined;
-  return { name: ch.name, ...(ch.player !== undefined ? { player: ch.player } : {}), round: state.round, turn: state.turn };
+  if (ch === undefined || ch.kind !== 'pc' || isDmDelegated(ch) || ch.hp === 0 || ch.conditions.includes('死亡')) return undefined;
+  const player = ch.delegated?.mode === 'player'
+    ? `${ch.delegated.player ?? '托管玩家'}(代${ch.player ?? ch.name})`
+    : ch.player;
+  return { name: ch.name, ...(player !== undefined ? { player } : {}), round: state.round, turn: state.turn };
 }
 
 export class DndTurnButtons {
@@ -218,13 +221,20 @@ export class DndTurnButtons {
   }
 
   private async openReactionWindow(record: SessionRecord): Promise<void> {
-    const p = reactionWindow(this.service.active(record.sessionKey)?.campaign);
+    const campaign = this.service.active(record.sessionKey)?.campaign;
+    const p = reactionWindow(campaign);
     if (p === undefined) return;
-    if (!this.disabled && record.scope === 'group' && p.reactors.some((r) => r.npc !== true)) {
+    if (!this.disabled && record.scope === 'group' && p.reactors.some((r) => r.npc !== true && r.dmManaged !== true)) {
+      const hasDelegated = campaign !== undefined && p.reactors.some((r) => {
+        if (r.npc === true || r.dmManaged === true) return false;
+        const ch = findCharacter(campaign, r.character);
+        return ch?.delegated?.mode === 'player';
+      });
+      const whoRule = hasDelegated ? '只有本人或受托托管玩家点才算' : '只有本人点才算';
       const text = p.kind === 'move' && p.swapWith !== undefined
-        ? `🔄 **${p.target}** 请求与 **${p.swapWith}** 交换站位（不消耗反应）。请 **${p.swapWith}** 本人点下面按钮，也可以直接打字说「同意 / 不同意」。`
-        : `⚡ ${describePending(p)}还没结算。要用反应的点下面，只有本人点才算，也可以直接打字说。`
-          + '不限时，等本人答复；人不在的话 DM 会替他跳过。';
+        ? `🔄 **${p.target}** 请求与 **${p.swapWith}** 交换站位（不消耗反应）。请 **${p.swapWith}** ${hasDelegated ? '本人/托管玩家' : '本人'}点下面按钮，也可以直接打字说「同意 / 不同意」。`
+        : `⚡ ${describePending(p)}还没结算。要用反应的点下面，${whoRule}，也可以直接打字说。`
+          + '不限时，等本人答复；人不在的话 DM 会替他跳过或接管托管。';
       try {
         await this.sender.sendMarkdown(record.replyTarget, text, { keyboard: buildReactionKeyboard(p) });
       } catch (err) {
@@ -252,7 +262,7 @@ export class DndTurnButtons {
     const clicker = event.group_member_openid ?? event.user_openid;
     const ownsReactor = (name: string): boolean => {
       const ch = this.service.active(key)?.campaign.characters.find((x) => x.name === name);
-      return ch !== undefined && ch.kind === 'pc' && ch.playerId !== undefined && ch.playerId === clicker;
+      return ch !== undefined && isControlledBy(ch, clicker);
     };
     const used = new Set(p.used.map((u) => u.by));
     const rememberDuplicate = (): number => {
@@ -299,7 +309,9 @@ export class DndTurnButtons {
     if (grant === undefined) return ACK.duplicate;
     this.logger.info(`im-qqbot: 跑团反应按钮 key=${key} ${option.character}·${option.reaction} by=${clicker ?? '?'}`);
     if (record !== undefined) {
-      this.notifyDm(record, `[系统 · 按钮] ${option.character} 的玩家本人点了用「${option.reaction}」。`
+      const ch = this.service.active(key)?.campaign.characters.find((x) => x.name === option.character);
+      const actorDesc = ch !== undefined && ch.playerId !== undefined && ch.playerId !== clicker ? '受托托管玩家代点' : '玩家本人点了';
+      this.notifyDm(record, `[系统 · 按钮] ${option.character} 的${actorDesc}用「${option.reaction}」。`
         + reactionReplyNote(this.service.active(key)!.campaign, { kind: 'use', characters: [option.character], grants: [grant] }));
     }
     return ACK.ok;
@@ -540,10 +552,12 @@ export class DndTurnButtons {
       return ACK.ok;
     }
     if (button.a === 'spells') {
-      // 谁点就列谁的：按钮挂在当前回合那条消息上，别的玩家等回合时也想翻自己的法术
+      // 优先看点击者有控制权的对应按钮角色（支持托管），否则找自己的卡或按钮角色
       const clicker = event.group_member_openid ?? event.user_openid;
-      const ch = found.campaign.characters.find((x) => x.kind === 'pc' && x.playerId !== undefined && x.playerId === clicker)
-        ?? findCharacter(found.campaign, String(button.n ?? ''));
+      const btnCh = findCharacter(found.campaign, String(button.n ?? ''));
+      const ch = (btnCh !== undefined && isControlledBy(btnCh, clicker) ? btnCh : undefined)
+        ?? found.campaign.characters.find((x) => isControlledBy(x, clicker))
+        ?? btnCh;
       if (ch === undefined) return ACK.failed;
       void this.sender.sendMarkdown(
         target,
@@ -553,12 +567,12 @@ export class DndTurnButtons {
       return ACK.ok;
     }
 
-    // 结束回合：必须还是按钮上的那个回合，且由该 PC 的玩家本人点
+    // 结束回合：必须还是按钮上的那个回合，且由该 PC 的绑定玩家或受托托管玩家点
     const pc = currentPc(found.campaign);
     if (pc === undefined || pc.name !== button.n || pc.round !== button.r) return ACK.duplicate;
     const ch = findCharacter(found.campaign, pc.name);
     const clicker = event.group_member_openid ?? event.user_openid;
-    if (ch?.playerId !== undefined && ch.playerId !== clicker) return ACK.denied;
+    if (ch?.playerId !== undefined && !isControlledBy(ch, clicker)) return ACK.denied;
     // 还有一笔没落账：现在推进就把窗口吃掉了
     if (reactionWindow(found.campaign) !== undefined) return ACK.failed;
 

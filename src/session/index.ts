@@ -3,7 +3,7 @@
  *
  * 管理 QQ peer → dsh Agent 的映射和生命周期。
  */
-export { SessionManager, type NoteTurnSummary } from './session-manager.ts';
+export { SessionManager, type EndDndSessionOutcome, type NoteTurnSummary } from './session-manager.ts';
 export { IdleEvictor } from './idle-evictor.ts';
 export type {
   AgentSetup,

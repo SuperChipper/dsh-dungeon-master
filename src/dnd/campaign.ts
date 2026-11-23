@@ -64,6 +64,13 @@ export type { ActiveState, ConcentrationRecord, TurnActionState };
 
 export type CharacterKind = 'pc' | 'npc' | 'monster';
 
+export interface CharacterDelegation {
+  mode: 'player' | 'dm';
+  playerId?: string;
+  player?: string;
+  since?: number;
+}
+
 export interface Character {
   name: string;
   kind: CharacterKind;
@@ -73,6 +80,8 @@ export interface Character {
   playerId?: string;
   /** 本次开团未签到或中途暂离，暂时移出队伍（角色卡完整保留；晚到点「签到」或收团后自动归队） */
   absent?: boolean;
+  /** 临时托管：把控制权交给另一位玩家或交由 DM 直接接管（保留原 playerId，停团/开团自动清空） */
+  delegated?: CharacterDelegation;
   className?: string;
   level: number;
   abilities: Record<Ability, number>;
@@ -248,6 +257,8 @@ export interface ReactorOption {
   manual?: boolean;
   /** NPC/怪物由 DM 决定，不生成可被群成员点击的反应按钮。 */
   npc?: boolean;
+  /** DM 托管中的 PC：保留反应窗口以防 AFK 丢反应，允许 DM 不凭玩家 authorization 直接代为触发/结算，且不发玩家按钮。 */
+  dmManaged?: boolean;
   /** 仅真实入站消息/按钮生成；旧存档没有凭证时必须重新确认。 */
   authorization?: string;
 }
@@ -537,6 +548,13 @@ export interface SessionHandoff {
   needsReview: boolean;
 }
 
+export interface EndPreparationState {
+  id: string;
+  phase: 'ending' | 'preparing';
+  startedAt: number;
+  hasSummary: boolean;
+}
+
 export interface Campaign {
   version: 2;
   key: string;
@@ -556,6 +574,8 @@ export interface Campaign {
   handoff?: SessionHandoff;
   /** 只给 DM 的候选计划，不能作为已经发生的事实 */
   preparation?: { at: number; state: string; text: string };
+  /** 停团过渡与后台备团状态（不计入剧情哈希；完成或下次开团时清除） */
+  endPrep?: EndPreparationState;
   /** 最近的关键事件（伤害、倒地、移动），摘要里展示最后几条 */
   log: string[];
 
@@ -1224,6 +1244,7 @@ export function setCharacterAbsent(
     }
     const prevAbsent = ch.absent === true;
     ch.absent = true;
+    delete ch.delegated;
     let leftCombat = false;
     const state = c.initiative;
     if (state !== undefined) {
@@ -1314,6 +1335,115 @@ export function restoreAllAbsent(c: Campaign): string[] {
     }
   }
   return restored;
+}
+
+export function isDmDelegated(ch: Character): boolean {
+  return ch.kind === 'pc' && ch.delegated?.mode === 'dm';
+}
+
+export function effectiveControllerId(ch: Character): string | undefined {
+  if (ch.kind !== 'pc' || isDmDelegated(ch)) return undefined;
+  if (ch.delegated?.mode === 'player' && ch.delegated.playerId !== undefined) return ch.delegated.playerId;
+  return ch.playerId;
+}
+
+/** 该角色此刻是否允许由指定 openid 操作：原绑定玩家本人与受托托管玩家都认 */
+export function isControlledBy(ch: Character, senderId: string | undefined): boolean {
+  if (ch.kind !== 'pc' || senderId === undefined) return false;
+  if (ch.delegated?.mode === 'player' && ch.delegated.playerId === senderId) return true;
+  return ch.playerId !== undefined && ch.playerId === senderId;
+}
+
+export function delegationTag(ch: Character): string | undefined {
+  if (ch.kind !== 'pc' || ch.delegated === undefined) return undefined;
+  if (ch.delegated.mode === 'dm') return 'DM托管';
+  if (ch.delegated.mode === 'player' && ch.delegated.playerId !== undefined) {
+    return `托管→${ch.delegated.player ?? ch.delegated.playerId}`;
+  }
+  return undefined;
+}
+
+function syncWindowDelegation(win: ReactionWindow | undefined, characterName: string, dmManaged: boolean): void {
+  if (win === undefined) return;
+  for (const r of win.reactors) {
+    if (r.character !== characterName) continue;
+    if (dmManaged) r.dmManaged = true;
+    else delete r.dmManaged;
+  }
+}
+
+export type DelegationTarget =
+  | { mode: 'none' }
+  | { mode: 'dm' }
+  | { mode: 'player'; playerId: string; player?: string };
+
+/**
+ * 设置或解除 PC 的临时托管状态：
+ * - mode='player': 保留原 `playerId`，额外授权受托玩家控制、反应与查看法术；若目标就是原主人自己则等效解除托管；
+ * - mode='dm': 由 DM 临时接管，保留反应窗口（`dmManaged=true`）使 DM 可直接代为结算以免 AFK 丢反应；
+ * - mode='none': 结束托管，恢复原玩家独占控制；
+ * 若当前正处于待结算/借机窗口中，立即同步对应 `ReactorOption.dmManaged`，即时解卡。
+ */
+export function setCharacterDelegation(
+  c: Campaign,
+  name: string,
+  target: DelegationTarget,
+  now = Date.now(),
+): { character: Character; changed: boolean } {
+  const ch = requireCharacter(c, name);
+  if (ch.kind !== 'pc') throw new Error(`只有 PC 可以设置托管：「${ch.name}」不是 PC`);
+  if (target.mode !== 'none' && isAbsent(ch)) {
+    throw new Error(`${ch.name} 已暂离队伍，如需托管参战请先传 absent=false 归队`);
+  }
+  const normalized: DelegationTarget = target.mode === 'player' && target.playerId === ch.playerId
+    ? { mode: 'none' }
+    : target;
+
+  if (normalized.mode === 'none') {
+    const had = ch.delegated !== undefined;
+    if (had) {
+      delete ch.delegated;
+      pushLog(c, `${ch.name} 结束托管，恢复原玩家控制`);
+    }
+    syncWindowDelegation(c.initiative?.pending, ch.name, false);
+    syncWindowDelegation(c.initiative?.movement, ch.name, false);
+    return { character: ch, changed: had };
+  }
+
+  if (normalized.mode === 'dm') {
+    const unchanged = ch.delegated?.mode === 'dm';
+    ch.delegated = { mode: 'dm', since: now };
+    syncWindowDelegation(c.initiative?.pending, ch.name, true);
+    syncWindowDelegation(c.initiative?.movement, ch.name, true);
+    if (!unchanged) pushLog(c, `${ch.name} 改为 DM 托管`);
+    return { character: ch, changed: !unchanged };
+  }
+
+  const unchanged = ch.delegated?.mode === 'player'
+    && ch.delegated.playerId === normalized.playerId
+    && ch.delegated.player === normalized.player;
+  ch.delegated = {
+    mode: 'player',
+    playerId: normalized.playerId,
+    ...(normalized.player !== undefined ? { player: normalized.player } : {}),
+    since: now,
+  };
+  syncWindowDelegation(c.initiative?.pending, ch.name, false);
+  syncWindowDelegation(c.initiative?.movement, ch.name, false);
+  if (!unchanged) pushLog(c, `${ch.name} 托管给 ${normalized.player ?? normalized.playerId}`);
+  return { character: ch, changed: !unchanged };
+}
+
+/** 清除全部 PC 的临时托管（用于停团、续团前重置） */
+export function clearAllDelegations(c: Campaign): string[] {
+  const cleared: string[] = [];
+  for (const ch of c.characters) {
+    if (ch.kind === 'pc' && ch.delegated !== undefined) {
+      delete ch.delegated;
+      cleared.push(ch.name);
+    }
+  }
+  return cleared;
 }
 
 /**
@@ -2144,18 +2274,23 @@ export interface ActOptions {
   recentSenders?: readonly string[];
 }
 
-/** PC 必须由绑定的玩家本人宣告，且这个人最近确实发过消息 */
+/** PC 必须由绑定的玩家本人（或受托托管玩家）宣告，且这个人最近确实发过消息；DM 托管中的 PC 由 DM 直接接管 */
 export function assertDeclaredByOwner(ch: Character, options: ActOptions, what: string): void {
-  if (ch.kind !== 'pc' || ch.playerId === undefined) return;
+  if (ch.kind !== 'pc' || ch.playerId === undefined || isDmDelegated(ch)) return;
   const owner = `〈${ch.player ?? ch.playerId}〉`;
-  if (options.declaredBy !== ch.playerId) {
+  const delegate = ch.delegated?.mode === 'player' && ch.delegated.playerId !== undefined
+    ? `〈${ch.delegated.player ?? ch.delegated.playerId}〉`
+    : undefined;
+  if (!isControlledBy(ch, options.declaredBy)) {
+    const whoDesc = delegate !== undefined ? `${owner}（当前托管给 ${delegate}）` : owner;
     throw new Error(
-      `${ch.name} 是${owner}的角色，${what}只能由他本人宣告（declared_by 填他消息标签里的编号，如 U3）。`
-      + '别人说的只当提议，去问他本人；DM 要求的对抗检定或反应传 reaction=true。',
+      `${ch.name} 是${whoDesc}的角色，${what}只能由${delegate !== undefined ? '本人或受托托管玩家' : '他本人'}宣告（declared_by 填他消息标签里的编号，如 U3）。`
+      + '别人说的只当提议，去问本人；DM 要求的对抗检定或反应传 reaction=true。',
     );
   }
-  if (options.recentSenders !== undefined && !options.recentSenders.includes(ch.playerId)) {
-    throw new Error(`${owner}最近没有发消息，不能替他宣告${what}。等他本人说话。`);
+  const actorLabel = ch.delegated?.mode === 'player' && options.declaredBy === ch.delegated.playerId ? delegate! : owner;
+  if (options.recentSenders !== undefined && !options.recentSenders.includes(options.declaredBy!)) {
+    throw new Error(`${actorLabel}最近没有发消息，不能替他宣告${what}。等他本人说话。`);
   }
 }
 
@@ -2607,12 +2742,12 @@ export function addSummary(c: Campaign, text: string, now = Date.now()): void {
   if (c.summaries.length > MAX_SUMMARIES) c.summaries.splice(0, c.summaries.length - MAX_SUMMARIES);
 }
 
-/** 元数据变化不代表剧情推进；备团计划也不能混进已发生事实。 */
+/** 元数据变化不代表剧情推进；备团计划和停团过渡标记也不能混进已发生事实。 */
 export function campaignState(c: Campaign): string {
-  const { summaries, handoff, preparation, lastCombat, active, updatedAt, sessionStartedAt, rollSeq, ...state } = c;
+  const { summaries, handoff, preparation, lastCombat, endPrep, active, updatedAt, sessionStartedAt, rollSeq, ...state } = c;
   const normalized = state.characters === undefined
     ? state
-    : { ...state, characters: state.characters.map(({ absent: _absent, ...rest }) => rest) };
+    : { ...state, characters: state.characters.map(({ absent: _absent, delegated: _delegated, ...rest }) => rest) };
   return createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
 }
 
@@ -2679,7 +2814,7 @@ export function summarize(c: Campaign, adv: Adventure): string {
 
   const activeParty = c.characters.filter((ch) => ch.kind !== 'monster' && !isAbsent(ch));
   const absentParty = c.characters.filter(isAbsent);
-  lines.push(`队伍：${activeParty.length > 0 ? activeParty.map((ch) => `${hpTag(ch, c)}${ch.player ? `〈${ch.player}〉` : ''}${resourceTag(ch, c)}`).join('；') : '还没有角色卡'}`);
+  lines.push(`队伍：${activeParty.length > 0 ? activeParty.map((ch) => `${hpTag(ch, c)}${ch.player ? `〈${ch.player}〉` : ''}${delegationTag(ch) ? `[${delegationTag(ch)}]` : ''}${resourceTag(ch, c)}`).join('；') : '还没有角色卡'}`);
   if (absentParty.length > 0) {
     lines.push(`暂离队伍（未签到，不参与探索/战斗）：${absentParty.map((ch) => `${ch.name}${ch.player ? `〈${ch.player}〉` : ''}`).join('、')}（点「签到」自动归队，或本人明确要求加入时 dnd_character update absent=false）`);
   }
@@ -2754,7 +2889,7 @@ export function summarizeCombat(
     : party.filter((ch) => !combatParty.includes(ch) && !isOut(ch) && activeRooms.has(roomOf(c, ch) ?? ''));
 
   if (combatParty.length > 0) {
-    lines.push(`参战我方：${combatParty.map((ch) => `${hpTag(ch, c, globalEffects)}${ch.player ? `〈${ch.player}〉` : ''}${resourceTag(ch, c)}`).join('；')}`);
+    lines.push(`参战我方：${combatParty.map((ch) => `${hpTag(ch, c, globalEffects)}${ch.player ? `〈${ch.player}〉` : ''}${delegationTag(ch) ? `[${delegationTag(ch)}]` : ''}${resourceTag(ch, c)}`).join('；')}`);
   }
   if (bystanders.length > 0) {
     lines.push(`同房未入战：${bystanders.map((ch) => ch.name).join('、')}（中途入战先 dnd_initiative join）`);
@@ -2858,7 +2993,7 @@ export function playerStatus(c: Campaign, adv: Adventure, viewer?: string, forma
   const roomName = (id: string): string => findRoom(graph, id)?.name ?? id;
   const grid = format === 'markdown' ? battleGridLines(c, roomName, visible) : undefined;
   lines.push(...(grid ?? battleLines(c, roomName, visible)));
-  const mine = viewer === undefined ? [] : c.characters.filter((ch) => ch.playerId === viewer && !isOut(ch) && cellOf(c, ch) !== undefined);
+  const mine = viewer === undefined ? [] : c.characters.filter((ch) => isControlledBy(ch, viewer) && !isOut(ch) && !isAbsent(ch) && cellOf(c, ch) !== undefined);
   for (const ch of mine) lines.push(distancesFrom(c, ch.name, visible));
   if (s.pending !== undefined) lines.push(`⏳ ${describePending(s.pending)}还没结算，等反应`);
   if (s.movement !== undefined) lines.push(`⏳ ${s.movement.swapWith !== undefined ? `${s.movement.target} 请求与 ${s.movement.swapWith} 交换站位` : `${s.movement.target} 暂停移动，等借机反应`}`);

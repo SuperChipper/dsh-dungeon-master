@@ -1,5 +1,5 @@
 /** 移动与借机的停止点：路径计算不代替玩家决定，也不把剩余路程提前落盘。 */
-import { type Campaign, type PendingMovement, nextRollId, pushLog, requireCharacter, requireInitiative } from './campaign.ts';
+import { type Campaign, type PendingMovement, isDmDelegated, nextRollId, pushLog, requireCharacter, requireInitiative } from './campaign.ts';
 import { type MoveGridOptions, type MoveRequest, moveOnGrid, moveResultText } from './battlefield.ts';
 import { hasCondition, movementSpeedInfo } from './conditions.ts';
 import { assertWindowClosed, declineReaction } from './pending-attack.ts';
@@ -34,6 +34,7 @@ export function beginMovement(c: Campaign, name: string, request: MoveRequest, o
         character: allyCh.name,
         reaction: '同意换位',
         ...(allyCh.kind !== 'pc' || allyCh.playerId === undefined ? { npc: true } : {}),
+        ...(isDmDelegated(allyCh) ? { dmManaged: true } : {}),
       }],
       declined: [],
       claimed: [],

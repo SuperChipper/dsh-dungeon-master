@@ -103,6 +103,13 @@ const COMPACTION_ERROR_HINTS: Record<string, string> = {
   persistence: '压缩完成但保存失败',
 };
 
+export type EndDndSessionOutcome =
+  | { status: 'handed_off' }
+  | { status: 'inactive' }
+  | { status: 'busy' }
+  | { status: 'error'; message: string }
+  | { status: 'paused_fallback'; message: string };
+
 /** ctx.llm 查模型窗口的最小接口 */
 /** 新会话的第一条消息最多等旧会话压缩这么久，再久就不带交接了（一次压缩通常十几秒） */
 const HANDOFF_WAIT_MS = 60_000;
@@ -329,6 +336,7 @@ export function dndStateText(
       agentKey: agent,
       fresh,
       ...(turnTag !== undefined ? { turnTag } : {}),
+      epoch,
       structKey,
       forceSeq,
       externallyDirty,
@@ -458,6 +466,9 @@ export class SessionManager {
   /** 切换先完成落盘；期间到来的 QQ 消息等待，不得进入即将离开的人格历史。 */
   private personaTransitions = new Map<string, Promise<SwitchPersonaOutcome>>();
   private personaRoutes = new Map<string, ModelRoute>();
+  /** `/dnd end` 原子停团并唤醒 DM 备团期间的并发锁与完成追踪 */
+  private dndTransitions = new Map<string, Promise<EndDndSessionOutcome>>();
+  private dndEndPreparing = new Map<string, { id: string; releaseLock: () => void }>();
   /** 多步关键事务/切换/待决交互期间阻止后台自动压缩与空闲压缩的锁表 */
   public contextLocks = new ContextLockManager();
   /** 正在进行手动/空闲/交接压缩的会话 key（防重入） */
@@ -1621,6 +1632,7 @@ export class SessionManager {
     replyTarget: ReplyTarget,
   ): Promise<SessionRecord> {
     await this.waitForPersonaSwitch(scope, peerId);
+    await (this.waitForDndTransition ?? SessionManager.prototype.waitForDndTransition).call(this, scope, peerId);
     const record = await this.openSession(scope, peerId, senderId, replyTarget);
     const route = this.personaRoutes?.get(record.sessionKey);
     if (route) {
@@ -1636,6 +1648,93 @@ export class SessionManager {
     const key = this.sessionKey?.(scope, peerId) ?? `qqbot:${this.config?.appId ?? ''}:${scope}:${peerId}`;
     await this.personaTransitions?.get(key);
     (this.recoverPersonaTransition ?? SessionManager.prototype.recoverPersonaTransition).call(this, scope, peerId);
+  }
+
+  async waitForDndTransition(scope: ChatScope, peerId: string): Promise<void> {
+    const key = this.sessionKey?.(scope, peerId) ?? `qqbot:${this.config?.appId ?? ''}:${scope}:${peerId}`;
+    await this.dndTransitions?.get(key);
+  }
+
+  clearDndEndPreparing(sessionKey: string): void {
+    const cur = this.dndEndPreparing?.get(sessionKey);
+    if (cur === undefined) return;
+    this.dndEndPreparing.delete(sessionKey);
+    cur.releaseLock();
+  }
+
+  async endDndSession(params: {
+    scope: ChatScope;
+    peerId: string;
+    senderId: string;
+    target: ReplyTarget;
+    summary?: string;
+  }): Promise<EndDndSessionOutcome> {
+    const { scope, peerId } = params;
+    const key = this.sessionKey(scope, peerId);
+    this.dndTransitions ??= new Map();
+    this.dndEndPreparing ??= new Map();
+    if (this.dndTransitions.has(key) || this.dndEndPreparing.has(key)) return { status: 'busy' };
+    if (this.dndService === undefined) return { status: 'error', message: '跑团功能未启用（配置 dnd.enabled）' };
+    const precheck = this.dndService.validateStop(key, params.summary);
+    if (!precheck.ok) {
+      return precheck.reason === 'inactive'
+        ? { status: 'inactive' }
+        : { status: 'error', message: precheck.message ?? '结团摘要无效' };
+    }
+
+    const transition = Promise.resolve().then(async (): Promise<EndDndSessionOutcome> => {
+      if (this.disposing) return { status: 'busy' };
+      const releaseLock = (this.contextLocks ??= new ContextLockManager()).acquire(key, 'dnd-end-prep', 3 * 60_000);
+      let handedOff = false;
+      const endPrepId = randomUUID();
+      try {
+        await this.waitForPersonaSwitch(scope, peerId);
+        let stopped = false;
+        const stopNow = () => {
+          stopped = this.dndService!.stop(key, params.summary, { endPrepId }) !== undefined;
+        };
+        const combatPaused = this.combatAgents !== undefined
+          ? await this.combatAgents.pauseForSessionEnd(key, stopNow)
+          : (stopNow(), undefined);
+        if (!stopped) return { status: 'inactive' };
+        try {
+          const main = combatPaused?.main ?? this.sessions.get(key) ?? await this.openSession(scope, peerId, params.senderId, params.target);
+          main.replyTarget = params.target;
+          main.lastActivity = Date.now();
+          if (params.senderId) noteSender(main, params.senderId);
+          this.dndToolScope?.sync(main);
+          const prompt = this.dndService!.buildEndPreparationPrompt(key, {
+            ...(params.summary !== undefined ? { userSummary: params.summary } : {}),
+            ...(combatPaused?.handoff !== undefined ? { combatHandoff: combatPaused.handoff } : {}),
+          });
+          this.dndEndPreparing.set(key, { id: endPrepId, releaseLock });
+          main.agent.followup(createUserMessage({ content: [{ type: 'text', text: prompt }], source: { kind: 'user' } }));
+          handedOff = true;
+          void main.agent.whenIdle()
+            .catch(() => {})
+            .finally(() => {
+              const cur = this.dndEndPreparing.get(key);
+              if (cur?.id === endPrepId) {
+                this.dndEndPreparing.delete(key);
+                cur.releaseLock();
+              }
+              this.dndService?.completeEndPreparation(key, endPrepId);
+            });
+          return { status: 'handed_off' };
+        } catch (err) {
+          const cur = this.dndEndPreparing.get(key);
+          if (cur?.id === endPrepId) this.dndEndPreparing.delete(key);
+          this.dndService?.completeEndPreparation(key, endPrepId);
+          this.logger.warn(`im-qqbot: 停团自动唤醒 DM 备团失败 key=${key}: ${err instanceof Error ? err.message : String(err)}`);
+          return { status: 'paused_fallback', message: '⏸ 进度、角色卡与停团交接已保存（自动唤醒 DM 备团失败，可稍后 @ 我备团）。' };
+        }
+      } finally {
+        if (!handedOff) releaseLock();
+        this.dndTransitions.delete(key);
+      }
+    });
+    this.dndTransitions.set(key, transition);
+    return await transition;
   }
 
   getPersonaSwitchState(scope: ChatScope, peerId: string): PersonaSwitchState {
@@ -1791,6 +1890,7 @@ export class SessionManager {
 
   /** 团开始或暂停后，让这个会话看得到的跑团工具跟上；会话不在内存里时等它下次创建再定 */
   syncDndTools(sessionKey: string): void {
+    if (this.dndService?.active(sessionKey) !== undefined) this.clearDndEndPreparing?.(sessionKey);
     const record = this.sessions.get(sessionKey);
     if (record !== undefined) this.dndToolScope?.sync(record);
     const child = this.combatAgents?.current(sessionKey);
@@ -2299,6 +2399,9 @@ export class SessionManager {
     const switchState = this.getPersonaSwitchState?.(record.scope, record.peerId)
       ?? SessionManager.prototype.getPersonaSwitchState.call(this, record.scope, record.peerId);
     if (switchState !== 'idle' && !reasons.includes('persona-switch')) reasons.push('persona-switch');
+    if ((this.dndTransitions?.has(record.sessionKey) || this.dndEndPreparing?.has(record.sessionKey)) && !reasons.includes('dnd-end-prep')) {
+      reasons.push('dnd-end-prep');
+    }
     if (this.questionChannel?.hasPending?.(record.sessionKey) && !reasons.includes('pending-question')) {
       reasons.push('pending-question');
     }
@@ -2438,6 +2541,7 @@ export class SessionManager {
     this.disposing = true;
     this.evictor.dispose();
     clearInterval(this.idleCompactTimer);
+    this.dndEndPreparing?.clear();
     this.contextLocks?.clearAll();
     this.stagedNoteRecalls.clear();
     const records = [...this.sessions.values()];

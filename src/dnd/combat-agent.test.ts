@@ -777,3 +777,21 @@ it('战斗子代理全程禁用宿主自动压缩/溢出摘要与插件侧自动
   await stepTrigger(child.agent, 'pressure');
   expect(innerCompact).toHaveBeenCalledOnce();
 });
+
+it('pauseForSessionEnd 串行取消并释放战斗子代理、落盘 paused 状态并返回交接，但不重复唤醒主 DM', async () => {
+  const h = harness();
+  const child = await h.router.select(h.main);
+  const res = await h.router.pauseForSessionEnd(h.key, () => {
+    h.service.stop(h.key, undefined, { endPrepId: 'prep-x' });
+  });
+  expect(res).toBeDefined();
+  expect(res!.main).toBe(h.main);
+  expect(res!.handoff).toContain('团已暂停');
+  expect(res!.handoff).toContain('dnd_prepare');
+  expect(child.agent.cancel).toHaveBeenCalledWith({ kind: 'user', reason: 'dnd_end' });
+  expect(h.children[0]!.dispose).toHaveBeenCalledOnce();
+  expect(h.router.current(h.key)).toBeUndefined();
+  expect(h.service.saved(h.key)!.campaign.initiative).toBeDefined();
+  // 由 SessionManager.endDndSession 统一发送单次合并消息，pauseForSessionEnd 本身不调用 followup
+  expect(h.main.agent.followup).not.toHaveBeenCalled();
+});

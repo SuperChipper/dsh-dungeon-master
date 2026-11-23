@@ -20,7 +20,7 @@ const USAGE = [
   '/dnd combat — 查看最近一场战斗代理的模型与用量（缓存单列）',
   '/dnd map [battle|explore] — 发地图：战斗中是站位图，平时是探索过的地方（和 DM 发的是同一张）',
   '/dnd checkin — 再发一次签到按钮',
-  '/dnd end [摘要] — 保存交接并暂停，战斗状态保留；也可直接说「今天先到这」',
+  '/dnd end [摘要] — 原子保存停团交接并唤醒 DM 私有备团（战斗状态保留）；也可直接说「今天先到这」',
   '/dnd dungeons — 列出可用模组',
   '/dnd search <词条> — 查 wiki（法术、技能、职业、专长、怪物…），如 /dnd search 火球术',
   '/dnd spells [职业] — 职业法术列表，如 /dnd spells 牧师',
@@ -113,6 +113,7 @@ export function dndCommand({ manager }: CommandDeps): CategorizedCommand {
       }
 
       if (sub === 'start' || sub === 'new') {
+        await manager.waitForDndTransition?.(scope, peerId);
         let text: string;
         try {
           // blank 不带旧角色卡；其余的词当模组 id
@@ -137,9 +138,22 @@ export function dndCommand({ manager }: CommandDeps): CategorizedCommand {
       }
 
       if (sub === 'end') {
+        const summary = rest.trim() || undefined;
+        if (typeof manager.endDndSession === 'function') {
+          const outcome = await manager.endDndSession({
+            scope,
+            peerId,
+            senderId: cmdCtx.message.senderId,
+            target,
+            ...(summary !== undefined ? { summary } : {}),
+          });
+          if (outcome.status === 'handed_off' || outcome.status === 'busy') return { kind: 'noop' as const };
+          if (outcome.status === 'inactive') return '现在没有进行中的团。';
+          return outcome.message;
+        }
         try {
-          const stopped = service.stop(key, rest.trim() || undefined);
-          return stopped === undefined ? '现在没有进行中的团。' : '⏸ 已暂停，进度、角色卡和停团交接已保存；战斗状态保留。下次 /dnd start 接着跑。';
+          const stopped = service.stop(key, summary);
+          return stopped === undefined ? '现在没有进行中的团。' : { kind: 'noop' as const };
         } catch (err) {
           return err instanceof Error ? err.message : String(err);
         }

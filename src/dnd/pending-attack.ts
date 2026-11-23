@@ -23,6 +23,8 @@ import {
   findCharacter,
   inInitiative,
   isAbsent,
+  isControlledBy,
+  isDmDelegated,
   isOut,
   reactionBlocked,
   reactionWindow,
@@ -150,7 +152,7 @@ export function eligibleReactors(
       }
       if (isDamagedReaction(r)) {
         if (free && ch.name === target.name && outcome.hit) {
-          postDamage.push({ character: ch.name, reaction: r.name });
+          postDamage.push({ character: ch.name, reaction: r.name, ...(isDmDelegated(ch) ? { dmManaged: true } : {}) });
         }
         continue;
       }
@@ -165,7 +167,7 @@ export function eligibleReactors(
             : when === 'attacked'
               ? free && ch.name === target.name && outcome.hit && !outcome.crit
               : free && enemyAttack && attacker.kind === 'monster' && outcome.hit;
-      if (fits) preDamage.push({ character: ch.name, reaction: r.name });
+      if (fits) preDamage.push({ character: ch.name, reaction: r.name, ...(isDmDelegated(ch) ? { dmManaged: true } : {}) });
     }
   }
   if (stage === 'damaged') return postDamage;
@@ -186,26 +188,27 @@ export function eligibleSpellReactors(
   const isMagicMissile = options.spellName !== undefined && /^(?:魔法飞弹|Magic Missile)$/i.test(options.spellName.trim());
   const out: ReactorOption[] = [];
   const seen = new Set<string>();
-  const pushOption = (character: string, reaction: string): void => {
+  const pushOption = (character: string, reaction: string, dmManaged: boolean): void => {
     const k = `${character}·${reaction}`;
     if (!seen.has(k)) {
       seen.add(k);
-      out.push({ character, reaction });
+      out.push({ character, reaction, ...(dmManaged ? { dmManaged: true } : {}) });
     }
   };
   for (const ch of c.characters) {
     if (ch.kind !== 'pc' || isAbsent(ch) || !canReact(ch) || roomOf(c, ch) !== room) continue;
     if (!inInitiative(c, ch.name)) continue;
     if (reactionBlocked(c, ch.name) !== undefined) continue;
+    const dmManaged = isDmDelegated(ch);
     for (const r of reactionsOf(ch)) {
       if (!hasReactionResource(ch, r)) continue;
       if (r.when === 'foe_casts' || isCounterspellReaction(r.name)) {
         const range = r.range ?? 60;
         const mine = cellOf(c, ch);
         if (mine !== undefined && casterCell !== undefined && distanceFeet(mine, casterCell) > range) continue;
-        pushOption(ch.name, r.name);
+        pushOption(ch.name, r.name, dmManaged);
       } else if (isMagicMissile && isShieldReaction(r.name) && options.targets?.includes(ch.name)) {
-        pushOption(ch.name, r.name);
+        pushOption(ch.name, r.name, dmManaged);
       }
     }
   }
@@ -294,7 +297,7 @@ export function manualReactors(c: Campaign, value: unknown): ReactorOption[] {
     if (!canReact(ch)) throw new Error(`${ch.name} 现在做不了反应`);
     const blocked = reactionBlocked(c, ch.name);
     if (blocked !== undefined) throw new Error(blocked);
-    return { character: ch.name, reaction: name, manual: true };
+    return { character: ch.name, reaction: name, manual: true, ...(isDmDelegated(ch) ? { dmManaged: true } : {}) };
   });
 }
 
@@ -332,7 +335,9 @@ export function waitingOn(p: ReactionWindow): string[] {
 }
 
 function optionsText(p: ReactionWindow): string {
-  return p.reactors.length > 0 ? p.reactors.map((r) => `${r.character}·${r.reaction}`).join('、') : '（DM 手动挂起）';
+  return p.reactors.length > 0
+    ? p.reactors.map((r) => `${r.character}·${r.reaction}${r.dmManaged === true ? '[DM托管]' : ''}`).join('、')
+    : '（DM 手动挂起）';
 }
 
 function rollLine(p: PendingCheck, r: PendingD20): string {
@@ -377,12 +382,20 @@ export function pendingState(p: ReactionWindow): string {
 export function pendingSummaryLine(p: ReactionWindow): string {
   const waiting = waitingOn(p);
   const used = p.used.map((u) => `${u.by}·${u.name}`).join('、');
+  const waitingSet = new Set(waiting);
+  const hasWaitingPlayer = p.reactors.some((r) => waitingSet.has(r.character) && r.npc !== true && r.dmManaged !== true);
+  const dmWaiting = [...new Set(p.reactors.filter((r) => waitingSet.has(r.character) && r.dmManaged === true).map((r) => r.character))];
+  const dmNote = dmWaiting.length > 0
+    ? (!hasWaitingPlayer
+        ? `其中仅剩 DM 托管角色（${dmWaiting.join('、')}），可直接 dnd_apply 触发反应或 decline 跳过。`
+        : `（${dmWaiting.join('、')} 为 DM 托管，可直接代为处理）`)
+    : '';
   return `【待结算 #R${p.seq}】${pendingState(p)}。`
     + `${used.length > 0 ? `已用：${used}。` : ''}`
     + `${p.declined.length > 0 ? `本人已拒绝/已跳过：${p.declined.join('、')}。` : ''}`
     + p.claimed.map((r) => `本人已授权 ${r.character}·${r.reaction}（authorization="${r.authorization ?? '旧确认无凭证，请本人重新确认'}"，仅限本次窗口）。`).join('')
     + `${waiting.length > 0 ? `还在等：${waiting.join('、')}。` : ''}`
-    + `落账用 dnd_apply target=${p.target} settle=true；落账前不能推进回合。`;
+    + `${dmNote}落账用 dnd_apply target=${p.target} settle=true；落账前不能推进回合。`;
 }
 
 /**
@@ -407,8 +420,18 @@ export function holdNotice(p: PendingRoll): string {
     && p.total + p.attackMod >= p.ac + p.acMod + 5
     ? '【算账核对】本次攻击总值不低于护盾术 +5 后的防御等级，单靠「护盾术」挡不下这一击（只能为本轮后续攻击提供 +5 AC，或配合减命中反应）；严禁在回复中误导玩家说护盾术能把这一击挡下！'
     : '';
+  const allDmOrNpc = p.reactors.length > 0 && p.reactors.every((r) => r.npc === true || r.dmManaged === true);
+  const dmManagedNames = [...new Set(p.reactors.filter((r) => r.dmManaged === true).map((r) => r.character))];
+  if (allDmOrNpc) {
+    return `【待结算 #R${p.seq}】这笔还没落账，别往下推进：${unsettled}。当前可用反应（${optionsText(p)}）均由 DM 托管/控制，无需等玩家按钮确认：`
+      + `你可以直接调用 dnd_apply target=${p.target} 传 ${fix}（免传 authorization）代为触发反应，或传 decline=["角色名"] + settle=true 跳过。`
+      + `${shieldWarn}落账前 next、再次攻击、豁免效果、移动都会被拒绝。`;
+  }
+  const mixedNote = dmManagedNames.length > 0
+    ? `其中 ${dmManagedNames.join('、')} 为 DM 托管，无需等按钮可直接代为结算或跳过，其余角色等对应玩家本人/受托玩家回应。`
+    : '';
   return `【待结算 #R${p.seq}】这笔还没落账，别往下推进：${unsettled}。这条回复报骰子和成败（规则要求先知道成败再决定，DC/AC 数字照样不报），`
-    + `问一句有没有人要用反应（可用：${optionsText(p)}），然后到此停下，不要写成后果已经发生。`
+    + `问一句有没有人要用反应（可用：${optionsText(p)}），然后到此停下，不要写成后果已经发生。${mixedNote}`
     + `玩家回应后用 dnd_apply target=${p.target}：要用就传 ${fix}，并原样附上服务器消息的 authorization（玩家编号不等于同意）；不用已由服务器登记，都答复了传 settle=true。`
     + `${shieldWarn}落账前 next、再次攻击、豁免效果、移动都会被拒绝。`;
 }
@@ -436,7 +459,7 @@ export function declineReaction(p: ReactionWindow, name: string): void {
 /** 只从真实玩家入站/按钮调用，不能让模型用 declared_by 自签授权。 */
 export function chooseReaction(c: Campaign, p: ReactionWindow, senderId: string, name: string, reaction?: string): ReactorOption | undefined {
   const ch = requireCharacter(c, name);
-  if (ch.kind !== 'pc' || ch.playerId !== senderId) throw new Error('只能由角色的玩家本人选择反应');
+  if (!isControlledBy(ch, senderId)) throw new Error('只能由该角色的玩家本人或受托托管玩家选择反应');
   const option = p.reactors.find((r) => r.character === ch.name && (reaction === undefined || r.reaction === reaction));
   if (option === undefined) throw new Error(`${ch.name} 不在这笔的对应反应名单里`);
   if (p.used.some((r) => r.by === ch.name)) throw new Error(`${ch.name} 的反应已经结算`);
@@ -457,15 +480,15 @@ export function chooseReaction(c: Campaign, p: ReactionWindow, senderId: string,
 /** 在资源、随机数和反应名额发生变化之前检查，过期/撤回的排队调用不能扣账。 */
 export function assertReactionAuthorized(p: ReactionWindow, ch: Character, name: string, authorization: unknown): void {
   if (p.declined.includes(ch.name)) throw new Error(`${ch.name} 本人已选择不用，不能结算反应或扣资源；需要本人重新确认`);
-  if (ch.kind !== 'pc' || ch.playerId === undefined) return;
+  if (ch.kind !== 'pc' || ch.playerId === undefined || isDmDelegated(ch)) return;
   if (typeof authorization !== 'string' || !p.claimed.some((r) => r.character === ch.name && r.reaction === name && r.authorization === authorization)) {
     throw new Error(`${ch.name} 的「${name}」没有本次窗口的有效授权。请等本人点按钮或明确说使用；照系统消息传 authorization，declared_by 不能代替同意。遗漏的技能用 dnd_apply ask_reactions=[{by,name}] 询问，不要重掷原骰。`);
   }
 }
 
-/** 这个玩家的角色 */
+/** 这个玩家此刻有操作权的角色（原绑定 PC + 托管给他的 PC） */
 function charactersOf(c: Campaign, senderId: string): Character[] {
-  return c.characters.filter((ch) => ch.playerId === senderId && !isOut(ch) && !isAbsent(ch));
+  return c.characters.filter((ch) => isControlledBy(ch, senderId) && !isOut(ch) && !isAbsent(ch));
 }
 
 function stripCharacterPrefix(text: string, characterName: string): string {
@@ -478,7 +501,7 @@ function stripCharacterPrefix(text: string, characterName: string): string {
   return text;
 }
 
-const DECLINE_REPLY = /^(不用|不用了|不反应|这次不用|跳过反应|pass|no)[。.!！~～]*$/i;
+const DECLINE_REPLY = /^(?:这次|这轮)?(不用|不用了|不反应|这次不用|跳过反应|pass|no)[。.!！~～]*$/i;
 const GENERIC_REACTION = /反应|借机|尖刻言语|护盾术|法术反制|反制法术|反制|导引打击|招架|幸运点|重掷|重骰|时间变幻/;
 
 export interface ReactionReply {
@@ -520,6 +543,11 @@ export function classifyReactionReply(c: Campaign, senderId: string, text: strin
     return undefined;
   }
   if (listed.length > 0 && DECLINE_REPLY.test(clean)) return { kind: 'decline', characters: listed, windowId: p.seq };
+  const declinedSpecific = listed.filter((name) => {
+    const body = stripCharacterPrefix(clean, name);
+    return body !== clean && DECLINE_REPLY.test(body);
+  });
+  if (declinedSpecific.length > 0) return { kind: 'decline', characters: declinedSpecific, windowId: p.seq };
   // DM 点名问的反应（时间变幻）不在角色卡的 reactions 里，名字从名单上认
   const named = mine.some((ch) => reactionsOf(ch).some((r) => clean.includes(r.name)))
     || p.reactors.some((r) => listed.includes(r.character) && clean.includes(r.reaction));

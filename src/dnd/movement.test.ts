@@ -699,4 +699,51 @@ describe('领域区域自动绕行与拆分移动（Breaking Up Your Move）提�
     });
     expect(safeMove).toContain('领域/拆分移动提醒：本次移动经过「火墙术」');
   });
+
+  it('DM 托管中的 PC 仍保留借机反应窗口（可免 authorization 触发）且可自动确认托管队友换位', async () => {
+    const t = table();
+    t.service.store.update(t.key, (c) => {
+      upsertCharacter(c, { name: '甲', player: 'A', playerId: 'P1', maxHp: 30, weapons: [{ name: '长剑', damage: '1d8' }], reactions: [] });
+      upsertCharacter(c, { name: '乙', player: 'B', playerId: 'P2', maxHp: 30, weapons: [{ name: '短剑', damage: '1d6' }], reactions: [] });
+      upsertCharacter(c, { name: '狼', kind: 'monster', maxHp: 20, speed: 30, room: c.currentRoom, reactions: [] });
+      c.initiative = {
+        round: 1,
+        turn: 0,
+        order: [{ name: '甲', init: 20 }, { name: '乙', init: 15 }, { name: '狼', init: 10 }],
+        positions: {
+          甲: { x: 1, y: 1, room: c.currentRoom },
+          乙: { x: 2, y: 1, room: c.currentRoom },
+          狼: { x: 2, y: 2, room: c.currentRoom },
+        },
+      };
+    });
+    await t.call('dnd_position', { action: 'terrain', width: 6, height: 6, areas: [] });
+
+    // 把 乙 设为 DM 托管：与 甲 贴身换位无需额外等 B 本人确认；狼 走出 乙 触及仍停下等 DM 决定 乙 是否借机
+    await t.call('dnd_character', { action: 'update', name: '乙', delegate: 'dm' });
+    const swapOut = await t.call('dnd_position', { action: 'swap', name: '甲', swap: '乙', declared_by: 'U1' });
+    expect(swapOut).toContain('与 乙 交换站位');
+    expect(t.campaign().initiative!.positions!.甲).toMatchObject({ x: 2, y: 1 });
+    expect(t.campaign().initiative!.positions!.乙).toMatchObject({ x: 1, y: 1 });
+
+    // 狼 站在 (2,2) 只与 甲 (2,1) 相邻；先让 甲(托管给乙/自己)或重置狼在 (1,2) 贴着 乙 (1,1)
+    t.service.store.update(t.key, (c) => {
+      c.initiative!.positions!.甲 = { x: 5, y: 5, room: c.currentRoom };
+      c.initiative!.positions!.狼 = { x: 1, y: 2, room: c.currentRoom };
+      c.initiative!.turn = 2; // 狼
+    });
+
+    const wolfFlee = await t.call('dnd_position', { action: 'move', name: '狼', x: 1, y: 4 });
+    expect(wolfFlee).toContain('移动待结算');
+    expect(wolfFlee).toContain('乙·借机攻击[DM托管]');
+    expect(t.campaign().initiative!.movement!.reactors[0]!.dmManaged).toBe(true);
+
+    // DM 免 authorization 直接触发 乙 对 狼 的借机攻击，再 settle 完成移动
+    t.rolls.push(15, 4);
+    const oaRes = await t.call('dnd_check', { type: 'attack', character: '乙', target: '狼', weapon: '短剑', reaction: true });
+    expect(oaRes).toContain('命中');
+    const afterOa = await t.call('dnd_apply', { target: '狼', settle: true });
+    expect(afterOa).toContain('狼');
+    expect(t.campaign().initiative!.positions!.狼).toMatchObject({ x: 1, y: 4 });
+  });
 });

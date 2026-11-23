@@ -16,6 +16,7 @@ import {
   changeCondition,
   findCharacter,
   isAbsent,
+  isDmDelegated,
   isOut,
   isRangedWeapon,
   inInitiative,
@@ -1423,8 +1424,15 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
     if (triggers.length > 0) {
       const first = Math.min(...triggers.map((t) => t.stop));
       const here = triggers.filter((t) => t.stop === first);
-      const reactorOptions: ReactorOption[] = here.map(({ character, reaction }) => ({ character, reaction,
-        ...(requireCharacter(c, character).kind !== 'pc' || requireCharacter(c, character).playerId === undefined ? { npc: true } : {}) }));
+      const reactorOptions: ReactorOption[] = here.map(({ character, reaction }) => {
+        const ch = requireCharacter(c, character);
+        return {
+          character,
+          reaction,
+          ...(ch.kind !== 'pc' || ch.playerId === undefined ? { npc: true } : {}),
+          ...(isDmDelegated(ch) ? { dmManaged: true } : {}),
+        };
+      });
       opportunity = { reactors: reactorOptions, resume: {
         ...(swapPartner !== undefined
           ? { swap: swapPartner.name, ...(request.swapApproved === true ? { swapApproved: true } : {}) }
@@ -1790,7 +1798,13 @@ export function moveResultText(r: MoveResult): string {
     lines.push(`【DM】进入 ${r.enters.map((e) => `${e.name} 的 ${e.reach} 尺触及（${e.reaction}）`).join('、')}：可以借机，用 dnd_check ... reaction=true 结算。`);
   }
   lines.push(...r.notes.map((n) => `【DM】${n}`));
-  if (r.opportunity !== undefined) lines.push(`【移动待结算】在触发处停下：${r.opportunity.reactors.map((r) => `${r.character}·${r.reaction}`).join('、')}。先问玩家，不能提前 next、攻击或走完剩余路程。借机用 dnd_check type=attack reaction=true target=${r.name}；不用传 dnd_apply target=${r.name} decline=[角色名]；全部处理后 settle=true 继续移动。`);
+  if (r.opportunity !== undefined) {
+    const oppNames = r.opportunity.reactors.map((o) => `${o.character}·${o.reaction}${o.dmManaged === true ? '[DM托管]' : ''}`).join('、');
+    const allDmOrNpc = r.opportunity.reactors.every((o) => o.npc === true || o.dmManaged === true);
+    lines.push(allDmOrNpc
+      ? `【移动待结算】在触发处停下：${oppNames}（均由 DM 托管/控制，无需等玩家按钮，也不能提前 next 或走完剩余路程）。可直接调用 dnd_check type=attack reaction=true target=${r.name}（免传 authorization）代为借机，或传 dnd_apply target=${r.name} decline=[角色名] + settle=true 继续移动。`
+      : `【移动待结算】在触发处停下：${oppNames}。先问玩家，不能提前 next、攻击或走完剩余路程。借机用 dnd_check type=attack reaction=true target=${r.name}；不用传 dnd_apply target=${r.name} decline=[角色名]；全部处理后 settle=true 继续移动。`);
+  }
   if (r.swapConsent !== undefined) {
     lines.push(`【换位待确认】${r.name} 已就位 ${fmtCoord(r.to)}，请求与 ${r.swapConsent.ally} ${fmtCoord(r.swapConsent.allyCell)} 交换站位（不消耗反应）。请先询问 ${r.swapConsent.ally} 的玩家本人点击下方「同意换位 / 不同意」按钮或打字回复，在此之前停下，不能提前 next 或攻击。本人同意后调用 dnd_apply target="${r.name}" settle=true 完成换位；若不同意或跳过则传 dnd_apply target="${r.name}" decline=["${r.swapConsent.ally}"] settle=true 停在原位。`);
   }

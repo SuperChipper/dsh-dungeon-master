@@ -105,9 +105,17 @@ export function registerSaveTools(kit: ToolKit): void {
       const record = recordOf(exec);
       const text = str(args.summary);
       if (args.summary !== undefined && text === undefined) throw new Error('dnd_end: summary 不能为空');
+      const wasActive = service.active(record.sessionKey) !== undefined;
+      const isChild = kit.manager.combatAgents?.isChild(record.agent) === true;
       const stopped = service.stop(record.sessionKey, text);
       if (stopped === undefined) return '现在没有进行中的团。';
-      return '已暂停并保存进度与停团交接，战斗状态保留。下次发送 /dnd start 继续。要核对交接用 dnd_prepare show，别把 DM 私有资料发到群里。';
+      if (isChild) {
+        return '已暂停并保存进度、停团交接与当前战斗状态。你只需要在本条回复中简短确认已暂停（勿推进战斗或剧情，勿发 DM 私有资料）；随后系统会自动交回主 DM 整理交接与下场备团。';
+      }
+      if (!wasActive) {
+        return '已补充停团交接，团仍处于暂停状态（战斗状态保留）。请确认已用 dnd_prepare(action="show") -> dnd_prepare(action="save") 保存下场私有备团计划，别把 DM 私有资料发到群里。';
+      }
+      return '已暂停并保存进度与停团交接（战斗状态保留）。现在不要直接复读停团套话：请立刻依次调用 dnd_prepare(action="show") 查阅候选下一站/原书只读目录、用 dnd_lookup（必要时 read/glob/grep）核对下场要点，并用 dnd_prepare(action="save", plan=...) 保存私有备团计划；保存后再向群里回复一句简短、不剧透的停团确认（下次 /dnd start 继续；严禁把 DM 私有资料或未来计划发到群里）。';
     },
   );
 

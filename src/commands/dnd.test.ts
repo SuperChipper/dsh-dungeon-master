@@ -52,6 +52,46 @@ describe('/dnd 子命令只认英文', () => {
     const { run } = setup();
     expect(await run('new sunken-bell blank', 'c2c')).toContain('🎲 开团');
   });
+
+  it('end 委派 SessionManager 原子停团并静默交接，不再发旧静态「已暂停」文字', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dnd-cmd-end-'));
+    const dndService = new DndService({ store: new CampaignStore(join(root, 'campaigns')), library: new AdventureLibrary(), mapDir: root });
+    let nextOutcome: unknown = { status: 'handed_off' };
+    const endDndSession = vi.fn(async () => nextOutcome);
+    const waitForDndTransition = vi.fn(async () => {});
+    const manager = {
+      dndService,
+      sessionKey: (s: string, id: string) => `${s}:${id}`,
+      endDndSession,
+      waitForDndTransition,
+    };
+    const cmd = dndCommand({ manager, config: {} } as never);
+    const run = (raw: string) => cmd.handler({
+      message: { kind: 'group', groupOpenid: 'G1', senderId: 'U1', messageId: 'M1' },
+      command: { raw },
+    } as never);
+
+    expect(await run('end 营地休整')).toEqual({ kind: 'noop' });
+    expect(endDndSession).toHaveBeenCalledWith({
+      scope: 'group',
+      peerId: 'G1',
+      senderId: 'U1',
+      target: expect.objectContaining({ scope: 'group', targetId: 'G1', msgId: 'M1' }),
+      summary: '营地休整',
+    });
+
+    nextOutcome = { status: 'busy' };
+    expect(await run('end')).toEqual({ kind: 'noop' });
+
+    nextOutcome = { status: 'inactive' };
+    expect(await run('end')).toBe('现在没有进行中的团。');
+
+    nextOutcome = { status: 'error', message: '摘要过长，未保存' };
+    expect(await run('end 很长')).toBe('摘要过长，未保存');
+
+    await run('start sunken-bell');
+    expect(waitForDndTransition).toHaveBeenCalledWith('group', 'G1');
+  });
 });
 
 describe('/dnd map 和 DM 发的是同一张图', () => {

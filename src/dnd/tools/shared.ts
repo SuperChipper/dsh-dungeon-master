@@ -22,8 +22,8 @@ type OnHitEffect,
 type PendingCheck,
 type PendingD20,
 type ReactorOption,UNDEAD_FORTITUDE,
-applyDamage,armorClass,assertDeclaredByOwner,attackModifier,changeInventory,checkAllAirborneCrashes,describePending,findCharacter,initBonusOf,
-findWeapon,isAbsent,isOut,inInitiative,isSurprised,
+applyDamage,armorClass,assertDeclaredByOwner,attackModifier,changeInventory,checkAllAirborneCrashes,delegationTag,describePending,findCharacter,initBonusOf,
+findWeapon,isAbsent,isDmDelegated,isOut,inInitiative,isSurprised,
 isRangedWeapon,
 isTwoHandedWeapon,outsideRooms,nextRollId,pushCombatLedger,pushLog,
 recordDeathFailures,resourceTag,reactionBlocked,
@@ -540,8 +540,9 @@ export function combatLedgerSuffix(c: Campaign): string {
 export function sheet(ch: Character, who: (openid: string) => string = (id) => id, campaign?: Campaign): string {
   const abilities = ABILITIES.map((a) => `${ABILITY_NAMES[a]}${ch.abilities[a]}`).join(' ');
   const effMax = effectiveMaxHp(ch);
+  const delTag = delegationTag(ch);
   const lines = [
-    `${ch.name}${ch.player ? `〈${ch.player}${ch.playerId ? ` ${who(ch.playerId)}` : ''}〉` : ''}｜${ch.kind === 'pc' ? 'PC' : (ch.kind === 'npc' ? 'NPC' : '怪物')}${ch.className ? ` ${ch.className}` : ''} ${ch.level} 级${isAbsent(ch) ? '［暂离队伍］' : ''}`,
+    `${ch.name}${ch.player ? `〈${ch.player}${ch.playerId ? ` ${who(ch.playerId)}` : ''}〉` : ''}｜${ch.kind === 'pc' ? 'PC' : (ch.kind === 'npc' ? 'NPC' : '怪物')}${ch.className ? ` ${ch.className}` : ''} ${ch.level} 级${delTag ? `［${delTag}］` : ''}${isAbsent(ch) ? '［暂离队伍］' : ''}`,
     `HP ${ch.hp}/${ch.maxHp}${effMax < ch.maxHp ? `（力竭有效上限 ${effMax}）` : ''}${ch.tempHp > 0 ? ` +${ch.tempHp}` : ''}  AC ${armorClass(campaign, ch)}${campaign?.initiative?.shielded?.includes(ch.name) ? `（基础 ${ch.ac}；护盾术 +5，到自己下回合开始）` : ''}${ch.speed !== undefined ? `  速度 ${ch.speed}` : ''}${ch.flySpeed !== undefined ? `  飞行 ${ch.flySpeed}${ch.hover ? '(悬浮)' : ''}` : ''}`,
     abilities,
     `固定先攻 ${initBonusOf(ch) >= 0 ? '+' : ''}${initBonusOf(ch)}${ch.initBonus === undefined ? '（敏捷；备注中的额外被动不会自动计入）' : '（角色卡总加值，开战时不要重复添加）'}`,
@@ -585,8 +586,9 @@ export function sheet(ch: Character, who: (openid: string) => string = (id) => i
 export function characterBrief(c: Campaign, ch: Character): string {
   const room = roomOf(c, ch);
   const tags = [...ch.conditions, ...externalConcentrationTags(c, ch)];
+  const delTag = delegationTag(ch);
   return `${ch.name} HP ${ch.hp}/${ch.maxHp}${ch.tempHp > 0 ? `+${ch.tempHp}` : ''} AC ${armorClass(c, ch)}`
-    + `${tags.length > 0 ? ` [${tags.join(',')}]` : ''}${resourceTag(ch, c)}${isAbsent(ch) ? ' [暂离]' : (room !== undefined ? ` @${room}` : '')}`;
+    + `${tags.length > 0 ? ` [${tags.join(',')}]` : ''}${delTag ? ` [${delTag}]` : ''}${resourceTag(ch, c)}${isAbsent(ch) ? ' [暂离]' : (room !== undefined ? ` @${room}` : '')}`;
 }
 
 export function parseSkills(values: string[] | undefined): Skill[] | undefined {
@@ -898,9 +900,17 @@ export function turnPrompt(ch: Character | undefined, name: string, options: Tur
   if (ch.hp === 0 && !ch.conditions.includes('稳定') && !ch.conditions.includes('死亡')) {
     return `轮到 ${name}（0 HP）：掷死亡豁免 dnd_check type=death，然后 dnd_initiative next。`;
   }
-  const player = ch.player ?? '玩家';
+  if (isDmDelegated(ch)) {
+    return full
+      ? `轮到 ${name}（当前由 DM 托管接管，保留全部反应能力）。由你直接代为行动并结算（免 declared_by / 玩家按钮），结算完调用 dnd_initiative next，直到轮到其他真实玩家 PC 为止。`
+      : `轮到 ${name}（DM 托管中），你代为结算后 next。`;
+  }
+  const delegateNick = ch.delegated?.mode === 'player' ? (ch.delegated.player ?? ch.delegated.playerId) : undefined;
+  const player = delegateNick !== undefined
+    ? `${delegateNick}（代 ${ch.player ?? '原玩家'}）`
+    : (ch.player ?? '玩家');
   const absent = options.absent === true
-    ? `${player} 最近 10 分钟没发过言：问一句等他，一直不回才 next dm_override=true 跳过并在回复里说明。`
+    ? `${player} 最近 10 分钟没发过言：问一句等他，一直不回可用 dnd_character update delegate="队友名"|"dm" 托管（保留反应防丢），或 next dm_override=true 跳过并在回复里说明。`
     : '';
   if (!full) return `轮到 ${name}〈${player}〉：停下等他本人宣告（规矩同前）。${absent}`;
   return `轮到 ${name}〈${player}〉。到此停下：描述局面后问他做什么，等他本人宣告；`
@@ -920,9 +930,10 @@ export function combatTurnPrompt(
 ): string {
   const ch = findCharacter(c, name);
   const state = c.initiative;
-  const kind = ch?.kind === 'pc' ? 'pc' : 'monster';
-  const absent = ch?.kind === 'pc' && ch.playerId !== undefined && extra.recentSenders !== undefined
-    && !extra.recentSenders.includes(ch.playerId);
+  const kind = ch?.kind === 'pc' && !isDmDelegated(ch) ? 'pc' : 'monster';
+  const absent = ch?.kind === 'pc' && !isDmDelegated(ch) && ch.playerId !== undefined && extra.recentSenders !== undefined
+    && !extra.recentSenders.includes(ch.playerId)
+    && !(ch.delegated?.mode === 'player' && ch.delegated.playerId !== undefined && extra.recentSenders.includes(ch.delegated.playerId));
   if (state === undefined) return turnPrompt(ch, name, { absent });
   const briefed = state.briefed ?? [];
   const full = extra.force === true || !briefed.includes(kind) || (kind === 'pc' && state.rebrief === true);

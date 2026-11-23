@@ -7,7 +7,7 @@ type PendingCheck,
 type PendingSpell,applyDamage,
 armorClass,assertCanAct,assertDeclaredByOwner,assertNoPending,attackModifier,
 changeCondition,checkAllAirborneCrashes,checkModifier,deathSave,findCharacter,
-findWeapon,grantTempHp,heal,hexbladeCurseOn,inInitiative,isRangedWeapon,pushCombatLedger,pushLog,requireCharacter,
+findWeapon,grantTempHp,heal,hexbladeCurseOn,inInitiative,isDmDelegated,isRangedWeapon,pushCombatLedger,pushLog,requireCharacter,
 requireInitiative,requireResource,usesElvenAccuracy,useResource,weaponAttackModifier,spendReaction
 } from '../campaign.ts';
 import {
@@ -435,12 +435,13 @@ export function registerDiceTools(kit: ToolKit): void {
           const counter = state.counterAttacks?.find((r) => r.by === ch.name && r.target === target.name);
           const prepaid = counter !== undefined;
           const chosen = !prepaid && movement !== undefined
-            ? movement.claimed.find((r) => r.character === ch.name && r.authorization === args.authorization)
+            ? (movement.claimed.find((r) => r.character === ch.name && r.authorization === args.authorization)
+              ?? (isDmDelegated(ch) ? movement.reactors.find((r) => r.character === ch.name) : undefined))
             : undefined;
           if (!prepaid && movement !== undefined) {
             assertReactionAuthorized(movement, ch, chosen?.reaction ?? '借机攻击', args.authorization);
           }
-          if (!prepaid && movement === undefined && ch.kind === 'pc' && ch.playerId !== undefined) {
+          if (!prepaid && movement === undefined && ch.kind === 'pc' && ch.playerId !== undefined && !isDmDelegated(ch)) {
             // 不能绕过窗口，直接用 reaction=true + 玩家编号替本人宣告。
             const blocked = state.reacted?.includes(ch.name);
             throw new Error(blocked ? `${ch.name} 的反应已经用过` : 'PC 反应攻击需要本次借机窗口授权，或已授权的还击；declared_by 不能代替同意');

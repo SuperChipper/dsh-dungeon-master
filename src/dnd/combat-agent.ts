@@ -944,11 +944,9 @@ export class DndCombatAgents {
     newChild.agent.followup(createUserMessage({ content: [{ type: 'text', text: promptWithState }], source: { kind: 'user' } }));
   }
 
-  private async finish(active: ActiveCombat, status: CombatRun['status']): Promise<void> {
-    if (active.child.agent.status !== 'idle') return;
-    const { run, main } = active;
+  private buildHandoff(active: ActiveCombat, status: CombatRun['status']): string {
+    const { run } = active;
     const found = this.service.active(run.sessionKey) ?? this.service.saved(run.sessionKey);
-    run.status = status; run.endedAt = Date.now();
     const lastCombat = found?.campaign.lastCombat !== undefined && found.campaign.lastCombat.at >= run.startedAt
       ? found.campaign.lastCombat
       : undefined;
@@ -972,9 +970,9 @@ export class DndCombatAgents {
     const newChronicle = found
       ? (found.campaign.chronicle ?? []).filter((e) => e.id > run.chronicleId).map((e) => e.text).join('\n')
       : '';
-    run.handoff = [
+    return [
       '【系统 · 战斗代理交回 · DM 私有】',
-      ...(status === 'paused' ? ['团已暂停。只确认保存，不推进回合或剧情；未结束的战斗留待下次开团。'] : []),
+      ...(status === 'paused' ? ['团已暂停。只确认保存与交接，不推进回合或剧情；未结束的战斗留待下次开团。若尚未完成下场备团，先依次调用 dnd_prepare(action="show") 与 dnd_prepare(action="save") 保存私有备团计划（必要时用 dnd_end summary 补写交接），再回复一句简短不剧透的确认。'] : []),
       status === 'completed'
         ? '战斗已结束。机械结算已经实时写入同一份团档，禁止重复扣血、扣资源、掷骰或再发奖励。只接续战后剧情，没确认的战利品按模组查证。'
         : `战斗代理已停止${run.error ? `（原因：${run.error}；此原因仅供 DM 知悉，勿把原始报错 JSON 发进群）` : ''}。先核对最新团况与待结算窗口，不能重做已落账行动，也不能当作战斗已结束。`,
@@ -986,6 +984,13 @@ export class DndCombatAgents {
       `战斗代理最后已发到群里的叙述${run.lastNarrationRound !== undefined ? `（第 ${run.lastNarrationRound} 轮）` : ''}（已播报内容不必复述；叙述不覆盖团档）：${run.lastNarration ?? '无'}`,
       '怪物 AC、HP、DC 和 DM 机密仍不进群消息；不要替玩家选择下一步。',
     ].join('\n');
+  }
+
+  private async finish(active: ActiveCombat, status: CombatRun['status']): Promise<void> {
+    if (active.child.agent.status !== 'idle') return;
+    const { run, main } = active;
+    run.status = status; run.endedAt = Date.now();
+    run.handoff = this.buildHandoff(active, status);
     this.checkpoint(run);
     this.active.delete(run.sessionKey);
     this.service.forceNextSnapshot?.(run.sessionKey);
@@ -1000,6 +1005,40 @@ export class DndCombatAgents {
       main.agent.followup(createUserMessage({ content: [{ type: 'text', text: run.handoff }], source: { kind: 'user' } }));
     }
     this.logger.info(`im-qqbot: 战斗代理交回 key=${run.sessionKey} status=${status}${run.error ? ` reason=${run.error}` : ''} ${Object.entries(run.usage).map(([k, u]) => rowUsage(k, u)).join(' | ')}`);
+  }
+
+  /**
+   * `/dnd end` 原子交接入口：串行取消并释放战斗子代理、执行停团落盘后返回交接文本，
+   * 不直接调用 `main.agent.followup`，由 `SessionManager.endDndSession` 统一唤醒主 DM 一次。
+   */
+  public async pauseForSessionEnd(
+    key: string,
+    afterChildStopped?: () => void,
+  ): Promise<{ main: SessionRecord; handoff: string } | undefined> {
+    return await this.serial(key, async () => {
+      const active = this.active.get(key);
+      if (active === undefined) {
+        afterChildStopped?.();
+        return undefined;
+      }
+      this.generations.set(key, (this.generations.get(key) ?? 0) + 1);
+      this.active.delete(key);
+      this.failed.delete(key);
+      active.child.agent.cancel({ kind: 'user', reason: 'dnd_end' });
+      await active.child.handle.dispose().catch(() => {});
+      afterChildStopped?.();
+      const handoff = this.buildHandoff(active, 'paused');
+      const run = active.run;
+      run.status = 'paused';
+      run.endedAt = Date.now();
+      run.handoff = handoff;
+      this.checkpoint(run);
+      this.service.forceNextSnapshot?.(key);
+      this.syncTools(active.main);
+      if (!this.disposed) this.settling.set(active.main.sessionId, run);
+      this.logger.info(`im-qqbot: 停团释放战斗代理 key=${key} ${Object.entries(run.usage).map(([k, u]) => rowUsage(k, u)).join(' | ')}`);
+      return { main: active.main, handoff };
+    });
   }
 
   public report(key: string): string {

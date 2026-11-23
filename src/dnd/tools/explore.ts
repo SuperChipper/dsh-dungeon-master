@@ -2,7 +2,7 @@
 import { join } from 'node:path';
 import { roomGraph } from '../adventure.ts';
 import {
-assertNoPending,isAbsent,moveParty,partyPositions,requireCharacter,isOut
+assertNoPending,isAbsent,isControlledBy,isDmDelegated,moveParty,partyPositions,requireCharacter,isOut
 } from '../campaign.ts';
 import { findRoom,resolveRoom } from '../dungeon.ts';
 import { assertCombatExit } from '../battlefield.ts';
@@ -66,8 +66,8 @@ export function registerExploreTools(kit: ToolKit): void {
         const senders = sendersOf(exec);
         const silent = who
           .map((n) => c.characters.find((ch) => ch.name === n))
-          .filter((ch) => ch !== undefined && ch.kind === 'pc' && ch.playerId !== undefined && !senders.includes(ch.playerId))
-          .map((ch) => `${ch!.name} 是〈${ch!.player ?? ch!.playerId}〉的角色`);
+          .filter((ch) => ch !== undefined && ch.kind === 'pc' && ch.playerId !== undefined && !isDmDelegated(ch) && !senders.some((s) => isControlledBy(ch, s)))
+          .map((ch) => `${ch!.name} 是〈${ch!.delegated?.mode === 'player' ? (ch!.delegated.player ?? ch!.delegated.playerId) : (ch!.player ?? ch!.playerId)}〉的角色`);
         if (silent.length > 0) {
           throw new Error(
             `${silent.join('；')}，他本人这轮还没发话。拆开队伍要带走别人的卡，传 dm_override=true，`

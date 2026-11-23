@@ -158,8 +158,8 @@ describe('isRuntimeContextEvent', () => {
   });
 });
 
-describe('DndSnapshotGate：单轮多次工具调用零重发 + 跨对话轮数节流 + 关键边界立即穿透', () => {
-  it('同一轮对话连续多次攻击扣血不触发 runtime-context 变化；跨对话默认每 4 轮同步一次，换房/压缩/撤销/结团立即穿透', () => {
+describe('DndSnapshotGate：同轮锁死 + 跨轮首步穿透 + 压缩/撤销同轮例外', () => {
+  it('同一轮对话连续多次动作/换房/开结战均锁定不重发；压缩与撤销同轮例外；跨到下一轮第一步立即穿透同步最终态', () => {
     const { service, key } = setup();
     service.store.update(key, (c) => { startInitiative(c, () => 10); });
 
@@ -204,7 +204,7 @@ describe('DndSnapshotGate：单轮多次工具调用零重发 + 跨对话轮数�
     expect(snap5).not.toBe(snap0);
     expect(snap5).toContain('卡厄斯 9/12');
 
-    // 关键边界 1：下一轮刚过 1 轮，但执行了 dnd_undo（forceNextSnapshot）→ 立即穿透节流！
+    // 关键边界 1：下一轮刚过 1 轮，但执行了 dnd_undo（forceNextSnapshot）→ 同轮立即穿透节流！
     pushUserTurn(60);
     toolMutate((c) => applyDamage(c, '卡厄斯', 2));
     service.forceNextSnapshot(key);
@@ -212,30 +212,155 @@ describe('DndSnapshotGate：单轮多次工具调用零重发 + 跨对话轮数�
     expect(snapUndo).not.toBe(snap5);
     expect(snapUndo).toContain('卡厄斯 7/12');
 
-    // 关键边界 2：单轮中途 dnd_move 切换房间（currentRoom 变化）→ 同轮内也立即刷新以拿到新房间 DM 笔记！
+    // 关键边界 2：同轮中途连续切换房间 / 结战 / 暂离变化 → 同轮严格锁死，返回值保持 === snapUndo（0 次重发）
     toolMutate((c) => { c.currentRoom = 'nave'; });
+    expect(evalState()).toBe(snapUndo);
+    toolMutate((c) => {
+      c.initiative = undefined;
+      c.characters[0]!.absent = true;
+    });
+    expect(evalState()).toBe(snapUndo);
+
+    // 跨到下一轮用户对话开头（仅隔 1 轮 < 4）：由于 lastStructKey 仍停留在本轮初，首步立刻穿透节流并同步最终稳定团况！
+    pushUserTurn(70);
     const snapRoom = evalState();
     expect(snapRoom).not.toBe(snapUndo);
+    expect(snapRoom).toContain('暂离');
+    expect(snapRoom).not.toContain('战斗第');
 
-    // 关键边界 3：上下文压缩（contentGeneration 递增）→ 立即刷新！
-    pushUserTurn(70);
+    // 关键边界 3：常规节流期内触发上下文压缩（contentGeneration 递增）→ 立即刷新！
+    pushUserTurn(75);
     toolMutate((c) => applyDamage(c, '卡厄斯', 1));
-    expect(evalState()).toBe(snapRoom); // 压缩前第 1 轮仍在节流期内
+    expect(evalState()).toBe(snapRoom); // 压缩前仅隔 1 轮仍在节流期内
     surface.contentGeneration += 1;
     const snapCompacted = evalState();
     expect(snapCompacted).not.toBe(snapRoom);
-    expect(snapCompacted).toContain('卡厄斯 6/12');
+    expect(snapCompacted).toContain('7→6/12');
 
     // 关键边界 4：工具外改档（未走 dnd_* mutate，如斜杠命令/后台修改）→ 下一轮用户消息立即穿透节流！
     pushUserTurn(80);
     service.store.update(key, (c) => applyDamage(c, '卡厄斯', 1));
     const snapExternal = evalState();
     expect(snapExternal).not.toBe(snapCompacted);
-    expect(snapExternal).toContain('卡厄斯 5/12');
+    expect(snapExternal).toContain('6→5/12');
 
     // 关键边界 5：停团后立即返回空串作废旧快照
     service.stop(key);
     expect(evalState()).toBe('');
+  });
+
+  it('DndSnapshotGate 严格执行同轮锁死（仅 epoch 压缩 / forceSeq 撤销例外）与跨轮首步穿透', () => {
+    const gate = new DndSnapshotGate();
+    const agentKey = {};
+
+    // 第 u1 轮初始注入
+    expect(gate.resolve({
+      agentKey,
+      fresh: 'S1-roomA',
+      turnTag: 'u1',
+      epoch: 'e0',
+      structKey: 'roomA|explore',
+      forceSeq: 0,
+      intervalTurns: 4,
+    })).toBe('S1-roomA');
+
+    // 同轮 u1 连续切换房间与开战（structKey 连续变化）→ 一律锁死返回 S1-roomA
+    expect(gate.resolve({
+      agentKey,
+      fresh: 'S2-roomB',
+      turnTag: 'u1',
+      epoch: 'e0',
+      structKey: 'roomB|explore',
+      forceSeq: 0,
+      intervalTurns: 4,
+    })).toBe('S1-roomA');
+
+    expect(gate.resolve({
+      agentKey,
+      fresh: 'S3-roomC-combat',
+      turnTag: 'u1',
+      epoch: 'e0',
+      structKey: 'roomC|combat',
+      forceSeq: 0,
+      intervalTurns: 4,
+    })).toBe('S1-roomA');
+
+    // 跨到下一轮 u2 开头（仅隔 1 轮 < 4）：命中上轮遗留的 structKey 差异，首步直接穿透输出最终稳定态 S3-roomC-combat
+    expect(gate.resolve({
+      agentKey,
+      fresh: 'S3-roomC-combat',
+      turnTag: 'u2',
+      epoch: 'e0',
+      structKey: 'roomC|combat',
+      forceSeq: 0,
+      intervalTurns: 4,
+    })).toBe('S3-roomC-combat');
+
+    // 下一轮 u3（距上次 1 轮 < 4）：无结构边界变化，常规节流返回 S3-roomC-combat
+    expect(gate.resolve({
+      agentKey,
+      fresh: 'S4-hp-down',
+      turnTag: 'u3',
+      epoch: 'e0',
+      structKey: 'roomC|combat',
+      forceSeq: 0,
+      intervalTurns: 4,
+    })).toBe('S3-roomC-combat');
+
+    // 同轮 u3 发生上下文压缩（epoch: e0 -> e1）→ 例外立即穿透
+    expect(gate.resolve({
+      agentKey,
+      fresh: 'S5-compacted',
+      turnTag: 'u3',
+      epoch: 'e1',
+      structKey: 'roomC|combat',
+      forceSeq: 0,
+      intervalTurns: 4,
+    })).toBe('S5-compacted');
+
+    // 仍处同轮 u3：压缩后再次换房 → 重新被同轮锁死在 S5-compacted
+    expect(gate.resolve({
+      agentKey,
+      fresh: 'S6-roomD',
+      turnTag: 'u3',
+      epoch: 'e1',
+      structKey: 'roomD|combat',
+      forceSeq: 0,
+      intervalTurns: 4,
+    })).toBe('S5-compacted');
+
+    // 仍处同轮 u3：触发 dnd_undo（forceSeq: 0 -> 1）→ 例外立即穿透并同步当前 structKey
+    expect(gate.resolve({
+      agentKey,
+      fresh: 'S7-undone',
+      turnTag: 'u3',
+      epoch: 'e1',
+      structKey: 'roomD|combat',
+      forceSeq: 1,
+      intervalTurns: 4,
+    })).toBe('S7-undone');
+
+    // 后续 u4~u6 在 roomD|combat 下按 4 轮节流锁定 S7-undone，满 4 轮（u7）自动刷新为 S8-settled
+    for (const turnTag of ['u4', 'u5', 'u6']) {
+      expect(gate.resolve({
+        agentKey,
+        fresh: 'S8-settled',
+        turnTag,
+        epoch: 'e1',
+        structKey: 'roomD|combat',
+        forceSeq: 1,
+        intervalTurns: 4,
+      })).toBe('S7-undone');
+    }
+    expect(gate.resolve({
+      agentKey,
+      fresh: 'S8-settled',
+      turnTag: 'u7',
+      epoch: 'e1',
+      structKey: 'roomD|combat',
+      forceSeq: 1,
+      intervalTurns: 4,
+    })).toBe('S8-settled');
   });
 
   it('专用战斗子代理 decorateTurnText 同样按轮数节流，首轮注入、间隔轮次跳过、满轮或外部改档/撤销立即同步', async () => {

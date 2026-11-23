@@ -1,11 +1,12 @@
 /** 角色卡与资源：dnd_character、dnd_resource、dnd_rest。 */
 import type { Adventure } from '../adventure.ts';
 import {
-type Campaign,type Character,type CharacterInput,type CharacterKind,type PendingSpell,assertNoPending,changeInventory,checkAllAirborneCrashes,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isAbsent,isOut,fightRooms,leaveInitiative,pushLog,reactionBlocked,removeCharacter,requireCharacter,requireInitiative,requireResource,rest,
+type Campaign,type Character,type CharacterInput,type CharacterKind,type DelegationTarget,type PendingSpell,assertNoPending,changeInventory,checkAllAirborneCrashes,delegationTag,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isAbsent,isDmDelegated,isOut,fightRooms,leaveInitiative,pushLog,reactionBlocked,removeCharacter,requireCharacter,requireInitiative,requireResource,rest,
 restoreReaction,
 restoreResource,
 roomOf,
 setCharacterAbsent,
+setCharacterDelegation,
 setHexbladeCurse,
 setResource,spendReaction,upsertCharacter,
 useResource
@@ -239,6 +240,7 @@ function assertPausedSheet(c: Campaign, args: Record<string, unknown>): void {
   if (!['create', 'update', 'show', 'list'].includes(action)) throw new Error('停团时只支持 PC 建卡、改卡和查卡；不能移除角色');
   if (args.kind !== undefined && args.kind !== 'pc') throw new Error('停团时只能操作 PC 角色卡');
   if (args.absent !== undefined) throw new Error('停团时不能设置暂离，收团后所有 PC 自动归队');
+  if (args.delegate !== undefined) throw new Error('停团时不能设置托管，开团后再设置或收团已自动解除');
   if (args.srd !== undefined || (int(args.count) ?? 1) > 1) throw new Error('停团时不能用 SRD 或 count 建怪；PC 一人一张卡');
   if (args.room !== undefined) throw new Error('停团写卡不能改变位置；移动请开团后用 dnd_move');
   if (action === 'list') return;
@@ -410,6 +412,8 @@ export function registerCharacterTools(kit: ToolKit): void {
       },
       notes: { type: 'string', description: 'Replaces ALL notes. Read current notes and preserve unrelated abilities, passives, active effects and agreements when editing. Notes alone do not apply mechanical bonuses; use supported structured fields too.' },
       absent: { type: 'boolean', description: 'PC only (active session): true temporarily removes an absent player\'s PC from the party (and initiative); false returns them to the party at the current room.' },
+      delegate: { type: 'string', description: 'PC only (active session, update): temporarily transfer control to another player without overwriting original player_id, hand over to DM to prevent AFK lost reactions, or clear. Pass a teammate character name (e.g. "奇塔露"), member id ("U2"), "dm", or "none"/"clear".' },
+      delegate_player: { type: 'string', description: 'Optional display nickname when `delegate` is a raw member id (#U2) with no PC sheet name to infer from.' },
       brief: { type: 'boolean', description: 'For show: one line (HP, AC, conditions, resources, room) instead of the full sheet.' },
     },
     ['action'],
@@ -471,6 +475,9 @@ export function registerCharacterTools(kit: ToolKit): void {
         if (action === 'create' && args.absent !== undefined) {
           throw new Error('dnd_character create 不支持传 absent；建好卡后如需暂离请用 update absent=true');
         }
+        if (action === 'create' && args.delegate !== undefined) {
+          throw new Error('dnd_character create 不支持传 delegate；建好卡后如需托管请用 update delegate=...');
+        }
         if (action === 'remove') return `已移除 ${removeCharacter(c, name).name}`;
         if (action === 'create' && str(args.kind) !== 'pc') {
           // 11-05 黑蜘蛛被现场建成「黑蜘蛛·内兹纳尔」，死讯没挂到模组的内兹纳上，神庙的剧本还让他再出场一次
@@ -531,6 +538,45 @@ export function registerCharacterTools(kit: ToolKit): void {
             lines.unshift(`${character.name} 已暂时移出队伍并移出先攻表。`);
           } else if (args.absent === false && absRes.changed && c.initiative !== undefined && !inInitiative(c, character.name)) {
             lines.unshift(`${character.name} 已归队（当前战斗进行中，如需入战请用 dnd_initiative join）。`);
+          }
+        }
+        if (action === 'update' && args.delegate !== undefined) {
+          const cleaned = (str(args.delegate) ?? '').trim();
+          let target: DelegationTarget;
+          if (cleaned === '' || /^(none|clear|off|owner|cancel|无|解除|取消|收回)$/i.test(cleaned)) {
+            target = { mode: 'none' };
+          } else if (/^dm$/i.test(cleaned)) {
+            target = { mode: 'dm' };
+          } else {
+            const refChar = findCharacter(c, cleaned);
+            if (refChar !== undefined) {
+              if (refChar.kind !== 'pc' || refChar.playerId === undefined) {
+                throw new Error(`「${refChar.name}」没有绑定玩家，不能作为受托托管玩家；请传已绑玩家的队友角色名、成员编号（如 U2）或 "dm"`);
+              }
+              const nick = str(args.delegate_player) ?? refChar.player;
+              target = {
+                mode: 'player',
+                playerId: refChar.playerId,
+                ...(nick !== undefined ? { player: nick } : {}),
+              };
+            } else {
+              const pid = memberId(exec, cleaned, 'delegate')!;
+              const matchedOwner = c.characters.find((x) => x.kind === 'pc' && x.playerId === pid);
+              const nick = str(args.delegate_player) ?? matchedOwner?.player;
+              target = {
+                mode: 'player',
+                playerId: pid,
+                ...(nick !== undefined ? { player: nick } : {}),
+              };
+            }
+          }
+          const delRes = setCharacterDelegation(c, character.name, target);
+          const updatedDel = requireCharacter(c, character.name);
+          const tag = delegationTag(updatedDel);
+          if (tag !== undefined) {
+            lines.unshift(`${character.name} 已设为「${tag}」${isDmDelegated(updatedDel) ? '（DM 可直接代为行动、结束回合与触发反应窗口，原玩家绑定保留）' : '（受托玩家与原玩家均可行动、回应反应与点击回合按钮，原玩家绑定保留）'}。`);
+          } else if (delRes.changed) {
+            lines.unshift(`${character.name} 已解除托管，恢复原玩家控制。`);
           }
         }
         if (!created && newRoom !== undefined && inInitiative(c, character.name) && !roomsBefore.has(newRoom)) {

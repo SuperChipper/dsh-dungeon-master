@@ -9,7 +9,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { Roller } from './dice.ts';
 import { cryptoRoller } from './dice.ts';
 import { type Adventure, type AdventureLibrary, findSite, roomGraph, siteOfRoom } from './adventure.ts';
-import { type Campaign, CampaignStore, addSummary, campaignState, createCampaign, ensureSessionSummary, reconcileKnownSites, restoreAllAbsent, summarize, summarizeCombat } from './campaign.ts';
+import { type Campaign, CampaignStore, SUMMARY_MAX_CHARS, addSummary, campaignState, clearAllDelegations, createCampaign, ensureSessionSummary, reconcileKnownSites, restoreAllAbsent, summarize, summarizeCombat } from './campaign.ts';
 import { CustomEffectStore, type CustomEffectDef } from './custom-effects.ts';
 import { PREPARATION_MAX_CHARS, preparationLines, recoveryLines } from './session-recovery.ts';
 import { type CheckIn, rosterOf, rosterPrompt } from './check-in.ts';
@@ -25,6 +25,8 @@ export interface DndPromptSection {
   order: number;
   text: string;
 }
+
+export type DndLifecyclePhase = 'none' | 'active' | 'ending' | 'preparing' | 'paused';
 
 // 开团、停团与战斗代理共用，避免收团后又凭聊天记录拼卡或口头改卡。
 const CHARACTER_RULE = '- 玩家要展示、核对角色卡（含物品、法术、资源）或改卡，已有卡先用 dnd_character show 查当前数据；本轮已查则复用。展示时把所需内容发给玩家，工具结果不会自动发群。改卡用 update、建卡用 create 落盘，成功后才说已保存；不凭旧聊天拼卡、不只口头修改。';
@@ -70,7 +72,7 @@ const DM_RULES = [
   '',
   '【战斗】',
   '- 严格按先攻，一次只结算当前这一个。怪物回合你决定，每只结算完 next，一路推到 PC 就停下问他，这条回复到此为止。',
-  '- PC 的回合只有他本人说「没了/结束」或点按钮才结束（next 传他的 declared_by），别人催不算。收到「[系统 · 按钮] X 点了结束回合」说明工具已经推进，不要再为 X next。',
+  '- PC 的回合只有他本人说「没了/结束」或点按钮才结束（next 传他的 declared_by），别人催不算。收到「[系统 · 按钮] X 点了结束回合」说明工具已经推进，不要再为 X next。若玩家临时离开并需要托管，用 dnd_character(action="update", name="角色名", delegate="队友名|U编号|dm|none") 把控制权交给其他玩家或由 DM 接管（DM 托管会保留反应窗口并允许 DM 免授权触发反应，防止 AFK 丢反应）。',
   '- 不是当前回合的人宣告了行动：说「记下了，等你的回合」，不提前结算；借机攻击和反应传 reaction=true。叙事里的「轮到谁」必须和工具一致，对不上先 goto。敌人倒光就 end。',
   '- 结果里有「待结算」时先停手：掷骰窗口报成败、问反应；移动借机窗口在触发格等玩家，不先把人走完或 next。PC 反应只认本人明确选择后的服务器 authorization，提问或 declared_by 都不算同意。豁免和检定要不要挂反应窗口由你判（dnd_check hold_for），尤其敌人对奇塔露自己法术的豁免。',
   '- 连击提前返回时先处理停点，照已结击数和骰号继续，不把整批重掷，也不自动向倒下的目标补刀。5e 允许在多次攻击、动作、附赠动作前后拆分移动：中途击倒当前目标且还有剩余攻击与移动力时，按【拆分移动提示】询问玩家是否 dnd_position move 转火其他目标，不要因为贴身没怪就默认收手。',
@@ -105,7 +107,7 @@ const PAUSED_RULES = [
   '- 说错了就一句改正、给出正确说法；不检讨、不讲自己怎么记混的。',
   CHARACTER_RULE,
   '- 玩家要求建卡或改卡：直接用 dnd_character create/update 写 PC，再用 dnd_resource set 配置法术位和职业资源，不用先开团。player_id 填消息标签里的 U 编号；不翻文件找 openid、不手改团档。工具成功后才说已入库；停团不能建怪、删卡、移动或结算行动。',
-  '- 明确要求备团时可用 dnd_prepare show/save 提前准备下一次团的内容（先用 dnd_prepare show 看候选下一站与模组原书目录，再用 dnd_lookup 查卡片，未展开的随机遭遇表、机关与支线可只读查阅该模组目录并提炼进 dnd_prepare save，避免下次开团临时翻书；不写过去总结），计划仅 DM 可见，不推进剧情，禁止修改原书文件或发给玩家。收团后补写交接可用 dnd_end summary，不用重新 start；不把 DM 计划发到群里。',
+  '- 收到 [系统 · 停团交接与下场备团] 唤醒或玩家明确要求备团时，可用 dnd_prepare show/save 提前准备下一次团的内容（先用 dnd_prepare show 看候选下一站与模组原书目录，再用 dnd_lookup 查卡片，未展开的随机遭遇表、机关与支线可只读查阅该模组目录并提炼进 dnd_prepare save，避免下次开团临时翻书；不写过去总结），计划仅 DM 可见，不推进剧情，禁止修改原书文件或发给玩家。收团后补写交接可用 dnd_end summary，不用重新 start；不把 DM 计划发到群里。',
 ].join('\n');
 
 /** 跟着队伍位置和章节变的背景：本章要点、当前场景的通用规则 */
@@ -302,7 +304,9 @@ export class DndService {
     if (existing !== undefined && existing.adventureId === adventure.id && !fresh) {
       existing.active = true;
       existing.sessionStartedAt = Date.now();
+      delete existing.endPrep;
       restoreAllAbsent(existing);
+      clearAllDelegations(existing);
       reconcileKnownSites(existing, adventure);
       this.store.save(existing);
       this.onStateChange?.(key);
@@ -324,8 +328,39 @@ export class DndService {
     return { campaign, adventure, resumed: false, carried: campaign.characters.map((ch) => ch.name) };
   }
 
+  public lifecyclePhase(key: string): DndLifecyclePhase {
+    const campaign = this.store.load(key);
+    if (campaign === undefined) return 'none';
+    if (campaign.active) return 'active';
+    return campaign.endPrep?.phase ?? 'paused';
+  }
+
+  public validateStop(
+    key: string,
+    summary?: string,
+  ): { ok: true; active: boolean } | { ok: false; reason: 'inactive' | 'invalid'; message?: string } {
+    const campaign = this.store.load(key);
+    if (campaign === undefined || (!campaign.active && summary === undefined)) {
+      return { ok: false, reason: 'inactive' };
+    }
+    if (summary !== undefined) {
+      const value = summary.trim();
+      if (value.length === 0) {
+        return { ok: false, reason: 'invalid', message: '结团摘要不能为空' };
+      }
+      if (value.length > SUMMARY_MAX_CHARS) {
+        return {
+          ok: false,
+          reason: 'invalid',
+          message: `进度共 ${value.length} 字，超过 ${SUMMARY_MAX_CHARS} 字，未保存、旧进度保留。请用 summary 精简后整份重写。`,
+        };
+      }
+    }
+    return { ok: true, active: campaign.active };
+  }
+
   /** 命令和 DM 工具共用一次落盘；暂停后也允许补写交接，不会重新开团。 */
-  public stop(key: string, summary?: string): Campaign | undefined {
+  public stop(key: string, summary?: string, options?: { endPrepId?: string }): Campaign | undefined {
     const campaign = this.store.load(key);
     if (campaign === undefined || (!campaign.active && summary === undefined)) return undefined;
     if (summary !== undefined) {
@@ -334,7 +369,18 @@ export class DndService {
     }
     campaign.active = false;
     restoreAllAbsent(campaign);
+    clearAllDelegations(campaign);
     ensureSessionSummary(campaign);
+    if (options?.endPrepId !== undefined) {
+      campaign.endPrep = {
+        id: options.endPrepId,
+        phase: 'preparing',
+        startedAt: Date.now(),
+        hasSummary: summary !== undefined,
+      };
+    } else if (summary !== undefined && campaign.endPrep !== undefined) {
+      campaign.endPrep.hasSummary = true;
+    }
     this.store.save(campaign);
     this.background.forget(key);
     this.forceNextSnapshot(key);
@@ -343,14 +389,52 @@ export class DndService {
     return campaign;
   }
 
+  public completeEndPreparation(key: string, id?: string): boolean {
+    const campaign = this.store.load(key);
+    if (campaign?.endPrep === undefined) return false;
+    if (id !== undefined && campaign.endPrep.id !== id) return false;
+    delete campaign.endPrep;
+    this.store.save(campaign);
+    return true;
+  }
+
   public savePreparation(key: string, text: string): void {
     const campaign = this.store.load(key);
     if (campaign === undefined) throw new Error('这个群没有团档');
     const value = text.trim();
     if (value.length > PREPARATION_MAX_CHARS) throw new Error(`备团计划超过 ${PREPARATION_MAX_CHARS} 字，未保存，请精简`);
     if (value.length === 0) delete campaign.preparation;
-    else campaign.preparation = { at: Date.now(), state: campaignState(campaign), text: value };
+    else {
+      campaign.preparation = { at: Date.now(), state: campaignState(campaign), text: value };
+      delete campaign.endPrep;
+    }
     this.store.save(campaign);
+  }
+
+  public buildEndPreparationPrompt(
+    key: string,
+    options?: { userSummary?: string; combatHandoff?: string },
+  ): string {
+    const found = this.saved(key) ?? this.active(key);
+    const hasOngoingCombat = found?.campaign.initiative !== undefined;
+    const summaryText = found?.campaign.summaries.at(-1)?.text;
+    const hasCustomSummary = summaryText !== undefined && (found?.campaign.sessionStartedAt === undefined || (found?.campaign.summaries.at(-1)?.at ?? 0) >= found.campaign.sessionStartedAt);
+    const lines = [
+      '[系统 · 停团交接与下场备团 · DM 私有]',
+      `玩家刚执行了 /dnd end：团档、角色卡${hasOngoingCombat ? '与当前进行中的战斗状态（先攻/站位/待结算）' : ''}已原子暂停并保存。禁止再推进剧情、改变站位、掷骰或重复发停团状态。`,
+      ...(options?.combatHandoff !== undefined ? [options.combatHandoff] : []),
+      ...(options?.userSummary !== undefined
+        ? [`玩家附带停团摘要「${options.userSummary}」（已记入交接；若不够完整，可补充调用 dnd_end summary）。`]
+        : [hasCustomSummary
+            ? `当前已有停团交接摘要，如需补充未结线头可直接调用 dnd_end(summary=...) 更新；不要重新 start。`
+            : '若本场还没有完整六段交接（【位置】【刚刚发生】【已定行动】【同行与留守】【未结事项】【下次接续】），请用 dnd_end(summary=...) 补写玩家已知事实。']),
+      '【必须执行的下场备团】现在立刻依次调用：',
+      '1. `dnd_prepare(action="show")` 查看最新团况、候选下一站、近期日志与模组原书只读目录；',
+      '2. 用 `dnd_lookup` 查候选房间/NPC（如目录有原书文件，用 read/glob/grep 只读查阅未展开的遭遇表、机关 DC 与支线）；',
+      '3. 调用 `dnd_prepare(action="save", plan=...)` 保存一份不超过 2000 字的 DM 私有前瞻计划（仅写后续可能用到的场景/检定/陷阱/NPC 要点，不写已发生总结，也绝不把未来计划当成已发生事实）。',
+      '4. 保存完成后，向群里只回复一段简短、不剧透的停团确认（说明进度/角色卡已归档、战斗或探险状态已保留、下场资料已备好，下次 `/dnd start` 继续；严禁透露任何 DM 私有计划、未去过的房间/剧情剧透或怪物 AC/HP/DC）。',
+    ];
+    return lines.join('\n');
   }
 
   public preparationContext(key: string): string {
@@ -494,7 +578,8 @@ export class DndService {
 
   /**
    * 决定团况快照是否跨越关键场景边界的签名：
-   * 换房间（需新房间 DM 笔记）、开战/结战、开场揭幕、签到/暂离变化或上下文压缩（epoch 变化）时立即刷新。
+   * 换房间（需新房间 DM 笔记）、开战/结战、开场揭幕、签到/暂离变化等结构变化在同轮内先锁住，
+   * 待进入下一轮用户对话第一步时立即穿透 4 轮节流同步；上下文压缩（epoch）与 dnd_undo（forceSeq）可在同轮立即穿透。
    */
   public snapshotStructuralKey(key: string, epoch = ''): string {
     const found = this.active(key);
@@ -518,18 +603,20 @@ export class DndService {
 interface SnapshotGateEntry {
   lastInjected: string;
   lastTurnTag?: string;
+  lastEpoch: string;
   lastStructKey: string;
   lastForceSeq: number;
   turnsSinceInject: number;
 }
 
 /**
- * 团况 runtime-context 节流门控：
- * 1. 单轮对话内（turnTag 未变）：多次连续调用攻击/移动/豁免等工具时锁定返回本轮初同一快照字符串，
- *    使宿主 diff 判定无变化、单轮工具循环内 0 次重发 runtime-context；
- * 2. 跨对话轮次（turnTag 递增）：默认每 `intervalTurns`（默认 4）轮对话才刷新一次完整团况，
- *    间隔轮次内直接复用紧邻上文中的工具返回值与【当前回合账本】；
- * 3. 遇到关键边界（换房间、开战/结战、压缩 epoch 变化、dnd_undo 回滚、签到变化、结团清空）立即穿透节流同步。
+ * 团况 runtime-context 节流门控（同轮锁死、跨轮首步穿透）：
+ * 1. 单轮对话内（turnTag 未变）：即使连续调用移动（换房）、开战/结战、暂离/签到等工具，也一律锁定返回本轮初同一快照字符串，
+ *    同时保持 `lastStructKey` 不提前推进，使宿主 diff 判定无变化、单轮工具循环内 0 次重发 runtime-context；
+ *    同轮仅在上下文压缩（`epoch` 变化）或 `dnd_undo` 回滚（`forceSeq` 变化）导致前文失效时立即穿透；
+ * 2. 跨到下一轮用户对话开头（turnTag 递增）：若上一轮发生过 `structKey` 变化（如批量切房、开战/结战等），
+ *    第一步即命中 `structKey !== lastStructKey` 并跳过 `intervalTurns`（默认 4 轮）节流，一次性同步最终稳定团况；
+ * 3. 常规对话轮次按 `intervalTurns`（默认 4 轮）刷新，结团/停团（fresh === ''）立即清空作废。
  */
 export class DndSnapshotGate {
   private readonly entries = new WeakMap<object, SnapshotGateEntry>();
@@ -538,12 +625,14 @@ export class DndSnapshotGate {
     agentKey: object;
     fresh: string;
     turnTag?: string;
+    epoch?: string;
     structKey: string;
     forceSeq: number;
     externallyDirty?: boolean;
     intervalTurns: number;
   }): string {
     const { agentKey, fresh, turnTag, structKey, forceSeq, externallyDirty } = options;
+    const epoch = options.epoch ?? '';
     const interval = Math.max(1, Math.trunc(options.intervalTurns || 4));
     if (fresh === '') {
       this.entries.delete(agentKey);
@@ -554,6 +643,7 @@ export class DndSnapshotGate {
       this.entries.set(agentKey, {
         lastInjected: fresh,
         ...(turnTag !== undefined ? { lastTurnTag: turnTag } : {}),
+        lastEpoch: epoch,
         lastStructKey: structKey,
         lastForceSeq: forceSeq,
         turnsSinceInject: 0,
@@ -561,23 +651,27 @@ export class DndSnapshotGate {
       return fresh;
     }
 
-    const boundaryChanged = structKey !== prev.lastStructKey || forceSeq !== prev.lastForceSeq;
+    const epochChanged = epoch !== prev.lastEpoch;
+    const forceChanged = forceSeq !== prev.lastForceSeq;
+    const structChanged = structKey !== prev.lastStructKey;
 
-    // 同一轮对话的多步工具调用循环内：除换房间 / dnd_undo / 开结战等结构性边界外，一律锁定不重发！
+    // 同一轮对话的多步工具调用循环内：同轮锁死 structKey 变化，仅在压缩（epoch）或 dnd_undo（forceSeq）使旧文失效时穿透
     if (turnTag !== undefined && turnTag === prev.lastTurnTag) {
-      if (!boundaryChanged) return prev.lastInjected;
+      if (!epochChanged && !forceChanged) return prev.lastInjected;
       prev.lastInjected = fresh;
+      prev.lastEpoch = epoch;
       prev.lastStructKey = structKey;
       prev.lastForceSeq = forceSeq;
       prev.turnsSinceInject = 0;
       return fresh;
     }
 
-    // 进入新的一轮用户对话
+    // 进入新的一轮用户对话：若上一轮有被同轮锁住的 structKey 变化，首步即刻穿透节流同步最终稳定态
     if (turnTag !== undefined) prev.lastTurnTag = turnTag;
     prev.turnsSinceInject += 1;
 
-    if (boundaryChanged || externallyDirty === true || prev.turnsSinceInject >= interval) {
+    if (epochChanged || forceChanged || structChanged || externallyDirty === true || prev.turnsSinceInject >= interval) {
+      prev.lastEpoch = epoch;
       prev.lastStructKey = structKey;
       prev.lastForceSeq = forceSeq;
       if (fresh !== prev.lastInjected) {

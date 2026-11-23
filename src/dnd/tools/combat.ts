@@ -3,8 +3,8 @@ import { roomGraph } from '../adventure.ts';
 import {
 type PendingSpell,
 assertCanAct,assertDeclaredByOwner,assertNoPending,
-assertCanEndTurn,endInitiative,findCharacter,gotoTurn,fightRooms,
-joinInitiative,nextTurn,skipSurprised,requireCharacter,
+assertCanEndTurn,effectiveControllerId,endInitiative,findCharacter,gotoTurn,fightRooms,
+joinInitiative,isDmDelegated,nextTurn,skipSurprised,requireCharacter,
 requireInitiative,startInitiative,spendReaction,useResource
 } from '../campaign.ts';
 import { combatParticipantCard } from '../combat-context.ts';
@@ -570,7 +570,7 @@ export function registerCombatTools(kit: ToolKit): void {
         if (swapTargetRaw !== undefined) {
           const ally = requireCharacter(c, swapTargetRaw);
           request.swap = ally.name;
-          if (ally.kind !== 'pc' || ally.playerId === undefined || ally.playerId === ch.playerId) {
+          if (ally.kind !== 'pc' || ally.playerId === undefined || isDmDelegated(ally) || effectiveControllerId(ally) === effectiveControllerId(ch)) {
             request.swapApproved = true;
           } else if (str(args.ally_declared_by) !== undefined) {
             assertDeclaredByOwner(

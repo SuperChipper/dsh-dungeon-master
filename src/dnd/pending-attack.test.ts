@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import type { InteractionEvent } from '@tencent-connect/qqbot-nodejs';
 import { AdventureLibrary } from './adventure.ts';
-import { type Campaign, CampaignStore, findCharacter, playerStatus, upsertCharacter } from './campaign.ts';
+import { type Campaign, CampaignStore, campaignState, findCharacter, playerStatus, upsertCharacter } from './campaign.ts';
 import { DndService } from './dnd-service.ts';
 import { registerDndTools } from './dnd-tools.ts';
 import { chooseReaction, classifyReactionReply, eligibleReactors, eligibleSpellReactors, hostileSpellcasterHints, recordReactionReply, reactionReplyNote, reactionsOf } from './pending-attack.ts';
@@ -1429,5 +1429,155 @@ describe('2026-11-15 角斗场反应与回滚加固', () => {
       declared_by: 'P3',
     });
     expect(hitSpentRx).not.toContain('【DM战术提醒】');
+  });
+
+  it('角色托管（玩家转移控制权 / DM 托管防丢反应）：保留原绑定、支持按钮与口头授权、DM 直接触发反应并即时解卡', async () => {
+    const t = setup();
+    t.service.store.update(t.key, (c) => {
+      findCharacter(c, '刻德温')!.spells = [{ name: '祝福术', level: 1 }];
+      findCharacter(c, '卡厄斯')!.spells = [{ name: '护盾术', level: 1 }];
+      findCharacter(c, '卡厄斯')!.resources = { '1环法术位': { current: 2, max: 2, reset: 'long' } };
+    });
+
+    // 1) 把 刻德温 托管给 Kriv 的玩家 (P2)，保留原 playerId='P4' 且 delegated 字段不改变剧情哈希
+    const transferMsg = await t.call('dnd_character', { action: 'update', name: '刻德温', delegate: 'Kriv' });
+    expect(transferMsg).toContain('托管→tty');
+    const kdAfter = findCharacter(t.campaign(), '刻德温')!;
+    expect(kdAfter.playerId).toBe('P4');
+    expect(kdAfter.delegated).toMatchObject({ mode: 'player', playerId: 'P2', player: 'tty' });
+    const campWithDel = t.campaign();
+    const campWithoutDel = { ...campWithDel, characters: campWithDel.characters.map(({ delegated: _d, ...ch }) => ch) };
+    expect(campaignState(campWithDel)).toBe(campaignState(campWithoutDel));
+
+    // 推进到 刻德温 的回合：P2（受托玩家）和 P4（原玩家）都能宣告攻击、结束回合、看法术按钮，无关 P3 被拒
+    await t.call('dnd_initiative', { action: 'next' }); // -> Kriv
+    await t.call('dnd_initiative', { action: 'next', declared_by: 'P2' }); // -> 刻德温
+    expect(findCharacter(t.campaign(), '刻德温')!.delegated).toBeDefined();
+
+    await expect(t.call('dnd_check', { type: 'attack', character: '刻德温', target: '狼', weapon: '银锤', declared_by: 'P3' })).rejects.toThrow(/托管/);
+    t.rolls.push(2, 4); // 银锤 d20=2+2=4 未中 -> 触发 导引打击
+    const kdMiss = await t.call('dnd_check', { type: 'attack', character: '刻德温', target: '狼', weapon: '银锤', declared_by: 'P2' });
+    expect(kdMiss).toContain('刻德温·导引打击');
+    expect(t.campaign().initiative!.pending!.reactors[0]!.dmManaged).toBeUndefined();
+
+    // 点击「法术/能力」按钮（带 刻德温）：受托玩家 P2 点了显示 刻德温 的法术而非 Kriv 的
+    expect(t.buttons.handleInteraction({
+      id: 'e-spells-kd', type: 11, version: 1, group_openid: 'G1', group_member_openid: 'P2',
+      data: { type: 11, resolved: { button_data: JSON.stringify({ t: 'dnd', a: 'spells', n: '刻德温' }) } },
+    } as never)).toBe(ACK.ok);
+    await vi.waitFor(() => expect(t.sender.sendMarkdown).toHaveBeenCalled());
+    expect(String(t.sender.sendMarkdown.mock.calls.at(-1)![1])).toContain('祝福术');
+
+    // 受托玩家 P2 点反应按钮、也能打字触发；原主人 P4 也可点；第三方 P3 点被拒绝
+    expect(t.press({ a: 'react', i: 0, r: t.campaign().initiative!.pending!.seq }, 'P3')).toBe(ACK.denied);
+    expect(t.press({ a: 'react', i: 0, r: t.campaign().initiative!.pending!.seq }, 'P2')).toBe(ACK.ok);
+    const kdGrant = t.campaign().initiative!.pending!.claimed.find((r) => r.character === '刻德温')!.authorization!;
+    const guidedHit = await t.call('dnd_apply', {
+      target: '狼',
+      reaction: { by: '刻德温', name: '导引打击', attack_mod: '+10', authorization: kdGrant },
+      settle: true,
+    });
+    expect(guidedHit).toContain('命中');
+
+    // P2 点「结束回合」按钮推进托管角色回合（推进到 卡厄斯）
+    const endRound = t.campaign().initiative!.round;
+    expect(t.buttons.handleInteraction({
+      id: 'e-end-kd', type: 11, version: 1, group_openid: 'G1', group_member_openid: 'P2',
+      data: { type: 11, resolved: { button_data: JSON.stringify({ t: 'dnd', a: 'end', n: '刻德温', r: endRound }) } },
+    } as never)).toBe(ACK.ok);
+    expect(t.campaign().initiative!.order[t.campaign().initiative!.turn]!.name).toBe('卡厄斯');
+
+    // 同一玩家同时控制自己与托管角色时，「角色名+不用」只跳过指定角色
+    t.service.store.update(t.key, (c) => {
+      c.characters.find((x) => x.name === '刻德温')!.reactions = [{ name: '保护', when: 'foe_attacks' }];
+      c.initiative!.pending = {
+        kind: 'attack', seq: 99, at: Date.now(), attacker: '狼', target: '卡厄斯', natural: 15, rollDetail: 'd20=15+6=21',
+        total: 21, ac: 18, crit: false, attackMod: 0, acMod: 0, damageMod: 0,
+        reactors: [{ character: 'Kriv', reaction: '尖刻言语' }, { character: '刻德温', reaction: '保护' }],
+        declined: [], claimed: [], used: [],
+      };
+    });
+    expect(classifyReactionReply(t.campaign(), 'P2', '刻德温不用')).toMatchObject({ kind: 'decline', characters: ['刻德温'] });
+    expect(classifyReactionReply(t.campaign(), 'P2', '不用')).toMatchObject({ kind: 'decline', characters: ['Kriv', '刻德温'] });
+    t.service.store.update(t.key, (c) => { delete c.initiative!.pending; });
+
+    // 2) DM 托管卡厄斯：回合免 declared_by / dm_override；敌方攻击仍保留反应窗口（dmManaged=true）、不发玩家按钮、且 DM 可免 authorization 直接触发护盾术！
+    const dmMsg = await t.call('dnd_character', { action: 'update', name: '卡厄斯', delegate: 'dm' });
+    expect(dmMsg).toContain('DM托管');
+    // 现在轮到 卡厄斯（DM托管）：DM 不传 declared_by 即可攻击并 next，且回合按钮不弹出
+    t.rolls.push(15, 4);
+    await t.call('dnd_check', { type: 'attack', character: '卡厄斯', target: '狼', damage: '1d6' });
+    t.sender.sendMarkdown.mockClear();
+    await t.call('dnd_initiative', { action: 'next' }); // -> 第 2 轮 狼
+    expect(t.campaign().initiative!.order[t.campaign().initiative!.turn]!.name).toBe('狼');
+
+    // 狼 攻击 DM 托管的 卡厄斯（同时场上仍有玩家 Kriv/刻德温）：混合名单只给真实玩家发按钮，不给 DM 托管角色发按钮！
+    t.rolls.push(15, 4); // d20=15+6=21 vs AC 18
+    const afkAttack = await t.call('dnd_check', { type: 'attack', character: '狼', target: '卡厄斯' });
+    expect(afkAttack).toContain('卡厄斯·护盾术[DM托管]');
+    expect(afkAttack).toContain('其中 卡厄斯 为 DM 托管');
+    expect(t.campaign().initiative!.pending!.reactors.find((r) => r.character === '卡厄斯')?.dmManaged).toBe(true);
+    // 混合名单：只生成 Kriv·尖刻言语、刻德温·保护 + Pass 共 3 行，过滤掉 卡厄斯[DM托管]
+    expect(buildReactionKeyboard(t.campaign().initiative!.pending!).content.rows).toHaveLength(3);
+
+    // DM 直接免 authorization 触发 卡厄斯·护盾术，并跳过已放弃反应的队友！
+    const dmShield = await t.call('dnd_apply', {
+      target: '卡厄斯',
+      reaction: { by: '卡厄斯', name: '护盾术' },
+      decline: ['Kriv', '刻德温'],
+      settle: true,
+    });
+    expect(dmShield).toContain('AC +5');
+    expect(dmShield).toContain('未命中');
+    expect(t.hp('卡厄斯')).toBe(29);
+    expect(findCharacter(t.campaign(), '卡厄斯')!.resources!['1环法术位']!.current).toBe(1);
+    expect(t.campaign().initiative!.reacted).toContain('卡厄斯');
+
+    // 3) 只有 卡厄斯 能反应时：先卡在 AFK 玩家处，现场改 update delegate="dm" 即刻标上 dmManaged 并免授权解卡！
+    t.service.store.update(t.key, (c) => {
+      delete c.initiative!.reacted;
+      delete c.initiative!.shielded;
+      findCharacter(c, 'Kriv')!.reactions = [];
+      findCharacter(c, '刻德温')!.reactions = [];
+      delete findCharacter(c, '卡厄斯')!.delegated; // 先恢复原玩家独占
+    });
+    t.rolls.push(15, 4);
+    const stuckWin = await t.call('dnd_check', { type: 'attack', character: '狼', target: '卡厄斯' });
+    expect(stuckWin).toContain('卡厄斯·护盾术');
+    expect(t.campaign().initiative!.pending!.reactors.find((r) => r.character === '卡厄斯')?.dmManaged).toBeUndefined();
+    // 没托管时 DM 不能免授权触发
+    await expect(t.call('dnd_apply', {
+      target: '卡厄斯',
+      reaction: { by: '卡厄斯', name: '护盾术' },
+    })).rejects.toThrow(/有效授权/);
+    // 现场切换 delegate="dm" -> 立即为已打开窗口同步 dmManaged；纯 DM 托管窗口提示免传 authorization 且键盘无玩家选项
+    await t.call('dnd_character', { action: 'update', name: '卡厄斯', delegate: 'dm' });
+    expect(t.campaign().initiative!.pending!.reactors.find((r) => r.character === '卡厄斯')?.dmManaged).toBe(true);
+    expect(buildReactionKeyboard(t.campaign().initiative!.pending!).content.rows).toHaveLength(1);
+    // 再新开纯 DM 托管窗口确认 holdNotice 直接给出免传 authorization 提示
+    t.service.store.update(t.key, (c) => { delete c.initiative!.pending; });
+    t.rolls.push(15, 4);
+    const pureDmHold = await t.call('dnd_check', { type: 'attack', character: '狼', target: '卡厄斯' });
+    expect(pureDmHold).toContain('免传 authorization');
+    const unstuck = await t.call('dnd_apply', {
+      target: '卡厄斯',
+      reaction: { by: '卡厄斯', name: '护盾术' },
+      settle: true,
+    });
+    expect(unstuck).toContain('未命中');
+
+    // 4) 解除托管 / 暂离 / 收团均正确清理，非 PC 与停团拒绝托管
+    await t.call('dnd_character', { action: 'update', name: '卡厄斯', delegate: 'none' });
+    expect(findCharacter(t.campaign(), '卡厄斯')!.delegated).toBeUndefined();
+    await expect(t.call('dnd_character', { action: 'update', name: '狼', delegate: 'dm' })).rejects.toThrow('只有 PC 可以设置托管');
+    await t.call('dnd_character', { action: 'update', name: '刻德温', absent: true });
+    expect(findCharacter(t.campaign(), '刻德温')!.delegated).toBeUndefined();
+    await expect(t.call('dnd_character', { action: 'update', name: '刻德温', delegate: 'dm' })).rejects.toThrow('暂离');
+
+    await t.call('dnd_character', { action: 'update', name: '卡厄斯', delegate: 'Kriv' });
+    expect(findCharacter(t.campaign(), '卡厄斯')!.delegated).toBeDefined();
+    t.service.stop(t.key);
+    expect(findCharacter(t.service.saved(t.key)!.campaign, '卡厄斯')!.delegated).toBeUndefined();
+    await expect(t.call('dnd_character', { action: 'update', name: '卡厄斯', delegate: 'dm' })).rejects.toThrow('停团时不能设置托管');
   });
 });
