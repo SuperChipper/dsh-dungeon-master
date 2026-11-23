@@ -1,6 +1,6 @@
 {
   "name": "dsh-dungeon-master",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "QQ Bot IM channel and D&D 5e Dungeon Master plugin for DeepSeek Harness (dsh)",
   "type": "module",
   "main": "./dist/index.js",
@@ -58,7 +58,8 @@
   ],
   "license": "MIT",
   "engines": {
-    "node": ">=20.3.0"
+    "node": ">=20.3.0",
+    "dsh": ">=0.1.0-rc.6 <1.0.0"
   },
   "repository": {
     "type": "git",
@@ -79,9 +80,10 @@
       "dshReleases": {
         "0.1.0-rc.8": "compatible",
         "0.2.0-rc.2": "compatible",
-        "0.2.1-rc.5": "compatible"
+        "0.2.1-rc.5": "compatible",
+        "0.2.2-rc.5": "compatible"
       },
-      "note": "0.1.0-rc.8 为 CLI（dsh web）已验证：扫码/手动/解绑全流程、终端二维码与端内绑定页；0.2.0-rc.2 为 Desktop 内嵌运行时已验证：端内绑定页（settings.section 与侧栏）、HMR 重载收敛。客户端依赖 settings.section / sidebarRightTabs / sidebar.right.pane.tab 席位契约与 dsh.client 模块系统，宿主大版本升级后请重新验收席位行为。"
+      "note": "已在 DSH 0.1.0-rc.8（CLI / dsh web 扫码、手动、解绑全流程）、0.2.0-rc.2 / 0.2.1-rc.5 / 0.2.2-rc.5（Desktop 内嵌运行时、设置席位与侧栏 HMR 收敛）验证通过；宿主大版本升级后请重新验收席位行为。"
     }
   },
   "dependencies": {
@@ -94,10 +96,10 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.1",
-    "@deepseek-ai/dsh-agent": ">=0.1.0-rc.6 <0.2.0 || >=0.2.0-0 <0.2.1 || >=0.2.1-0 <0.2.2 || >=0.2.2-0 <0.2.3 || >=0.2.3-0 <0.2.4 || >=0.2.4-0 <0.2.5 || >=0.2.5-0 <0.3.0-0",
-    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6 <0.2.0 || >=0.2.0-0 <0.2.1 || >=0.2.1-0 <0.2.2 || >=0.2.2-0 <0.2.3 || >=0.2.3-0 <0.2.4 || >=0.2.4-0 <0.2.5 || >=0.2.5-0 <0.3.0-0",
-    "@deepseek-ai/dsh-session": ">=0.1.0-rc.6 <0.2.0 || >=0.2.0-0 <0.2.1 || >=0.2.1-0 <0.2.2 || >=0.2.2-0 <0.2.3 || >=0.2.3-0 <0.2.4 || >=0.2.4-0 <0.2.5 || >=0.2.5-0 <0.3.0-0",
-    "@deepseek-ai/dsh-user-approval": ">=0.1.0-rc.6 <0.2.0 || >=0.2.0-0 <0.2.1 || >=0.2.1-0 <0.2.2 || >=0.2.2-0 <0.2.3 || >=0.2.3-0 <0.2.4 || >=0.2.4-0 <0.2.5 || >=0.2.5-0 <0.3.0-0",
+    "@deepseek-ai/dsh-agent": ">=0.1.0-rc.6 <1.0.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6 <1.0.0",
+    "@deepseek-ai/dsh-session": ">=0.1.0-rc.6 <1.0.0",
+    "@deepseek-ai/dsh-user-approval": ">=0.1.0-rc.6 <1.0.0",
     "@deepseek-ai/schemastery": ">=3.18.1",
     "@tencent-connect/qqbot-connector": "1.2.0"
   },

@@ -6,6 +6,18 @@ This file records significant `dsh-dungeon-master` updates from a product perspe
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.8.1] - 2026-11-24
+
+### Added
+
+- **Atomic `/dnd end` pause & next-session preparation state machine**: integrates `/dnd end` into a transactional state machine that atomically persists saves, cleans up live combat state, and dispatches an internal post-session preparation prompt to the DM, removing the legacy static pause reply.
+- **PC delegation (player control transfer & DM-managed reaction windows)**: adds a `delegate` parameter on `dnd_character` to temporarily transfer control to a teammate (by character name or U-number) or to the DM (`delegate="dm"`) while preserving the original player binding; delegated controllers gain button and verbal authorization, and DM-managed characters keep reaction windows unblocked so AFK players do not miss reactions or stall turns.
+
+### Changed
+
+- **Tightened `DndSnapshotGate` to same-turn lock with next-turn first-step breakthrough**: locks `runtime-context` snapshots across structural changes (`structKey`: room moves, combat start/end, check-in/absent toggles) within the same user dialogue turn to avoid mid-turn re-emissions, allowing immediate mid-turn breakthrough only on compaction (`epoch`) or `dnd_undo` (`forceSeq`), and automatically breaking through on the first step of the next user turn to sync the final settled state once.
+- **Manifest dependencies & README cleanup**: declared `engines.dsh` (`>=0.1.0-rc.6 <1.0.0`), cleaned up `@deepseek-ai/dsh-*` `peerDependencies` ranges and `0.2.2-rc.5` compatibility metadata, and streamlined `README.md` / `README_EN.md` with a default PTC recommendation.
+
 ## [0.8.0] - 2026-11-22
 
 ### Added
