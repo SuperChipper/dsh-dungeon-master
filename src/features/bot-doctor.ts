@@ -147,6 +147,43 @@ export async function runBotDoctor(deps: {
     warnings.push(`imageGen 已启用，但未设置 imageGen.apiKey 与环境变量 ${imageGenEnvRef}`);
   }
 
+  const envFiles = deps.envFiles ?? (
+    deps.env !== undefined || process.env.VITEST
+      ? []
+      : defaultEnvFiles()
+  );
+
+  if (Object.prototype.hasOwnProperty.call(config, 'browser') && (config as Record<string, unknown>).browser !== undefined) {
+    warnings.push('配置仍含已下线的 browser 字段（Playwright 已于 0.9.0 移除），保存一次设置会自动清理或可手动删除');
+  }
+  const asrChatUrl = (config.asr?.chatBaseUrl ?? '').trim()
+    || (env.QQBOT_TRANSCRIBE_BASE_URL ?? '').trim()
+    || (hasEnvKeyInFiles(envFiles, 'QQBOT_TRANSCRIBE_BASE_URL') ? 'configured' : '');
+  if (config.asr?.enabled === true && (config.asr.mode ?? 'chat') === 'chat' && asrChatUrl === '') {
+    warnings.push('asr 已启用（chat 模式），但 0.9.0 已清空内置第三方转写网关，请在设置页补填 chatBaseUrl 或设置 QQBOT_TRANSCRIBE_BASE_URL');
+  }
+  if (
+    config.modelFailover?.enabled === true
+    && (!config.modelFailover.backupProvider?.trim() || !config.modelFailover.backupModel?.trim())
+  ) {
+    warnings.push('modelFailover 已启用，但 0.9.0 已清空默认备模，请补填自有 backupProvider/backupModel 或关闭该开关');
+  }
+  if (
+    config.dnd?.combatAgent?.enabled === true
+    && (!config.dnd.combatAgent.provider?.trim() || !config.dnd.combatAgent.model?.trim())
+  ) {
+    warnings.push('dnd.combatAgent 已启用，但 0.9.0 已清空默认战斗模型，请补填 provider/model 或关闭以继承主模型');
+  }
+  if (
+    config.fanart?.enabled !== true
+    && Boolean(config.fanart?.proxy?.trim() || config.fanart?.poolDir?.trim())
+  ) {
+    warnings.push('fanart 填有代理/标签池配置但当前未开启（0.9.0 起扩展工具默认关闭，如需继续使用请开启 fanart.enabled）');
+  }
+  if (config.sing?.enabled !== true && Boolean(config.sing?.baseUrl?.trim())) {
+    warnings.push('sing 填有 baseUrl 但当前未开启（0.9.0 起扩展工具默认关闭，如需继续使用请开启 sing.enabled）');
+  }
+
   const route = manager.getEffectiveModel(scope, peerId);
   const record = manager.getSessionRecord(scope, peerId);
   const contextLock = record !== undefined && manager.getContextLockStatus !== undefined
@@ -173,11 +210,6 @@ export async function runBotDoctor(deps: {
   const el = config.speak?.elevenlabs;
   const elEnabled = el?.enabled === true;
   const elEnvRef = el?.apiKeyEnv?.trim() || 'ELEVENLABS_API_KEY';
-  const envFiles = deps.envFiles ?? (
-    deps.env !== undefined || process.env.VITEST
-      ? []
-      : defaultEnvFiles()
-  );
   const elHasKey = Boolean(el?.apiKey?.trim() || env[elEnvRef]?.trim() || hasEnvKeyInFiles(envFiles, elEnvRef));
   const roleVoiceCount = Object.values(el?.roleVoices ?? {}).filter((v) => typeof v === 'string' && v.trim() !== '').length;
   const personaVoiceCount = [defaultGroup, defaultDirect, ...(ps?.list(scope) ?? [])]

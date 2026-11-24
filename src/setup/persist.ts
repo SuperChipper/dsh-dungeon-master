@@ -159,8 +159,9 @@ export function updateProfileConfig(
     const entry = entries.find((e) => e.id === 'im-qqbot');
     if (entry !== undefined) {
       const existing = (entry.config ?? {}) as Record<string, unknown>;
-      // 只覆盖提交键；appId/appSecret 由绑定流程管理，防御性保留
+      // 只覆盖提交键；appId/appSecret 由绑定流程管理，防御性保留，并顺手清理 0.9.0 已下线的 browser 字段
       const next: Record<string, unknown> = { ...existing };
+      delete next.browser;
       for (const [key, value] of Object.entries(configPatch)) {
         if (key === 'appId' || key === 'appSecret') continue;
         next[key] = value;

@@ -158,6 +158,10 @@ export function AdvancedSessionSection({ form, patch }: { form: ConfigWire; patc
   };
   const personas: PersonasWire = { root: '', ...form.personas };
   const cleanup: CleanupWire = form.cleanup ?? { dryRun: false };
+  const legacyPromptNames = [
+    ...(form.groupPrompt?.trim() ? ['groupPrompt'] : []),
+    ...(form.directPrompt?.trim() ? ['directPrompt'] : []),
+  ];
 
   return createElement(Fragment, null,
     createElement('div', { className: 'imqb2-group-title' }, '管理员与文件访问'),
@@ -335,6 +339,22 @@ export function AdvancedSessionSection({ form, patch }: { form: ConfigWire; patc
       onChange: (v) => { patch('personas', { ...personas, root: v }); },
     }),
     createElement(PersonasManager, null),
+    legacyPromptNames.length > 0
+      ? createElement('div', { className: 'imqb2-subcard' },
+          createElement('p', { className: 'imqb2-help' },
+            `检测到旧版内嵌提示词（${legacyPromptNames.join(' / ')}），0.9.0 起建议统一由上方人设目录管理；点击清除后请再点底部「保存设置」即可移除。`),
+          createElement('div', { className: 'imqb2-btn-row' },
+            createElement('button', {
+              type: 'button',
+              className: 'imqb2-btn-secondary',
+              onClick: () => {
+                if (form.groupPrompt !== undefined && form.groupPrompt !== '') patch('groupPrompt', '');
+                if (form.directPrompt !== undefined && form.directPrompt !== '') patch('directPrompt', '');
+              },
+            }, '清除旧内嵌提示词'),
+          ),
+        )
+      : null,
 
     createElement('div', { className: 'imqb2-group-title' }, '临时目录与清理'),
     createElement(FieldRow, {

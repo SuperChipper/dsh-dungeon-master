@@ -24,6 +24,13 @@ function formatChipText(persona: PersonaSummaryWire): string {
   return badge === '' ? base : `${base} · ${badge}`;
 }
 
+function formatPersonasHttpError(status: number, fallback: string, serverError?: string): string {
+  if (status === 404) {
+    return '后端尚未加载到新版人设接口，请重启一次 DSH 进程后刷新页面';
+  }
+  return serverError ?? fallback;
+}
+
 /** 查看生效人设清单、一键打开人设目录，并支持新建自定义人设文件。 */
 export function PersonasManager(): ReactNode {
   const [info, setInfo] = useState<PersonasListResponse | null>(null);
@@ -40,7 +47,10 @@ export function PersonasManager(): ReactNode {
   const reload = useCallback(async (signal?: { cancelled: boolean }) => {
     try {
       const res = await fetch(BIND_PERSONAS_PATH, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        const errBody = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(formatPersonasHttpError(res.status, `HTTP ${res.status}`, errBody.error));
+      }
       const body = (await res.json()) as PersonasListResponse;
       if (signal?.cancelled) return;
       setInfo(body);
@@ -68,7 +78,10 @@ export function PersonasManager(): ReactNode {
           setFeedback({ ok: true, text: body.message ?? '已打开人设目录' });
           return;
         }
-        setFeedback({ ok: false, text: body.error ?? `打开目录失败（HTTP ${res.status}）` });
+        setFeedback({
+          ok: false,
+          text: formatPersonasHttpError(res.status, `打开目录失败（HTTP ${res.status}）`, body.error),
+        });
       })
       .catch((err: unknown) => {
         setFeedback({ ok: false, text: err instanceof Error ? err.message : String(err) });
@@ -142,7 +155,10 @@ export function PersonasManager(): ReactNode {
           await reload();
           return;
         }
-        setFeedback({ ok: false, text: body.error ?? `创建失败（HTTP ${res.status}）` });
+        setFeedback({
+          ok: false,
+          text: formatPersonasHttpError(res.status, `创建失败（HTTP ${res.status}）`, body.error),
+        });
       })
       .catch((err: unknown) => {
         setFeedback({ ok: false, text: err instanceof Error ? err.message : String(err) });

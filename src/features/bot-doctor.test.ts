@@ -156,6 +156,35 @@ describe('bot-doctor', () => {
     }
   });
 
+  it('检测 0.8.x -> 0.9.0 迁移漂移（browser 残留、清空的第三方默认网关、停用但填过参数的扩展工具）', async () => {
+    const report = await runBotDoctor({
+      manager: makeManager(),
+      config: {
+        groupTriggerMode: 'mention',
+        browser: { enabled: true, mode: 'local' },
+        asr: { enabled: true, mode: 'chat', chatBaseUrl: '' },
+        modelFailover: { enabled: true, backupProvider: '', backupModel: '' },
+        dnd: { enabled: true, combatAgent: { enabled: true, provider: '', model: '' } },
+        fanart: { enabled: false, proxy: 'http://127.0.0.1:7890', poolDir: '' },
+        sing: { enabled: false, baseUrl: 'http://127.0.0.1:8766' },
+      } as never,
+      scope: 'group',
+      peerId: 'g1',
+      readScheduleCount: () => 0,
+      env: {},
+      envFiles: [],
+    });
+
+    expect(report.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining('browser 字段'),
+      expect.stringContaining('asr 已启用（chat 模式）'),
+      expect.stringContaining('modelFailover 已启用'),
+      expect.stringContaining('dnd.combatAgent 已启用'),
+      expect.stringContaining('fanart.enabled'),
+      expect.stringContaining('sing.enabled'),
+    ]));
+  });
+
   it('/bot-doctor 仅允许 owner / admin 执行', () => {
     const cmd = doctorCommand({
       manager: makeManager() as never,

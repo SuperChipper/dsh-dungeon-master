@@ -11,6 +11,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import yaml from 'js-yaml';
+import { ConfigSchema } from '../config.ts';
 import {
   BIND_CONFIG_PATH,
   BIND_MANUAL_PATH,
@@ -1356,6 +1358,53 @@ describe('bind-routes', () => {
       expect(target).toContain('测试');
       expect(target).toContain('%2C');
       expect(target).toContain('%3D');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('0.8.1 旧配置升级兼容：ConfigSchema 容忍遗留字段，POST config 清空内嵌提示词时保留凭据并自动清理 browser', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'im-qqbot-upgrade-081-'));
+    try {
+      const patchPath = join(dir, 'cordis.patch.yml');
+      const legacyConfig = {
+        appId: 'app-081',
+        appSecret: 'sec-081',
+        browser: { enabled: true, mode: 'local' },
+        requireMention: false,
+        groupPrompt: 'legacy group prompt',
+        directPrompt: 'legacy direct prompt',
+      };
+      const parsed = ConfigSchema(legacyConfig as never) as unknown as Record<string, unknown>;
+      expect(parsed.requireMention).toBe(false);
+      expect(parsed.groupPrompt).toBe('legacy group prompt');
+
+      writeFileSync(patchPath, yaml.dump([{ id: 'im-qqbot', config: legacyConfig }]), 'utf8');
+
+      const { routes } = createHarness({
+        profileDir: dir,
+        currentConfig: () => ({ ...legacyConfig }),
+      });
+
+      const res = fakeRes();
+      await invoke(
+        routes.get(BIND_CONFIG_PATH),
+        fakeReq('POST', { host: '127.0.0.1:3080' }, JSON.stringify({ groupPrompt: '', directPrompt: '' })),
+        res,
+      );
+      expect(res.statusCode).toBe(200);
+
+      const savedEntries = yaml.load(readFileSync(patchPath, 'utf8')) as Array<{ id?: string; config?: Record<string, unknown> }>;
+      const savedConfig = savedEntries.find((e) => e.id === 'im-qqbot')?.config;
+      expect(savedConfig).toBeDefined();
+      expect(savedConfig).toMatchObject({
+        appId: 'app-081',
+        appSecret: 'sec-081',
+        requireMention: false,
+        groupPrompt: '',
+        directPrompt: '',
+      });
+      expect('browser' in savedConfig!).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
