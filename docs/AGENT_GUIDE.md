@@ -16,7 +16,7 @@
    - 绝不在终端回显或聊天回复中输出 `appSecret`、`apiKey`、环境变量真实密钥或私人 TTS `voice_id`。
    - 绝不自行编造或硬编码第三方 API 网关 URL、模型 ID 或 Key 环境变量名；缺失时先询问用户自有渠道配置，或留空继承 DSH 主模型路由。
 4. **注意热更新与重载边界**
-   - 新装或升级 `dsh-dungeon-master`、或修改构建产物 `dist/` 后，需触发一次 profile 重组（在 DSH Web 保存一次配置或通过插件管理器重载），或重启 `dsh` 进程，服务端新代码才会生效；仅刷新浏览器只会更新前端面板（`lib/client.js`）。
+   - 新装或升级 `dsh-dungeon-master`、或重建构建产物 `dist/` 后，必须**重启 `dsh` 进程**，服务端新代码才会生效（DSH 仅重载 profile 时不会刷新 Node 的 ESM 模块缓存；仅刷新浏览器只会更新前端面板 `lib/client.js`）。
 
 ---
 
@@ -85,8 +85,8 @@ dsh --version  # 需 >= 0.1.0-rc.6 且 < 1.0.0
 2. **执行升级**：
    - npm 安装用户：执行 `dsh plugin --profile <profile> upgrade dsh-dungeon-master`（若宿主要求指定版本或重装，可用 `dsh plugin --profile <profile> add dsh-dungeon-master@latest`）。
    - 源码挂载用户：进入插件目录执行 `git pull && npm run clean && npm run build`。
-3. **重载运行态并验证**：
-   - 触发一次设置保存 / 插件重组，或重启 `dsh` 进程；
+3. **重启运行态并验证**：
+   - 必须重启 `dsh` 进程使新版后端生效（仅重载 profile 不会刷新 Node ESM 缓存），如打开网页面板也顺手刷新一次页面；
    - 通过 `/bot-version` 确认版本号已更新，并运行 `/bot-doctor` 检查配置与依赖状态。
 
 ---
@@ -149,4 +149,15 @@ dsh --version  # 需 >= 0.1.0-rc.6 且 < 1.0.0
 - [ ] `package.json`（profile 侧）不存在 `@tencent-connect/dsh-qqbot` 与 `dsh-dungeon-master` 并存冲突；
 - [ ] 升级至 `0.9.0` 时，已向用户确认扩展工具开关（`bili` / `fanart` / `reverseImage` / `sing`）、`combatAgent` / `modelFailover` / `asr` 自定义渠道以及 `speak.*.roleVoices` 人设键名；
 - [ ] 原跑团存档目录（`<dnd.root>/campaigns/` 或 `<cwd>/dnd/campaigns/`）完好；
-- [ ] 已重载或重启 `dsh`，且 `/bot-version`、`/bot-doctor`、`/bot-ping` 与（开团后）`/dnd status` 均返回正常。
+- [ ] 已重启 `dsh` 进程使新版后端生效，且 `/bot-version`、`/bot-doctor`、`/bot-ping` 与（开团后）`/dnd status` 均返回正常。
+
+---
+
+## 五、常见升级排障速查
+
+遇到以下异常时，Agent 可直接按现象定位并修复：
+
+1. **设置页人设区提示 `404` / 找不到新版人设接口**：升级后只刷新浏览器或仅在页面点「重载 profile」时，Node ESM 缓存仍停留在旧版 `dist/`；**请提示用户重启一次 `dsh` 进程**，再刷新设置页。
+2. **`/bot-doctor` 提示残留 `browser` 或内嵌 `groupPrompt` / `directPrompt`**：让用户在 DSH Web「插件 → QQ 机器人 → 会话、权限与人设进阶」人设管理器下方点击「清除旧内嵌提示词」并点击「保存设置」（保存动作同时会自动清除已下线的 `browser` 字段）；或按本文档红线备份后用 YAML 解析器移除对应字段。
+3. **升级后搜图 / B 站 / 以图搜图 / 点歌不可用**：`0.9.0` 起 `bili`、`fanart`、`reverseImage`、`sing` 改为默认 `enabled: false`；确认用户仍需使用后，引导用户在设置页「共享笔记、上游监测与扩展工具」抽屉开启，或在 `im-qqbot.config` 中显式补充 `enabled: true`。
+4. **`asr`（chat 模式）/ `modelFailover` / `dnd.combatAgent` 报错或未生效**：`0.9.0` 已清空第三方厂商默认预设；按 `/bot-doctor` 输出的提示询问用户自有网关 / 模型配置并补填，或将对应开关设为 `false` 继承 DSH 主模型路由。

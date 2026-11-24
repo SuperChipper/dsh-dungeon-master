@@ -6,6 +6,27 @@
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [0.9.0] - 2026-11-24
+
+### 从 `0.8.x` 升级必读（含 Agent 排障指引）
+
+- **交给 AI Agent 自动迁移 / 排障**：包内随附 [`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md)（内含 `0.8.x → 0.9.0` 迁移清单、配置合并红线与排障速查），也可直接复制 [README](./README.md) 顶部 Quick Start 的 Prompt 交给 AI 助手代为核对升级。
+- ① **更新后请重启一次 `dsh` 进程**：插件市场更新或只点「重载 profile」不会刷新 Node ESM 后端模块缓存；更新完成后重启 `dsh` 进程，并在 QQ 发送 `/bot-doctor` 完成升级自检。
+- ② **部分扩展工具改为默认关闭**：`bili`（B 站只读）、`fanart`（搜图）、`reverseImage`（以图搜图）、`sing`（外部点歌）默认变为 `enabled: false`，如升级前依赖这些工具，请在「共享笔记、上游监测与扩展工具」折叠抽屉中重新开启。
+- ③ **移除内置浏览器与第三方默认预设**：彻底移除内置 Playwright 浏览器（`qqbot_browser` / `playwright-core`）及 `asr.chat*`、`video` 直传、`modelFailover.backup*`、`dnd.combatAgent.*` 的第三方厂商默认值。旧版 `cordis.patch.yml` 仍可安全加载不阻断启动；保存一次设置会自动清理废弃 `browser` 字段，若残留内嵌 `groupPrompt` / `directPrompt`，可在设置页人设面板下方一键清除。
+
+### 新功能
+
+- **人设目录与自定义人设面板**：在设置页「会话、权限与人设进阶」中直接查看当前生效人设目录与人设清单（区分 `both` / `group` / `direct` 作用域），支持跨平台一键打开目录（Windows 经 `ShellExecuteExW` 拉起文件管理器并支持降级）、一键复制路径、在线生成新 `<id>.md` 人设模板；遇到后端未重载返回 `404` 时给出明确重启提示。
+- **Agent 安装与迁移文档及 Quick Start Prompt**：新增 [`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md)（覆盖全新安装、`@tencent-connect/dsh-qqbot` 冲突排查、`0.8.x → 0.9.0` 迁移与排障速查），并在中英文 `README` 的 Quick Start 提供可直接复制给 AI Agent 的 Prompt 块与手动命令行双入口。
+- **`/bot-doctor` 升级漂移诊断与旧提示词一键清理**：`/bot-doctor` 新增检测残留 `browser` 字段、启用但未填自有网关的 `asr`（chat 模式）/`modelFailover`/`dnd.combatAgent`、以及填有参数但未开启的 `fanart`/`sing`；Web 设置面板在检测到旧 `groupPrompt`/`directPrompt` 时自动展示一键清理卡片，`persist` 保存时顺手清理 `browser`。
+
+### 变更与优化
+
+- **Web 设置面板重构与抽屉折叠**：首屏仅保留「快速上手」（私聊/群聊权限、主人 `openid` 含 `/bot-me` 指引、群触发模式）与「跑团」核心开关，其余设置归入 4 个默认折叠的 `<details>` 抽屉（含已启用状态摘要），并移除旧内嵌 `groupPrompt`/`directPrompt` 文本框。
+- **剥离个人默认配置并内置公共人设包**：默认启用内置 `personas/` 人设库；TTS `roleVoices`（ElevenLabs / DeepSeek / 本地 TTS）改为直接按当前 `personaId` 精确匹配；清空第三方私有默认渠道与特定余额钩子；移除 `src/browser/` 与 `playwright-core` 依赖以大幅精简包体积。
+- **宿主适配边界隔离与去私有化整理**：集中收敛 `ctx` 访问至 `src/host-adapter/` 并补齐边界守卫单元测试，全面去私有化公开配置文件、文档与模板。
+
 ## [0.8.1] - 2026-11-24
 
 ### 新功能

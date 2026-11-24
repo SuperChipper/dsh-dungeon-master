@@ -6,6 +6,27 @@ This file records significant `dsh-dungeon-master` updates from a product perspe
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.9.0] - 2026-11-24
+
+### Upgrade Notes from 0.8.x (Agent Migration & Troubleshooting)
+
+- **Let an AI Agent migrate or troubleshoot**: This package bundles [`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md) (checklist, YAML merge guardrails, and troubleshooting quick reference), or paste the ready-to-copy Quick Start prompt from [`README_EN.md`](./README_EN.md) to your AI assistant.
+- ① **Restart the `dsh` process once after upgrading**: Marketplace updates or profile reloads alone do not invalidate Node's ESM cache for the backend bundle. Restart `dsh`, then run `/bot-doctor` in QQ to check for configuration drift.
+- ② **Optional utility tools are now opt-in (`enabled: false`)**: `bili`, `fanart`, `reverseImage`, and `sing` default to disabled. Re-enable the ones you rely on under the **Shared Notes, Failover & Extra Tools** drawer in Settings.
+- ③ **Built-in Playwright browser & third-party vendor defaults removed**: `qqbot_browser` (`playwright-core`) and preset third-party gateways/models (`asr.chat*`, `video` direct endpoint, `modelFailover.backup*`, `dnd.combatAgent.*`) have been cleared. Legacy `0.8.x` `cordis.patch.yml` files remain loadable without blocking startup; saving Settings automatically removes stale `browser` keys, and an inline cleanup card clears legacy `groupPrompt`/`directPrompt` fields.
+
+### Added
+
+- **Persona Directory & Custom Persona Manager**: View the active personas folder and loaded personas (`both` / `group` / `direct` badges), open the folder in the OS file manager (Windows uses `ShellExecuteExW` with `explorer.exe` fallback), copy its path, and create new `<id>.md` templates directly from Settings; surfaces clear restart guidance if the backend returns `404`.
+- **Agent Install/Migration Guide & Dual Quick Start**: Added bundled [`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md) covering fresh install, replacing `@tencent-connect/dsh-qqbot`, `0.8.x -> 0.9.0` migration checks, and troubleshooting; split `README.md` / `README_EN.md` Quick Start into a ready-to-copy Agent prompt option and manual CLI option.
+- **`/bot-doctor` 0.9.0 Drift Diagnostics & Legacy Prompt Cleanup Banner**: `/bot-doctor` detects leftover `browser` blocks, enabled `asr` (chat)/`modelFailover`/`dnd.combatAgent` with missing custom routes, and disabled `fanart`/`sing` with stale settings; Settings shows a targeted cleanup card only when legacy `groupPrompt`/`directPrompt` values exist, and `persist` strips deprecated `browser` entries on save.
+
+### Changed
+
+- **Collapsible Web Settings Panel**: Keeps Quick Start and core D&D controls at the top level while grouping advanced settings into four collapsible `<details>` drawers with active-state summaries, removing the deprecated `groupPrompt`/`directPrompt` fields from the form.
+- **De-personalized Defaults & Bundled Public Personas**: Ships bundled public `personas/`, switches TTS `roleVoices` (ElevenLabs / DeepSeek / local TTS) to match directly by active `personaId`, clears built-in third-party vendor defaults, and removes `src/browser/` + `playwright-core` to slim package footprint.
+- **Host-Adapter Boundary Hardening**: Consolidated Cordis host `ctx` access inside `src/host-adapter/` with boundary guard tests and stripped personal defaults across public docs and config templates.
+
 ## [0.8.1] - 2026-11-24
 
 ### Added

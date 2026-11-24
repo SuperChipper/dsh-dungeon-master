@@ -4,17 +4,30 @@
 
 **An AI dungeon master that runs D&D 5e in QQ groups.** Forked from [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot): send `/dnd start` in a group and the bot becomes that group's DM—dice, checks, initiative, grid positions, reactions, and HP are resolved deterministically by tools while the model focuses on narration.
 
-> 🤖 **Using an AI Agent to install, troubleshoot, or upgrade from `0.8.x` to `0.9.0`?**
->
-> Have your assistant (DSH / Claude Code / Antigravity / Codex) read **[`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md)** first—it covers fresh installation, migrating from upstream, the `0.9.0` migration checklist, and profile-editing guardrails (also bundled in the npm package).
->
-> QR binding, base configuration, and overall architecture follow upstream: see the **[upstream README](https://github.com/tencent-connect/dsh-qqbot#readme)**. Do not enable `@tencent-connect/dsh-qqbot` alongside this package in the same profile (both share the `im-qqbot` plugin ID).
+QR binding, base configuration, and overall architecture follow upstream: see the **[upstream README](https://github.com/tencent-connect/dsh-qqbot#readme)**. Do not enable `@tencent-connect/dsh-qqbot` alongside this package in the same profile (both share the `im-qqbot` plugin ID).
 
 ---
 
 ## Quick Start
 
 ### 1. Install & Run
+
+#### Option A: Copy Prompt for Your AI Agent (Recommended)
+
+Paste this prompt to your AI coding assistant (DSH / Claude Code / Antigravity / Codex):
+
+```text
+Please install or upgrade the DSH plugin dsh-dungeon-master (plugin ID: im-qqbot) on my machine:
+1. Read docs/AGENT_GUIDE.md first (if not present locally yet, read node_modules/dsh-dungeon-master/docs/AGENT_GUIDE.md after installation or https://github.com/SuperChipper/dsh-dungeon-master/blob/main/docs/AGENT_GUIDE.md), and strictly follow its guardrails.
+2. Confirm my target DSH profile (default to web if unspecified), check Node (>= 20.3.0) and dsh versions, and if the conflicting package @tencent-connect/dsh-qqbot is installed in that profile, back up ~/.dsh/profiles/<profile>/cordis.patch.yml first and cleanly remove the old package while preserving credentials.
+3. Install or upgrade (npm: dsh plugin --profile <profile> add dsh-dungeon-master; or build and link local source). If I am upgrading from 0.8.x to 0.9.0, verify all 5 items in the migration checklist inside AGENT_GUIDE, back up cordis.patch.yml before editing, and merge only the im-qqbot entry using a YAML parser.
+4. Never print or echo appSecret, apiKey, or personal voice_id values, and never invent unconfirmed third-party gateway URLs, model IDs, or API key env var names.
+5. Remind me to restart the dsh process once finished so the updated server bundle loads, then guide me through QR binding under DSH Web -> Plugins -> QQ Bot and running /bot-me, /bot-doctor, and /dnd start to verify.
+```
+
+See **[`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md)** for full details (also bundled in the npm package).
+
+#### Option B: Manual CLI Install
 
 ```bash
 # Install from npm (recommended)
@@ -32,7 +45,7 @@ npx @deepseek-ai/dsh --profile qqbot
 
 - **Requirements**: `Node >= 20.3.0`, `DSH >= 0.1.0-rc.6 <1.0.0` (verified on `0.1.0-rc.8`, `0.2.0-rc.2`, `0.2.1-rc.5`, `0.2.2-rc.5`).
 - **Optional dependencies**: `sharp` for PNG battle/fog-of-war maps; system `ffmpeg` / `ffprobe` for video analysis tools.
-- **Reloading local changes**: Run `pnpm build` and trigger a settings save or plugin recompose in DSH so the updated server bundle is loaded.
+- **Upgrading & reloading changes**: After upgrading the package or running `pnpm build`, **restart the `dsh` process** so Node loads the new server bundle (refreshing the browser updates the client panel `lib/client.js` only, and reloading a profile does not invalidate Node's ESM module cache).
 
 ### 2. Start a Game in Three Steps
 

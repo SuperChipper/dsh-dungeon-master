@@ -4,17 +4,30 @@
 
 **在 QQ 群里跑 D&D 5e 的 AI 地下城主。** 本项目基于 [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot) 二次开发：群里发一句 `/dnd start`，bot 即成为该群 DM——掷骰、检定、先攻、站位、反应与血量全由确定性工具结算，模型专注叙事。
 
-> 🤖 **交给 AI Agent 自动安装 / 从 `0.8.x` 迁移到 `0.9.0`？**
->
-> 请直接让你的 AI 助手（DSH / Claude Code / Antigravity / Codex）先阅读 **[`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md)**，内含全新安装、上游平滑替换、`0.9.0` 配置迁移检查表与操作红线（本文件已随 npm 包附带）。
->
-> 基础扫码绑定、通用配置项与整体架构沿用上游，详见 **[上游 README](https://github.com/tencent-connect/dsh-qqbot#readme)**。请勿在同一 profile 中同时启用 `@tencent-connect/dsh-qqbot`（共用 `im-qqbot` 插件 ID）。
+基础扫码绑定、通用配置项与整体架构详见 **[上游 README](https://github.com/tencent-connect/dsh-qqbot#readme)**。请勿在同一 profile 中同时启用 `@tencent-connect/dsh-qqbot`（共用 `im-qqbot` 插件 ID）。
 
 ---
 
 ## 快速开始
 
 ### 1. 安装与运行
+
+#### 方式一：复制 Prompt 交给 AI Agent 安装或升级（推荐）
+
+把下面这段直接发给你的 AI 助手（DSH / Claude Code / Antigravity / Codex）：
+
+```text
+请帮我在本地安装或升级 DSH 插件 dsh-dungeon-master（插件 ID：im-qqbot）：
+1. 先阅读本仓库的 docs/AGENT_GUIDE.md；如果当前目录还没有该文件，请在安装后读取 node_modules/dsh-dungeon-master/docs/AGENT_GUIDE.md，或先查看 https://github.com/SuperChipper/dsh-dungeon-master/blob/main/docs/AGENT_GUIDE.md，严格遵守其中的操作红线。
+2. 向我确认要使用的 DSH profile（未指定时默认 web），检查 Node（>= 20.3.0）与 dsh 版本；如发现同一 profile 已装过冲突包 @tencent-connect/dsh-qqbot，先备份 ~/.dsh/profiles/<profile>/cordis.patch.yml 再平滑卸载旧包并保留已有凭据。
+3. 执行安装或升级（npm：dsh plugin --profile <profile> add dsh-dungeon-master；源码模式请先构建再挂载）。若我是从 0.8.x 升级到 0.9.0，请按 AGENT_GUIDE 的 5 项迁移检查表逐项核对我的 cordis.patch.yml，修改前必须先备份，且只用 YAML 解析器合并 im-qqbot 条目。
+4. 绝不在聊天或日志中回显 appSecret、apiKey 或私人 voice_id；也不要编造未确认的第三方网关、模型 ID 或 Key 环境变量名。
+5. 完成后提醒我重启一次 dsh 进程以加载新版后端代码，并引导我打开 DSH Web「插件 → QQ 机器人」安全扫码绑定，用 /bot-me、/bot-doctor 和 /dnd start 完成验收。
+```
+
+完整迁移细则见 **[`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md)**（已随 npm 包附带）。
+
+#### 方式二：手动命令行安装
 
 ```bash
 # 从 npm 安装（推荐）
@@ -32,7 +45,7 @@ npx @deepseek-ai/dsh --profile qqbot
 
 - **运行要求**：`Node >= 20.3.0`，`DSH >= 0.1.0-rc.6 <1.0.0`（已验证 `0.1.0-rc.8`、`0.2.0-rc.2`、`0.2.1-rc.5`、`0.2.2-rc.5`）。
 - **可选依赖**：安装 `sharp` 启用 PNG 战棋地图与迷雾地图；视频工具依赖系统 `ffmpeg` / `ffprobe`。
-- **代码热改**：修改源码后需执行 `pnpm build` 并在 DSH 中触发一次设置保存或插件重组才会加载新服务端代码。
+- **升级与重载注意**：升级插件包或修改源码并 `pnpm build` 后，**请重启 `dsh` 进程**（仅刷新浏览器只会更新前端面板，重载 profile 不会刷新 Node ESM 缓存里的后端代码）。
 
 ### 2. 三步开团
 
