@@ -326,7 +326,7 @@ describe('工具：开战提示与 terrain', () => {
     service.store.update(key, (c) => { c.initiative!.turn = c.initiative!.order.findIndex((e) => e.name === 'Kriv'); });
     expect(await call('dnd_position', { action: 'move', name: 'Kriv', to: '门外', declared_by: 'P2' })).toContain('站在门外(通B)');
     await expect(call('dnd_position', { action: 'move', name: 'Kriv', x: 3, y: 2, to: '狼', declared_by: 'P2' })).rejects.toThrow(/二选一/);
-    const shown = await call('dnd_position', { action: 'show' });
+    const shown = await call('dnd_position', { action: 'show', text_grid: true });
     expect(shown).toContain('#=墙');
   });
 });

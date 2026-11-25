@@ -318,7 +318,7 @@ export function pendingHit(p: PendingAttack): boolean {
 
 /** 豁免/检定的这一骰现在过没过；没给 DC 时不知道 */
 export function rollPassed(p: PendingCheck, r: PendingD20): boolean | undefined {
-  return p.dc === undefined ? undefined : r.total + r.mod >= p.dc;
+  return p.dc === undefined ? undefined : r.autoFailed === undefined && r.total + r.mod >= p.dc;
 }
 
 export function requirePending(c: Campaign): PendingRoll {

@@ -59,9 +59,11 @@ import {
   BIND_REFRESH_PATH,
   BIND_STATE_PATH,
   BIND_UNBIND_PATH,
+  BIND_UPDATE_CHECK_PATH,
   type BindStateWire,
   type PersonaScopeKind,
   type PersonaSummaryWire,
+  type UpdateCheckResponse,
 } from '../shared/bind-protocol.ts';
 
 // 协议单一来源：shared/bind-protocol.ts（类型 + 路径常量，客户端共用）
@@ -73,8 +75,9 @@ export {
   BIND_REFRESH_PATH,
   BIND_STATE_PATH,
   BIND_UNBIND_PATH,
+  BIND_UPDATE_CHECK_PATH,
 };
-export type { BindStateWire, PersonaScopeKind, PersonaSummaryWire };
+export type { BindStateWire, PersonaScopeKind, PersonaSummaryWire, UpdateCheckResponse };
 
 /** dsh-host-webserver 的具名路由注册形状（局部投影，避免硬依赖） */
 export interface WebRoute {
@@ -144,6 +147,14 @@ export interface BindRoutesOptions {
   openDirectory?: (
     dir: string,
   ) => { ok: boolean; error?: string } | Promise<{ ok: boolean; error?: string }>;
+  /**
+   * 查询 npm 最新版本号（测试可注入替身，避免真实外网请求）。
+   */
+  checkLatestVersion?: (packageName: string) => Promise<string>;
+  /**
+   * 覆盖当前插件版本号（测试可注入）。
+   */
+  currentVersion?: string;
 }
 
 /** 可经 UI 编辑的配置键（白名单：只收用户必要的字段，其余走 patch/env） */
@@ -295,6 +306,8 @@ export function registerBindRoutes(
   };
   const handleManualSubmit = options.onManualCredentials ?? defaultManual;
 
+  const updateCache: UpdateCheckCache = { entry: null };
+
   const disposers = [
     webServer.register({
       kind: 'exact',
@@ -330,6 +343,11 @@ export function registerBindRoutes(
       kind: 'exact',
       path: BIND_PERSONAS_OPEN_PATH,
       handler: (req, res) => handlePersonasOpen(req, res, options, logger),
+    }),
+    webServer.register({
+      kind: 'exact',
+      path: BIND_UPDATE_CHECK_PATH,
+      handler: (req, res) => handleUpdateCheck(req, res, options, updateCache),
     }),
   ];
   logger.info(`im-qqbot: 端内绑定页已就绪: ${BIND_STATE_PATH}`);
@@ -1001,4 +1019,143 @@ async function handlePersonasOpen(
     return;
   }
   sendJson(res, 200, { ok: true, dir, message: `已打开人设目录: ${dir}` });
+}
+
+const DEFAULT_PACKAGE_NAME = 'dsh-dungeon-master';
+const DEFAULT_RELEASE_URL = 'https://github.com/SuperChipper/dsh-dungeon-master/blob/main/CHANGELOG.md';
+const UPDATE_CHECK_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const UPDATE_CHECK_TIMEOUT_MS = 5_000;
+
+interface UpdateCheckCache {
+  entry: { latestVersion: string; checkedAt: number } | null;
+}
+
+function readPackageMeta(): { packageName: string; currentVersion: string } {
+  try {
+    const raw = JSON.parse(readFileSync(resolve(PLUGIN_ROOT, 'package.json'), 'utf8')) as {
+      name?: unknown;
+      version?: unknown;
+    };
+    const packageName = typeof raw.name === 'string' && raw.name.trim() !== ''
+      ? raw.name.trim()
+      : DEFAULT_PACKAGE_NAME;
+    const currentVersion = typeof raw.version === 'string' && raw.version.trim() !== ''
+      ? raw.version.trim()
+      : '0.0.0';
+    return { packageName, currentVersion };
+  } catch {
+    return { packageName: DEFAULT_PACKAGE_NAME, currentVersion: '0.0.0' };
+  }
+}
+
+/**
+ * 轻量 SemVer 比较：返回 >0 表示 a > b，0 表示相等，<0 表示 a < b。
+ * 同主次补丁号下，正式版大于预发布版（如 0.9.1 > 0.9.1-rc.1）。
+ */
+export function compareSemver(a: string, b: string): number {
+  const parse = (raw: string): { nums: [number, number, number]; pre: string } | null => {
+    const clean = raw.trim().replace(/^v/i, '');
+    const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.*)?$/.exec(clean);
+    if (!match) return null;
+    return {
+      nums: [Number(match[1]), Number(match[2]), Number(match[3])],
+      pre: match[4] ?? '',
+    };
+  };
+  const pa = parse(a);
+  const pb = parse(b);
+  if (!pa || !pb) return a.trim().localeCompare(b.trim());
+  for (let i = 0; i < 3; i++) {
+    const diff = pa.nums[i]! - pb.nums[i]!;
+    if (diff !== 0) return diff;
+  }
+  if (pa.pre === pb.pre) return 0;
+  if (pa.pre === '') return 1;
+  if (pb.pre === '') return -1;
+  return pa.pre.localeCompare(pb.pre);
+}
+
+async function fetchLatestNpmVersion(packageName: string): Promise<string> {
+  const url = `https://registry.npmjs.org/${encodeURIComponent(packageName)}/latest`;
+  const res = await fetch(url, {
+    headers: { accept: 'application/json' },
+    signal: AbortSignal.timeout(UPDATE_CHECK_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`npm registry HTTP ${res.status}`);
+  const data = (await res.json()) as { version?: unknown };
+  if (typeof data.version !== 'string' || data.version.trim() === '') {
+    throw new Error('npm registry 响应缺少 version 字段');
+  }
+  return data.version.trim();
+}
+
+/** 只读检查插件更新（带 6 小时内存缓存，?force=1 可强制刷新） */
+async function handleUpdateCheck(
+  req: IncomingMessage,
+  res: ServerResponse,
+  options: BindRoutesOptions,
+  cache: UpdateCheckCache,
+): Promise<void> {
+  if (!trusted(req)) {
+    sendJson(res, 403, { error: 'forbidden' });
+    return;
+  }
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
+
+  const meta = readPackageMeta();
+  const packageName = meta.packageName;
+  const currentVersion = options.currentVersion ?? meta.currentVersion;
+  let force = false;
+  try {
+    const parsedUrl = new URL(req.url ?? BIND_UPDATE_CHECK_PATH, 'http://localhost');
+    force = parsedUrl.searchParams.get('force') === '1';
+  } catch {
+    force = false;
+  }
+
+  const now = Date.now();
+  if (!force && cache.entry !== null && now - cache.entry.checkedAt < UPDATE_CHECK_CACHE_TTL_MS) {
+    const latestVersion = cache.entry.latestVersion;
+    const payload: UpdateCheckResponse = {
+      packageName,
+      currentVersion,
+      latestVersion,
+      hasUpdate: compareSemver(latestVersion, currentVersion) > 0,
+      releaseUrl: DEFAULT_RELEASE_URL,
+      checkedAt: cache.entry.checkedAt,
+      cached: true,
+    };
+    sendJson(res, 200, payload);
+    return;
+  }
+
+  const fetcher = options.checkLatestVersion ?? fetchLatestNpmVersion;
+  try {
+    const latestVersion = (await fetcher(packageName)).trim();
+    cache.entry = { latestVersion, checkedAt: now };
+    const payload: UpdateCheckResponse = {
+      packageName,
+      currentVersion,
+      latestVersion,
+      hasUpdate: compareSemver(latestVersion, currentVersion) > 0,
+      releaseUrl: DEFAULT_RELEASE_URL,
+      checkedAt: now,
+      cached: false,
+    };
+    sendJson(res, 200, payload);
+  } catch (err) {
+    const payload: UpdateCheckResponse = {
+      packageName,
+      currentVersion,
+      hasUpdate: false,
+      releaseUrl: DEFAULT_RELEASE_URL,
+      checkedAt: now,
+      cached: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+    sendJson(res, 200, payload);
+  }
 }

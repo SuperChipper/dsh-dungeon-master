@@ -38,7 +38,7 @@ import {
 import { createForwardTagger, type ForwardImage, type TaggedForwardImage } from '../media/forward-images.ts';
 import { registerMediaRef, shortenQqMediaUrls } from '../media/media-ref-store.ts';
 import { ASR_OFFLINE_HINT } from '../media/asr.ts';
-import { buildGifSheetNote, isGifBytes, makeGifSheet, type GifSheet } from '../media/gif-sheet.ts';
+import { buildGifSheetNote, countGifFrames, isGifBytes, makeGifSheet, type GifSheet } from '../media/gif-sheet.ts';
 import { formatMessageTime, makeSenderLabeler, MENTION_MARK, quoteHeader, type SenderLabeler } from '../features/message-format.ts';
 import { SELF_SENDER_ID } from './self-sent.ts';
 import { QUOTE_MISSING_NOTE, renderChatRecord, splitQuote } from '../features/chat-record.ts';
@@ -257,9 +257,12 @@ export async function handleInbound(
     for (const image of attachHistory ? historyImages : []) {
       if (image.localPath === undefined || seen.has(image.localPath)) continue;
       seen.add(image.localPath);
-      const block = await manager.createImageBlock(image.localPath);
+      const prepared = await attachableImageFor(image.localPath, manager.ffmpegPath, logger);
+      const block = await manager.createImageBlock(prepared.path);
       if (block === undefined) continue;
-      content.push({ type: 'text', text: `[历史图片#${image.index}]` }, block);
+      content.push({ type: 'text', text: `[历史图片#${image.index}]` });
+      if (prepared.note !== undefined) content.push({ type: 'text', text: prepared.note });
+      content.push(block);
       historyAttached++;
     }
 
@@ -272,13 +275,9 @@ export async function handleInbound(
       if (file.contentType !== 'image' || seen.has(file.localPath)) continue;
       seen.add(file.localPath);
       // 动图先抽帧拼宫格：宿主的图片归一化只留单帧，动画会整个丢掉
-      let attachPath = file.localPath;
-      const sheet = await gifSheetFor(file.localPath, manager.ffmpegPath);
-      if (sheet !== undefined) {
-        content.push({ type: 'text', text: buildGifSheetNote(sheet) });
-        attachPath = sheet.path;
-      }
-      const block = await manager.createImageBlock(attachPath);
+      const prepared = await attachableImageFor(file.localPath, manager.ffmpegPath, logger);
+      if (prepared.note !== undefined) content.push({ type: 'text', text: prepared.note });
+      const block = await manager.createImageBlock(prepared.path);
       if (block === undefined) continue;
       if (historyAttached > 0 && !currentLabeled) {
         content.push({ type: 'text', text: '[当前消息的图片]' });
@@ -291,9 +290,12 @@ export async function handleInbound(
     for (const image of forwardImages) {
       if (image.localPath === undefined || seen.has(image.localPath)) continue;
       seen.add(image.localPath);
-      const block = await manager.createImageBlock(image.localPath);
+      const prepared = await attachableImageFor(image.localPath, manager.ffmpegPath, logger);
+      const block = await manager.createImageBlock(prepared.path);
       if (block === undefined) continue;
-      content.push({ type: 'text', text: `[转发图片#${image.index}]` }, block);
+      content.push({ type: 'text', text: `[转发图片#${image.index}]` });
+      if (prepared.note !== undefined) content.push({ type: 'text', text: prepared.note });
+      content.push(block);
     }
   }
 
@@ -313,6 +315,11 @@ export async function handleInbound(
   ].filter((value): value is string => typeof value === 'string');
   const operations = inboundOperations(notesQuery, noteMediaTypes);
   if (!ctx.signal.aborted) {
+    // Use only the direct input, not assembled history, quoted text or media transcripts.
+    if (!steered && !mwState.senderTagged && !mwState.forwardImages?.length && !msg.attachments?.length
+        && scope === 'c2c' && !manager.dndService?.active(record.sessionKey)) {
+      manager.learnInbox?.stage(record, message.id, msg.messageId, msg.content ?? '');
+    }
     manager.stageNoteRecall?.(message.id, {
       query: notesQuery,
       operations,
@@ -346,6 +353,7 @@ export async function handleInbound(
     logger.warn(`whenIdle rejected: ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     if (!submitted) manager.unstageNoteRecall?.(message.id);
+    manager.learnInbox?.unstage(message.id);
   }
 
   // 上下文超阈值时后台压缩（只针对 QQ 会话；steer 注入分支由外层回合统一收尾压缩）
@@ -834,10 +842,42 @@ function buildAttachmentTags(attachments?: RawAttachment[]): string {
  * 动图 GIF → 关键帧宫格。静态图、读不到的图、ffmpeg 抽帧失败都返回 undefined，
  * 调用方照常附原图，不让这一层挡住整条消息。
  */
-async function gifSheetFor(path: string, ffmpegPath?: string): Promise<GifSheet | undefined> {
+async function gifSheetFor(path: string, ffmpegPath?: string, logger?: Logger): Promise<GifSheet | undefined> {
   const head = await readFile(path).catch(() => undefined);
-  if (head === undefined || !isGifBytes(head)) return undefined;
-  return makeGifSheet(path, ffmpegPath ?? '').catch(() => undefined);
+  if (head === undefined) { logger?.warn(`im-qqbot: GIF 检查读不到文件，按静态图处理 ${path}`); return undefined; }
+  if (!isGifBytes(head)) return undefined;
+  const sheet = await (async () => {
+    const first = await makeGifSheet(path, ffmpegPath ?? '', (message) => {
+      logger?.warn(`im-qqbot: GIF 抽帧未产出（ffmpeg=${ffmpegPath || 'PATH'}）：${message}`);
+    });
+    if (first !== undefined) return first;
+    // ffprobe 报不出帧数时按字节兜底，避免明明是多帧动图却被当静态图
+    const declared = countGifFrames(head);
+    if (declared <= 1) return undefined;
+    logger?.warn(`im-qqbot: ffprobe 未给出帧数，按字节判定 ${declared} 帧重试`);
+    return makeGifSheet(path, ffmpegPath ?? '', (message) => {
+      logger?.warn(`im-qqbot: GIF 抽帧（字节帧数兜底）未产出：${message}`);
+    }, declared);
+  })().catch((err: unknown) => {
+    logger?.warn(`im-qqbot: GIF 抽帧异常：${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  });
+  if (sheet !== undefined) logger?.info(`im-qqbot: GIF 抽帧宫格 ${sheet.frames} 帧 → ${sheet.path.split(/[\\\\/]/).pop()}`);
+  return sheet;
+}
+
+/**
+ * 图片附件可能是动图：动图先抽帧拼宫格（宿主归一化只留单帧），静态图原样返回。
+ * 返回 note 时调用方必须把它一起塞进 content，否则模型会把九宫格当成九张无关的图。
+ */
+export async function attachableImageFor(
+  path: string,
+  ffmpegPath?: string,
+  logger?: Logger,
+): Promise<{ path: string; note?: string }> {
+  const sheet = await gifSheetFor(path, ffmpegPath, logger);
+  if (sheet === undefined) return { path };
+  return { path: sheet.path, note: buildGifSheetNote(sheet) };
 }
 
 function formatFileSize(bytes: number): string {

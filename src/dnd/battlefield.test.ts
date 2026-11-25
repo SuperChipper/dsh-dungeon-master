@@ -64,9 +64,69 @@ describe('摆位', () => {
     expect(() => setPositions(c, [{ name: '不存在', x: 1, y: 1 }])).toThrow(/找不到角色/);
   });
 
+  it('稀疏阵型给手动钉住的队友留间距，窄房间则退让并给提示', () => {
+    const neighbors = (spacing: 'compact' | 'normal' | 'spread') => {
+      const c = arena();
+      setBattleMap(c, c.currentRoom, { width: 14, height: 11, areas: [] });
+      const notes = setPositions(c, [
+        { name: '刻德温', x: 4, y: 5 }, { name: '狼', x: 11, y: 5 },
+      ], { x: 4, y: 5, front: ['刻德温', 'Kriv'], spacing });
+      expect(cellOf(c, ch(c, '刻德温'))).toMatchObject({ x: 4, y: 5 });
+      expect(notes).toEqual([]);
+      return distanceFeet(cellOf(c, ch(c, '刻德温'))!, cellOf(c, ch(c, 'Kriv'))!);
+    };
+    expect(neighbors('compact')).toBe(5);
+    expect(neighbors('normal')).toBeGreaterThanOrEqual(10);
+    expect(neighbors('spread')).toBeGreaterThanOrEqual(15);
+
+    const narrow = arena();
+    setBattleMap(narrow, narrow.currentRoom, { width: 4, height: 2, areas: [] });
+    const notes = setPositions(narrow, [{ name: '狼', x: 3, y: 0 }], {
+      x: 0, y: 0, front: ['刻德温', 'Kriv'], spacing: 'spread',
+    });
+    expect(notes[0]).toContain('低于目标间距 15 尺');
+    expect(cellOf(narrow, ch(narrow, '刻德温'))).not.toEqual(cellOf(narrow, ch(narrow, 'Kriv')));
+  });
+
   it('不在战斗中不能摆', () => {
     const c = createCampaign('group:abc', BELL);
     expect(() => setPositions(c, [{ name: 'x', x: 1, y: 1 }])).toThrow(/不在战斗/);
+  });
+
+  it('交涉者与敌首领锁在原位，各入场组只在本侧可达格里摆位', () => {
+    const c = arena();
+    upsertCharacter(c, { name: '接应', maxHp: 18 });
+    setBattleMap(c, c.currentRoom, { width: 14, height: 9, areas: [
+      { kind: 'wall', x: 6, y: 0, w: 1, h: 9 },
+      { kind: 'door', name: '西门', x: 1, y: 2 },
+      { kind: 'door', name: '东门', x: 11, y: 2 },
+    ] });
+    const pinned = [
+      { name: '狼', x: 9, y: 5 }, { name: 'Kriv', x: 8, y: 5 }, { name: '大地精', x: 9, y: 6 },
+    ];
+    const formation = { front: ['刻德温', '接应'], back: ['Kriv'], spacing: 'spread' } as const;
+    const place = () => setPositions(c, [
+      ...pinned, { name: '刻德温', near: '西门', rank: 'mid' },
+      { name: '接应', near: '东门', rank: 'front' },
+    ], { ...formation, front: [...formation.front], back: [...formation.back] });
+    place();
+    for (const { name, x, y } of pinned) expect(cellOf(c, ch(c, name))).toMatchObject({ x, y });
+    expect(cellOf(c, ch(c, '刻德温'))!.x).toBeLessThan(6);
+    expect(cellOf(c, ch(c, '接应'))!.x).toBeGreaterThan(6);
+    const first = structuredClone(c.initiative!.positions);
+    place();
+    expect(c.initiative!.positions).toEqual(first);
+  });
+
+  it('没有足够的可达格时整次摆位回滚，不跨隔墙取空格', () => {
+    const c = arena();
+    setBattleMap(c, c.currentRoom, { width: 7, height: 3, areas: [{ kind: 'wall', x: 1, y: 0, w: 1, h: 3 }] });
+    setPositions(c, [{ name: '狼', x: 3, y: 0 }, { name: '大地精', x: 3, y: 1 }]);
+    const first = structuredClone(c.initiative!.positions);
+    expect(() => setPositions(c, [
+      { name: '狼', x: 0, y: 1 }, { name: '大地精', x: 0, y: 2 },
+    ], { x: 0, y: 0, front: ['刻德温', 'Kriv'] })).toThrow(/可达的空格不足/);
+    expect(c.initiative!.positions).toEqual(first);
   });
 
   it('同格提醒但不拦，同一次调用里互换位置不算冲突', () => {
@@ -443,10 +503,21 @@ describe('dnd_position 工具', () => {
     // 前排比中排更靠近敌群，中排比后排更靠近敌群
     expect(distToFoes('卡厄斯')).toBeLessThan(distToFoes('恩佐'));
     expect(distToFoes('丛云')).toBeLessThan(distToFoes('恩佐'));
-    expect(distToFoes('恩佐')).toBeLessThan(distToFoes('奇塔露'));
+    expect(distToFoes('恩佐'), JSON.stringify(pos)).toBeLessThan(distToFoes('奇塔露'));
     expect(distToFoes('恩佐')).toBeLessThan(distToFoes('维斯珀'));
     // 敌方前排（地精/纯血2）比敌方后排（祭司）更靠近西门
     expect(pos['地精']!.x).toBeLessThan(pos['蛇人祭司']!.x);
+  });
+
+  it('单人摆位简写只修改指定单位，省略高度时保留已摆高度', async () => {
+    const { call, service, key } = setup();
+    await call('dnd_initiative', { action: 'start' });
+    await call('dnd_position', { action: 'set', placements: [{ name: '卡厄斯', x: 1, y: 1 }, { name: '地精', x: 5, y: 5, z: 15 }] });
+    const before = service.store.load(key)!.initiative!.positions!;
+    await call('dnd_position', { action: 'set', name: '地精', x: 6, y: 4 });
+    const after = service.store.load(key)!.initiative!.positions!;
+    expect(after['卡厄斯']).toEqual(before['卡厄斯']);
+    expect(after['地精']).toMatchObject({ x: 6, y: 4, z: 15 });
   });
 });
 

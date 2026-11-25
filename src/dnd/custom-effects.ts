@@ -147,6 +147,15 @@ export interface HealModHook {
   capAtHalfMaxHp?: boolean;
 }
 
+export interface OngoingEffectRule {
+  conditions?: string[];
+  requiresCondition?: string;
+  repeatSave?: { timing: 'target_turn_start' | 'target_turn_end'; ability: Ability };
+  endOnDamage?: boolean;
+  wakeAsAction?: boolean;
+  zeroSpeed?: boolean;
+}
+
 export interface CustomEffectDef {
   name: string;
   aliases?: string[];
@@ -159,6 +168,7 @@ export interface CustomEffectDef {
   /** 目标倒下或战斗结束后专注保留在施法者身上，后续可用附赠动作免费转移给新目标（如脆弱诅咒、猎人印记） */
   transferable?: boolean;
   defaultRounds?: number;
+  ongoing?: OngoingEffectRule;
   attackMod?: AttackModHook;
   hitRider?: HitRiderHook;
   defenseMod?: DefenseModHook;
@@ -168,6 +178,24 @@ export interface CustomEffectDef {
 }
 
 export const BUILTIN_EFFECTS: Readonly<Record<string, CustomEffectDef>> = {
+  人类定身术: {
+    name: '人类定身术', aliases: ['定身人类', 'Hold Person'], concentration: true, defaultRounds: 10,
+    ongoing: { conditions: ['麻痹'], repeatSave: { timing: 'target_turn_end', ability: 'wis' } },
+  },
+  怪物定身术: {
+    name: '怪物定身术', aliases: ['定身怪物', 'Hold Monster'], concentration: true, defaultRounds: 10,
+    ongoing: { conditions: ['麻痹'], repeatSave: { timing: 'target_turn_end', ability: 'wis' } },
+  },
+  迟缓术: {
+    name: '迟缓术', aliases: ['缓慢术', '减速术', 'Slow'], concentration: true, defaultRounds: 10,
+    ongoing: { conditions: ['迟缓术'], repeatSave: { timing: 'target_turn_end', ability: 'wis' } },
+  },
+  催眠图纹: {
+    name: '催眠图纹', aliases: ['Hypnotic Pattern'], concentration: true, defaultRounds: 10,
+    ongoing: {
+      conditions: ['魅惑', '失能'], requiresCondition: '魅惑', zeroSpeed: true, endOnDamage: true, wakeAsAction: true,
+    },
+  },
   脆弱诅咒: {
     name: '脆弱诅咒',
     aliases: ['hex', '邪咒', '诅咒术'],
@@ -471,6 +499,44 @@ export function parseCustomEffectDef(raw: unknown): CustomEffectDef {
     ...(defaultRounds !== undefined ? { defaultRounds } : {}),
   };
 
+  if (o.ongoing !== undefined) {
+    if (o.ongoing === null || typeof o.ongoing !== 'object' || Array.isArray(o.ongoing)) {
+      throw new Error('ongoing 必须是对象');
+    }
+    const raw = o.ongoing as Record<string, unknown>;
+    const conditions = strArr(raw.conditions);
+    if (raw.conditions !== undefined && (conditions === undefined || conditions.length !== (raw.conditions as unknown[]).length)) {
+      throw new Error('ongoing.conditions 要填非空状态名列表');
+    }
+    const required = raw.requiresCondition ?? raw.requires_condition;
+    if (required !== undefined && (typeof required !== 'string' || !conditions?.includes(required.trim()))) {
+      throw new Error('ongoing.requires_condition 必须是 conditions 中的状态');
+    }
+    const save = raw.repeatSave ?? raw.repeat_save;
+    let repeatSave: OngoingEffectRule['repeatSave'];
+    if (save !== undefined) {
+      const { timing, ability } = (save ?? {}) as Record<string, unknown>;
+      if ((timing !== 'target_turn_start' && timing !== 'target_turn_end') || !ABILITIES.includes(ability as Ability)) {
+        throw new Error('ongoing.repeat_save 需要合法的 timing 和 ability');
+      }
+      repeatSave = { timing, ability: ability as Ability };
+    }
+    const endOnDamage = raw.endOnDamage ?? raw.end_on_damage;
+    const wakeAsAction = raw.wakeAsAction ?? raw.wake_as_action;
+    const zeroSpeed = raw.zeroSpeed ?? raw.zero_speed;
+    if ([endOnDamage, wakeAsAction, zeroSpeed].some((value) => value !== undefined && typeof value !== 'boolean')) {
+      throw new Error('ongoing 的解除和速度开关必须是布尔值');
+    }
+    def.ongoing = {
+      ...(conditions !== undefined ? { conditions } : {}),
+      ...(typeof required === 'string' ? { requiresCondition: required.trim() } : {}),
+      ...(repeatSave !== undefined ? { repeatSave } : {}),
+      ...(typeof endOnDamage === 'boolean' ? { endOnDamage } : {}),
+      ...(typeof wakeAsAction === 'boolean' ? { wakeAsAction } : {}),
+      ...(typeof zeroSpeed === 'boolean' ? { zeroSpeed } : {}),
+    };
+  }
+
   const rawAtk = (o.attackMod ?? o.attack_mod) as Record<string, unknown> | undefined;
   if (rawAtk !== undefined && rawAtk !== null && typeof rawAtk === 'object') {
     const toHitFormula = typeof (rawAtk.toHitFormula ?? rawAtk.to_hit_formula) === 'string'
@@ -696,10 +762,10 @@ export function parseCustomEffectDef(raw: unknown): CustomEffectDef {
   }
 
   const hasAnyHook = def.attackMod !== undefined || def.hitRider !== undefined || def.defenseMod !== undefined
-    || def.saveMod !== undefined || def.aura !== undefined || def.healMod !== undefined
+    || def.saveMod !== undefined || def.aura !== undefined || def.healMod !== undefined || def.ongoing !== undefined
     || def.concentration === true || def.transferable === true;
   if (!hasAnyHook) {
-    throw new Error('规则定义至少需要包含一个效果钩子（attack_mod / hit_rider / defense_mod / save_mod / aura / heal_mod / concentration / transferable）');
+    throw new Error('规则定义至少需要包含一个效果钩子（attack_mod / hit_rider / defense_mod / save_mod / aura / heal_mod / ongoing / concentration / transferable）');
   }
   return def;
 }
@@ -754,9 +820,18 @@ export function mergedEffectMap(
 ): Map<string, CustomEffectDef> {
   const byKey = new Map<string, CustomEffectDef>();
   const register = (def: CustomEffectDef): void => {
-    byKey.set(def.name.toLowerCase(), def);
+    const key = def.name.toLowerCase();
+    const previous = byKey.get(key);
+    const inherited = previous?.ongoing;
+    const resolved = def.ongoing === undefined && inherited !== undefined ? { ...def, ongoing: inherited } : def;
+    byKey.set(key, resolved);
+    if (previous !== undefined) {
+      for (const [alias, value] of byKey) {
+        if (value === previous) byKey.set(alias, resolved);
+      }
+    }
     for (const alias of def.aliases ?? []) {
-      byKey.set(alias.toLowerCase(), def);
+      byKey.set(alias.toLowerCase(), resolved);
     }
   };
   for (const def of Object.values(BUILTIN_EFFECTS)) register(def);

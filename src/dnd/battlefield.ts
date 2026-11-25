@@ -6,6 +6,7 @@
  * 一格 5 尺，x 向东、y 向南；斜走也算 5 尺（5e 默认规则；2026-11-07 本桌定了不改 DMG 的 5-10-5 变体）。
  * 只提醒不拦截的地方是故意的：冲刺、触及武器、特性都可能让「超速」「够不到」其实合法，那是 DM 的裁量。
  */
+import { FORMATION_EXPANSION_BUDGET, solveFormation, type FormationCandidate } from '../features/formation-solver.ts';
 import {
   type BattleCell,
   type Campaign,
@@ -28,6 +29,7 @@ import {
   roomOf,
 } from './campaign.ts';
 import {
+  assertTurnActionAllowed,
   breakConcentration,
   concentratingSpellNames,
   ensureTurnState,
@@ -190,6 +192,8 @@ export interface SideFormationSpec {
   mid?: string[];
   /** 后排角色名列表（处于最远离对手的安全后侧） */
   back?: string[];
+  /** 自动摆位的同侧目标间距：紧凑 5 尺、常规 10 尺、疏开 15 尺。 */
+  spacing?: 'compact' | 'normal' | 'spread';
 }
 
 export interface FormationInput extends SideFormationSpec {
@@ -297,14 +301,13 @@ function gridFeetFromSeeds(
   const passable = (at: Cell): boolean => inWin(at) && !blocksMove(map, at);
 
   for (const s of seeds) {
-    if (passable(s)) {
-      const k = cellKey(s);
-      if (!dist.has(k)) {
-        dist.set(k, 0);
-        queue.push({ x: s.x, y: s.y });
-      }
-      continue;
-    }
+    const k = cellKey(s);
+    if (!passable(s) || dist.has(k)) continue;
+    dist.set(k, 0);
+    queue.push({ x: s.x, y: s.y });
+  }
+  for (const s of seeds) {
+    if (passable(s)) continue;
     // 种子本身是阻挡格（如以「石棺/祭坛」或站着怪物的格子为参照）时，从其相邻可通行格起算 5 尺
     for (const st of FORMATION_STEPS) {
       const nb = { x: s.x + st.x, y: s.y + st.y };
@@ -431,25 +434,50 @@ function resolveSideAnchorCells(
   return [isMonsterSide ? { x: 6, y: 2 } : { x: 1, y: 2 }];
 }
 
+/** 交错挑取中、左、右和三档纵深，让截取的候选能覆盖侧翼与相邻排。 */
+function orderFormationCandidates(
+  candidates: readonly FormationCandidate[], targetDepth: number, lateral: (at: Cell) => number,
+): FormationCandidate[] {
+  const bands: FormationCandidate[][] = Array.from({ length: 9 }, () => []);
+  for (const candidate of candidates) {
+    const across = lateral(candidate);
+    const lane = across < -0.75 ? 1 : across > 0.75 ? 2 : 0;
+    const band = Math.min(2, Math.floor(Math.abs(candidate.depth - targetDepth) / CELL_FEET));
+    bands[band * 3 + lane]!.push(candidate);
+  }
+  for (const band of bands) band.sort((a, b) => Number(a.hazardous) - Number(b.hazardous)
+    || a.rankDeviation - b.rankDeviation || a.anchorDistance - b.anchorDistance || a.y - b.y || a.x - b.x);
+  const ordered: FormationCandidate[] = [];
+  const length = Math.max(...bands.map((band) => band.length));
+  for (let index = 0; index < length; index++) {
+    for (const band of bands) {
+      const candidate = band[index];
+      if (candidate !== undefined) ordered.push(candidate);
+    }
+  }
+  return ordered;
+}
+
 function placeSideByRanks(
   c: Campaign,
   room: string,
   entries: ReadonlyArray<{ ch: Character; rank: FormationRank; z: number }>,
   spec: SideFormationSpec | undefined,
-  fallbackNear: string | undefined,
   isMonsterSide: boolean,
+  maxExpansions: number,
   fallbackOpponentHints: readonly Cell[] = [],
-): void {
-  if (entries.length === 0) return;
+): { note?: string; examined: number } {
+  if (entries.length === 0) return { examined: 0 };
   const state = requireInitiative(c);
   const map = mapOf(c, room);
   const entryNames = new Set(entries.map((e) => e.ch.name));
-  const existingOpponents = placedIn(c, room)
-    .filter(({ ch }) => !entryNames.has(ch.name) && (ch.kind === 'monster') !== isMonsterSide)
+  const fixed = placedIn(c, room).filter(({ ch }) => !entryNames.has(ch.name));
+  const existingOpponents = fixed
+    .filter(({ ch }) => (ch.kind === 'monster') !== isMonsterSide)
     .map(({ cell }) => ({ x: cell.x, y: cell.y }));
   const refOpponents = existingOpponents.length > 0 ? existingOpponents : [...fallbackOpponentHints];
 
-  const anchorCells = resolveSideAnchorCells(c, room, spec, fallbackNear, isMonsterSide, refOpponents);
+  const anchorCells = resolveSideAnchorCells(c, room, spec, undefined, isMonsterSide, refOpponents);
   const anchorAvgX = anchorCells.reduce((s, p) => s + p.x, 0) / anchorCells.length;
   const anchorAvgY = anchorCells.reduce((s, p) => s + p.y, 0) / anchorCells.length;
 
@@ -462,7 +490,7 @@ function placeSideByRanks(
           y: Math.max(0, Math.min(map.height - 1, Math.round(anchorAvgY))),
         }
       : {
-          x: Math.min(MAX_COORD, Math.round(anchorAvgX) + (isMonsterSide ? -5 : 5)),
+          x: Math.max(0, Math.min(MAX_COORD, Math.round(anchorAvgX) + (isMonsterSide ? -5 : 5))),
           y: Math.max(0, Math.min(MAX_COORD, Math.round(anchorAvgY))),
         }];
 
@@ -483,46 +511,47 @@ function placeSideByRanks(
     !zonesAtCell(c, room, { ...at, z: 0 }).some((z) => z.damage !== undefined || (z.onFailConditions?.length ?? 0) > 0);
   const isCellOutside = (at: Cell): boolean => map !== undefined && areaAt(map, at)?.kind === 'outside';
 
-  const allFree: Cell[] = [];
+  const blocked = new Set(fixed.map(({ cell }) => cellKey(cell)));
+  const baseCandidates: Cell[] = [];
   for (let y = bounds.y0; y <= bounds.y1; y++) {
     for (let x = bounds.x0; x <= bounds.x1; x++) {
       const at = { x, y };
-      if (blocksMove(map, at)) continue;
-      if (occupant(c, room, at, '') !== undefined) continue;
-      if (existingOpponents.some((o) => o.x === x && o.y === y)) continue;
-      allFree.push(at);
+      if (!dAnchorMap.has(cellKey(at)) || blocked.has(cellKey(at))) continue;
+      baseCandidates.push(at);
     }
   }
-  if (allFree.length < entries.length) {
-    throw new Error(`房间「${room}」内可站立的空格不足（需 ${entries.length} 格，仅剩 ${allFree.length} 格）`);
+  if (baseCandidates.length < entries.length) {
+    throw new Error(`房间「${room}」从入场点可达的空格不足（需 ${entries.length} 格，仅剩 ${baseCandidates.length} 格）。可改入口或明确指定已有站位。`);
   }
 
-  const reachableFree = allFree.filter((at) => dAnchorMap.has(cellKey(at)));
-  const baseCandidates = reachableFree.length >= entries.length ? reachableFree : allFree;
-  const safeCandidates = baseCandidates.filter(isCellSafe);
+  const unsafe = new Set(baseCandidates.filter((at) => !isCellSafe(at)).map(cellKey));
+  const safeCandidates = baseCandidates.filter((at) => !unsafe.has(cellKey(at)));
   const cleanPool = safeCandidates.length >= entries.length ? safeCandidates : baseCandidates;
 
   // 若并未显式把锚点钉在敌人脸上，开战阵型默认与真敌群保留 >=10 尺缓冲，避免还没开打就把全队塞进怪堆贴脸
-  const explicitCloseAnchor = spec?.x !== undefined && spec?.y !== undefined && existingOpponents.length > 0
-    && minFeet(existingOpponents, { x: spec.x, y: spec.y }) <= MELEE_REACH_FEET;
+  const explicitAnchor = spec?.x !== undefined || spec?.y !== undefined || spec?.entry !== undefined;
+  const explicitCloseAnchor = explicitAnchor && existingOpponents.length > 0
+    && anchorCells.some((at) => minFeet(existingOpponents, at) <= MELEE_REACH_FEET);
   const buffered = !explicitCloseAnchor && existingOpponents.length > 0
     ? cleanPool.filter((at) => (dOppMap.get(cellKey(at)) ?? distanceFeet(at, existingOpponents[0]!)) >= 10)
     : cleanPool;
-  const workingSet = buffered.length >= entries.length ? buffered : cleanPool;
+  const workingSet = safeCandidates.length >= entries.length && buffered.length >= entries.length ? buffered : cleanPool;
 
   const frontGroup = entries.filter((e) => e.rank === 'front');
   const midGroup = entries.filter((e) => e.rank === 'mid');
   const backGroup = entries.filter((e) => e.rank === 'back');
   const activeTierCount = [frontGroup, midGroup, backGroup].filter((g) => g.length > 0).length;
 
-  // 从入场锚点向外扩张出紧凑小队驻区（默认先取锚点周围 5 尺九宫格，不够站或层数不够再逐格扩圈，避免冲到场地另一头）
-  const dAnc = (at: Cell): number => dAnchorMap.get(cellKey(at)) ?? Math.round(Math.hypot(at.x - anchorAvgX, at.y - anchorAvgY) * CELL_FEET);
+  // 从入场锚点向外扩张，给所选间距和排数留出空间。
+  const gap = spec?.spacing === 'compact' ? CELL_FEET : spec?.spacing === 'spread' ? 15 : 10;
+  const dAnc = (at: Cell): number => dAnchorMap.get(cellKey(at))!;
   const dOpp = (at: Cell): number => dOppMap.get(cellKey(at)) ?? minFeet(opponentSeeds, at);
-  let maxRadius = CELL_FEET;
+  let maxRadius = gap;
   let squadPool = workingSet.filter((at) => dAnc(at) <= maxRadius);
   const distinctOppDepths = (pts: readonly Cell[]): number => new Set(pts.map(dOpp)).size;
-  const desiredPoolSize = Math.min(workingSet.length, Math.max(entries.length + 2, activeTierCount * 2));
-  while ((squadPool.length < desiredPoolSize || distinctOppDepths(squadPool) < Math.min(activeTierCount, distinctOppDepths(workingSet))) && maxRadius < 200) {
+  const desiredPoolSize = Math.min(workingSet.length, Math.max(entries.length * (gap / CELL_FEET) ** 2 + 2, activeTierCount * 2));
+  const desiredDepths = Math.min(activeTierCount, distinctOppDepths(workingSet));
+  while ((squadPool.length < desiredPoolSize || distinctOppDepths(squadPool) < desiredDepths) && maxRadius < 200) {
     maxRadius += CELL_FEET;
     squadPool = workingSet.filter((at) => dAnc(at) <= maxRadius);
   }
@@ -530,6 +559,10 @@ function placeSideByRanks(
 
   const takenKeys = new Set<string>();
   const squadPlaced: Cell[] = [];
+  const fallback = new Map<string, Cell>();
+  const fixedAllies = fixed.filter(({ ch }) => (ch.kind === 'monster') === isMonsterSide).map(({ cell }) => cell);
+  const spacingPenalty = (at: Cell): number => gap === CELL_FEET ? 0
+    : Math.max(0, gap - Math.min(minFeet(fixedAllies, at), minFeet(squadPlaced, at)));
   const lateralBias = (at: Cell): number => Math.abs(at.y - anchorAvgY) + Math.abs(at.x - anchorAvgX) * 0.25;
   const squadCohesion = (at: Cell): number => {
     if (squadPlaced.length === 0) return 0;
@@ -551,21 +584,20 @@ function placeSideByRanks(
       squadPlaced.push(chosen);
       const chosenDOpp = dOpp(chosen);
       tierMaxDOpp = tierMaxDOpp === undefined ? chosenDOpp : Math.max(tierMaxDOpp, chosenDOpp);
-      (state.positions ??= {})[item.ch.name] = {
-        x: chosen.x,
-        y: chosen.y,
-        ...(item.z > 0 ? { z: item.z } : {}),
-        room,
-      };
+      fallback.set(item.ch.name, chosen);
     }
     return tierMaxDOpp;
   };
 
   // 1. 前排（front）：优先踏入室内（非门外走廊）、离对手最近、紧靠入场阵线居中并肩排开
+  const frontLimit = Math.min(...anchorCells.map(dOpp)) - CELL_FEET;
+  const aheadOfEntry = (at: Cell): number => gap > CELL_FEET && dOpp(at) < frontLimit ? 1 : 0;
   const frontMaxDOpp = takeBest(frontGroup, (a, b) => {
     const outA = isCellOutside(a) ? 1 : 0;
     const outB = isCellOutside(b) ? 1 : 0;
     return outA - outB
+      || aheadOfEntry(a) - aheadOfEntry(b)
+      || spacingPenalty(a) - spacingPenalty(b)
       || dOpp(a) - dOpp(b)
       || squadCohesion(a) - squadCohesion(b)
       || dAnc(a) - dAnc(b)
@@ -584,6 +616,7 @@ function placeSideByRanks(
     };
     return rankBucket(a) - rankBucket(b)
       || Math.abs(dOpp(a) - targetMidDOpp) - Math.abs(dOpp(b) - targetMidDOpp)
+      || spacingPenalty(a) - spacingPenalty(b)
       || squadCohesion(a) - squadCohesion(b)
       || (isCellOutside(a) ? 1 : 0) - (isCellOutside(b) ? 1 : 0)
       || dAnc(a) - dAnc(b)
@@ -603,10 +636,50 @@ function placeSideByRanks(
       || (prevTierDOpp !== undefined
         ? Math.abs(dOpp(a) - targetBackDOpp) - Math.abs(dOpp(b) - targetBackDOpp)
         : dOpp(b) - dOpp(a))
+      || spacingPenalty(a) - spacingPenalty(b)
       || squadCohesion(a) - squadCohesion(b)
       || dAnc(a) - dAnc(b)
       || lateralBias(a) - lateralBias(b);
   });
+  const targetFrontDOpp = frontGroup.length === 0 ? medianDOpp
+    : Math.min(...frontGroup.map(({ ch }) => dOpp(fallback.get(ch.name)!)));
+  const rankTargets = { front: targetFrontDOpp, mid: targetMidDOpp, back: targetBackDOpp };
+  const bearingX = opponentSeeds.reduce((sum, at) => sum + at.x - anchorAvgX, 0);
+  const bearingY = opponentSeeds.reduce((sum, at) => sum + at.y - anchorAvgY, 0);
+  const bearingLength = Math.hypot(bearingX, bearingY);
+  const lateral = (at: Cell): number => bearingLength === 0 ? at.y - anchorAvgY
+    : (bearingX * (at.y - anchorAvgY) - bearingY * (at.x - anchorAvgX)) / bearingLength;
+  const candidatesByRank = new Map<FormationRank, readonly FormationCandidate[]>();
+  for (const rank of ['front', 'mid', 'back'] as const) {
+    if (!entries.some((entry) => entry.rank === rank)) continue;
+    const target = rankTargets[rank];
+    const candidates = workingSet.map((at): FormationCandidate => {
+      const depth = dOpp(at);
+      return {
+        ...at, depth, anchorDistance: dAnc(at), hazardous: unsafe.has(cellKey(at)),
+        rankDeviation: Math.abs(depth - target) + (rank === 'front' ? CELL_FEET * (Number(isCellOutside(at)) + aheadOfEntry(at)) : 0),
+      };
+    });
+    candidatesByRank.set(rank, orderFormationCandidates(candidates, target, lateral));
+  }
+
+  const rankOrder = { front: 0, mid: 1, back: 2 };
+  const solution = solveFormation({
+    members: entries.map((entry) => ({
+      name: entry.ch.name, rank: rankOrder[entry.rank],
+      candidates: entry.z === 0 ? candidatesByRank.get(entry.rank)! : candidatesByRank.get(entry.rank)!.map((at) => ({ ...at, z: entry.z })),
+    })),
+    occupied: fixed.map(({ cell }) => cell),
+    fixedAllies, cellFeet: CELL_FEET, targetGap: gap, fallback,
+  }, maxExpansions);
+  if (solution === undefined) throw new Error(`房间「${room}」没有可用的完整阵型`);
+  for (const [name, at] of solution.positions) {
+    (state.positions ??= {})[name] = { x: at.x, y: at.y, ...(at.z !== undefined ? { z: at.z } : {}), room };
+  }
+  const note = solution.closePairs > 0
+    ? `【站位】房间「${room}」${isMonsterSide ? '敌方' : '我方'}部分站位低于目标间距 ${gap} 尺（${solution.closePairs} 对合计少 ${solution.spacingDeficit} 尺）。`
+    : undefined;
+  return { note, examined: solution.examined };
 }
 
 /** 摆位/修正：不算移动力、不触发借机。支持直接坐标、near 锚点，以及按前排/中排/后排（formation / rank）全自动排阵 */
@@ -616,6 +689,26 @@ export function setPositions(
   formation?: FormationInput,
 ): string[] {
   const state = requireInitiative(c);
+  const { positions, marks } = state;
+  if (positions !== undefined) state.positions = { ...positions };
+  if (marks !== undefined) state.marks = { ...marks };
+  try {
+    return placeFormation(c, state, placements, formation);
+  } catch (error) {
+    if (positions === undefined) delete state.positions;
+    else state.positions = positions;
+    if (marks === undefined) delete state.marks;
+    else state.marks = marks;
+    throw error;
+  }
+}
+
+function placeFormation(
+  c: Campaign,
+  state: InitiativeState,
+  placements: readonly Placement[],
+  formation?: FormationInput,
+): string[] {
   if (placements.length === 0 && formation === undefined) {
     throw new Error('set 要给 placements 或 formation（前排/中排/后排自动阵型）');
   }
@@ -682,9 +775,10 @@ export function setPositions(
     }
     const room = roomOf(c, ch);
     if (room === undefined) throw new Error(`${ch.name} 没有所在房间，先 dnd_character update room`);
+    const bucket = ch.kind === 'monster' ? monsterRanked : allyRanked;
+    if (expectMonster !== undefined && bucket.has(ch.name)) return;
     const map = mapOf(c, room);
     const z = requireAltitude(rawZ, `${ch.name} 的 z`, map?.ceiling);
-    const bucket = ch.kind === 'monster' ? monsterRanked : allyRanked;
     bucket.set(ch.name, { ch, room, rank, z, ...(near !== undefined ? { near } : {}) });
   };
 
@@ -717,33 +811,29 @@ export function setPositions(
     delete state.positions?.[e.ch.name];
   }
 
-  // 第二阶段：若有敌方阵型，先根据我方入场方向把敌方按前/中/后排落位
-  const byRoom = <T extends { room: string }>(items: Iterable<T>): Map<string, T[]> => {
-    const m = new Map<string, T[]>();
-    for (const item of items) m.set(item.room, [...(m.get(item.room) ?? []), item]);
-    return m;
-  };
-
-  for (const [room, list] of byRoom(monsterRanked.values())) {
-    const fallbackNear = list.find((x) => x.near !== undefined)?.near;
-    const allyHintNear = [...allyRanked.values()].find((x) => x.room === room && x.near !== undefined)?.near;
-    const partyHintCells = (formation !== undefined || allyHintNear !== undefined)
-      ? resolveSideAnchorCells(c, room, formation, allyHintNear, false, [])
-      : [];
-    placeSideByRanks(c, room, list, formation?.enemies, fallbackNear, true, partyHintCells);
-    for (const item of list) {
-      touchedNames.push(item.ch.name);
-      if (item.z > 0 && (item.ch.flySpeed ?? 0) <= 0 && item.ch.hover !== true && !hasCondition(item.ch, '飞行术')) {
-        notes.push(`【DM】${item.ch.name} 置于高空 ↑${item.z}尺，但未记录 fly_speed。`);
-      }
+  // 独立入口各成一组。已有坐标始终作为固定点，随后让我方朝已落位的敌人排阵。
+  const byEntrance = (items: Iterable<RankedEntry>, isMonsterSide: boolean) => {
+    const groups = new Map<string, { room: string; near?: string; isMonsterSide: boolean; entries: RankedEntry[] }>();
+    for (const item of items) {
+      const key = JSON.stringify([item.room, item.near]);
+      const group = groups.get(key);
+      if (group === undefined) groups.set(key, { room: item.room, near: item.near, isMonsterSide, entries: [item] });
+      else group.entries.push(item);
     }
-  }
-
-  // 第三阶段：根据场上实际敌群位置，将我方按 front（前排）→ mid（中排）→ back（后排）自动成阵
-  for (const [room, list] of byRoom(allyRanked.values())) {
-    const fallbackNear = list.find((x) => x.near !== undefined)?.near;
-    placeSideByRanks(c, room, list, formation, fallbackNear, false);
-    for (const item of list) {
+    return [...groups.values()];
+  };
+  const groups = [...byEntrance(monsterRanked.values(), true), ...byEntrance(allyRanked.values(), false)];
+  let budget = FORMATION_EXPANSION_BUDGET;
+  for (const [index, { room, near, isMonsterSide, entries }] of groups.entries()) {
+    const side = isMonsterSide ? formation?.enemies : formation;
+    const spec = near === undefined ? side : { entry: near, spacing: side?.spacing };
+    const allyHintNear = [...allyRanked.values()].find((item) => item.room === room && item.near !== undefined)?.near;
+    const partyHintCells = isMonsterSide && (formation !== undefined || allyHintNear !== undefined)
+      ? resolveSideAnchorCells(c, room, formation, allyHintNear, false, []) : [];
+    const result = placeSideByRanks(c, room, entries, spec, isMonsterSide, Math.floor(budget / (groups.length - index)), partyHintCells);
+    budget -= result.examined;
+    if (result.note !== undefined) notes.push(result.note);
+    for (const item of entries) {
       touchedNames.push(item.ch.name);
       if (item.z > 0 && (item.ch.flySpeed ?? 0) <= 0 && item.ch.hover !== true && !hasCondition(item.ch, '飞行术')) {
         notes.push(`【DM】${item.ch.name} 置于高空 ↑${item.z}尺，但角色卡未记录 fly_speed 且未挂「飞行术」；若天生会飞请用 dnd_character update fly_speed=60 补齐。`);
@@ -1013,6 +1103,9 @@ export function moveOnGrid(c: Campaign, name: string, request: MoveRequest, opti
   }
 
   const reaction = request.reaction === true;
+  if (!reaction && request.ignoreStateMods !== true && (request.disengage === true || request.dash === true)) {
+    assertTurnActionAllowed(ensureTurnState(c), ch, 'action');
+  }
   if (request.disengage === true) {
     state.disengaged = [...new Set([...(state.disengaged ?? []), ch.name])];
     if (!reaction) {

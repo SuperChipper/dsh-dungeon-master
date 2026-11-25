@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { AdventureLibrary } from './adventure.ts';
 import { armorClass, CampaignStore, requireCharacter, rest, upsertCharacter } from './campaign.ts';
-import { collectHitRiders, computeAttackStateMods, computeSaveStateMods, effectiveMaxHp, normalizeCondition, unhandledCombatPassives, upsertActiveState } from './conditions.ts';
+import { collectHitRiders, computeAttackStateMods, computeSaveStateMods, effectiveMaxHp, movementSpeedInfo, normalizeCondition, unhandledCombatPassives, upsertActiveState } from './conditions.ts';
 import { srdMonsterInput } from './dnd-tools.ts';
 import { computeExpected5eSlots } from './tools/character.ts';
 import { DndService } from './dnd-service.ts';
@@ -491,6 +491,146 @@ describe('D&D 5e 全量结构化状态与旧存档兼容', () => {
     await t.call('dnd_initiative', { action: 'next' }); // 回到卡厄斯回合开始 → 1 轮到期解除！
     expect(t.ch('卡厄斯').conditions).not.toContain('护盾信仰');
     expect(t.ch('卡厄斯').activeStates).toBeUndefined();
+  });
+
+  it('定身按玩家和怪物自己的回合末复豁免，只解除成功目标且不输出 DC', async () => {
+    const t = createArena();
+    await t.startCombat();
+    t.rolls.push(2, 2, 3, 20);
+    await t.call('dnd_check', {
+      type: 'save', character: '卡厄斯', declared_by: 'P1', spell_name: 'Hold Person', ability: '感知', dc: 15,
+      targets: [{ name: '刻德温' }, { name: '地精首领' }],
+    });
+    expect(t.ch('刻德温').conditions).toContain('麻痹');
+    expect(t.ch('地精首领').conditions).toContain('麻痹');
+    expect(await t.call('dnd_initiative', { action: 'next', declared_by: 'P1' })).not.toContain('回合结束感知豁免');
+    const pc = await t.call('dnd_initiative', { action: 'next', declared_by: 'P2' });
+    expect(pc).toMatch(/刻德温「人类定身术」回合结束感知豁免.*失败，持续/);
+    const monster = await t.call('dnd_initiative', { action: 'next' });
+    expect(monster).toMatch(/地精首领「人类定身术」回合结束感知豁免.*成功，解除/);
+    expect(monster).not.toMatch(/DC\s*15/);
+    expect(t.ch('地精首领').conditions).not.toContain('麻痹');
+    expect(t.ch('刻德温').conditions).toContain('麻痹');
+    expect(t.rolls).toEqual([]);
+    await t.call('dnd_initiative', { action: 'goto', name: '刻德温', round: 1 });
+    t.rolls.push(20);
+    expect(await t.call('dnd_initiative', { action: 'next', declared_by: 'P2' })).not.toContain('回合结束感知豁免');
+    expect(t.rolls).toEqual([20]);
+  });
+
+  it('首次开战会结算首个行动者的回合开始复豁免', async () => {
+    const t = createArena();
+    await t.call('dnd_rule', {
+      action: 'define', name: '测试开场束缚',
+      ongoing: { conditions: ['束缚'], repeat_save: { timing: 'target_turn_start', ability: 'str' } },
+    });
+    await t.call('dnd_apply', { target: '卡厄斯', add_conditions: ['测试开场束缚'], save_dc: 19 });
+    t.rolls.push(20, 15, 10, 5, 2);
+    const start = await t.call('dnd_initiative', {
+      action: 'start', participants: ['卡厄斯', '刻德温', '地精首领', '食人魔'],
+    });
+    expect(start).toMatch(/卡厄斯「测试开场束缚」回合开始力量豁免.*失败，持续/);
+    expect(t.ch('卡厄斯').conditions).toContain('束缚');
+    expect(t.ch('卡厄斯').activeStates?.[0]?.ongoing?.lastSaveRound).toBe(1);
+    expect(t.rolls).toEqual([]);
+  });
+
+  it('dnd_apply 传入 save_dc 但只传裸状态名时给出明确提醒，改传效果名则正常挂载复豁免', async () => {
+    const t = createArena();
+    await t.startCombat();
+    const raw = await t.call('dnd_apply', { target: '地精首领', add_conditions: ['麻痹'], save_dc: 15, rounds: 10 });
+    expect(raw).toContain('未匹配到带自动复豁免的效果规则');
+    expect(t.ch('地精首领').conditions).toContain('麻痹');
+    expect(t.ch('地精首领').activeStates?.some((s) => s.ongoing?.repeatSave !== undefined)).toBe(false);
+
+    const named = await t.call('dnd_apply', { target: '食人魔', add_conditions: ['人类定身术'], save_dc: 15 });
+    expect(named).not.toContain('未匹配到带自动复豁免的效果规则');
+    expect(t.ch('食人魔').activeStates?.some((s) => s.ongoing?.repeatSave?.dc === 15)).toBe(true);
+  });
+
+  it('催眠图纹速度为零，免疫魅惑阻止整个效果，受伤与唤醒只移除该效果', async () => {
+    const t = createArena();
+    await t.startCombat();
+    await t.call('dnd_character', { action: 'update', name: '食人魔', condition_immunities: ['charmed'] });
+    await t.call('dnd_apply', { target: '地精首领', add_conditions: ['失能'] });
+    t.rolls.push(2, 2);
+    const cast = await t.call('dnd_check', {
+      type: 'save', character: '卡厄斯', declared_by: 'P1', spell_name: '催眠图纹', ability: '感知', dc: 15,
+      targets: [{ name: '地精首领' }, { name: '食人魔' }],
+    });
+    expect(cast).toContain('免疫「魅惑」');
+    expect(t.ch('食人魔').conditions).not.toContain('失能');
+    expect(movementSpeedInfo(t.ch('地精首领')).baseSpeed).toBe(0);
+    const damage = await t.call('dnd_apply', { target: '地精首领', damage: 1 });
+    expect(damage).toContain('受伤解除「催眠图纹」');
+    expect(t.ch('地精首领').conditions).toEqual(['失能']);
+    expect(movementSpeedInfo(t.ch('地精首领')).baseSpeed).toBe(30);
+    await t.call('dnd_apply', { target: '地精首领', add_conditions: ['催眠图纹'] });
+    expect(await t.call('dnd_apply', { target: '地精首领', wake_by: '卡厄斯', declared_by: 'P1' })).toContain('用主动作唤醒');
+    expect(t.ch('地精首领').conditions).toEqual(['失能']);
+    expect(t.campaign().initiative!.turnState?.actionUsed).toBe('唤醒');
+  });
+
+  it('热注册的复豁免在挂起、落盘及规则更新后保持生效时的规则', async () => {
+    const t = createArena();
+    await t.startCombat();
+    const rule = { action: 'define', name: '测试毒触', scope: 'campaign' };
+    await t.call('dnd_rule', {
+      ...rule, ongoing: { conditions: ['中毒'], repeat_save: { timing: 'target_turn_end', ability: 'con' } },
+    });
+    t.rolls.push(2, 20);
+    await t.call('dnd_check', {
+      character: '卡厄斯', declared_by: 'P1', type: 'save', spell_name: rule.name, is_spell: false,
+      ability: '体质', dc: 15, targets: [{ name: '地精首领' }], hold: true,
+    });
+    await t.call('dnd_rule', { ...rule, ongoing: { conditions: ['中毒'], end_on_damage: true } });
+    await t.call('dnd_apply', { target: '地精首领', settle: true });
+    await t.call('dnd_apply', { target: '地精首领', damage: 1 });
+    expect(t.ch('地精首领').conditions).toContain('中毒');
+    await t.call('dnd_apply', { target: '食人魔', add_conditions: [rule.name] });
+    expect(t.ch('食人魔').conditions).toContain('中毒');
+    await t.call('dnd_apply', { target: '食人魔', damage: 1 });
+    expect(t.ch('食人魔').conditions).not.toContain('中毒');
+    await t.call('dnd_initiative', { action: 'next', declared_by: 'P1' });
+    await t.call('dnd_initiative', { action: 'next', declared_by: 'P2' });
+    expect(await t.call('dnd_initiative', { action: 'next' })).toMatch(/地精首领「测试毒触」回合结束体质豁免.*成功，解除/);
+    expect(t.ch('地精首领').conditions).not.toContain('中毒');
+  });
+
+  it('迟缓阻止同回合的第二击和附赠动作，也不能用动作如潮清掉攻击限制', async () => {
+    const t = createArena();
+    await t.startCombat();
+    await t.call('dnd_apply', { target: '卡厄斯', add_conditions: ['缓慢术'], save_dc: 15 });
+    const attack = { type: 'attack', character: '卡厄斯', declared_by: 'P1', target: '地精首领', weapon: '长剑' };
+    t.rolls.push(20, 4, 4, 19);
+    await t.call('dnd_check', attack);
+    const hp = t.ch('地精首领').hp;
+    await expect(t.call('dnd_check', attack)).rejects.toThrow(/每回合只能攻击一次/);
+    await expect(t.call('dnd_resource', { action: 'use', character: '卡厄斯', resource: '战斗英姿', declared_by: 'P1' }))
+      .rejects.toThrow(/只能选择主动作或附赠动作/);
+    await t.call('dnd_resource', { action: 'use', character: '卡厄斯', resource: '动作如潮', declared_by: 'P1' });
+    await expect(t.call('dnd_check', attack)).rejects.toThrow(/每回合只能攻击一次/);
+    expect(t.ch('地精首领').hp).toBe(hp);
+    expect(t.rolls).toEqual([19]);
+  });
+
+  it('SRD 状态免疫独立于伤害，非专注豁免仍保存施加者', async () => {
+    const t = createArena();
+    t.service.store.update(t.key, (c) => {
+      upsertCharacter(c, {
+        ...srdMonsterInput({ index: 'skeleton', hit_points: 13, condition_immunities: [{ index: 'poisoned' }] }),
+        name: '骷髅', room: c.currentRoom,
+      });
+    });
+    t.rolls.push(3, 3);
+    const cast = await t.call('dnd_check', {
+      type: 'save', character: '卡厄斯', declared_by: 'P1', ability: '感知', dc: 15, concentration: false,
+      damage: '3', damage_type: '火焰', on_fail_conditions: ['中毒', '恐慌'], targets: [{ name: '骷髅' }],
+    });
+    expect(cast).toContain('免疫「中毒」');
+    expect(t.ch('骷髅').hp).toBe(10);
+    expect(t.ch('骷髅').conditions).toEqual(['恐慌']);
+    expect(t.ch('骷髅').activeStates).toEqual([{ name: '恐慌', source: '卡厄斯' }]);
   });
 
   it('可转移专注（脆弱诅咒/猎人印记）：双术士同首领共存不互吞、击杀与战后清尸保留专注、零环位免费 transfer、护栏防误扣法术位、3环8小时跨短休保留', async () => {

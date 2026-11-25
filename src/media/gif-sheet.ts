@@ -31,6 +31,19 @@ export function isGifBytes(bytes: Uint8Array): boolean {
     && bytes[3] === 0x38;
 }
 
+/**
+ * 按 GIF 结构数字节里的帧数：每个图形控制扩展（0x21 0xF9 0x04）对应一帧。
+ * ffprobe 在某些构建/环境下会返回空或 N/A，这时用字节数兜底，不至于把动图当单帧丢掉。
+ */
+export function countGifFrames(bytes: Uint8Array): number {
+  if (!isGifBytes(bytes)) return 0;
+  let frames = 0;
+  for (let i = 0; i + 2 < bytes.length; i++) {
+    if (bytes[i] === 0x21 && bytes[i + 1] === 0xF9 && bytes[i + 2] === 0x04) frames++;
+  }
+  return frames;
+}
+
 /** 宫格布局：4 帧以内 2 列，再多 3 列，行数向上取整 */
 export function sheetLayout(frames: number): { cols: number; rows: number; count: number } {
   const count = Math.max(1, Math.min(MAX_SHEET_FRAMES, frames));
@@ -50,20 +63,37 @@ export function sheetFilter(frames: number): string {
  * 给一张 GIF 生成宫格图；单帧或非动图返回 undefined（那种情况宿主归一化就够了）。
  * ffmpeg 缺失或抽帧失败同样返回 undefined，调用方回退成原来的静态图。
  */
-export async function makeGifSheet(gifPath: string, ffmpegPath = ''): Promise<GifSheet | undefined> {
+export async function makeGifSheet(
+  gifPath: string,
+  ffmpegPath = '',
+  onWarn?: (message: string) => void,
+  framesOverride?: number,
+): Promise<GifSheet | undefined> {
   const bins = resolveFfmpegBins(ffmpegPath);
   let frames: number;
-  try {
-    const { stdout } = await execFileAsync(
-      bins.ffprobe,
-      ['-v', 'error', '-select_streams', 'v:0', '-count_frames', '-show_entries', 'stream=nb_read_frames', '-of', 'csv=p=0', gifPath],
-      { timeout: FFMPEG_TIMEOUT_MS },
-    );
-    frames = Number(String(stdout).trim().split(',')[0]);
-  } catch {
-    return undefined;
+  if (framesOverride !== undefined && framesOverride > 1) {
+    frames = framesOverride;
+  } else {
+    let rawFrames = '';
+    try {
+      const { stdout } = await execFileAsync(
+        bins.ffprobe,
+        ['-v', 'error', '-select_streams', 'v:0', '-count_frames', '-show_entries', 'stream=nb_read_frames', '-of', 'csv=p=0', gifPath],
+        { timeout: FFMPEG_TIMEOUT_MS },
+      );
+      rawFrames = String(stdout).trim();
+      // csv 输出理论上就是 "36"，但不同构建可能带前导空格、N/A 或多列，捞第一个数字最稳
+      const matched = rawFrames.match(/\d+/);
+      frames = matched === null ? Number.NaN : Number(matched[0]);
+    } catch (err) {
+      onWarn?.(`ffprobe 调用失败（${bins.ffprobe}）：${describeExecError(err)}`);
+      return undefined;
+    }
+    if (!Number.isFinite(frames) || frames <= 1) {
+      onWarn?.(`ffprobe 报告帧数=${rawFrames || '<空>'}（ffprobe=${bins.ffprobe}），按单帧处理，不拼宫格`);
+      return undefined;
+    }
   }
-  if (!Number.isFinite(frames) || frames <= 1) return undefined;
 
   const out = join(dirname(gifPath), `${basename(gifPath, extname(gifPath))}_sheet.png`);
   try {
@@ -72,10 +102,18 @@ export async function makeGifSheet(gifPath: string, ffmpegPath = ''): Promise<Gi
       ['-v', 'error', '-y', '-i', gifPath, '-vf', sheetFilter(frames), '-frames:v', '1', out],
       { timeout: FFMPEG_TIMEOUT_MS },
     );
-  } catch {
+  } catch (err) {
+    onWarn?.(`ffmpeg 拼宫格失败（${bins.ffmpeg}）：${describeExecError(err)}`);
     return undefined;
   }
   return { path: out, frames };
+}
+
+/** execFile 失败原因：ENOENT 这类 code 比 message 更能说明问题 */
+function describeExecError(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  const detail = error instanceof Error ? (error.message.split('\n')[0] ?? error.message) : String(error);
+  return code === undefined ? detail : `${code} ${detail}`;
 }
 
 /** 给模型的说明：这一坨格子的读法 */

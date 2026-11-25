@@ -66,8 +66,8 @@ No preset switch or separate session is needed: active campaigns inject compact 
 - **Full 5e combat engine**:
   - **Reaction windows**: Opportunity Attacks, `Shield`, `Counterspell` (auto-hold within 60 ft with deterministic `DC = 10 + spell level` checks), `Vicious Mockery`, and one-use button/verbal `authorization` tokens.
   - **Passives, auras & conditions**: Covers PHB conditions & exhaustion, transferable concentration (`Hex` / `Hunter's Mark` retained across kills and short rests), conditional passives (Colossus Slayer, Sneak Attack, Brutal Critical, etc.), Paladin/Cleric auras, Life Domain bonuses, and DM-only tactical caster hints.
-  - **Spatial combat & batching**: 5-ft Dijkstra pathfinding, 3D flight altitude `z` & crash falls, persistent `BattleZone` hazards (Darkness, Wall of Fire, Spike Growth, etc.), same-turn multi-attack `attacks`, and post-reaction `on_hit` spending (e.g. Divine Smite).
-  - **Hot-registered custom rules (`dnd_rule`)**: Add `campaign`- or `global`-scoped attack, rider, defense, save, aura, and healing formulas safely via sandboxed expressions—paired with **[`dnd-rule-extension`](./skills/dnd-rule-extension/SKILL.md)**.
+  - **Spatial combat & batching**: 5-ft Dijkstra pathfinding, flight altitude and falls, persistent hazards, same-turn multi-attack `attacks`, and post-reaction `on_hit` spending. Opening formations support 5, 10, or 15 feet of preferred spacing and individual position corrections.
+  - **Hot-registered custom rules (`dnd_rule`)**: Add campaign or global rules for attacks, riders, defenses, save modifiers, ongoing effects, auras, and healing. [Rule extension guide](./skills/dnd-rule-extension/SKILL.md)
 - **Durable state & throttling**: Saves live as JSON with 40-step rollback history (`dnd_undo` by step or `#R` roll ID); `/dnd end` runs an atomic pause + DM prep handoff state machine; `DndSnapshotGate` locks snapshots within a user turn and breaks through on the first step of the next turn to keep context lean.
 
 ### Common Commands

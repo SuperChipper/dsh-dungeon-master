@@ -4,16 +4,17 @@ import {
 type PendingAttack,
 type PendingRider,
 type PendingCheck,
-type PendingSpell,applyDamage,
+type PendingSpell,applyDamage,applyEffectConditions,
 armorClass,assertCanAct,assertDeclaredByOwner,assertNoPending,attackModifier,
 changeCondition,checkAllAirborneCrashes,checkModifier,deathSave,findCharacter,
 findWeapon,grantTempHp,heal,hexbladeCurseOn,inInitiative,isDmDelegated,isRangedWeapon,pushCombatLedger,pushLog,requireCharacter,
-requireInitiative,requireResource,usesElvenAccuracy,useResource,weaponAttackModifier,spendReaction
+requireInitiative,requireResource,usesElvenAccuracy,useResource,weaponAttackModifier,spendReaction,wakeFromEffect
 } from '../campaign.ts';
 import {
-activeEffectDefsFor,breakConcentration,collectHitRiders,computeAttackStateMods,computeCheckStateMods,computeDefenseStateMod,
-computeSaveStateMods,concentratingSpellNames,defaultStateRounds,effectiveMaxHp,ensureTurnState,formatStateModSummary,hasCondition,isDefaultConcentrationState,isTransferableState,movementSpeedInfo,normalizeCondition,recordTurnSpellCast,transferConcentration,unhandledCombatPassives,type CollectedRider
+activeEffectDefsFor,assertTurnActionAllowed,breakConcentration,collectHitRiders,computeAttackStateMods,computeCheckStateMods,computeDefenseStateMod,
+computeSaveStateMods,concentratingSpellNames,defaultStateRounds,effectiveMaxHp,ensureTurnState,formatStateModSummary,hasCondition,isDefaultConcentrationState,isTransferableState,movementSpeedInfo,normalizeCondition,prepareOngoingEffect,recordTurnSpellCast,transferConcentration,unhandledCombatPassives,type CollectedRider
 } from '../conditions.ts';
+import { resolveEffectDef } from '../custom-effects.ts';
 import { buildFormulaContext,evalIntFormula } from '../formula.ts';
 import { ABILITY_NAMES,type Ability,type Skill,SKILLS,parseAbility,parseSkill,proficiencyBonus,skillLabel } from '../rules.ts';
 import {
@@ -409,6 +410,7 @@ export function registerDiceTools(kit: ToolKit): void {
       }
       if (type === 'attack') {
         const state = c.initiative;
+        if (args.reaction !== true && args.ignore_state_mods !== true) assertTurnActionAllowed(ensureTurnState(c), ch, 'attack');
         const movement = state?.movement;
         const target = requireCharacter(c, String(args.target ?? ''));
         if (state?.pending !== undefined) assertNoPending(c, '再结算攻击');
@@ -893,6 +895,9 @@ export function registerDiceTools(kit: ToolKit): void {
       rounds: { type: 'integer', description: 'Duration in rounds for add_conditions.' },
       add_conditions: { type: 'array', items: { type: 'string' }, description: 'e.g. ["中毒", "倒地"]' },
       remove_conditions: { type: 'array', items: { type: 'string' } },
+      save_dc: { type: 'integer', minimum: 1, description: 'Original DC for a directly applied ongoing effect with repeated saves. Prefer dnd_check with spell_name if the effect has an initial save.' },
+      wake_by: { type: 'string', description: 'Creature spending its action to wake target from an effect such as Hypnotic Pattern. Use with target, optional wake_effect, and declared_by.' },
+      wake_effect: { type: 'string', description: 'Effect to wake the target from, if multiple effects qualify.' },
       reaction: {
         type: 'object',
         description: 'For a pending roll. `target` names whose roll it changes (attack: the one attacked; save/check: the roller). '
@@ -940,6 +945,23 @@ export function registerDiceTools(kit: ToolKit): void {
     },
     [],
     (args, exec) => mutate(exec, (c) => {
+      const wakeBy = str(args.wake_by);
+      if (wakeBy !== undefined) {
+        if (Object.keys(args).some((key) => !['wake_by', 'wake_effect', 'target', 'declared_by'].includes(key))) {
+          throw new Error('wake_by 不能与伤害、状态或反应参数混用');
+        }
+        const actor = requireCharacter(c, wakeBy);
+        const target = requireCharacter(c, String(args.target ?? ''));
+        assertCanAct(c, actor, { declaredBy: memberId(exec, args.declared_by, 'declared_by'), recentSenders: sendersOf(exec) });
+        const turn = ensureTurnState(c);
+        assertTurnActionAllowed(turn, actor, 'action');
+        if (turn?.actor === actor.name && (turn.actionUsed !== undefined || turn.attacks > 0)) {
+          throw new Error(`${actor.name} 已用过本回合的主动作`);
+        }
+        const line = wakeFromEffect(c, actor, target, str(args.wake_effect));
+        if (turn?.actor === actor.name) turn.actionUsed = '唤醒';
+        return line + combatLedgerSuffix(c);
+      }
       if (args.targets !== undefined && (args.settle === true || args.cancel === true || args.reaction !== undefined || args.decline !== undefined || args.ask_reactions !== undefined)) {
         throw new Error('批量 targets 不能和反应/待结算混用；先处理停止点');
       }
@@ -988,6 +1010,11 @@ export function registerDiceTools(kit: ToolKit): void {
       const casterName = str(args.caster);
       const casterCh = casterName !== undefined ? requireCharacter(c, casterName) : undefined;
       const spellName = str(args.spell_name);
+      if (casterCh !== undefined && spellName !== undefined && args.ignore_state_mods !== true) {
+        const turn = ensureTurnState(c);
+        assertTurnActionAllowed(turn, casterCh, 'action');
+        if (turn?.actor === casterCh.name && hasCondition(casterCh, '迟缓术')) turn.actionUsed ??= spellName;
+      }
       const slotLevel = int(args.slot_level);
       const damageRoll = str(args.damage_roll) === undefined ? undefined : rollExpression(String(args.damage_roll), service.roller);
       const healRoll = str(args.heal_roll) === undefined ? undefined : rollExpression(String(args.heal_roll), service.roller);
@@ -1115,7 +1142,10 @@ export function registerDiceTools(kit: ToolKit): void {
           details.push(broken.length > 0 ? broken.join('；') : `${ch.name} 当前没有维持中的专注效果`);
         }
         const addRounds = int(values.rounds);
-        for (const cond of strList(values.add_conditions) ?? []) {
+        const addList = strList(values.add_conditions) ?? [];
+        const saveDc = int(values.save_dc);
+        let matchedRepeatSave = false;
+        for (const cond of addList) {
           const normCond = normalizeCondition(cond);
           // 兼容模型用 dnd_apply 转移「脆弱诅咒/猎人印记」等可转移专注：自动识别在场维持该专注的施法者并无损转移 source 与剩余轮数
           if (isTransferableState(c, normCond, globalEffects)) {
@@ -1140,15 +1170,26 @@ export function registerDiceTools(kit: ToolKit): void {
               continue;
             }
           }
+          const def = resolveEffectDef(normCond, c.customEffects, globalEffects);
+          const missingDc = def?.ongoing?.repeatSave !== undefined && saveDc === undefined;
+          const ongoing = missingDc ? undefined : prepareOngoingEffect(def, saveDc);
+          if (ongoing?.repeatSave !== undefined) matchedRepeatSave = true;
+          if (missingDc) details.push(`「${def.name}」已按直接挂状态处理。需要自动复豁免时请给原始 save_dc，或用 dnd_check spell_name 一次结算。`);
           const autoConc = casterCh !== undefined && (args.concentration === true || (args.concentration !== false && isDefaultConcentrationState(c, normCond, globalEffects)));
-          const effRounds = addRounds ?? (autoConc ? defaultStateRounds(normCond, slotLevel, c, globalEffects) : undefined);
-          changeCondition(c, ch.name, cond, true, {
+          const effRounds = addRounds ?? (ongoing !== undefined ? def?.defaultRounds : undefined)
+            ?? (autoConc ? defaultStateRounds(normCond, slotLevel, c, globalEffects) : undefined);
+          const { immune } = applyEffectConditions(c, ch, def?.ongoing?.conditions ?? [cond], {
             ...(casterCh !== undefined ? { source: casterCh.name } : {}),
             ...(autoConc ? { concentration: true, replaceConcentration: false } : {}),
             ...(effRounds !== undefined ? { roundsLeft: effRounds } : {}),
+            ongoing,
             roller: service.roller,
             globalEffects,
           });
+          if (immune.length > 0) details.push(`免疫「${immune.join('、')}」`);
+        }
+        if (saveDc !== undefined && addList.length > 0 && !matchedRepeatSave) {
+          details.push(`已传入 save_dc=${saveDc}，但「${addList.join('、')}」未匹配到带自动复豁免的效果规则，不会自动回合复豁免；如需自动复豁免，请改传对应效果/法术名（如「人类定身术」「怪物定身术」「迟缓术」，或先用 dnd_rule 注册 ongoing），或用 dnd_check(type="save", spell_name=...) 一次结算。`);
         }
         const removals = strList(values.remove_conditions) ?? [];
         // 先移除非“倒地”状态（例如同一步挣脱擒抱并起身），再结算起身半速校验

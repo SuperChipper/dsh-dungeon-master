@@ -20,6 +20,7 @@ import { CollapsibleSection, useConfigPanelStyles } from './config-panel/control
 import { AdvancedSessionSection, QuickStartCoreSection } from './config-panel/sections-core.ts';
 import { DndAdvancedSection, DndCoreSection, NotesAndExtrasSection } from './config-panel/sections-features.ts';
 import { MediaConfigSections } from './config-panel/sections-media.ts';
+import { UpdateChecker } from './config-panel/update-checker.ts';
 import {
   formatRoleVoices,
   normalizeChangedConfig,
@@ -108,6 +109,7 @@ export function ConfigPanel(): ReactNode {
   const dirty = (Object.keys(form) as Array<keyof ConfigWire>).some((key) => !shallowEqual(form[key], initial[key]));
 
   return createElement('form', { className: 'imqb2-form', onSubmit: submit },
+    createElement(UpdateChecker),
     createElement(QuickStartCoreSection, { form, patch }),
     createElement(DndCoreSection, { form, patch }),
     createElement(CollapsibleSection, {

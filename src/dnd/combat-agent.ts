@@ -18,7 +18,7 @@ import { isAutoSteerTurnEnd } from '../transport/turn-steer.ts';
 
 /** 不继承终端、文件、任意委派或剧情推进能力，群权限不因战斗委派扩大。 */
 export const COMBAT_TOOLS = [
-  'dnd_roll', 'dnd_check', 'dnd_apply', 'dnd_initiative', 'dnd_position', 'dnd_move',
+  'dnd_roll', 'dnd_check', 'dnd_apply', 'dnd_initiative', 'dnd_position', 'dnd_move', 'dnd_map',
   'dnd_lookup', 'dnd_srd', 'dnd_resource', 'dnd_character', 'dnd_undo', 'dnd_chronicle', 'dnd_end', 'dnd_rule',
 ] as const;
 
@@ -132,6 +132,40 @@ export function recentCombatDialogue(agent: DshAgent, maxChars: number, fromComb
 
 function routeKey(r: { provider: string; model: string }): string {
   return `${r.provider.trim()}/${r.model.trim()}`;
+}
+
+const RESUME_UNAVAILABLE_NAMES = new Set([
+  'SessionAlreadyOwnedError',
+  'SessionAlreadyExistsError',
+  'SessionPersistenceNotFoundError',
+  'SessionFormatError',
+  'SessionQueryError',
+]);
+
+const RESUME_UNAVAILABLE_CODES = new Set([
+  'session/writer-held',
+  'session/not-found',
+  'SESSION_QUERY_SESSION_NOT_FOUND',
+]);
+
+const RESUME_UNAVAILABLE_RE = /already owned|writer-held|already exists|write lease|write lock|stored log is corrupt|SessionFormatError|session\s+"[^"]+"\s+not found/i;
+
+function isResumeSessionUnavailableError(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 3 && current !== undefined && current !== null; depth++) {
+    if (typeof current === 'object') {
+      const obj = current as { name?: unknown; code?: unknown; message?: unknown; cause?: unknown };
+      if (typeof obj.name === 'string' && RESUME_UNAVAILABLE_NAMES.has(obj.name)) return true;
+      if (typeof obj.code === 'string' && RESUME_UNAVAILABLE_CODES.has(obj.code)) return true;
+      if (typeof obj.message === 'string' && RESUME_UNAVAILABLE_RE.test(obj.message)) return true;
+      current = obj.cause;
+    } else if (typeof current === 'string') {
+      return RESUME_UNAVAILABLE_RE.test(current);
+    } else {
+      break;
+    }
+  }
+  return false;
 }
 
 function normalizeRoute(r: CombatRoute | undefined): CombatRoute | undefined {
@@ -432,6 +466,7 @@ export class DndCombatAgents {
         if (!COMBAT_TOOLS.includes(exec.name as typeof COMBAT_TOOLS[number])) return '战斗代理只能使用授权的跑团工具';
         if (!this.service.active(sessionKey)?.campaign.initiative) return '战斗已结束或暂停，等待主 DM 接手，不再执行战斗操作';
         if (exec.name === 'dnd_initiative' && (exec.arguments as { action?: string })?.action === 'start') return '这场战斗已有先攻表，不可重开战斗';
+        if (exec.name === 'dnd_map' && (exec.arguments as { view?: string })?.view === 'explore') return '战斗代理只发送当前房间的战斗图';
         if (exec.name === 'dnd_rule') {
           const ruleAct = (exec.arguments as { action?: string })?.action;
           if (ruleAct === 'define' || ruleAct === 'remove') {
@@ -619,6 +654,18 @@ export class DndCombatAgents {
     return [...this.active.values()].find((a) => a.child.sessionId === id)?.child;
   }
 
+  /** 外部（如宿主重载或手动释放）销毁活跃战斗子代理时解除悬空绑定，保留 active 运行档供下次接回。 */
+  public onAgentDisposed(agent: DshAgent): void {
+    for (const [key, active] of this.active.entries()) {
+      if (active.child.agent !== agent) continue;
+      this.active.delete(key);
+      this.checkpoint(active.run);
+      this.syncTools(active.main);
+      this.logger.warn(`im-qqbot: 战斗子代理被外部释放，已解除悬空绑定 key=${key} child=${active.child.sessionId}`);
+      break;
+    }
+  }
+
   public async select(main: SessionRecord): Promise<SessionRecord> {
     const generation = this.generations.get(main.sessionKey) ?? 0;
     return this.serial(main.sessionKey, async () => {
@@ -628,13 +675,20 @@ export class DndCombatAgents {
       const found = this.service.active(main.sessionKey);
       const config = this.settings();
       if (existing !== undefined) {
-        existing.child.replyTarget = main.replyTarget;
-        existing.child.lastActivity = main.lastActivity;
-        existing.child.recentSenders = main.recentSenders;
-        if (existing.child.agent.status !== 'idle') return existing.child;
-        if (found?.campaign.initiative !== undefined && found.campaign.createdAt === existing.run.campaignCreatedAt && config?.enabled) return existing.child;
-        await this.finish(existing, found === undefined ? 'paused' : found.campaign.initiative ? 'interrupted' : 'completed');
-        return main;
+        const liveById = this.agents.get?.(existing.child.sessionId);
+        if (liveById !== undefined && liveById !== existing.child.agent) {
+          this.active.delete(main.sessionKey);
+          this.checkpoint(existing.run);
+          this.logger.warn(`im-qqbot: 战斗子代理会话已被外部接管，解除悬空绑定并重新接管 key=${main.sessionKey} child=${existing.child.sessionId}`);
+        } else {
+          existing.child.replyTarget = main.replyTarget;
+          existing.child.lastActivity = main.lastActivity;
+          existing.child.recentSenders = main.recentSenders;
+          if (existing.child.agent.status !== 'idle') return existing.child;
+          if (found?.campaign.initiative !== undefined && found.campaign.createdAt === existing.run.campaignCreatedAt && config?.enabled) return existing.child;
+          await this.finish(existing, found === undefined ? 'paused' : found.campaign.initiative ? 'interrupted' : 'completed');
+          return main;
+        }
       }
       if (!found?.campaign.initiative) this.failed.delete(main.sessionKey);
       if (!config?.enabled || !found?.campaign.initiative || this.failed.has(main.sessionKey)) {
@@ -693,12 +747,42 @@ export class DndCombatAgents {
         const failureNotes = run.fallbackFrom ? [run.fallbackFrom] : [];
         let currentRoute: CombatRoute = { provider: run.provider, model: run.model, reasoningEffort: run.reasoningEffort ?? null };
         let allowResume = restore;
+        const detachUnresumableChild = (reason: string, occupiedAgent?: DshAgent): void => {
+          const prevChildId = run!.childSessionId;
+          if (occupiedAgent !== undefined && eventsOf(occupiedAgent).some((e) => e.type === 'assistant/message')) {
+            const liveDialogue = recentCombatDialogue(occupiedAgent, config.contextChars, true);
+            if (liveDialogue) {
+              run!.prompt = buildCombatPromptFromDialogue(
+                found.campaign,
+                liveDialogue,
+                true,
+                this.service.roomCombatNotes(main.sessionKey),
+              );
+            }
+          } else if (run!.lastNarration && !run!.prompt.includes(run!.lastNarration)) {
+            run!.prompt = `${run!.prompt}\n\n【恢复接续 · 此前已播报的最后战况（以最新团况为准，勿重复结算）】\n${run!.lastNarration}`;
+          }
+          run!.childSessionId = randomUUID();
+          restore = false;
+          allowResume = false;
+          this.logger.warn(`im-qqbot: 战斗子会话 ${prevChildId} 无法恢复（${reason}），保留当前模型 ${currentRoute.provider}/${currentRoute.model} 并新建子会话继续战斗 key=${main.sessionKey}`);
+        };
+        if (allowResume) {
+          const occupied = this.agents.get?.(run.childSessionId);
+          if (occupied !== undefined) {
+            detachUnresumableChild('会话已被外部（如 Web 端）占用', occupied);
+          }
+        }
         for (;;) {
           try {
             handle = await spawn(currentRoute, run.reasoningEffort, allowResume);
             break;
           } catch (attemptErr) {
             const errMsg = attemptErr instanceof Error ? attemptErr.message.slice(0, 200) : String(attemptErr).slice(0, 200);
+            if (allowResume && isResumeSessionUnavailableError(attemptErr)) {
+              detachUnresumableChild(errMsg, this.agents.get?.(run.childSessionId));
+              continue;
+            }
             this.markPrimaryCooldown(currentRoute, errMsg);
             const prevLabel = routeKey(currentRoute);
             failureNotes.push(`${prevLabel} (${errMsg})`);

@@ -18,6 +18,13 @@ function formatEffectHooks(def: CustomEffectDef): string {
   if (def.concentration) parts.push('专注');
   if (def.transferable) parts.push('可转移专注');
   if (def.defaultRounds !== undefined) parts.push(`默认${def.defaultRounds}轮`);
+  if (def.ongoing !== undefined) {
+    const { repeatSave, endOnDamage, wakeAsAction, zeroSpeed } = def.ongoing;
+    if (repeatSave !== undefined) parts.push(`${repeatSave.timing === 'target_turn_start' ? '目标回合开始' : '目标回合结束'}复豁免（${repeatSave.ability}）`);
+    if (endOnDamage) parts.push('受伤解除');
+    if (wakeAsAction) parts.push('可用动作唤醒');
+    if (zeroSpeed) parts.push('速度归零');
+  }
   if (def.attackMod) {
     const a = def.attackMod;
     const sub = [
@@ -136,6 +143,25 @@ export function registerRuleTools(kit: ToolKit): void {
       save_mod: {
         type: 'object',
         description: '豁免检定修正：{abilities: ["con"] | "all", bonus_formula, bonus_dice, advantage, vs_tags: ["concentration", "毒素"]}',
+      },
+      ongoing: {
+        type: 'object',
+        description: '挂在目标身上的效果。conditions 为失败时施加的状态；requires_condition 被免疫时整个效果不生效。repeat_save 使用本次原始 DC，timing 为 target_turn_start 或 target_turn_end，ability 为 str/dex/con/int/wis/cha。end_on_damage、wake_as_action、zero_speed 为可选布尔值。',
+        properties: {
+          conditions: { type: 'array', minItems: 1, items: { type: 'string' } },
+          requires_condition: { type: 'string' },
+          repeat_save: {
+            type: 'object', required: ['timing', 'ability'], additionalProperties: false,
+            properties: {
+              timing: { type: 'string', enum: ['target_turn_start', 'target_turn_end'] },
+              ability: { type: 'string', enum: ['str', 'dex', 'con', 'int', 'wis', 'cha'] },
+            },
+          },
+          end_on_damage: { type: 'boolean' },
+          wake_as_action: { type: 'boolean' },
+          zero_speed: { type: 'boolean' },
+        },
+        additionalProperties: false,
       },
       aura: {
         type: 'object',

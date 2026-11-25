@@ -7,6 +7,7 @@
 import type { BattleCell, Campaign, Character, Weapon } from './campaign.ts';
 import {
   type CustomEffectDef,
+  type OngoingEffectRule,
   hasPositivePassiveMention,
   matchesDamageType,
   mergedEffectMap,
@@ -47,6 +48,35 @@ export interface ActiveState {
   saveDc?: number;
   /** 随状态挂载的额外命中附伤 */
   riders?: StateRiderSpec[];
+  ongoing?: ActiveOngoingEffect;
+}
+
+/** 同一次施加的各个状态共享 ID，解除时只移除这一组。 */
+export interface ActiveOngoingEffect extends Pick<OngoingEffectRule, 'endOnDamage' | 'wakeAsAction' | 'zeroSpeed'> {
+  id: string;
+  name: string;
+  repeatSave?: NonNullable<OngoingEffectRule['repeatSave']> & { dc: number };
+  lastSaveRound?: number;
+}
+
+export interface PreparedOngoingEffect extends Omit<ActiveOngoingEffect, 'id'> {
+  requiresCondition?: string;
+}
+
+export function prepareOngoingEffect(def: CustomEffectDef | undefined, dc: number | undefined): PreparedOngoingEffect | undefined {
+  if (def?.ongoing === undefined) return undefined;
+  const rule = def.ongoing;
+  if (rule.repeatSave !== undefined && (dc === undefined || !Number.isSafeInteger(dc) || dc < 1)) {
+    throw new Error(`「${def.name}」的复豁免需要有效的原始 DC`);
+  }
+  return {
+    name: def.name,
+    ...(rule.repeatSave !== undefined && dc !== undefined ? { repeatSave: { ...rule.repeatSave, dc } } : {}),
+    ...(rule.endOnDamage ? { endOnDamage: true } : {}),
+    ...(rule.wakeAsAction ? { wakeAsAction: true } : {}),
+    ...(rule.zeroSpeed ? { zeroSpeed: true } : {}),
+    ...(rule.requiresCondition !== undefined ? { requiresCondition: rule.requiresCondition } : {}),
+  };
 }
 
 export interface ConcentrationRecord {
@@ -72,6 +102,8 @@ export interface TurnActionState {
   actionUsed?: string;
   /** 本回合已消耗的附赠动作（如 "战斗英姿"、"咒剑诅咒"） */
   bonusUsed?: string;
+  /** 动作如潮可以刷新动作槽，不能刷新迟缓术限制的一回合一次攻击。 */
+  surgeAttacks?: number;
   /** 本回合是否已结算过倒地起身半速 */
   stoodUp?: boolean;
   /** 本回合主动作施放的环阶法术名（用于同回合附赠法术+主动作环阶法术规则校验） */
@@ -421,14 +453,14 @@ export function activeEffectDefsFor(
       byName.set(def.name, { def });
     }
   }
-  for (const s of effectiveStates(ch)) {
-    const def = resolveEffectDef(s.name, campaignEffects, globalEffects);
-    if (def === undefined) continue;
-    const existing = byName.get(def.name);
-    if (existing === undefined) {
-      byName.set(def.name, { def, state: s });
-    } else if (existing.state === undefined) {
-      existing.state = s;
+  const namedStates = [...effectiveStates(ch), ...(ch.activeStates ?? []).filter((state) => state.ongoing !== undefined)];
+  for (const s of namedStates) {
+    const names = s.ongoing === undefined ? [s.name] : [s.name, s.ongoing.name];
+    for (const name of names) {
+      const def = resolveEffectDef(name, campaignEffects, globalEffects);
+      if (def === undefined) continue;
+      const existing = byName.get(def.name);
+      if (existing?.state === undefined) byName.set(def.name, { def, state: s });
     }
   }
   if (ch.notes !== undefined && ch.notes.trim().length > 0) {
@@ -456,6 +488,11 @@ export function hasCondition(ch: Character, canonicalName: string): boolean {
   const target = normalizeCondition(canonicalName);
   return ch.conditions.some((c) => normalizeCondition(c) === target)
     || (ch.activeStates?.some((s) => normalizeCondition(s.name) === target) ?? false);
+}
+
+export function immuneToCondition(ch: Character, condition: string): boolean {
+  const name = normalizeCondition(condition);
+  return ch.conditionImmunities?.some((value) => normalizeCondition(value) === name) === true;
 }
 
 export function isIncapacitated(ch: Character): boolean {
@@ -522,6 +559,9 @@ export interface MovementSpeedInfo {
 export function movementSpeedInfo(ch: Character, defaultSpeed = 30, baseOverride?: number): MovementSpeedInfo {
   const states = effectiveStates(ch);
   const zeroReasons = states.filter((s) => ZERO_SPEED_CONDITIONS.has(s.name)).map((s) => s.name);
+  for (const effect of ongoingEffects(ch)) {
+    if (effect.zeroSpeed) zeroReasons.push(effect.name);
+  }
   const exh = exhaustionLevel(ch);
   if (exh >= 5) zeroReasons.push(`力竭:${exh}`);
   const rawSpeed = baseOverride ?? ch.speed ?? defaultSpeed;
@@ -540,7 +580,7 @@ export function movementSpeedInfo(ch: Character, defaultSpeed = 30, baseOverride
     baseSpeed = Math.floor(baseSpeed / 2);
     notes.push(`力竭:${exh}（速度减半为 ${baseSpeed} 尺）`);
   }
-  const fearStates = states.filter((s) => s.name === '恐慌');
+  const fearStates = conditionSources(ch, '恐慌');
   const fearSources = fearStates.map((s) => s.source).filter((s): s is string => s !== undefined && s.length > 0);
   const hasUnboundFear = fearStates.length > 0 && fearSources.length === 0;
   if (zeroReasons.length > 0) baseSpeed = 0;
@@ -721,10 +761,11 @@ export function upsertActiveState(
   ch: Character,
   input: ActiveState,
   options: { replaceConcentration?: boolean; globalEffects?: Record<string, CustomEffectDef> } = {},
-): { broken: string[] } {
+): { broken: string[]; immune?: true } {
   const rawTrimmed = input.name.trim();
   const name = normalizeCondition(rawTrimmed);
   if (name.length === 0) throw new Error('状态名不能为空');
+  if (immuneToCondition(ch, name)) return { broken: [], immune: true };
   const displayCond = rawTrimmed === '祝福' || rawTrimmed === '灾祸' ? rawTrimmed : name;
   const broken: string[] = [];
   const transferable = isTransferableState(c, name, options.globalEffects);
@@ -759,21 +800,30 @@ export function upsertActiveState(
     ...(input.acBonus !== undefined ? { acBonus: input.acBonus } : {}),
     ...(input.slotLevel !== undefined ? { slotLevel: input.slotLevel } : {}),
     ...(input.saveDc !== undefined ? { saveDc: input.saveDc } : {}),
+    ...(input.ongoing !== undefined ? { ongoing: input.ongoing } : {}),
     ...(input.riders !== undefined && input.riders.length > 0 ? { riders: input.riders } : {}),
   };
   const hasMetadata = clean.source !== undefined || clean.target !== undefined || clean.concentration === true
     || clean.expires !== undefined || clean.roundsLeft !== undefined || clean.hitBonus !== undefined
-    || clean.acBonus !== undefined || clean.slotLevel !== undefined || clean.saveDc !== undefined || clean.riders !== undefined;
+    || clean.acBonus !== undefined || clean.slotLevel !== undefined || clean.saveDc !== undefined || clean.riders !== undefined
+    || clean.ongoing !== undefined;
 
   if (hasMetadata || ch.activeStates !== undefined) {
     // 不同施法者对同一目标施加的专注状态（如双术士同时对首领挂脆弱诅咒）按 (name, source) 独立共存，互不覆盖
-    const list = (ch.activeStates ?? []).filter((s) => {
+    const previous = ch.activeStates ?? [];
+    const list = previous.filter((s) => {
       if (normalizeCondition(s.name) !== name) return true;
+      if (s.ongoing !== undefined || clean.ongoing !== undefined) return s.ongoing?.id !== clean.ongoing?.id;
       if (clean.concentration === true && clean.source !== undefined && s.concentration === true && s.source !== undefined) {
+        return s.source !== clean.source;
+      }
+      if ((name === '魅惑' || name === '恐慌' || name === '擒抱') && clean.source !== undefined && s.source !== undefined) {
         return s.source !== clean.source;
       }
       return false;
     });
+    if (clean.ongoing !== undefined && ch.conditions.some((cond) => normalizeCondition(cond) === name)
+      && !previous.some((s) => normalizeCondition(s.name) === name)) list.push({ name });
     list.push(clean);
     ch.activeStates = list;
   }
@@ -807,6 +857,32 @@ export function upsertActiveState(
     broken.push(...breakConcentration(c, ch.name, `陷入${name}`));
   }
   return { broken };
+}
+
+function conditionSources(ch: Character, name: string): ActiveState[] {
+  const structured = (ch.activeStates ?? []).filter((s) => normalizeCondition(s.name) === name);
+  return structured.length > 0 ? structured : effectiveStates(ch).filter((s) => s.name === name);
+}
+
+export function ongoingEffects(ch: Character): ActiveOngoingEffect[] {
+  const effects = new Map<string, ActiveOngoingEffect>();
+  for (const { ongoing } of ch.activeStates ?? []) {
+    if (ongoing !== undefined) effects.set(ongoing.id, ongoing);
+  }
+  return [...effects.values()];
+}
+
+export function removeOngoingEffect(c: Campaign, ch: Character, id: string): void {
+  const previous = ch.activeStates ?? [];
+  const removed = previous.filter((s) => s.ongoing?.id === id).map((s) => normalizeCondition(s.name));
+  const kept = previous.filter((s) => s.ongoing?.id !== id);
+  if (kept.length > 0) ch.activeStates = kept;
+  else delete ch.activeStates;
+  ch.conditions = ch.conditions.filter((condition) => {
+    const name = normalizeCondition(condition);
+    return !removed.includes(name) || kept.some((s) => normalizeCondition(s.name) === name);
+  });
+  syncConcentrationAfterRemoval(c, ch, removed);
 }
 
 /** 移除角色身上的某状态（兼容移除裸 `"力竭"` 清除任意等级力竭；可选按 source 仅移除某施法者的标记），同步清理 `activeStates` 与 `conditions` */
@@ -1041,6 +1117,24 @@ export function ensureTurnState(c: Campaign): TurnActionState | undefined {
     state.turnState = { actor, attacks: 0 };
   }
   return state.turnState;
+}
+
+export function assertTurnActionAllowed(
+  ts: TurnActionState | undefined,
+  ch: Character,
+  cost: 'attack' | 'action' | 'bonus' | 'reaction' | 'free' | undefined,
+): void {
+  if (ts?.actor !== ch.name) return;
+  if ((cost === 'attack' || cost === 'action') && ts.actionUsed === '唤醒') {
+    throw new Error(`${ch.name} 已用本回合的主动作唤醒目标`);
+  }
+  if (!hasCondition(ch, '迟缓术')) return;
+  const attacks = ts.attacks + (ts.surgeAttacks ?? 0);
+  if (cost === 'attack' && attacks > 0) throw new Error(`${ch.name} 受迟缓术影响，每回合只能攻击一次`);
+  if ((cost === 'attack' || cost === 'action') && ts.bonusUsed !== undefined
+    || cost === 'bonus' && (ts.actionUsed !== undefined || ts.leveledSpellAction !== undefined || attacks > 0)) {
+    throw new Error(`${ch.name} 受迟缓术影响，每回合只能选择主动作或附赠动作`);
+  }
 }
 
 /** 校验并记录 5e 同回合「附赠动作施法 + 主动作环阶法术」冲突 */
@@ -1326,7 +1420,7 @@ export function computeAttackStateMods(
   const notes: string[] = [];
 
   // 1. 魅惑硬拦截：不能攻击魅惑源
-  const charmed = atkStates.filter((s) => s.name === '魅惑');
+  const charmed = conditionSources(attacker, '魅惑');
   for (const chm of charmed) {
     if (chm.source !== undefined && chm.source === target.name) {
       throw new Error(`${attacker.name} 正被 ${target.name} 魅惑，规则上不能攻击魅惑源（若免疫或特殊效果覆盖请传 ignore_state_mods=true）`);
@@ -1351,7 +1445,7 @@ export function computeAttackStateMods(
   const atkExh = exhaustionLevel(attacker);
   if (atkExh >= 3) disadvReasons.push(`自身力竭:${atkExh}(劣)`);
 
-  for (const fear of atkStates.filter((s) => s.name === '恐慌')) {
+  for (const fear of conditionSources(attacker, '恐慌')) {
     if (fear.source !== undefined) {
       const src = c.characters.find((x) => x.name === fear.source && !x.conditions.includes('死亡'));
       if (src !== undefined && charRoom(c, src) === charRoom(c, attacker)) {
@@ -1462,12 +1556,6 @@ export function computeAttackStateMods(
   const critCond = tgtStates.find((s) => s.name === '麻痹' || s.name === '昏迷');
   const autoCritOnHit = within5ft && critCond !== undefined;
   const autoCritReason = autoCritOnHit ? `目标5尺内${critCond!.name}(命中自动重击)` : undefined;
-
-  if (atkStates.some((s) => s.name === '迟缓术')
-    && c.initiative?.turnState?.actor === attacker.name
-    && (c.initiative.turnState.attacks ?? 0) >= 1) {
-    notes.push(`${attacker.name} 受迟缓术影响：本回合已攻击过，5e 规则下迟缓术受术者每回合至多只能进行 1 次近战或远程攻击`);
-  }
 
   return {
     advantage,
@@ -1881,7 +1969,7 @@ export function computeCheckStateMods(
   const exh = exhaustionLevel(ch);
   if (exh >= 1) disadvReasons.push(`力竭:${exh}(劣)`);
 
-  for (const fear of states.filter((s) => s.name === '恐慌')) {
+  for (const fear of conditionSources(ch, '恐慌')) {
     if (fear.source !== undefined) {
       const src = c.characters.find((x) => x.name === fear.source && !x.conditions.includes('死亡'));
       if (src !== undefined && charRoom(c, src) === charRoom(c, ch)) {
@@ -1979,6 +2067,16 @@ export function formatCharacterStates(c: Campaign, ch: Character): string {
     if (s.concentration === true) meta.push(s.source !== undefined && s.source !== ch.name ? `由${s.source}专注` : '专注');
     return `${s.name}${meta.length > 0 ? `(${meta.join(',')})` : ''}`;
   });
+  for (const effect of ongoingEffects(ch)) {
+    const timing = effect.repeatSave?.timing;
+    const notes = [
+      timing !== undefined ? `${timing === 'target_turn_start' ? '回合开始' : '回合末'}自动复豁免` : '',
+      effect.zeroSpeed ? '速度0' : '',
+      effect.endOnDamage ? '受伤解除' : '',
+      effect.wakeAsAction ? '可唤醒' : '',
+    ].filter(Boolean);
+    if (notes.length > 0) items.push(`${effect.name}(${notes.join(',')})`);
+  }
   // 若该角色专注维持在队友/敌人身上、战场区域或处于原目标倒下后的待转移状态，也明确提示出来
   const coveredSelf = new Set(states.filter((s) => s.concentration === true).map((s) => normalizeCondition(s.name)));
   const shownExt = new Set<string>();
@@ -2043,7 +2141,13 @@ export function turnLedgerLine(
     else if (ts.actionUsed !== undefined) actionLabel = ts.actionUsed;
     else if (ts.attacks > 0) actionLabel = `已攻击×${ts.attacks}`;
   }
-  const bonusLabel = ts?.bonusUsed ?? '可用';
+  let bonusLabel = ts?.bonusUsed ?? '可用';
+  if (isIncapacitated(ch)) {
+    actionLabel = bonusLabel = '不可用（失能）';
+  } else if (hasCondition(ch, '迟缓术')) {
+    if (ts?.bonusUsed !== undefined && ts.actionUsed === undefined && ts.attacks === 0) actionLabel = '不可用（迟缓）';
+    if (ts?.bonusUsed === undefined && (ts?.actionUsed !== undefined || (ts?.attacks ?? 0) > 0)) bonusLabel = '不可用（迟缓）';
+  }
   const reactAvail = helpers.canReact(ch) && helpers.reactionBlocked(c, ch.name) === undefined ? 1 : 0;
   const effMax = effectiveMaxHp(ch);
   const altSuffix = flying ? ` ↑${cell!.z}尺` : '';

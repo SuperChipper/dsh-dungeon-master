@@ -6,6 +6,24 @@ This file records significant `dsh-dungeon-master` updates from a product perspe
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.9.1] - 2026-11-26
+
+> Backwards-compatible with `0.9.0`; no data migration required. Restart the `dsh` process once after upgrading to reload the backend ESM bundle.
+
+### Added & Enhanced
+
+- **Lightweight Update Check & Copyable Upgrade Prompt in Settings**: Added a read-only version bar and **Check for Updates** button at the top of the Web Settings panel (6-hour in-memory cache with silent offline fallback). When a newer release is available, users can copy a ready-to-paste upgrade prompt for their AI Agent or jump straight to the changelog without risking automated disk edits or host restarts.
+- **Owner QQ DM Experience Drafts (`/learn` integration)**: Captures explicit ongoing preferences and verified same-turn Vitest fail→edit→pass rechecks in an isolated `qqbot-learn-inbox` directory under the active profile. Readable only during an explicit `/learn` in the bot owner's QQ DM via `qqbot_learn_inbox`; never injected into shared note recall or auto-promoted to notes/skills.
+- **D&D Battle Formation Solver & Declarative `ongoing` Condition Hooks**:
+  - Added a dedicated formation solver for combat setup supporting 5 / 10 / 15 ft target spacing and single-character position adjustments.
+  - Added `ongoing` hooks to `dnd_rule` for automatic turn-start/turn-end repeat saves, end-on-damage, wake-as-action (`dnd_apply` `wake_by`), and zero-speed effects, along with matching `dnd-rule-extension` skill updates.
+
+### Hardened & Fixed
+
+- **Attachment Download SSRF & Inbound Image Hardening**: Expanded private-network blocking to cover IPv4 `0.0.0.0/8`, CGNAT `100.64.0.0/10`, and IPv6 ULA/link-local/multicast ranges, tightened inbound image attachment checks, and added regression tests.
+- **GIF Sprite-Sheet Frame Counting Fallback**: Added byte-level `countGifFrames` fallback when `ffprobe` returns empty or `N/A` so animated GIFs are not dropped as single frames, with clearer `ffprobe`/`ffmpeg` failure warnings.
+- **Bundled Direct Persona Refinement**: Updated `personas/*.direct.md` so routine tool calls during coding/debugging are not narrated step-by-step unless blocked, awaiting a decision, or reaching a substantive milestone.
+
 ## [0.9.0] - 2026-11-24
 
 ### Upgrade Notes from 0.8.x (Agent Migration & Troubleshooting)

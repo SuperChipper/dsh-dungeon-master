@@ -1,7 +1,7 @@
 /** 角色卡与资源：dnd_character、dnd_resource、dnd_rest。 */
 import type { Adventure } from '../adventure.ts';
 import {
-type Campaign,type Character,type CharacterInput,type CharacterKind,type DelegationTarget,type PendingSpell,assertNoPending,changeInventory,checkAllAirborneCrashes,delegationTag,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isAbsent,isDmDelegated,isOut,fightRooms,leaveInitiative,pushLog,reactionBlocked,removeCharacter,requireCharacter,requireInitiative,requireResource,rest,
+type Campaign,type Character,type CharacterInput,type CharacterKind,type DelegationTarget,type PendingSpell,applyEffectConditions,assertNoPending,changeInventory,checkAllAirborneCrashes,delegationTag,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isAbsent,isDmDelegated,isOut,fightRooms,leaveInitiative,pushLog,reactionBlocked,removeCharacter,requireCharacter,requireInitiative,requireResource,rest,
 restoreReaction,
 restoreResource,
 roomOf,
@@ -16,7 +16,7 @@ npcAlive
 } from '../story.ts';
 import { ABILITIES,type Ability,abilityModifier,proficiencyBonus } from '../rules.ts';
 import {
-breakConcentration,concentratingOn,defaultStateRounds,ensureTurnState,isDefaultConcentrationState,isTransferableState,normalizeCondition,recordTurnSpellCast,transferConcentration,upsertActiveState
+assertTurnActionAllowed,breakConcentration,concentratingOn,defaultStateRounds,ensureTurnState,hasCondition,isDefaultConcentrationState,isTransferableState,normalizeCondition,prepareOngoingEffect,recordTurnSpellCast,transferConcentration,upsertActiveState
 } from '../conditions.ts';
 import { resolveEffectDef } from '../custom-effects.ts';
 import { buildFormulaContext,evalIntFormula } from '../formula.ts';
@@ -284,7 +284,8 @@ export function registerCharacterTools(kit: ToolKit): void {
         description: 'For update/show: several characters at once instead of `name`. update applies the same fields to each '
           + '(room, add_items, remove_items, gp_change, max_hp_change, ac, speed…) and returns one line per character.',
       },
-      srd: { type: 'string', description: 'For create: SRD monster index; fills AC/HP/abilities/attack from dnd5eapi.' },
+      srd: { type: 'string', description: 'For create: SRD monster index; fills AC/HP/abilities/attack and condition immunities.' },
+      condition_immunities: { type: 'array', items: { type: 'string' }, description: 'Condition immunities, e.g. ["中毒", "魅惑"]. Replaces the list, including when empty.' },
       count: { type: 'integer', description: 'For create: how many copies (numbered names).' },
       room: {
         type: 'string',
@@ -506,6 +507,7 @@ export function registerCharacterTools(kit: ToolKit): void {
           weapons: parseWeapons(args.weapons), room: str(args.room), hitDie: str(args.hit_die), traits: strList(args.traits),
           speed: int(args.speed), flySpeed: int(args.fly_speed), hover: typeof args.hover === 'boolean' ? args.hover : undefined,
           reactions: parseReactions(args.reactions),
+          conditionImmunities: Array.isArray(args.condition_immunities) ? strList(args.condition_immunities) ?? [] : undefined,
         };
         for (const [k, v] of Object.entries(optional)) {
           if (v !== undefined) (input as unknown as Record<string, unknown>)[k] = v;
@@ -663,6 +665,7 @@ export function registerCharacterTools(kit: ToolKit): void {
       hit_bonus: { type: 'integer', description: 'For apply_state: flat attack bonus while active (神圣武器 auto-computes max(1, CHA mod) if omitted).' },
       ac_bonus: { type: 'integer', description: 'For apply_state: flat AC bonus while active (护盾信仰/加速术 auto-apply +2 if omitted).' },
       action_cost: { type: 'string', enum: ['action', 'bonus', 'reaction', 'free'], description: 'Optional turn action-economy slot spent in combat (records 主动作/附赠动作 and warns on duplicate usage).' },
+      save_dc: { type: 'integer', minimum: 1, description: 'Original spell DC for an ongoing effect. Defaults to the caster’s spell save DC. Use dnd_check for effects requiring an initial target save.' },
       temp_hp: { type: 'integer', description: 'Optional temporary HP override for features like "战斗英姿" (computed automatically from fighter level if omitted).' },
       ignore_state_mods: { type: 'boolean', description: 'For transfer: allow transferring before the previous target drops to 0 HP when a special feature permits.' },
       max: { type: 'integer', description: 'For set.' },
@@ -708,15 +711,16 @@ export function registerCharacterTools(kit: ToolKit): void {
         }
         const targetCh = requireCharacter(c, targetName);
         const rawSpell = str(args.apply_state) ?? (!/^(?:专注|concentration|)$/i.test(key.trim()) ? key.trim() : undefined);
+        const onOwnTurn = c.initiative !== undefined && c.initiative.order[c.initiative.turn]?.name === ch.name;
+        const ts = onOwnTurn ? ensureTurnState(c) : undefined;
+        const costKind = (str(args.action_cost) as 'action' | 'bonus' | 'reaction' | 'free' | undefined) ?? 'bonus';
+        if (args.ignore_state_mods !== true) assertTurnActionAllowed(ts, ch, costKind);
         const res = transferConcentration(c, ch, targetCh, {
           ...(rawSpell !== undefined ? { spellName: rawSpell } : {}),
           force: args.ignore_state_mods === true,
           globalEffects,
         });
         const warnings: string[] = [];
-        const onOwnTurn = c.initiative !== undefined && c.initiative.order[c.initiative.turn]?.name === ch.name;
-        const ts = onOwnTurn ? ensureTurnState(c) : undefined;
-        const costKind = (str(args.action_cost) as 'action' | 'bonus' | 'reaction' | 'free' | undefined) ?? 'bonus';
         if (ts !== undefined && costKind === 'bonus') {
           if (ts.bonusUsed !== undefined) {
             warnings.push(`【动作经济提醒】${ch.name} 本回合此前已使用过附赠动作（${ts.bonusUsed}），每回合通常只有 1 个附赠动作`);
@@ -814,20 +818,23 @@ export function registerCharacterTools(kit: ToolKit): void {
           ?? (isActionSurge ? 'free' : undefined)
           ?? (isFightingSpirit || curseTarget !== undefined || isRageResource || normApplyState === '狂暴' || isBonusSpellState || /^(回气|Second Wind)$/i.test(keyTrim) ? 'bonus' : undefined)
           ?? (isSacredWeapon ? 'action' : undefined);
+        const actionCost = inferredCost ?? (slotLevel !== undefined && hasCondition(ch, '迟缓术') ? 'action' : undefined);
+        if (args.ignore_state_mods !== true) assertTurnActionAllowed(ts, ch, actionCost);
 
         if (isActionSurge) {
           if (ts !== undefined) {
+            ts.surgeAttacks = (ts.surgeAttacks ?? 0) + ts.attacks;
             delete ts.actionUsed;
             ts.attacks = 0;
           }
           return `${baseLine}；动作如潮生效，本回合获得额外一个主动作（主动作与攻击计数已刷新）${combatLedgerSuffix(c)}`;
         }
-        if (ts !== undefined && inferredCost === 'action') {
+        if (ts !== undefined && actionCost === 'action') {
           if (ts.actionUsed !== undefined || ts.attacks > 0) {
             warnings.push(`【动作经济提醒】${ch.name} 本回合此前已使用主动作（${ts.actionUsed ?? `已攻击×${ts.attacks}`}），请核对是否有动作如潮或特殊规则支持`);
           }
           ts.actionUsed = normApplyState ?? keyTrim;
-        } else if (ts !== undefined && inferredCost === 'bonus') {
+        } else if (ts !== undefined && actionCost === 'bonus') {
           if (ts.bonusUsed !== undefined) {
             warnings.push(`【动作经济提醒】${ch.name} 本回合此前已使用过附赠动作（${ts.bonusUsed}），每回合通常只有 1 个附赠动作`);
           }
@@ -894,7 +901,9 @@ export function registerCharacterTools(kit: ToolKit): void {
           const expires = effectiveApplyState === '闪避' ? 'start_of_source_turn' as const : undefined;
           const hitBonus = int(args.hit_bonus);
           const acBonus = int(args.ac_bonus);
-          const saveDc = effectDef?.aura?.hazard !== undefined ? inferSpellSaveDc(ch) : undefined;
+          const saveDc = int(args.save_dc) ?? (effectDef?.aura?.hazard !== undefined || effectDef?.ongoing?.repeatSave !== undefined
+            ? inferSpellSaveDc(ch) : undefined);
+          const ongoing = prepareOngoingEffect(effectDef, saveDc);
 
           if (c.initiative !== undefined && ch.kind === 'monster' && slotLevel !== undefined && args.drop_concentration !== true) {
             const spellReactors = eligibleSpellReactors(c, ch, { spellName: effectiveApplyState });
@@ -923,6 +932,7 @@ export function registerCharacterTools(kit: ToolKit): void {
                   ...(acBonus !== undefined ? { acBonus } : {}),
                   ...(slotLevel !== undefined ? { slotLevel } : {}),
                   ...(saveDc !== undefined ? { saveDc } : {}),
+                  ...(ongoing !== undefined ? { ongoing, conditions: effectDef?.ongoing?.conditions ?? [effectiveApplyState] } : {}),
                   ...(warnings.length > 0 ? { warnings } : {}),
                 },
               };
@@ -936,18 +946,20 @@ export function registerCharacterTools(kit: ToolKit): void {
             ? [...breakConcentration(c, ch.name, `改换专注为「${effectiveApplyState}」`), ...checkAllAirborneCrashes(c, service.roller, globalEffects)]
             : [];
           for (const tCh of targetChars) {
-            const up = upsertActiveState(c, tCh, {
-              name: effectiveApplyState,
+            const options = {
               source: ch.name,
-              ...(isConc ? { concentration: true } : {}),
-              ...(rounds !== undefined ? { roundsLeft: rounds } : {}),
-              ...(expires !== undefined ? { expires } : {}),
-              ...(hitBonus !== undefined ? { hitBonus } : {}),
-              ...(acBonus !== undefined ? { acBonus } : {}),
-              ...(slotLevel !== undefined ? { slotLevel } : {}),
-              ...(saveDc !== undefined ? { saveDc } : {}),
-            }, { replaceConcentration: false, globalEffects });
-            broken.push(...up.broken);
+              concentration: isConc, roundsLeft: rounds, expires, hitBonus, acBonus, slotLevel, saveDc,
+            };
+            if (ongoing !== undefined) {
+              const result = applyEffectConditions(c, tCh, effectDef?.ongoing?.conditions ?? [effectiveApplyState], {
+                ...options, ongoing, replaceConcentration: false, globalEffects, roller: service.roller,
+              });
+              if (result.immune.length > 0) broken.push(`${tCh.name} 免疫「${result.immune.join('、')}」`);
+            } else {
+              const up = upsertActiveState(c, tCh, { name: effectiveApplyState, ...options }, { replaceConcentration: false, globalEffects });
+              broken.push(...up.broken);
+              if (up.immune) broken.push(`${tCh.name} 免疫「${effectiveApplyState}」`);
+            }
           }
           broken.push(...checkAllAirborneCrashes(c, service.roller, globalEffects));
           const metaDesc = [

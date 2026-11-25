@@ -8,7 +8,7 @@
  */
 import { existsSync, readFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { writeJsonAtomic } from '../shared/atomic-fs.ts';
 import { parseProgress } from './progress-patch.ts';
 import { rollD20, rollExpression, type Roller, cryptoRoller } from './dice.ts';
@@ -30,6 +30,8 @@ import { ABILITIES, type Ability, type Skill, abilityModifier, parseAbility, par
 import { type MoveRequest, battleGridLines, battleLines, canReact, cellOf, distancesFrom, hiddenFromPlayers } from './battlefield.ts';
 import {
   type ActiveState,
+  type ActiveOngoingEffect,
+  type PreparedOngoingEffect,
   type ConcentrationRecord,
   type TurnActionState,
   INCAPACITATING_CONDITIONS,
@@ -44,10 +46,13 @@ import {
   exhaustionLevel,
   externalConcentrationTags,
   hasCondition,
+  immuneToCondition,
   isIncapacitated,
   normalizeCondition,
   notifyConcentrationTargetDown,
+  ongoingEffects,
   removeActiveState,
+  removeOngoingEffect,
   stateAcBonus,
   syncConcentrationAfterRemoval,
   tickActiveStatesOnTurnChange,
@@ -55,7 +60,7 @@ import {
 } from './conditions.ts';
 import type { CustomEffectDef } from './custom-effects.ts';
 import { pendingSummaryLine } from './pending-attack.ts';
-import { DEFENSE_NAMES } from './save-effect.ts';
+import { DEFENSE_NAMES, settleOngoingSaves } from './save-effect.ts';
 import type { BattleMap } from './terrain.ts';
 import { type NpcState, afterChange, describeCondition, evalCondition, locationKnown, roomView, storySummaryLines } from './story.ts';
 import { type BattleZone, type BattleZoneInput, settleTurnBoundaryHazards } from './zones.ts';
@@ -96,6 +101,7 @@ export interface Character {
   tempHp: number;
   ac: number;
   conditions: string[];
+  conditionImmunities?: string[];
   /** 结构化生效状态（含持续轮数、专注归属、动态命中/AC加值）；旧存档缺省时自动从 conditions 推导 */
   activeStates?: ActiveState[];
   /** 施法者本人维持的专注记录（使脆弱诅咒/猎人印记等可转移专注在原目标倒下、清尸或跨场战斗后依然保留在施法者身上） */
@@ -349,6 +355,7 @@ export interface PendingD20 {
   detail: string;
   /** 反应加减的（尖刻言语 -1d6），重掷后保留 */
   mod: number;
+  autoFailed?: string;
   defense?: 'resistant' | 'immune' | 'vulnerable';
 }
 
@@ -366,6 +373,8 @@ export interface PendingCheck extends PendingBase {
   damage?: { total: number; detail: string; type?: string; onSave: 'half' | 'none' };
   /** 豁免失败附带的状态 */
   onFail?: string[];
+  effectSource?: string;
+  ongoing?: PreparedOngoingEffect;
   /** 豁免失败附加状态绑定的专注施法者 */
   concentrationSource?: string;
   /** 是否为受击体质专注豁免（挂起后若落账结果为失败，自动打断施法者专注） */
@@ -400,6 +409,8 @@ export interface PendingSpell extends PendingBase {
         acBonus?: number;
         slotLevel?: number;
         saveDc?: number;
+        conditions?: string[];
+        ongoing?: PreparedOngoingEffect;
         warnings?: string[];
       }
     | {
@@ -482,6 +493,7 @@ export interface LastCombatSummary {
 }
 
 export interface InitiativeState {
+  battleId?: string;
   round: number;
   /** 当前行动者在 order 里的下标 */
   turn: number;
@@ -743,6 +755,7 @@ export interface CharacterInput {
   skills?: Skill[];
   expertise?: Skill[];
   saves?: Ability[];
+  conditionImmunities?: string[];
   maxHp?: number;
   hp?: number;
   ac?: number;
@@ -798,6 +811,9 @@ export function upsertCharacter(c: Campaign, input: CharacterInput): { character
     next.skills = [...new Set([...next.skills, ...next.expertise])];
   }
   if (input.saves !== undefined) next.saves = [...new Set(input.saves)];
+  if (input.conditionImmunities !== undefined) {
+    next.conditionImmunities = [...new Set(input.conditionImmunities.map(normalizeCondition).filter(Boolean))];
+  }
   if (input.ac !== undefined) next.ac = clampInt(input.ac, 1, 30);
   if (input.maxHp !== undefined) {
     next.maxHp = clampInt(input.maxHp, 1, 999);
@@ -915,6 +931,13 @@ export function applyDamage(c: Campaign, name: string, amount: number, options: 
   const overflow = rest - ch.hp;
   ch.hp = Math.max(0, ch.hp - rest);
   const events: string[] = [];
+  if (dmg > 0) {
+    for (const effect of ongoingEffects(ch)) {
+      if (!effect.endOnDamage) continue;
+      removeOngoingEffect(c, ch, effect.id);
+      events.push(`受伤解除「${effect.name}」`);
+    }
+  }
   if (ch.hp === 0 && before > 0 && rest > 0 && ch.kind !== 'pc' && ch.traits?.includes(UNDEAD_FORTITUDE)
     && options.crit !== true && !/光耀|radiant/i.test(options.damageType ?? '')) {
     const dc = 5 + rest;
@@ -1037,6 +1060,7 @@ export function checkAirborneCrash(
   const lostFlight = (ch.flySpeed ?? 0) <= 0;
   const incapacitatedOrPinned = hasCondition(ch, '倒地')
     || effectiveStates(ch).some((s) => ZERO_SPEED_CONDITIONS.has(s.name) || INCAPACITATING_CONDITIONS.has(s.name))
+    || ongoingEffects(ch).some((effect) => effect.zeroSpeed)
     || exhaustionLevel(ch) >= 5;
   if (!lostFlight && !incapacitatedOrPinned) return [];
 
@@ -1085,12 +1109,13 @@ export function checkAllAirborneCrashes(
   return out;
 }
 
-export interface ChangeConditionOptions {
+export interface ChangeConditionOptions extends Pick<ActiveState, 'saveDc' | 'slotLevel' | 'acBonus' | 'hitBonus'> {
   source?: string;
   concentration?: boolean;
   replaceConcentration?: boolean;
   roundsLeft?: number;
   expires?: ActiveState['expires'];
+  ongoing?: ActiveOngoingEffect;
   roller?: Roller;
   globalEffects?: Record<string, CustomEffectDef>;
 }
@@ -1110,7 +1135,7 @@ export function changeCondition(
   }
   if (on) {
     const had = ch.conditions.some((x) => normalizeCondition(x) === norm);
-    const { broken } = upsertActiveState(
+    const { broken, immune } = upsertActiveState(
       c,
       ch,
       {
@@ -1120,13 +1145,24 @@ export function changeCondition(
         ...(options.concentration !== undefined ? { concentration: options.concentration } : {}),
         ...(options.roundsLeft !== undefined ? { roundsLeft: options.roundsLeft } : {}),
         ...(options.expires !== undefined ? { expires: options.expires } : {}),
+        ...(options.ongoing !== undefined ? { ongoing: options.ongoing } : {}),
+        ...(options.saveDc !== undefined ? { saveDc: options.saveDc } : {}),
+        ...(options.slotLevel !== undefined ? { slotLevel: options.slotLevel } : {}),
+        ...(options.acBonus !== undefined ? { acBonus: options.acBonus } : {}),
+        ...(options.hitBonus !== undefined ? { hitBonus: options.hitBonus } : {}),
       },
-      { ...(options.replaceConcentration !== undefined ? { replaceConcentration: options.replaceConcentration } : {}) },
+      { replaceConcentration: options.replaceConcentration, globalEffects: options.globalEffects },
     );
+    if (immune) return ch;
     if (!had) pushLog(c, `${ch.name} 获得状态「${norm}」`);
     for (const line of broken) pushLog(c, line);
     checkAllAirborneCrashes(c, options.roller ?? cryptoRoller, options.globalEffects);
   } else {
+    for (const effect of ongoingEffects(ch)) {
+      if (normalizeCondition(effect.name) !== norm) continue;
+      removeOngoingEffect(c, ch, effect.id);
+      pushLog(c, `${ch.name} 解除「${effect.name}」`);
+    }
     const removed = removeActiveState(ch, condition);
     syncConcentrationAfterRemoval(c, ch, removed);
     if (
@@ -1139,6 +1175,44 @@ export function changeCondition(
     checkAllAirborneCrashes(c, options.roller ?? cryptoRoller, options.globalEffects);
   }
   return ch;
+}
+
+export function applyEffectConditions(
+  c: Campaign, ch: Character, conditions: readonly string[],
+  options: Omit<ChangeConditionOptions, 'ongoing'> & { ongoing?: PreparedOngoingEffect },
+): { applied: string[]; immune: string[] } {
+  const unique = [...new Map(conditions.map((name) => [normalizeCondition(name), name])).values()];
+  const { ongoing, ...stateOptions } = options;
+  const immune = unique.filter((name) => immuneToCondition(ch, name));
+  if (ongoing?.requiresCondition !== undefined && immuneToCondition(ch, ongoing.requiresCondition)) {
+    return { applied: [], immune };
+  }
+  const applied = unique.filter((name) => !immune.includes(name));
+  const instance = ongoing === undefined ? undefined : {
+    id: randomUUID(), name: ongoing.name, repeatSave: ongoing.repeatSave, endOnDamage: ongoing.endOnDamage,
+    wakeAsAction: ongoing.wakeAsAction, zeroSpeed: ongoing.zeroSpeed,
+  };
+  for (const name of applied) {
+    changeCondition(c, ch.name, name, true, { ...stateOptions, ongoing: instance });
+  }
+  return { applied, immune };
+}
+
+export function wakeFromEffect(c: Campaign, actor: Character, target: Character, effectName?: string): string {
+  assertNoPending(c, '唤醒');
+  if (actor === target || actor.hp <= 0 || roomOf(c, actor) !== roomOf(c, target)) throw new Error('必须由同场的另一名生物唤醒');
+  const from = cellOf(c, actor), to = cellOf(c, target);
+  if (from !== undefined && to !== undefined && Math.max(Math.abs(from.x - to.x), Math.abs(from.y - to.y), Math.abs((from.z ?? 0) - (to.z ?? 0)) / 5) > 1) {
+    throw new Error('必须进入目标 5 尺内才能唤醒');
+  }
+  const matches = ongoingEffects(target).filter((effect) => effect.wakeAsAction
+    && (effectName === undefined || normalizeCondition(effect.name) === normalizeCondition(effectName)));
+  if (matches.length !== 1) throw new Error(matches.length === 0 ? '目标没有可用动作唤醒的效果' : '目标有多个可唤醒效果，请指定效果名');
+  const effect = matches[0]!;
+  removeOngoingEffect(c, target, effect.id);
+  const line = `${actor.name} 用主动作唤醒 ${target.name}，解除「${effect.name}」`;
+  pushLog(c, line);
+  return line;
 }
 
 // ── 死亡豁免 ──
@@ -1542,6 +1616,7 @@ export function startInitiative(
   });
   rolls.sort((a, b) => b.init - a.init || b.tiebreak - a.tiebreak);
   c.initiative = {
+    battleId: randomUUID(),
     round: 1,
     turn: 0,
     order: rolls.map(({ name, init }) => ({ name, init })),
@@ -1799,15 +1874,20 @@ export function nextTurn(
 
   const allSkipped: string[] = [];
   const allExpired: string[] = [];
-  const allHazards: string[] = [];
+  const allHazards = settleOngoingSaves(c, prevActor, 'target_turn_end', roller, globalEffects);
   let newRound = false;
   const maxHops = Math.max(1, state.order.length + 1);
 
   for (let hop = 0; hop < maxHops; hop++) {
     if (stepTurn(state)) newRound = true;
+    const skippedRound = state.round;
     const skip = skipSurprised(c);
     newRound ||= skip.newRound;
     allSkipped.push(...skip.skipped);
+    for (const actor of skip.skipped) {
+      allHazards.push(...settleOngoingSaves(c, actor, 'target_turn_start', roller, globalEffects, skippedRound));
+      allHazards.push(...settleOngoingSaves(c, actor, 'target_turn_end', roller, globalEffects, skippedRound));
+    }
     const current = state.order[state.turn];
     if (current === undefined) break;
     if (state.shielded !== undefined) state.shielded = state.shielded.filter((name) => name !== current.name);
@@ -1820,6 +1900,7 @@ export function nextTurn(
     allExpired.push(...expired);
     allHazards.push(...checkAllAirborneCrashes(c, roller, globalEffects));
     allHazards.push(...settleTurnBoundaryHazards(c, prevActor, current.name, roller, globalEffects));
+    allHazards.push(...settleOngoingSaves(c, current.name, 'target_turn_start', roller, globalEffects));
     allHazards.push(...checkAllAirborneCrashes(c, roller, globalEffects));
 
     const curCh = findCharacter(c, current.name);
@@ -2789,6 +2870,20 @@ function hpTag(ch: Character, c?: Campaign, globalEffects?: Record<string, Custo
   return `${ch.name} ${ch.hp}${temp}/${ch.maxHp} AC${armorClass(c, ch, globalEffects)}${cond}`;
 }
 
+function ongoingSummary(c: Campaign): string[] {
+  const effects = c.characters.flatMap((ch) => inInitiative(c, ch.name) ? ongoingEffects(ch).map((effect) => {
+    const timing = effect.repeatSave?.timing;
+    const rules = [
+      timing === undefined ? '' : `${timing === 'target_turn_start' ? '回合开始' : '回合末'}自动复豁免`,
+      effect.endOnDamage ? '受伤解除' : '',
+      effect.wakeAsAction ? '可唤醒' : '',
+      effect.zeroSpeed ? '速度0' : '',
+    ].filter(Boolean);
+    return `${ch.name}·${effect.name}${rules.length > 0 ? `（${rules.join('、')}）` : ''}`;
+  }) : []);
+  return effects.length > 0 ? [`持续减益：${effects.join('；')}`] : [];
+}
+
 /** 队伍主位置所在的场景，以及这个场景探索了几个房间 */
 export function explored(c: Campaign, adv: Adventure): { site: Site | undefined; seen: number; total: number } {
   const site = siteOfRoom(adv, c.currentRoom);
@@ -2837,6 +2932,7 @@ export function summarize(c: Campaign, adv: Adventure): string {
     const order = s.order.map((e, i) => (i === s.turn ? `▶${e.name}(${e.init})` : `${e.name}(${e.init})`)).join(' > ');
     lines.push(`${s.rehearsal === true ? '【演练模式·战后自动还原状态与场地图】' : ''}战斗第 ${s.round} 轮：${order}`);
     lines.push(...battleLines(c, (id) => findRoom(graph, id)?.name ?? id));
+    lines.push(...ongoingSummary(c));
     if (s.reacted?.length) lines.push(`已用反应：${s.reacted.join('、')}`);
     if (s.fightingSpirit?.length) lines.push(`战斗英姿生效：${s.fightingSpirit.join('、')}（本回合武器攻击自动具优势）`);
     if (c.hexbladeCurses?.length) {
@@ -2908,6 +3004,7 @@ export function summarizeCombat(
     const order = s.order.map((e, i) => (i === s.turn ? `▶${e.name}(${e.init})` : `${e.name}(${e.init})`)).join(' > ');
     lines.push(`${s.rehearsal === true ? '【演练模式·战后自动还原状态与场地图】' : ''}战斗第 ${s.round} 轮：${order}`);
     lines.push(...battleLines(c, (id) => findRoom(graph, id)?.name ?? id));
+    lines.push(...ongoingSummary(c));
     if (s.reacted?.length) lines.push(`已用反应：${s.reacted.join('、')}`);
     if (s.fightingSpirit?.length) lines.push(`战斗英姿生效：${s.fightingSpirit.join('、')}（本回合武器攻击自动具优势）`);
     if (c.hexbladeCurses?.length) {

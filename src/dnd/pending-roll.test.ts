@@ -19,7 +19,7 @@ type Tool = { name: string; execute(args: unknown, exec: { agent?: unknown }): P
 const CHRONAL = [{ by: '奇塔露', name: '时间变幻' }];
 
 /** rolls 里按顺序给骰子，给完了都是 10。先攻：狼 > 奇塔露 > 地精 > Kriv */
-function setup() {
+function setup(autoOpeningMap = false) {
   const rolls: number[] = [];
   const root = mkdtempSync(join(tmpdir(), 'dnd-pending-roll-'));
   const service = new DndService({
@@ -51,7 +51,11 @@ function setup() {
   const tools = new Map<string, Tool>();
   const ctx = { get: () => ({ register: (d: Tool) => tools.set(d.name, d) }) };
   const onPendingAttack = vi.fn();
-  registerDndTools(ctx as never, { service, manager: manager as never, logger: logger as never, sendImage: vi.fn(), onPendingAttack });
+  const sendToolImage = vi.fn(async (_record: unknown, _path: string, _caption?: string) => {});
+  registerDndTools(ctx as never, {
+    service, manager: manager as never, logger: logger as never, sendImage: sendToolImage, onPendingAttack,
+    ...(autoOpeningMap ? { onBattlePlacement: (target) => buttons.sendOpeningImage(target) } : {}),
+  });
   const call = async (name: string, args: Record<string, unknown>) => (await tools.get(name)!.execute(args, { agent: {} })).text;
   const campaign = (): Campaign => service.store.load(key)!;
   const consent = (by: string, skill: string): string => service.store.update(key, (c) => {
@@ -71,7 +75,7 @@ function setup() {
   const chronal = (target: string) => call('dnd_apply', {
     target, declared_by: 'P5', reaction: { by: '奇塔露', name: '时间变幻', authorization: consent('奇塔露', '时间变幻'), reroll: 'd20', spend: '时间变幻' },
   });
-  return { consent, rolls, service, key, call, campaign, ch, castOnGoblin, chronal, buttons, followup, record, onPendingAttack, sender };
+  return { consent, rolls, service, key, call, campaign, ch, castOnGoblin, chronal, buttons, followup, record, onPendingAttack, sender, sendToolImage };
 }
 
 afterEach(() => {
@@ -354,7 +358,8 @@ describe('存档和玩家视角', () => {
     const t = setup();
     await t.call('dnd_position', { action: 'set', placements: [{ name: '狼', x: 0, y: 0 }, { name: 'Kriv', x: 3, y: 0 }, { name: '地精', x: 5, y: 0 }] });
     t.service.store.update(t.key, (c) => { c.characters.find((x) => x.name === '地精')!.conditions.push('隐形'); });
-    const text = await t.call('dnd_position', { action: 'show' });
+    expect(await t.call('dnd_position', { action: 'show' })).not.toContain('```');
+    const text = await t.call('dnd_position', { action: 'show', text_grid: true });
     expect(text).toContain('地精(5,0)');
     const grid = text.slice(text.indexOf('玩家视角示意图'));
     expect(grid).toContain('```');
@@ -376,7 +381,7 @@ describe('战斗图代替字符网格', () => {
     const sendImage = vi.fn((..._args: unknown[]) => Promise.resolve());
     t.service.sendImage = sendImage as never;
     await t.call('dnd_position', { action: 'terrain', width: 6, height: 4, areas: [{ kind: 'object', x: 2, y: 2, name: '石台' }] });
-    await t.call('dnd_position', { action: 'set', placements: [{ name: '狼', x: 0, y: 0 }, { name: 'Kriv', x: 3, y: 0 }, { name: '奇塔露', x: 4, y: 1 }] });
+    await t.call('dnd_position', { action: 'set', placements: [{ name: '狼', x: 0, y: 0 }, { name: 'Kriv', x: 3, y: 0 }, { name: '奇塔露', x: 4, y: 1 }, { name: '地精', x: 5, y: 2 }] });
     return { ...t, sendImage };
   };
 
@@ -403,6 +408,17 @@ describe('战斗图代替字符网格', () => {
     expect(text).not.toContain('报位置用');
   });
 
+  it('战斗中的 dnd_map 默认用战斗图，场地图未准备时不改发探索图', async () => {
+    if (!(await hasSharp())) return;
+    const t = setup();
+    await expect(t.call('dnd_map', {})).rejects.toThrow(/还没有场地图/);
+    expect(t.sendToolImage).not.toHaveBeenCalled();
+    await t.call('dnd_position', { action: 'terrain', width: 6, height: 4, areas: [] });
+    await t.call('dnd_position', { action: 'set', name: '狼', x: 1, y: 0 });
+    expect(await t.call('dnd_map', {})).toContain('战斗图已发');
+    expect(t.sendToolImage.mock.calls[0]?.[1]).toMatch(/\.jpg$/);
+  });
+
   it('每轮只自动发一张战斗图：同一轮第二个 PC 的回合提示不再带图', async () => {
     if (!(await hasSharp())) return;
     const t = await withMap();
@@ -414,5 +430,28 @@ describe('战斗图代替字符网格', () => {
     t.buttons.schedule(t.record as never);
     await vi.waitFor(() => expect(t.sender.sendMarkdown).toHaveBeenCalledTimes(2), { timeout: 5000 });
     expect(t.sendImage).toHaveBeenCalledTimes(1);
+  });
+
+  it('首次完整摆位落盘后直接发送战斗图，发送失败可重试，PC 按钮不重复发图', async () => {
+    if (!(await hasSharp())) return;
+    const t = setup(true);
+    const sendImage = vi.fn(async () => {});
+    t.service.sendImage = sendImage;
+    await t.call('dnd_position', { action: 'terrain', width: 6, height: 4, areas: [] });
+    await t.call('dnd_position', { action: 'set', placements: [{ name: '狼', x: 0, y: 0 }, { name: '地精', x: 5, y: 2 }] });
+    expect(sendImage).not.toHaveBeenCalled();
+    sendImage.mockRejectedValueOnce(new Error('暂时发送失败'));
+    const first = await t.call('dnd_position', {
+      action: 'set', placements: [{ name: 'Kriv', x: 3, y: 0 }, { name: '奇塔露', x: 4, y: 1 }],
+    });
+    expect(first).not.toContain('开战图片已发');
+    expect(sendImage).toHaveBeenCalledTimes(1);
+    const retried = await t.call('dnd_position', { action: 'set', name: 'Kriv', x: 3, y: 1 });
+    expect(retried).toContain('开战图片已发');
+    expect(sendImage).toHaveBeenCalledTimes(2);
+    t.service.store.update(t.key, (c) => { c.initiative!.turn = 1; });
+    t.buttons.schedule(t.record as never);
+    await vi.waitFor(() => expect(t.sender.sendMarkdown).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(sendImage).toHaveBeenCalledTimes(2);
   });
 });

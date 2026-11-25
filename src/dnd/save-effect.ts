@@ -5,10 +5,10 @@
  * 这里一次给出每个目标的豁免、伤害和 HP 变化，减半/抗性/免疫/易伤按 5e 顺序算（先减半再抗性，都向下取整）。
  */
 import { type Advantage, type DiceResult, type Roller, rollD20, rollExpression } from './dice.ts';
-import { type Campaign, type HpChange, applyDamage, changeCondition, checkModifier, requireCharacter } from './campaign.ts';
-import { computeDefenseStateMod, computeSaveStateMods, formatStateModSummary } from './conditions.ts';
+import { type Campaign, type HpChange, applyDamage, applyEffectConditions, checkModifier, findCharacter, pushLog, requireCharacter } from './campaign.ts';
+import { computeDefenseStateMod, computeSaveStateMods, formatStateModSummary, ongoingEffects, removeOngoingEffect, type PreparedOngoingEffect } from './conditions.ts';
 import type { CustomEffectDef } from './custom-effects.ts';
-import type { Ability } from './rules.ts';
+import { ABILITY_NAMES, type Ability } from './rules.ts';
 
 export type Defense = 'resistant' | 'immune' | 'vulnerable';
 
@@ -83,6 +83,9 @@ export interface SaveEffectInput {
   ignoreStateMods?: boolean;
   /** 专注控制法术施法者名称：豁免失败附加的状态将绑定至该施法者的专注位 */
   concentrationSource?: string;
+  effectSource?: string;
+  ongoing?: PreparedOngoingEffect;
+  saveTags?: readonly string[];
   /** 持续轮数（可选，绑定到失败附加状态） */
   failRounds?: number;
   globalEffects?: Record<string, CustomEffectDef>;
@@ -121,6 +124,7 @@ export interface SaveOutcome {
   change?: HpChange;
   /** 豁免失败加上的状态 */
   conditions?: string[];
+  immuneConditions?: string[];
 }
 
 export interface SaveEffectResult {
@@ -144,6 +148,7 @@ export function rollSaveEffect(c: Campaign, input: SaveEffectInput): RolledSaveE
   const vsTags = [
     ...(input.damageType ? [input.damageType] : []),
     ...(input.onFail ?? []),
+    ...(input.saveTags ?? []),
   ];
   const saves = resolved.map(({ t, ch }): RolledSave => {
     if (ch.conditions.includes('死亡')) return { name: ch.name, skipped: '已死亡' };
@@ -209,6 +214,9 @@ export interface ApplySaveInput {
   onSave?: 'half' | 'none';
   onFail?: string[];
   concentrationSource?: string;
+  effectSource?: string;
+  ongoing?: PreparedOngoingEffect;
+  globalEffects?: Record<string, CustomEffectDef>;
   failRounds?: number;
   roller: Roller;
 }
@@ -229,24 +237,17 @@ export function applySaveEffect(c: Campaign, saves: readonly RolledSave[], input
     const conditions = saved ? [] : (input.onFail ?? []);
     if (conditions.length > 0 && !requireCharacter(c, s.name).conditions.includes('死亡')) {
       const targetCh = requireCharacter(c, s.name);
-      for (const cond of conditions) {
-        if (input.concentrationSource !== undefined) {
-          changeCondition(c, s.name, cond, true, {
-            source: input.concentrationSource,
-            concentration: true,
-            replaceConcentration: false,
-            ...(input.failRounds !== undefined ? { roundsLeft: input.failRounds } : {}),
-            roller: input.roller,
-          });
-        } else {
-          changeCondition(c, s.name, cond, true, {
-            ...(input.failRounds !== undefined ? { roundsLeft: input.failRounds } : {}),
-            roller: input.roller,
-          });
-        }
-      }
-      out.conditions = [...conditions];
-      void targetCh;
+      const { applied, immune } = applyEffectConditions(c, targetCh, conditions, {
+        source: input.concentrationSource ?? input.effectSource,
+        concentration: input.concentrationSource !== undefined,
+        replaceConcentration: false,
+        roundsLeft: input.failRounds,
+        ongoing: input.ongoing,
+        globalEffects: input.globalEffects,
+        roller: input.roller,
+      });
+      if (applied.length > 0) out.conditions = applied;
+      if (immune.length > 0) out.immuneConditions = immune;
     }
     return out;
   });
@@ -262,8 +263,38 @@ export function resolveSaveEffect(c: Campaign, input: SaveEffectInput): SaveEffe
     ...(input.onSave !== undefined ? { onSave: input.onSave } : {}),
     ...(input.onFail !== undefined ? { onFail: input.onFail } : {}),
     ...(input.concentrationSource !== undefined ? { concentrationSource: input.concentrationSource } : {}),
+    effectSource: input.effectSource,
+    ongoing: input.ongoing,
+    globalEffects: input.globalEffects,
     ...(input.failRounds !== undefined ? { failRounds: input.failRounds } : {}),
     roller: input.roller,
   });
   return rolled.damageRoll === undefined ? { outcomes } : { damageRoll: rolled.damageRoll, outcomes };
+}
+
+export function settleOngoingSaves(
+  c: Campaign, actor: string | undefined, timing: 'target_turn_start' | 'target_turn_end',
+  roller: Roller, globalEffects?: Record<string, CustomEffectDef>, round = c.initiative?.round,
+): string[] {
+  const target = actor === undefined ? undefined : findCharacter(c, actor);
+  if (target === undefined || target.conditions.includes('死亡')) return [];
+  const notes: string[] = [];
+  for (const effect of ongoingEffects(target)) {
+    const save = effect.repeatSave;
+    if (save?.timing !== timing || (round !== undefined && effect.lastSaveRound === round)) continue;
+    const states = (target.activeStates ?? []).filter((state) => state.ongoing?.id === effect.id);
+    const { outcomes } = resolveSaveEffect(c, {
+      targets: [{ name: target.name }], ability: save.ability, dc: save.dc,
+      saveTags: [effect.name, ...states.map((state) => state.name)], globalEffects, roller,
+    });
+    const outcome = outcomes[0];
+    if (outcome?.saved === undefined) continue;
+    if (outcome.saved) removeOngoingEffect(c, target, effect.id);
+    else for (const state of states) state.ongoing!.lastSaveRound = round;
+    const boundary = timing === 'target_turn_start' ? '回合开始' : '回合结束';
+    const line = `${target.name}「${effect.name}」${boundary}${ABILITY_NAMES[save.ability]}豁免 ${outcome.detail} → ${outcome.saved ? '成功，解除' : '失败，持续'}`;
+    notes.push(line);
+    pushLog(c, line);
+  }
+  return notes;
 }

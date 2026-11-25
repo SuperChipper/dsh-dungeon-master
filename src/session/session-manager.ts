@@ -36,6 +36,7 @@ import { IdleEvictor } from './idle-evictor.ts';
 import type { StickerStore, StickerMatchResult } from '../media/sticker-store.ts';
 import { chatKeyOf, planNoteInjection, type NoteHit, type NoteQueryContext, type NotesStore } from '../notes/notes-store.ts';
 import type { MediaReviewCoordinator } from '../features/media-review-coordinator.ts';
+import type { LearnInbox } from '../features/learn-inbox.ts';
 import { boundedRecall, noteRevisionKey, operationQueryTerms, RecallTurnState, toolOperationEvidence } from '../notes/operation-recall.ts';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import {
@@ -464,6 +465,7 @@ export class SessionManager {
   public stickerStore?: StickerStore;
   /** 由 bootstrap 注入的共享笔记库（工具 + 自动召回） */
   public notesStore?: NotesStore;
+  public learnInbox?: LearnInbox;
   /** 笔记注入账本（只记录，不参与排序） */
   public noteMetrics?: NoteMetricsStore;
   /** 笔记相关性打分（llm 服务不可用时缺省，只记账不打分） */

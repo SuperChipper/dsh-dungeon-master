@@ -50,6 +50,7 @@ import { createGatewaySenders } from './senders.ts';
 import { registerGatewayTools } from './media-tools.ts';
 import { startModelWatch } from './model-watch.ts';
 import { wireDndTools } from './dnd-wiring.ts';
+import { wireLearnInbox } from './learn-wiring.ts';
 
 export { dispatchInteraction };
 
@@ -74,6 +75,9 @@ export async function bootstrapGateway(
   manager.notesStore = notesStore;
   // 注入账本：只观察「哪几段真的进了提示词」，先跑一周看分布再谈调权
   if (notesStore !== undefined) manager.noteMetrics = new NoteMetricsStore(undefined, logger);
+
+  const profileDir = resolveProfileDir(ctx.baseUrl);
+  if (profileDir) wireLearnInbox(ctx, manager, config, profileDir, logger);
 
   const dndService = createDndService(config, logger);
   manager.dndService = dndService;

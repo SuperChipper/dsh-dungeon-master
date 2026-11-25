@@ -19,7 +19,7 @@ combatJoinHint,type ToolKit
 } from './shared.ts';
 
 export function registerExploreTools(kit: ToolKit): void {
-  const { deps, service, recordOf, mutate, sendersOf, register } = kit;
+  const { deps, service, manager, recordOf, mutate, sendersOf, register } = kit;
 
   register(
     'dnd_move',
@@ -137,8 +137,8 @@ export function registerExploreTools(kit: ToolKit): void {
     'dnd_map',
     'Send a map to the group as an image. During a fight (initiative running, positions set) it sends the battle map of '
     + 'the fight\'s room: the room\'s terrain (on the module book\'s art when the room has it) with everyone\'s position, '
-    + 'grid coordinates matching dnd_position, hidden monsters left out. Send it once positions are set at the start of a '
-    + 'fight and whenever players ask where things are, not every turn. Outside a fight it sends the exploration map: the '
+    + 'grid coordinates matching dnd_position, hidden monsters left out. If set or terrain confirms that the opening image '
+    + 'was sent, do not send it again. Use this tool when players ask for a map. Outside a fight it sends the exploration map: the '
     + 'book\'s player map with unvisited rooms blacked out, or a schematic when the site has none.',
     {
       caption: { type: 'string', description: 'Optional short text sent with the map.' },
@@ -150,11 +150,15 @@ export function registerExploreTools(kit: ToolKit): void {
       const record = recordOf(exec);
       const { campaign, adventure } = service.require(record.sessionKey);
       const out = join(service.mapDir, `${record.sessionKey.replace(/[^a-zA-Z0-9_-]+/g, '_')}-${Date.now()}.png`);
-      const view = (['battle', 'explore'] as const).find((v) => v === args.view) ?? 'auto';
+      if (args.view === 'explore' && manager.combatAgents?.isChild?.(record.agent)) {
+        throw new Error('战斗代理只发送当前房间的战斗图');
+      }
+      const view = args.view === 'explore' ? 'explore'
+        : args.view === 'battle' || campaign.initiative !== undefined ? 'battle' : 'auto';
       const globalEffects = service.globalEffects();
       const map = await renderPartyMap(campaign, adventure, out, view, { schematic: args.schematic === true, globalEffects })
-        .catch((err: unknown) => { throw new Error(`dnd_map: ${err instanceof Error ? err.message : String(err)}，先 dnd_position terrain 画一张`); });
-      if (map === undefined) throw new Error('dnd_map: 地图渲染需要 sharp，当前环境没装上');
+        .catch((err: unknown) => { throw new Error(`dnd_map: ${err instanceof Error ? err.message : String(err)}`); });
+      if (map === undefined) throw new Error('dnd_map: sharp 渲染器不可用。战斗中可用 dnd_position show text_grid=true 获取备用文字图');
       // 地点、轮次、轮到谁画在图的标题条上；图例、能去哪附在图下面（DM 自己的话放最前）
       const caption = [str(args.caption), mapCaption(campaign, adventure, map.kind, globalEffects)].filter((s) => s !== undefined && s.length > 0).join('\n');
       await deps.sendImage(record, map.path, caption);

@@ -47,6 +47,7 @@ export function wireDndTools(deps: WireDndToolsDeps): void {
       );
     },
     onTurnChange: (record) => dndButtons?.schedule(record),
+    ...(dndButtons === undefined ? {} : { onBattlePlacement: (record) => dndButtons.sendOpeningImage(record) }),
     onCombatStart: (record, field) => {
       const starting = manager.combatAgents?.startAfterReply(record, field);
       if (starting === undefined) return false;
@@ -92,7 +93,12 @@ export function wireDndTools(deps: WireDndToolsDeps): void {
 
   // 不是 QQ 会话的 agent 也不带跑团工具：每个 agent 出现时先全藏，QQ 会话建好记录后再按团的状态放开。
   onHostAgentLifecycle<DshAgent>(ctx, 'agent/created', ({ agent }) => { if (agent !== undefined) toolScope.hideAll(agent); });
-  onHostAgentLifecycle<DshAgent>(ctx, 'agent/disposed', ({ agent }) => { if (agent !== undefined) toolScope.release(agent); });
+  onHostAgentLifecycle<DshAgent>(ctx, 'agent/disposed', ({ agent }) => {
+    if (agent !== undefined) {
+      toolScope.release(agent);
+      manager.combatAgents?.onAgentDisposed(agent);
+    }
+  });
 
   // 插件加载前就活着的 agent 收不到 created
   try {

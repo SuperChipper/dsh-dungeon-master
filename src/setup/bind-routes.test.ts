@@ -21,6 +21,8 @@ import {
   BIND_REFRESH_PATH,
   BIND_STATE_PATH,
   BIND_UNBIND_PATH,
+  BIND_UPDATE_CHECK_PATH,
+  compareSemver,
   formatWindowsExplorerTarget,
   openDirectoryInOs,
   registerBindRoutes,
@@ -1408,5 +1410,71 @@ describe('bind-routes', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('GET update-check：检测新版、命中内存缓存、force=1 强刷以及失败降级', async () => {
+    expect(compareSemver('0.9.1', '0.9.0')).toBeGreaterThan(0);
+    expect(compareSemver('0.9.1', '0.9.1-rc.1')).toBeGreaterThan(0);
+    expect(compareSemver('0.9.0', '0.9.0')).toBe(0);
+    expect(compareSemver('0.8.9', '0.9.0')).toBeLessThan(0);
+
+    const checkLatestVersion = vi.fn<(_pkg: string) => Promise<string>>()
+      .mockResolvedValueOnce('0.9.2')
+      .mockResolvedValueOnce('0.9.3');
+    const { routes } = createHarness({
+      currentVersion: '0.9.1',
+      checkLatestVersion,
+    });
+
+    // 首次请求走远端并判定有更新
+    const res1 = fakeRes();
+    await invoke(routes.get(BIND_UPDATE_CHECK_PATH), fakeReq('GET', { host: '127.0.0.1:3080' }), res1);
+    expect(res1.statusCode).toBe(200);
+    expect(JSON.parse(res1.body)).toMatchObject({
+      currentVersion: '0.9.1',
+      latestVersion: '0.9.2',
+      hasUpdate: true,
+      cached: false,
+    });
+    expect(checkLatestVersion).toHaveBeenCalledTimes(1);
+
+    // 二次请求命中内存缓存，不重复查远端
+    const res2 = fakeRes();
+    await invoke(routes.get(BIND_UPDATE_CHECK_PATH), fakeReq('GET', { host: '127.0.0.1:3080' }), res2);
+    expect(res2.statusCode).toBe(200);
+    expect(JSON.parse(res2.body)).toMatchObject({
+      latestVersion: '0.9.2',
+      hasUpdate: true,
+      cached: true,
+    });
+    expect(checkLatestVersion).toHaveBeenCalledTimes(1);
+
+    // force=1 强制跳过缓存刷新
+    const forceReq = fakeReq('GET', { host: '127.0.0.1:3080' });
+    forceReq.url = `${BIND_UPDATE_CHECK_PATH}?force=1`;
+    const res3 = fakeRes();
+    await invoke(routes.get(BIND_UPDATE_CHECK_PATH), forceReq, res3);
+    expect(res3.statusCode).toBe(200);
+    expect(JSON.parse(res3.body)).toMatchObject({
+      latestVersion: '0.9.3',
+      hasUpdate: true,
+      cached: false,
+    });
+    expect(checkLatestVersion).toHaveBeenCalledTimes(2);
+
+    // 远端失败时静默降级返回 200 + error，不抛 500
+    const { routes: failRoutes } = createHarness({
+      currentVersion: '0.9.1',
+      checkLatestVersion: async () => { throw new Error('network timeout'); },
+    });
+    const res4 = fakeRes();
+    await invoke(failRoutes.get(BIND_UPDATE_CHECK_PATH), fakeReq('GET', { host: '127.0.0.1:3080' }), res4);
+    expect(res4.statusCode).toBe(200);
+    expect(JSON.parse(res4.body)).toMatchObject({
+      currentVersion: '0.9.1',
+      hasUpdate: false,
+      cached: false,
+      error: 'network timeout',
+    });
   });
 });

@@ -8,7 +8,8 @@ joinInitiative,isDmDelegated,nextTurn,skipSurprised,requireCharacter,
 requireInitiative,startInitiative,spendReaction,useResource
 } from '../campaign.ts';
 import { combatParticipantCard } from '../combat-context.ts';
-import { ensureTurnState, recordTurnSpellCast } from '../conditions.ts';
+import { assertTurnActionAllowed, ensureTurnState, hasCondition, recordTurnSpellCast } from '../conditions.ts';
+import { settleOngoingSaves } from '../save-effect.ts';
 import { findRoom,resolveRoom } from '../dungeon.ts';
 import {
 type AreaRequest,
@@ -39,7 +40,7 @@ strList,
 initiativeBonusArg,fightRoom,
 battlemapHint,
 positionNote,
-orderLine,combatTurnPrompt,combatLedgerSuffix,type ToolKit
+orderLine,combatTurnPrompt,combatLedgerSuffix,type Exec,type ToolKit
 } from './shared.ts';
 
 export function registerCombatTools(kit: ToolKit): void {
@@ -121,6 +122,12 @@ export function registerCombatTools(kit: ToolKit): void {
         });
         const { skipped } = skipSurprised(c);
         const state = requireInitiative(c);
+        const effects = skipped.flatMap((actor) => [
+          ...settleOngoingSaves(c, actor, 'target_turn_start', service.roller, service.globalEffects(), 1),
+          ...settleOngoingSaves(c, actor, 'target_turn_end', service.roller, service.globalEffects(), 1),
+        ]);
+        effects.push(...settleOngoingSaves(c, state.order[state.turn]?.name, 'target_turn_start', service.roller, service.globalEffects()));
+        const effectsNote = effects.length === 0 ? '' : `\n【开战状态结算】\n${effects.join('\n')}`;
         const rehearsalNote = state.rehearsal ? '\n【演练模式】已保存演练前快照；演练期间的地形、伤害与消耗在 dnd_initiative end 时自动恢复，不污染真实地图与账本。' : '';
         const surpriseNote = surprised.length === 0 ? ''
           : `\n【突袭】受惊的人第 1 轮整回合由工具跳过，跳过之前也不能反应：${surprised.join('、')}。不用叫他们点结束回合。`
@@ -131,7 +138,7 @@ export function registerCombatTools(kit: ToolKit): void {
         if (!delegated) turnChanged();
         const unused = Object.keys(initiativeBonusArg(args.bonus)).filter((n) => !rolls.some((r) => r.name === n));
         const warn = unused.length > 0 ? `\n【DM】bonus 里这几个名字不在参战者里，没算进去：${unused.join('、')}` : '';
-        return `先攻：\n${rolls.map((r, i) => `${i + 1}. ${r.name} ${r.detail}`).join('\n')}\n${delegated ? '【战斗委派】回复只叙述开场并停下。回复结束后战斗代理自动接手场地图、摆位和当前回合；不要再用主 DM 结算攻击或 next。' : field}${rehearsalNote}${surpriseNote}\n第 ${state.round} 轮，${delegated ? `当前 ${state.order[state.turn]!.name}` : combatTurnPrompt(c, state.order[state.turn]!.name, { recentSenders: sendersOf(exec), globalEffects: service.globalEffects() })}${away}${warn}`;
+        return `先攻：\n${rolls.map((r, i) => `${i + 1}. ${r.name} ${r.detail}`).join('\n')}\n${delegated ? '【战斗委派】回复只叙述开场并停下。回复结束后战斗代理自动接手场地图、摆位和当前回合；不要再用主 DM 结算攻击或 next。' : field}${rehearsalNote}${surpriseNote}${effectsNote}\n第 ${state.round} 轮，${delegated ? `当前 ${state.order[state.turn]!.name}` : combatTurnPrompt(c, state.order[state.turn]!.name, { recentSenders: sendersOf(exec), globalEffects: service.globalEffects() })}${away}${warn}`;
       }
       if (action === 'join') {
         assertNoPending(c, '加入战斗');
@@ -224,6 +231,7 @@ export function registerCombatTools(kit: ToolKit): void {
     + 'set: place combatants at the start of a fight, when someone joins or enters the room, or for forced movement (shove, '
     + 'teleport: no movement cost, no opportunity attack). For fast opening setup, pass `formation` ({ entry?, front:[...], mid:[...], back:[...], auto_rest?, enemies? }) '
     + 'together with enemy `placements` (x/y or `near`) — the engine automatically arranges front/mid/back ranks facing the enemies around walls & doors without manual coordinate math! '
+    + 'Set formation.spacing to compact / normal / spread for a 5 / 10 / 15 ft preferred gap; enemies.spacing is independent. For a single correction use set with name and x/y or near. '
     + '`near` places someone next to a door, landmark or creature without counting cells; `rank` ("front"/"mid"/"back") on a placement item also auto-ranks it; mark=true places a landmark or an uncarded creature (captive). '
     + 'move / swap: one creature moves on its own turn (or swaps cells with a consenting ally via swap="队友名" or action="swap"). Prefer intent over coordinates: `to` a creature (ends adjacent), a '
     + 'door, the corridor outside, an obstacle; `away_from` a creature; `swap` an ally (approaches an adjacent free cell if >5 ft away, then swaps cells once the ally\'s player consents — pass `ally_declared_by` if the ally\'s player already agreed in chat, otherwise the tool pauses and opens a 0-reaction consent button window); `feet` caps the distance; `keep_adjacent` '
@@ -233,7 +241,7 @@ export function registerCombatTools(kit: ToolKit): void {
     + 'Never bypass this with set; set is only for initial placement, correction or actual forced movement. '
     + 'area: before an area spell or breath (fireball, hypnotic pattern, lightning bolt), list who the '
     + 'shape covers so the placement is checked on the grid instead of guessed; tell the players honestly if an ally is in it. '
-    + 'show: everyone\'s positions; with `from`, distances from that creature. remove: drop a mark '
+    + 'show: everyone\'s positions; with `from`, distances from that creature. Use dnd_map for an image; text_grid=true requests a character grid only when needed. remove: drop a mark '
     + 'or placement (never remove someone who just stepped outside: move them `to` the corridor outside). '
     + 'zone / remove_zone: place or clear persistent battlefield zones (黑暗术, 毒雾, 云雾术, 蛛网术, 荆棘丛生, 月华之光, 火墙术 or custom ground hazards); pass `spend` (e.g. "4环法术位") to spend the spell slot atomically; rendered on /dnd status map, integrated with move/nextTurn saves & obscurement, and auto-cleared on round expiry, concentration break or combat end. '
     + 'clear_terrain: clear an improvised/temporary arena map for the room, restoring the module\'s authored map if one exists.',
@@ -285,7 +293,7 @@ export function registerCombatTools(kit: ToolKit): void {
             x: { type: 'integer' },
             y: { type: 'integer' },
             z: { type: 'integer', description: 'Altitude in feet (multiple of 5, default 0 ground).' },
-            near: { type: 'string', description: 'Instead of x/y: nearest free cell to this door / landmark / creature, in list order.' },
+            near: { type: 'string', description: 'Instead of x/y: use a nearby free cell. With rank, use this door, landmark or creature as the entry anchor for this group.' },
             rank: { type: 'string', enum: ['front', 'mid', 'back', '前排', '中排', '后排'], description: 'Instead of x/y: auto-place in front / mid / back rank relative to opposing forces.' },
             mark: { type: 'boolean', description: 'Not a character sheet: landmark or uncarded captive (needs x/y).' },
           },
@@ -300,6 +308,7 @@ export function registerCombatTools(kit: ToolKit): void {
           entry: { type: 'string', description: 'Optional party entry door / landmark name (auto-inferred from room entrance if omitted).' },
           x: { type: 'integer', description: 'Optional party anchor x cell.' },
           y: { type: 'integer', description: 'Optional party anchor y cell.' },
+          spacing: { type: 'string', enum: ['compact', 'normal', 'spread'], description: 'Preferred allied spacing: compact 5 ft, normal 10 ft (default), spread 15 ft. Tight rooms may force a smaller gap.' },
           front: { type: 'array', items: { type: 'string' }, description: 'Frontline party members (e.g. fighters, paladins, barbarians).' },
           mid: { type: 'array', items: { type: 'string' }, description: 'Midline party members (e.g. bards, clerics, rogues, monks).' },
           back: { type: 'array', items: { type: 'string' }, description: 'Backline party members (e.g. wizards, sorcerers, warlocks, archers).' },
@@ -311,6 +320,7 @@ export function registerCombatTools(kit: ToolKit): void {
               entry: { type: 'string', description: 'Optional enemy anchor landmark / door name.' },
               x: { type: 'integer' },
               y: { type: 'integer' },
+              spacing: { type: 'string', enum: ['compact', 'normal', 'spread'], description: 'Preferred enemy spacing: compact 5 ft, normal 10 ft (default), spread 15 ft.' },
               front: { type: 'array', items: { type: 'string' } },
               mid: { type: 'array', items: { type: 'string' } },
               back: { type: 'array', items: { type: 'string' } },
@@ -321,8 +331,9 @@ export function registerCombatTools(kit: ToolKit): void {
         additionalProperties: false,
       },
       name: { type: 'string', description: 'For move / remove: creature or mark name. For zone / remove_zone: zone name (e.g. "黑暗术", "毒雾", "蛛网术", "荆棘丛生", "月华之光").' },
-      x: { type: 'integer', description: 'For move / area / zone: grid x cell.' },
-      y: { type: 'integer', description: 'For move / area / zone: grid y cell.' },
+      x: { type: 'integer', description: 'For set / move / area / zone: grid x cell.' },
+      y: { type: 'integer', description: 'For set / move / area / zone: grid y cell.' },
+      near: { type: 'string', description: 'For single-creature set with name: use a nearby free cell by this door, landmark or creature instead of x/y.' },
       z: { type: 'integer', description: 'For move: target flying altitude in feet (multiple of 5, e.g. 15 or 30; 0 to land).' },
       radius: { type: 'integer', description: 'For zone (sphere): radius in feet (multiple of 5, e.g. 15 for 黑暗术, 20 for 毒雾/云雾术).' },
       w: { type: 'integer', description: 'For zone (rect): width in 5-ft cells.' },
@@ -357,6 +368,7 @@ export function registerCombatTools(kit: ToolKit): void {
       enter_hazards: { type: 'boolean', description: 'For move: allow taking a direct path straight through damaging/restraining zones or hostile auras instead of automatically detouring around them within available movement.' },
       ignore_state_mods: { type: 'boolean', description: 'For move: bypass automatic condition restrictions (speed=0, prone auto-stand, fear source block) when a special feature/immunity overrides standard 5e rules.' },
       from: { type: 'string', description: 'For show: list distances from this creature.' },
+      text_grid: { type: 'boolean', description: 'For show: include a player-visible character grid when an image cannot be sent or players request a text map.' },
       declared_by: { type: 'string', description: 'For move / swap of a PC: member id of the player who declared it (the #U number, pass "U3").' },
       ally_declared_by: { type: 'string', description: 'For move with `swap` (or action="swap") when swapping with another player\'s PC: member id (#U) of that teammate\'s player IF they already explicitly agreed to swap in recent chat. Omit to pause and open an interactive swap-consent button window.' },
       ally_dm_override: { type: 'boolean', description: 'For swap: true ONLY when the swapped teammate\'s player explicitly delegated control of their PC (must also pass `ally_declared_by` of the delegating player).' },
@@ -365,8 +377,21 @@ export function registerCombatTools(kit: ToolKit): void {
       dm_override: { type: 'boolean', description: 'For move: a player explicitly delegated this PC\'s move. Say so in the reply.' },
     },
     ['action'],
-    (args, exec) => mutate(exec, (c, adventure) => {
+    async (args, exec) => {
       const action = String(args.action);
+      const text = position(action, args, exec);
+      if (action !== 'set' && action !== 'terrain' || deps.onBattlePlacement === undefined) return text;
+      try {
+        return await deps.onBattlePlacement(recordOf(exec)) ? `${text}\n开战图片已发给玩家。` : text;
+      } catch (err) {
+        deps.logger.warn(`im-qqbot: 开战图发送失败: ${String(err)}`);
+        return text;
+      }
+    },
+  );
+
+  function position(action: string, args: Record<string, unknown>, exec: Exec): string {
+    return mutate(exec, (c, adventure) => {
       const graph = roomGraph(adventure);
       const roomName = (id: string): string => findRoom(graph, id)?.name ?? id;
       if (action === 'terrain') {
@@ -378,8 +403,6 @@ export function registerCombatTools(kit: ToolKit): void {
         const lines = [`已存 ${roomName(room)} 的场地图（再进这间沿用）。${terrainLine(map)}`];
         if (unknown.length > 0) lines.push(`【DM】to 里的房间 id 不认识：${unknown.join('、')}，用 dnd_lookup 查准再画一次。`);
         if (misplaced.length > 0) lines.push(`【DM】这些人现在站在墙里或障碍上：${misplaced.join('、')}，用 set 挪出来。`);
-        const grid = c.initiative === undefined ? undefined : battleGridLines(c, roomName);
-        if (grid !== undefined) lines.push('', ...grid);
         return lines.join('\n');
       }
       if (action === 'clear_terrain') {
@@ -434,6 +457,11 @@ export function registerCombatTools(kit: ToolKit): void {
         const spendKey = str(args.spend);
         if (spendKey !== undefined && casterCh === undefined) {
           throw new Error('dnd_position zone 传 spend 扣减法术位时必须同时指定 caster="施法者角色名"');
+        }
+        if (casterCh !== undefined) {
+          const turn = ensureTurnState(c);
+          assertTurnActionAllowed(turn, casterCh, 'action');
+          if (turn?.actor === casterCh.name && hasCondition(casterCh, '迟缓术')) turn.actionUsed ??= zoneName;
         }
         const spent = spendKey !== undefined && casterCh !== undefined ? useResource(c, casterCh.name, spendKey) : undefined;
         let spellWarn: string | undefined;
@@ -537,7 +565,16 @@ export function registerCombatTools(kit: ToolKit): void {
       if (action === 'set') {
         assertNoPending(c, '重新摆位');
         const formation = parseFormationInput(args.formation);
-        const notes = setPositions(c, parsePlacements(args.placements, formation !== undefined), formation);
+        const name = str(args.name);
+        const hasSingle = name !== undefined || args.x !== undefined || args.y !== undefined || args.near !== undefined || args.z !== undefined;
+        if (hasSingle && (name === undefined || args.placements !== undefined)) {
+          throw new Error('单人摆位用 name + x/y 或 near，与 placements 二选一');
+        }
+        const single = name === undefined ? undefined : {
+          name, x: args.x, y: args.y, near: args.near,
+          z: args.z ?? cellOf(c, requireCharacter(c, name))?.z,
+        };
+        const notes = setPositions(c, parsePlacements(single === undefined ? args.placements : [single], formation !== undefined), formation);
         return [...battleLines(c, roomName), ...notes].join('\n');
       }
       if (action === 'move' || action === 'swap') {
@@ -620,10 +657,9 @@ export function registerCombatTools(kit: ToolKit): void {
       const from = str(args.from);
       if (from !== undefined) lines.push(distancesFrom(c, from));
       if (lines.length === 0) return '还没有人摆位，用 dnd_position set。';
-      // 玩家要看图时原样贴这段：手画的坐标轴会错位、漏行，藏起来的怪也容易顺手画进去
-      const grid = battleGridLines(c, roomName, (ch) => !hiddenFromPlayers(ch));
-      if (grid !== undefined) lines.push('', '玩家视角示意图（要在回复里画就原样贴下面这段，含 ``` 那两行；藏起来的怪已去掉）：', ...grid);
+      const grid = args.text_grid === true ? battleGridLines(c, roomName, (ch) => !hiddenFromPlayers(ch)) : undefined;
+      if (grid !== undefined) lines.push('', '玩家视角示意图（原样发送，含代码块围栏）：', ...grid);
       return lines.join('\n');
-    }),
-  );
+    });
+  }
 }

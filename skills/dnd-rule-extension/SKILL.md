@@ -9,7 +9,7 @@ metadata:
 
 `dsh-dungeon-master` 将攻击修正、命中附伤、豁免加值、光环、治疗加成、2.5D 飞行与持续地形统一交由确定性引擎结算，避免依赖模型在长对话中凭 `notes` 文本回忆数值。
 
-遇到内置表尚未收录的扩展规则（如魔兽 5e 职业、塔莎/珊娜萨扩展、个人专武「段云」、宿命被动「风暴遗誓」「冥河炉心」等）时，**默认走路径一（通过 `dnd_rule` 零重启热注册）**；仅当机制引入全新状态机阶段、现有 6 类声明式钩子与 `BattleZone` 均无法表达且经部署者授权修改源码时，才走路径二。
+遇到内置表尚未收录的扩展规则（如魔兽 5e 职业、塔莎/珊娜萨扩展、个人专武「段云」、宿命被动「风暴遗誓」「冥河炉心」等）时，**默认走路径一（通过 `dnd_rule` 零重启热注册）**；仅当机制引入全新状态机阶段、现有声明式钩子与 `BattleZone` 均无法表达且经部署者授权修改源码时，才走路径二。
 
 ---
 
@@ -49,7 +49,7 @@ metadata:
 - **可用变量**：`level`、`class_level`（兼职时结合顶层 `class_filter` 解析对应职业等级）、`prof`、`slot_level`（无环位时默认 `1`）、`str`..`cha`、`str_mod`..`cha_mod`、`hp`、`max_hp`、`target_hp`、`target_max_hp`。
 - **运算符与函数**：`+`、`-`、`*`、`/`、括号 `(...)`、`min(a, b, ...)`、`max(a, b, ...)`、`floor(x)`、`ceil(x)`、`abs(x)`。
 
-### 第 3 步：映射到 6 类钩子
+### 第 3 步：选结算钩子
 顶层可选标记：`passive: true`（标记为常驻被动——同时支持从 `spells` 的特性/物品条目及非否定语境 `notes` 安全识别，可施放法术勿设）和 `class_filter`（如 `"游荡者|rogue"`，用于多职下计算 `class_level`）。
 
 | 钩子字段 | 核心配置项 | 典型场景 |
@@ -58,10 +58,13 @@ metadata:
 | `hit_rider` | `damage_dice`, `scaling_dice` (`{count_formula, sides}`), `weapon_die`, `bonus_formula`, `damage_type`（如 `"闪电"` 或 `"武器同型"`）, `marked_target_only`, `weapon_only`, `melee_only`, `ranged_only`, `finesse_or_ranged_only`, `str_attack_only`, `advantage_only`, `no_disadvantage`, `target_below_max_hp`, `target_half_hp`, `target_conditions`, `ally_adjacent_to_target`, `advantage_or_ally_adjacent`, `first_round_only`, `crit_only`, `own_turn_only`, `requires_states`, `once_per_turn` | 元素附伤、巨兽杀手/巨像屠夫（`target_below_max_hp` + `once_per_turn`）、偷袭（`scaling_dice` + `advantage_or_ally_adjacent`）、凶蛮攻击（`weapon_die` + `crit_only`）、优势触发附伤（`advantage_only`）、印记类锁定附伤（`marked_target_only`） |
 | `defense_mod` | `ac_bonus`（整数或公式）, `resistant`, `immune`, `vulnerable`, `attacker_advantage` | 护甲增益、元素抗性/免疫（如 `["闪电", "雷鸣"]` 或 `["*"]`） |
 | `save_mod` | `abilities`（`["con", "wis"]` 或 `"all"`）, `bonus_formula`, `bonus_dice`, `advantage`, `vs_tags`（如 `["concentration", "毒素"]`） | 专注豁免优势、特定伤害/状态豁免加成 |
+| `ongoing` | `conditions`、`requires_condition`、`repeat_save:{timing,ability}`、`end_on_damage`、`wake_as_action`、`zero_speed` | 指定目标的回合开始/结束复豁免、受伤解控、用动作唤醒、速度归零 |
 | `aura` | `radius`, `radius_at_18`, `target`（`"allies"`/`"enemies"`/`"all"`）, `include_self`, `save_bonus_formula`, `slow_factor`, `hazard`（`{damage_dice, upcast_per_slot, base_slot, damage_type, save_ability, half_on_save}`） | 圣武士/魔兽光环、萨满图腾光环、持续伤害减速光环 |
 | `heal_mod` | `bonus_formula`, `self_heal_on_other_formula`, `pool_formula`, `cap_at_half_max_hp` | 治疗量加成、治疗他人自愈、固定治疗池 |
 
 ### 第 4 步：常用注册示例
+
+有首次豁免的减益用 `dnd_check`，传 `spell_name`、目标、豁免属性和 `dc`。引擎把该次 DC 和解除规则随失败状态保存。用 `ongoing: { conditions: ["中毒"], repeat_save: { timing: "target_turn_end", ability: "con" } }` 可以让目标在回合末自动掷体质豁免。若规则在效果持续时更新，已经施加的解除规则继续生效，后续施加使用新定义。直接挂载带复豁免的效果时可传原始 `save_dc`。带 `wake_as_action` 的效果可用 `dnd_apply` 的 `target` 和 `wake_by` 唤醒。
 
 #### 示例 1：个人宿命被动（每回合首击闪电附伤 + 双抗 + 专注优势）
 ```json

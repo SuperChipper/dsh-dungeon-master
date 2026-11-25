@@ -205,6 +205,9 @@ describe('战斗代理路由和同一份团档', () => {
     expect(h.guards[0]!({ name: 'pwsh' })).toContain('只能');
     expect(h.guards[0]!({ name: 'subagent' })).toContain('只能');
     expect(h.guards[0]!({ name: 'dnd_initiative', arguments: { action: 'start' } })).toContain('不可重开');
+    expect(COMBAT_TOOLS).toContain('dnd_map');
+    expect(h.guards[0]!({ name: 'dnd_map', arguments: { view: 'battle' } })).toBeUndefined();
+    expect(h.guards[0]!({ name: 'dnd_map', arguments: { view: 'explore' } })).toContain('当前房间的战斗图');
     expect(h.guards[0]!({ name: 'dnd_rule', arguments: { action: 'define' } })).toContain('仅可查询');
     expect(h.guards[0]!({ name: 'dnd_rule', arguments: { action: 'list' } })).toBeUndefined();
     await h.router.dispose();
@@ -794,4 +797,106 @@ it('pauseForSessionEnd 串行取消并释放战斗子代理、落盘 paused 状�
   expect(h.service.saved(h.key)!.campaign.initiative).toBeDefined();
   // 由 SessionManager.endDndSession 统一发送单次合并消息，pauseForSessionEnd 本身不调用 followup
   expect(h.main.agent.followup).not.toHaveBeenCalled();
+});
+
+it('重载恢复时若旧子会话已被外部（如 Web GUI）占用，保留主模型新建子会话延续对话而不误触发冷却或切换备用通道', async () => {
+  const h = harness();
+  h.setFallback({ backup: { provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' } });
+  const child1 = await h.router.select(h.main);
+  (child1.agent.session.events as unknown[]).push(
+    { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '我施放缓慢术' }] } },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '五名敌人陷入缓慢。' }] } } },
+  );
+  await h.router.dispose();
+
+  const restored = h.createRouter();
+  h.agents.get.mockImplementation((id: string) => (id === child1.sessionId ? child1.agent : undefined));
+  const next = await restored.select(h.main);
+  expect(h.agents.resume).not.toHaveBeenCalled();
+  expect(h.agents.create).toHaveBeenCalledTimes(2);
+  expect(next.sessionId).not.toBe(child1.sessionId);
+  const createOpts = h.agents.create.mock.calls[1]![0] as { agentOptions?: { provider?: string; model?: string; reasoningEffort?: string } };
+  expect(createOpts.agentOptions).toMatchObject({ provider: 'opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high' });
+  expect(h.prompts.at(-1)!.text).toContain('五名敌人陷入缓慢。');
+  expect(restored.report(h.key)).not.toContain('已回退自');
+
+  // 主通道未被误冷却：下一场新战仍直连主模型
+  h.service.store.update(h.key, (c) => endInitiative(c));
+  await restored.select(h.main);
+  h.service.store.update(h.key, (c) => startInitiative(c, () => 12));
+  await restored.select(h.main);
+  const thirdOpts = h.agents.create.mock.calls[2]![0] as { agentOptions?: { provider?: string; model?: string } };
+  expect(thirdOpts.agentOptions).toMatchObject({ provider: 'opencode-go', model: 'deepseek-v4.1-flash' });
+  await restored.dispose();
+});
+
+it('重载恢复时若 resume 报 SessionAlreadyOwnedError，不切备用源也不冷却主通道，带 lastNarration 新建子会话', async () => {
+  const h = harness();
+  h.setFallback({ backup: { provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' } });
+  const child1 = await h.router.select(h.main);
+  h.router.observe(child1, {
+    type: 'assistant/message',
+    seq: 5,
+    data: {
+      message: {
+        source: { provider: 'opencode-go', model: 'deepseek-v4.1-flash' },
+        content: [{ type: 'text', text: 'Kriv 拨响琴弦，五名敌人被缓慢术罩住。' }],
+      },
+    },
+  });
+  await h.router.dispose();
+
+  const restored = h.createRouter();
+  const ownedErr = Object.assign(new Error(`session "${child1.sessionId}" is already owned by another writer`), {
+    name: 'SessionAlreadyOwnedError',
+  });
+  h.agents.resume.mockRejectedValueOnce(ownedErr);
+  const next = await restored.select(h.main);
+  expect(h.agents.resume).toHaveBeenCalledOnce();
+  expect(h.agents.create).toHaveBeenCalledTimes(2);
+  expect(next.sessionId).not.toBe(child1.sessionId);
+  const createOpts = h.agents.create.mock.calls[1]![0] as { agentOptions?: { provider?: string; model?: string; reasoningEffort?: string } };
+  expect(createOpts.agentOptions).toMatchObject({ provider: 'opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'high' });
+  expect(h.prompts.at(-1)!.text).toContain('Kriv 拨响琴弦，五名敌人被缓慢术罩住。');
+  expect(restored.report(h.key)).not.toContain('已回退自');
+  await restored.dispose();
+});
+
+it('重载恢复时若 resume 遇到真正的模型/鉴权报错，仍正常回退到备用通道', async () => {
+  const h = harness();
+  h.setFallback({ backup: { provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' } });
+  const child1 = await h.router.select(h.main);
+  await h.router.dispose();
+
+  const restored = h.createRouter();
+  h.agents.resume.mockRejectedValueOnce(new Error('401 Unauthorized'));
+  const next = await restored.select(h.main);
+  expect(h.agents.resume).toHaveBeenCalledOnce();
+  expect(h.agents.create).toHaveBeenCalledTimes(2);
+  expect(next.sessionId).not.toBe(child1.sessionId);
+  const createOpts = h.agents.create.mock.calls[1]![0] as { agentOptions?: { provider?: string; model?: string } };
+  expect(createOpts.agentOptions).toMatchObject({ provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' });
+  expect(restored.report(h.key)).toContain('已回退自：opencode-go/deepseek-v4.1-flash');
+  await restored.dispose();
+});
+
+it('onAgentDisposed 解除外部释放导致的悬空绑定并允许下次接回，正常 finish/dispose 不误报', async () => {
+  const h = harness();
+  const child1 = await h.router.select(h.main);
+  h.router.onAgentDisposed(child1.agent);
+  expect(h.router.current(h.key)).toBeUndefined();
+  expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('战斗子代理被外部释放'));
+
+  const child2 = await h.router.select(h.main);
+  expect(child2.sessionId).toBe(child1.sessionId);
+  expect(h.agents.resume).toHaveBeenCalledOnce();
+
+  // 正常停战释放与销毁不应再触发外部释放警告
+  h.logger.warn.mockClear();
+  h.service.store.update(h.key, (c) => endInitiative(c));
+  h.router.observe(child2, { type: 'turn/end', seq: 1, data: { reason: { kind: 'completed' } } });
+  await vi.waitFor(() => expect(h.main.agent.followup).toHaveBeenCalledOnce());
+  h.router.onAgentDisposed(child2.agent);
+  expect(h.logger.warn).not.toHaveBeenCalled();
+  await h.router.dispose();
 });

@@ -115,8 +115,10 @@ function formatSize(bytes: number): string {
 
 // ── SSRF 防护：阻断解析到私有/保留地址的下载 ──
 
-const PRIVATE_RANGES: Array<[netmask: bigint, prefix: number]> = [
+const IPV4_PRIVATE_RANGES: Array<[netmask: bigint, prefix: number]> = [
+  [0x00000000n, 8], // 0.0.0.0/8
   [0x0A000000n, 8], // 10.0.0.0/8
+  [0x64400000n, 10], // 100.64.0.0/10 (CGNAT)
   [0xAC100000n, 12], // 172.16.0.0/12
   [0xC0A80000n, 16], // 192.168.0.0/16
   [0x7F000000n, 8], // 127.0.0.0/8
@@ -124,23 +126,142 @@ const PRIVATE_RANGES: Array<[netmask: bigint, prefix: number]> = [
   [0xE0000000n, 4], // 224.0.0.0/4 (multicast)
 ];
 
-function ipToBigInt(ip: string): bigint {
-  return ip.split('.').reduce((acc, octet) => (acc << 8n) | BigInt(Number(octet)), 0n);
+const IPV6_PRIVATE_RANGES: Array<[netmask: bigint, prefix: number]> = [
+  [0xFC00n << 112n, 7], // fc00::/7 unique local
+  [0xFE80n << 112n, 10], // fe80::/10 link local
+  [0xFF00n << 112n, 8], // ff00::/8 multicast
+];
+
+/** 解析 IPv4 为整数；非法返回 undefined */
+function ipv4ToBigInt(ip: string): bigint | undefined {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return undefined;
+  let value = 0n;
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return undefined;
+    const octet = Number(part);
+    if (octet > 255) return undefined;
+    value = (value << 8n) | BigInt(octet);
+  }
+  return value;
 }
 
-function isPrivateIP(ip: string): boolean {
-  const val = ipToBigInt(ip);
-  return PRIVATE_RANGES.some(
-    ([mask, prefix]) => (val >> (32n - BigInt(prefix))) === (mask >> (32n - BigInt(prefix))),
-  );
+/** 解析 IPv6（含 :: 压缩与内嵌 IPv4）为整数；非法返回 undefined */
+function ipv6ToBigInt(ip: string): bigint | undefined {
+  const zoneIndex = ip.indexOf('%');
+  const addr = zoneIndex >= 0 ? ip.slice(0, zoneIndex) : ip;
+  const halves = addr.split('::');
+  if (halves.length > 2) return undefined;
+
+  const parseGroups = (text: string): number[] | undefined => {
+    if (text === '') return [];
+    const groups: number[] = [];
+    for (const piece of text.split(':')) {
+      if (piece.includes('.')) {
+        const embedded = ipv4ToBigInt(piece);
+        if (embedded === undefined) return undefined;
+        groups.push(Number(embedded >> 16n), Number(embedded & 0xFFFFn));
+        continue;
+      }
+      if (!/^[0-9a-fA-F]{1,4}$/.test(piece)) return undefined;
+      groups.push(Number.parseInt(piece, 16));
+    }
+    return groups;
+  };
+
+  const [headText = '', tailText] = halves;
+  const head = parseGroups(headText);
+  const tail = tailText === undefined ? undefined : parseGroups(tailText);
+  if (head === undefined || (halves.length === 2 && tail === undefined)) return undefined;
+
+  let groups: number[];
+  if (halves.length === 1) {
+    if (head.length !== 8) return undefined;
+    groups = head;
+  } else {
+    const filler = 8 - head.length - (tail as number[]).length;
+    if (filler < 0) return undefined;
+    groups = [...head, ...new Array<number>(filler).fill(0), ...(tail as number[])];
+  }
+
+  let value = 0n;
+  for (const group of groups) value = (value << 16n) | BigInt(group);
+  return value;
+}
+
+function inRanges(value: bigint, ranges: Array<[netmask: bigint, prefix: number]>, bits: bigint): boolean {
+  return ranges.some(([mask, prefix]) => {
+    const shift = bits - BigInt(prefix);
+    return (value >> shift) === (mask >> shift);
+  });
+}
+
+/** 单个地址是否属于内网/保留段（同时覆盖 IPv4 与 IPv6） */
+export function isPrivateAddress(address: string): boolean {
+  if (!address.includes(':')) {
+    const value = ipv4ToBigInt(address);
+    return value !== undefined && inRanges(value, IPV4_PRIVATE_RANGES, 32n);
+  }
+  const value = ipv6ToBigInt(address);
+  if (value === undefined) return false;
+  if (value === 0n || value === 1n) return true; // :: 与 ::1
+  // IPv4-mapped / IPv4-compatible（::ffff:10.0.0.1 之类）按内嵌 IPv4 判定
+  if (value >> 32n === 0n) {
+    return inRanges(value & 0xFFFFFFFFn, IPV4_PRIVATE_RANGES, 32n);
+  }
+  if (value >> 32n === 0xFFFFn) {
+    // ::ffff:0:0/96 IPv4-mapped
+    return inRanges(value & 0xFFFFFFFFn, IPV4_PRIVATE_RANGES, 32n);
+  }
+  return inRanges(value, IPV6_PRIVATE_RANGES, 128n);
+}
+
+/** 解析器注入点，便于测试替换（默认走 Node 的内置实现） */
+export interface HostResolver {
+  lookup: (hostname: string) => Promise<string[]>;
+  resolve4: (hostname: string) => Promise<string[]>;
+  resolve6: (hostname: string) => Promise<string[]>;
+}
+
+export const nodeHostResolver: HostResolver = {
+  lookup: async (hostname) => {
+    const results = await dns.promises.lookup(hostname, { all: true, verbatim: true });
+    return results.map((entry) => entry.address);
+  },
+  resolve4: (hostname) => dns.promises.resolve4(hostname),
+  resolve6: (hostname) => dns.promises.resolve6(hostname),
+};
+
+/**
+ * 解析 hostname 的全部地址。
+ *
+ * 先用系统解析器（GetAddrInfo）：它带 Windows 缓存、NRPT 与重试，和浏览器/curl 走同一条路，
+ * 不会被链路本地 DNS 服务器抖动拖死；只有在它拿不到结果时才回退到 c-ares 的 A/AAAA 查询。
+ * 历史 bug：只调 dns.promises.resolve4（c-ares 直连 fe80::1 这类链路本地 DNS），一旦超时
+ * 就返回空数组并抛「DNS resolution failed」，图片明明能下载却报 DNS 失败。
+ */
+export async function resolveHostAddresses(
+  hostname: string,
+  resolver: HostResolver = nodeHostResolver,
+): Promise<string[]> {
+  const viaSystem = await resolver.lookup(hostname).catch(() => [] as string[]);
+  if (viaSystem.length > 0) return viaSystem;
+  const [v4, v6] = await Promise.all([
+    resolver.resolve4(hostname).catch(() => [] as string[]),
+    resolver.resolve6(hostname).catch(() => [] as string[]),
+  ]);
+  return [...v4, ...v6];
 }
 
 /** 解析 hostname 并阻断指向私有/内网地址的 URL（SSRF 防护） */
-async function assertSafeHostname(hostname: string): Promise<void> {
-  const addresses = await dns.promises.resolve4(hostname).catch(() => []);
+export async function assertSafeHostname(
+  hostname: string,
+  resolver: HostResolver = nodeHostResolver,
+): Promise<void> {
+  const addresses = await resolveHostAddresses(hostname, resolver);
   if (addresses.length === 0) throw new Error(`DNS resolution failed: ${hostname}`);
   for (const addr of addresses) {
-    if (isPrivateIP(addr)) throw new Error(`SSRF blocked: ${hostname} resolves to private IP ${addr}`);
+    if (isPrivateAddress(addr)) throw new Error(`SSRF blocked: ${hostname} resolves to private IP ${addr}`);
   }
 }
 

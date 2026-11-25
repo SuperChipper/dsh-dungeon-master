@@ -28,6 +28,9 @@ export const BIND_PERSONAS_PATH = '/qqbot/im-qqbot/personas';
 /** 在宿主系统文件管理器打开当前人设目录 */
 export const BIND_PERSONAS_OPEN_PATH = '/qqbot/im-qqbot/personas/open';
 
+/** 检查插件是否有新版本（只读查询 npm registry，带内存缓存） */
+export const BIND_UPDATE_CHECK_PATH = '/qqbot/im-qqbot/update-check';
+
 /** 线上协议（HTTP 路由序列化形态） */
 export type BindStateWire =
   | { phase: 'starting' }
@@ -65,5 +68,16 @@ export interface PersonaCreateResponse {
   filePath?: string;
   dir?: string;
   message?: string;
+  error?: string;
+}
+
+export interface UpdateCheckResponse {
+  packageName: string;
+  currentVersion: string;
+  latestVersion?: string;
+  hasUpdate: boolean;
+  releaseUrl: string;
+  checkedAt: number;
+  cached: boolean;
   error?: string;
 }

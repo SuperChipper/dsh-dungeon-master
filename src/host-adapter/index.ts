@@ -163,6 +163,14 @@ export function onHostToolsExecute<TExec = unknown, TResult = unknown>(
   registerHostEvent(ctx, 'tools/execute', handler as (...args: unknown[]) => unknown);
 }
 
+/** Observe the final canonical outcome, including PTC sub-dispatches. */
+export function onHostToolsResult<TExec = unknown, TResult = unknown>(
+  ctx: Context,
+  handler: (exec: TExec, result: TResult) => void,
+): void {
+  registerHostEvent(ctx, 'tools/result', handler as (...args: unknown[]) => unknown, { global: true });
+}
+
 /** 全局监听宿主 `tools/post-execute` 工具后处理瀑布。 */
 export function onHostToolsPostExecute<TExec = unknown, TResult = unknown, TDecision = unknown>(
   ctx: Context,

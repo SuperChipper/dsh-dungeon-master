@@ -12,11 +12,12 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { SessionManager, SessionRecord } from '../session/index.ts';
 import type { Logger, ReplyTarget } from '../types.ts';
 import { BUTTONS_PER_ROW, buttonLabel, decodeButtonData, encodeButtonData } from '../features/button-utils.ts';
-import { mapCaption, renderPartyMap } from './map-view.ts';
+import { battleRoom, mapCaption, renderPartyMap } from './map-view.ts';
+import { cellOf, hiddenFromPlayers, mapOf } from './battlefield.ts';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Adventure } from './adventure.ts';
-import { type Campaign, type ReactionWindow, describePending, findCharacter, isAbsent, isControlledBy, isDmDelegated, nextTurn, playerStatus, reactionWindow, setCharacterAbsent } from './campaign.ts';
+import { type Campaign, type Character, type ReactionWindow, describePending, findCharacter, isAbsent, isControlledBy, isDmDelegated, isOut, nextTurn, playerStatus, reactionWindow, roomOf, setCharacterAbsent } from './campaign.ts';
 import { chooseReaction, reactionsOf, reactionReplyNote, waitingOn } from './pending-attack.ts';
 import { type CheckIn, arrivalNotice, checkInHint, createCheckIn, isComplete, kickoffMessage, lateReturnNotice, markArrived, rehydrateCheckIn, rosterOf, rosterText } from './check-in.ts';
 import type { DndService } from './dnd-service.ts';
@@ -142,6 +143,7 @@ export class DndTurnButtons {
   private disabled = false;
   /** 每个会话最后一次自动发战斗图的那一轮：一轮只发一张，每回合都发会刷屏 */
   private readonly lastImage = new Map<string, string>();
+  private readonly sendingImage = new Map<string, Promise<boolean>>();
 
   public constructor(
     private readonly service: DndService,
@@ -186,26 +188,47 @@ export class DndTurnButtons {
 
   /** 画当前的战斗图；没开战、没摆位、没场地图或发不了图时返回 undefined */
   private async battleImage(key: string, campaign: Campaign, adventure: Adventure): Promise<string | undefined> {
-    if (this.service.sendImage === undefined || campaign.initiative === undefined) return undefined;
-    const out = join(this.service.mapDir, `${key.replace(/[^a-zA-Z0-9_-]+/g, '_')}-turn-${Date.now()}.png`);
-    const map = await renderPartyMap(campaign, adventure, out, 'battle', { globalEffects: this.service.globalEffects() }).catch(() => undefined);
+    if (this.service.sendImage === undefined || campaign.initiative === undefined || mapOf(campaign, battleRoom(campaign)) === undefined) return undefined;
+    const out = join(this.service.mapDir, `${key.replace(/[^a-zA-Z0-9_-]+/g, '_')}-turn-${randomUUID()}.png`);
+    const map = await renderPartyMap(campaign, adventure, out, 'battle', { globalEffects: this.service.globalEffects() });
     return map?.path;
   }
 
-  /** 每轮第一个 PC 回合前发一张战斗图：玩家每轮至少看到一次最新站位，其余回合提示保持纯文字 */
-  private async sendRoundImage(record: SessionRecord, campaign: Campaign, adventure: Adventure): Promise<void> {
+  /** 场地图与当前房间的可见参战者齐备后，在模型播报前发送开战图。 */
+  public async sendOpeningImage(record: SessionRecord): Promise<boolean> {
+    const found = this.service.active(record.sessionKey);
+    if (found?.campaign.initiative?.round !== 1) return false;
+    return this.sendRoundImage(record, found.campaign, found.adventure);
+  }
+
+  /** 开战图与每轮第一张图共享发送状态，渲染或发送失败后仍允许重试。 */
+  private async sendRoundImage(record: SessionRecord, campaign: Campaign, adventure: Adventure): Promise<boolean> {
     const state = campaign.initiative;
-    if (state === undefined) return;
-    // 带上先攻表：新开的一场仗也是第 1 轮，不能被上一场的记号挡住
-    const mark = `${state.round}:${state.order.map((e) => e.name).join(',')}`;
-    if (this.lastImage.get(record.sessionKey) === mark) return;
-    this.lastImage.set(record.sessionKey, mark);
-    try {
-      const path = await this.battleImage(record.sessionKey, campaign, adventure);
-      if (path !== undefined) await this.service.sendImage!(record.replyTarget, path, mapCaption(campaign, adventure, 'battle', this.service.globalEffects()));
-    } catch (err) {
-      this.logger.warn(`im-qqbot: 每轮战斗图发送失败: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    if (state === undefined) return false;
+    const room = battleRoom(campaign);
+    const visible = state.order.map((entry) => findCharacter(campaign, entry.name)).filter((ch): ch is Character =>
+      ch !== undefined && roomOf(campaign, ch) === room && !isOut(ch) && !hiddenFromPlayers(ch));
+    if (!visible.some((ch) => cellOf(campaign, ch)) || (state.round === 1 && visible.some((ch) => !cellOf(campaign, ch)))) return false;
+    const battle = state.battleId ?? JSON.stringify([campaign.createdAt, state.allParticipants ?? state.order.map((entry) => entry.name)]);
+    const mark = JSON.stringify([battle, state.round]);
+    if (this.lastImage.get(record.sessionKey) === mark) return true;
+    const requestKey = JSON.stringify([record.sessionKey, mark]);
+    const pending = this.sendingImage.get(requestKey);
+    if (pending !== undefined) return pending;
+    const task = (async () => {
+      try {
+        const path = await this.battleImage(record.sessionKey, campaign, adventure);
+        if (path === undefined) return false;
+        await this.service.sendImage!(record.replyTarget, path, mapCaption(campaign, adventure, 'battle', this.service.globalEffects()));
+        this.lastImage.set(record.sessionKey, mark);
+        return true;
+      } catch (err) {
+        this.logger.warn(`im-qqbot: 每轮战斗图发送失败: ${err instanceof Error ? err.message : String(err)}`);
+        return false;
+      }
+    })().finally(() => this.sendingImage.delete(requestKey));
+    this.sendingImage.set(requestKey, task);
+    return task;
   }
 
   /**
