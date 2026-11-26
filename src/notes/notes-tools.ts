@@ -12,6 +12,7 @@ import type { DshAgent, SessionManager } from '../session/index.ts';
 import type { Logger } from '../types.ts';
 import {
   chatKeyOf,
+  chatNotesDir,
   formatConflictsSummary,
   type NoteInjectPolicy,
   type NoteQueryContext,
@@ -32,18 +33,23 @@ const SEARCH_SNIPPET_CHARS = 800;
 const NOTES_DESCRIPTION =
   'Shared notes library (long-term memory with scope isolation and lifecycle metadata). Choose action: '
   + '"search" — look up relevant sections by query (optional `project` / `persona`, or `all_scopes=true` in owner private chat / local sessions); '
-  + '"save" — record distilled long-term knowledge. General lessons leave `projects`/`personas` empty; project lessons set `projects`; '
+  + '"save" — record distilled long-term knowledge. For /learn, search for the same scoped decision first. Use a question title, '
+  + 'then a 召回正文： paragraph (conditions, action, exceptions) and a separate 依据： paragraph with references. '
+  + 'General lessons leave `projects`/`personas` empty; project lessons set `projects`; '
   + 'roleplay notes set `personas`/`scenes`; chat-private affairs (TRPG/group plans) set scope="chat". Never save DM-only stats or secrets.';
 
 const MANAGE_DESCRIPTION =
   'Owner-only housekeeping for the shared notes library; works only in a private chat with the owner or local sessions. '
   + 'action="stats": show injection ledger and relevance scores (view="low"|"top"|"muted"). '
   + 'action="mute" / "unmute": stop or resume auto-injecting a section (remains searchable). '
+  + 'action="revise": apply an approved clarification to an existing section using its exact reviewed body. Preserve scope and evidence. '
   + 'action="supersede": mark an outdated note/section as superseded in place while preserving its date, source and text. '
   + 'action="archive": move a file or section into .archive/ (not indexed, nothing is deleted).';
 
 interface ManageArgs {
-  action: 'stats' | 'mute' | 'unmute' | 'archive' | 'supersede';
+  action: 'stats' | 'mute' | 'unmute' | 'archive' | 'supersede' | 'revise';
+  expected_content?: string;
+  content?: string;
   view?: NoteStatsView;
   limit?: number;
   file?: string;
@@ -62,6 +68,17 @@ const CAMPAIGN_NOTE_PATTERN = /跑团|开团|结团|带团|模组|\/dnd|\bDM\b|\
 
 export function looksLikeCampaignNote(title: string, content: string): boolean {
   return CAMPAIGN_NOTE_PATTERN.test(`${title}\n${content}`);
+}
+
+function checkCampaignContent(manager: SessionManager, sessionKey: string | undefined, text: string): void {
+  const campaign = sessionKey === undefined ? undefined : manager.dndService?.active(sessionKey)?.campaign;
+  if (!campaign) return;
+  const monsters = campaign.characters.filter(ch => ch.kind === 'monster').map(ch => ch.name);
+  const pcs = campaign.characters.filter(ch => ch.kind === 'pc').flatMap(ch => ch.name.split(/\s+/));
+  const secret = findDmSecret(text, monsters, pcs);
+  if (secret !== undefined) {
+    throw new Error(`qqbot_notes: 跑团进行中，笔记${secret}。DM 机密（DC、怪物数值、DM 笔记）不写进笔记，去掉后再记；跑团进度用 dnd_progress 写进团档。`);
+  }
 }
 
 interface ToolsRegistryLike {
@@ -93,6 +110,7 @@ interface SearchOutputHit {
   file: string;
   heading: string;
   text: string;
+  fullSection?: boolean;
   score: number;
   exact?: string[];
   similarity?: number;
@@ -113,7 +131,7 @@ function cleanStringArray(value: unknown): string[] | undefined {
 function renderHits(query: string, hits: readonly SearchOutputHit[]): string {
   if (hits.length === 0) return `笔记库里没有和「${query}」相关的内容。`;
   return hits.map((hit, i) => {
-    const text = hit.text.length > SEARCH_SNIPPET_CHARS ? `${hit.text.slice(0, SEARCH_SNIPPET_CHARS)}…` : hit.text;
+    const text = !hit.fullSection && hit.text.length > SEARCH_SNIPPET_CHARS ? `${hit.text.slice(0, SEARCH_SNIPPET_CHARS)}…` : hit.text;
     const prov: string[] = [];
     if (hit.status === 'superseded') prov.push('⚠️已过期');
     if (hit.date) prov.push(hit.date);
@@ -271,6 +289,7 @@ export function registerNotesTools(
             file: hit.file,
             heading: hit.heading,
             text: hit.text,
+            ...(hit.section && { fullSection: true }),
             score: Math.round(hit.score * 100) / 100,
             ...(hit.exact === undefined ? {} : { exact: hit.exact.matched }),
             ...(hit.similarity === undefined ? {} : { similarity: Math.round(hit.similarity * 100) / 100 }),
@@ -304,16 +323,7 @@ export function registerNotesTools(
       const record = exec.agent !== undefined ? manager.findByAgent(exec.agent as DshAgent) : undefined;
       const source = record === undefined ? '本机会话' : (record.scope === 'group' ? '群聊' : '私聊');
       // 本会话开着团时，笔记会在之后的消息里被自动检索出来，DM 机密一旦写进去就可能被念给玩家
-      const campaign = record === undefined ? undefined : manager.dndService?.active(record.sessionKey)?.campaign;
-      if (campaign !== undefined) {
-        const monsters = campaign.characters.filter((ch) => ch.kind === 'monster').map((ch) => ch.name);
-        // 「刻德温 Kodwin」在笔记里常只写中文名或英文名，拆开分别匹配
-        const pcs = campaign.characters.filter((ch) => ch.kind === 'pc').flatMap((ch) => ch.name.split(/\s+/));
-        const secret = findDmSecret(`${title}\n${content}`, monsters, pcs);
-        if (secret !== undefined) {
-          throw new Error(`qqbot_notes: 跑团进行中，笔记${secret}。DM 机密（DC、怪物数值、DM 笔记）不写进笔记，去掉后再记；跑团进度用 dnd_progress 写进团档。`);
-        }
-      }
+      checkCampaignContent(manager, record?.sessionKey, `${title}\n${content}`);
       // 本机会话没有「本会话」可言，一律记到共享区
       const chatOnly = record !== undefined
         && (scope === 'chat' || (scope === undefined && looksLikeCampaignNote(title, content)));
@@ -351,7 +361,9 @@ export function registerNotesTools(
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['stats', 'mute', 'unmute', 'archive', 'supersede'], description: 'What to do.' },
+        action: { type: 'string', enum: ['stats', 'mute', 'unmute', 'archive', 'supersede', 'revise'], description: 'What to do.' },
+        expected_content: { type: 'string', description: 'revise: complete original body as reviewed, excluding the heading and metadata line.' },
+        content: { type: 'string', description: 'revise: complete replacement body starting with 召回正文：, followed by 依据： and the retained and new evidence.' },
         view: { type: 'string', enum: ['low', 'top', 'muted'], description: 'stats only: low = lowest relevance among sections currently eligible for auto-injection (default), top = most injected historically, muted = recorded mutes.' },
         limit: { type: 'integer', description: 'stats only: how many rows (1-30, default 10).' },
         file: { type: 'string', description: 'mute/unmute/archive/supersede: note path relative to the notes root, exactly as shown by stats or search.' },
@@ -372,7 +384,7 @@ export function registerNotesTools(
       render: (_args: unknown, value: unknown): ContentBlock[] => [{ type: 'text', text: (value as { message: string }).message }],
     },
     async execute(args: unknown, exec: { agent?: unknown }): Promise<{ message: string }> {
-      const { action, view, limit, file, heading, occurrence, superseded_by } = args as ManageArgs;
+      const { action, view, limit, file, heading, occurrence, superseded_by, expected_content, content } = args as ManageArgs;
       const record = exec.agent !== undefined ? manager.findByAgent(exec.agent as DshAgent) : undefined;
       // 清单里有每个群的私有笔记标题，静音和归档又会影响所有会话：只给主人私聊和本机会话
       const owner = options.ownerOpenid?.trim() ?? '';
@@ -385,11 +397,21 @@ export function registerNotesTools(
         if (message === undefined) throw new Error('qqbot_notes_manage: 笔记账本不可用');
         return { message };
       }
-      const metrics = manager.noteMetrics;
-      if (metrics === undefined) throw new Error('qqbot_notes_manage: 笔记账本不可用');
       if (typeof file !== 'string' || file.trim() === '') throw new Error(`qqbot_notes_manage: ${action} 需要 file`);
-      const path = file.trim().split('\\').join('/');
+      const path = file.trim().split('\\').join('/').replace(/^\.\//, '');
       const section = typeof heading === 'string' ? heading.trim() : '';
+
+      if (action === 'revise') {
+        if (typeof expected_content !== 'string' || typeof content !== 'string' || !section) {
+          throw new Error('修订需要 heading、expected_content 和 content');
+        }
+        if (path.split('/').some(part => !part || part.startsWith('.'))) throw new Error('请使用搜索显示的笔记相对路径');
+        if (path.startsWith('chats/') && (!record || path.split('/')[1] !== chatNotesDir(chatKeyOf(record.scope, record.peerId)))) {
+          throw new Error('只能修订共享笔记或当前会话私有笔记');
+        }
+        checkCampaignContent(manager, record?.sessionKey, `${section}\n${content}`);
+        return { message: store.revise(path, section, expected_content, content) };
+      }
 
       if (action === 'supersede') {
         if (typeof superseded_by !== 'string' || superseded_by.trim() === '') {
@@ -413,6 +435,8 @@ export function registerNotesTools(
         return { message: `${result.message}要恢复就把它从归档目录搬回原处。` };
       }
       if (action === 'mute' || action === 'unmute') {
+        const metrics = manager.noteMetrics;
+        if (metrics === undefined) throw new Error('qqbot_notes_manage: 笔记账本不可用');
         if (section === '') throw new Error(`qqbot_notes_manage: ${action} 需要 heading（完整标题路径，stats 里「›」后面那一串）`);
         if (action === 'unmute') {
           if (metrics.mutedAt(path, section) === undefined) return { message: `${path} › ${section} 本来就没有静音。` };

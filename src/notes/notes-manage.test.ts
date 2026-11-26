@@ -34,7 +34,8 @@ const DIARY = [
   '',
 ].join('\n');
 
-type Tool = { name: string; execute(args: unknown, exec: { agent?: unknown }): Promise<Record<string, unknown>> };
+type Tool = { name: string; execute(args: unknown, exec: { agent?: unknown }): Promise<Record<string, unknown>>;
+  output: { render(args: unknown, value: unknown): Array<{ text: string }> } };
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 
 function setup(recordOrNull: Record<string, unknown> | null = { scope: 'c2c', peerId: 'OWNER' }) {
@@ -61,7 +62,7 @@ function setup(recordOrNull: Record<string, unknown> | null = { scope: 'c2c', pe
     const dir = join(root, '.archive');
     return existsSync(dir) ? readdirSync(dir, { recursive: true }).map(String).filter((name) => name.endsWith('.md')) : [];
   };
-  return { root, store, metrics, call, callSave, callSearch, archived, manager, notes };
+  return { root, store, metrics, call, callSave, callSearch, archived, manager, notes, tools };
 }
 
 describe('cutSection', () => {
@@ -139,6 +140,24 @@ describe('NotesStore.archive', () => {
 });
 
 describe('qqbot_notes_manage', () => {
+  it('按审阅原文修订同一节，保留标题、元数据、邻节和换行；拒绝过时的提案', async () => {
+    const { root, call, callSearch, tools } = setup(null);
+    const file = '验收.md';
+    const heading = '项目 › 验收';
+    const old = '验收结束后可收尾。';
+    const body = '召回正文：验收通过可收尾，改动后重验受影响项。\n\n依据：' + '验收记录'.repeat(350) + 'REF_X7';
+    const original = `# 项目\r\n## 验收\r\n> 来源：私聊\r\n\r\n${old}\r\n\r\n### 附录\r\n邻节原文\r\n`;
+    writeFileSync(join(root, file), original);
+    const revise = { action: 'revise', file, heading, expected_content: old, content: body };
+    await call(revise);
+    expect(readFileSync(join(root, file), 'utf8')).toBe(original.replace(old, body.replace(/\n/g, '\r\n')));
+    const result = await callSearch({ query: 'REF_X7' });
+    expect(result.hits).toEqual([expect.objectContaining({ file, heading, text: body, fullSection: true })]);
+    expect(tools.get(NOTES_TOOL_NAME)!.output.render({}, result)[0]?.text).toContain(body);
+    await expect(call(revise)).rejects.toThrow(/重新读取/);
+    await expect(call({ ...revise, file: '观察日记.md', heading: '观察日记 › 002 第二条' })).rejects.toThrow(/有 2 节/);
+    await expect(call({ ...revise, file: 'chats/group_G1/点歌.md' })).rejects.toThrow(/当前会话/);
+  });
   it('只有主人私聊和本机会话能用', async () => {
     await expect(setup({ scope: 'group', peerId: 'G1' }).call({ action: 'stats' })).rejects.toThrow(/主人私聊/);
     await expect(setup({ scope: 'c2c', peerId: 'SOMEONE' }).call({ action: 'stats' })).rejects.toThrow(/主人私聊/);

@@ -22,6 +22,7 @@ describe('人设提示词注入', () => {
     expect(current).toHaveBeenLastCalledWith('peer', scope);
     expect(first.sections).toContainEqual({ name: 'qqbot:scope-prompt', order: 90, text: '女仆正文' });
     expect(first.sections).toContainEqual({ name: 'host', text: '宿主提示词' });
+    expect(first.sections.some((s) => s.name === 'qqbot:shared-notes')).toBe(false);
     if (scope === 'c2c') expect(first.sections.some((s) => s.name === 'qqbot:group-focus')).toBe(false);
 
     current.mockReturnValue({ prompt: '修改后的正文' });
@@ -30,5 +31,25 @@ describe('人设提示词注入', () => {
     current.mockReturnValue(undefined);
     expect((await assemble(undefined, { agent }, next)).sections)
       .toContainEqual({ name: 'qqbot:scope-prompt', order: 90, text: scope === 'group' ? '群聊默认' : '私聊默认' });
+  });
+
+  it.each(['group', 'c2c'] as const)('%s 分别注入正式笔记和观察日记的记录条件', async (scope) => {
+    const agent = { session: { id: 's1' } };
+    let assemble!: Assemble;
+    const manager = {
+      ctx: { on: (_event: string, callback: Assemble) => { assemble = callback; } },
+      config: {},
+      notesStore: {},
+      findByAgent: (value: unknown) => value === agent ? { scope, peerId: 'peer', agent } : undefined,
+    };
+    (SessionManager.prototype as unknown as { registerScopePromptInjection(): void }).registerScopePromptInjection.call(manager);
+    const { sections } = await assemble(undefined, { agent }, async () => ({ sections: [] }));
+    const memory = sections.filter((s) => s.name === 'qqbot:shared-notes');
+    expect(memory).toHaveLength(1);
+    expect(memory[0]!.text).toContain('正式结论默认自动召回');
+    expect(memory[0]!.text).toContain('用户的纠正确实推翻了它');
+    expect(memory[0]!.text).toContain('普通同意、补充未知条件、观点不同不记');
+    expect(memory[0]!.text).toContain('file="人类观察日记.md", inject="search-only"');
+    expect(memory[0]!.text).toContain('不抄私聊原话');
   });
 });

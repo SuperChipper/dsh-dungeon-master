@@ -78,6 +78,8 @@ export interface NoteChunk {
   /** 标题路径，如「大肥鱼小课堂 › 一、逐集笔记 › 04 …」 */
   heading: string;
   text: string;
+  /** Shared by all retrieval chunks of one marked section. */
+  section?: { text: string; recall: string };
   /** 解析并继承后的结构化元数据 */
   meta?: NoteMeta;
 }
@@ -258,7 +260,9 @@ export function chunkMarkdown(file: string, markdown: string): NoteChunk[] {
     if (currentLevel >= 1) metaStack[currentLevel] = meta;
     const text = bodyLines.join('\n').trim();
     if (text.length === 0) return;
-    for (const part of splitLong(text)) chunks.push({ file, heading, text: part.trim(), meta });
+    const recall = readRecallBody(text);
+    const section = recall === undefined ? undefined : { text, recall };
+    for (const part of splitLong(text)) chunks.push({ file, heading, text: part.trim(), meta, ...(section && { section }) });
   };
 
   for (const line of markdownBody.split(/\r?\n/)) {
@@ -284,6 +288,12 @@ export function chunkMarkdown(file: string, markdown: string): NoteChunk[] {
 
 /** 归档目录：点开头，不进检索索引 */
 const ARCHIVE_DIR = '.archive';
+
+function readRecallBody(text: string): string | undefined {
+  const label = /^召回正文[：:]/u.exec(text);
+  if (!label) return undefined;
+  return text.slice(label[0].length).split(/^依据[：:]/mu, 1)[0]!.trim();
+}
 
 export interface ArchiveNoteResult {
   /** 归档到哪（相对笔记根目录） */
@@ -405,7 +415,8 @@ function resolveTargetRef(ref: string, chunks: IndexedChunk[]): IndexedChunk[] {
   // A file reference intentionally selects the file; a bare heading must identify one section.
   if (found.some((chunk) => chunk.file === norm)) return found;
   const sections = new Set(found.map((chunk) => `${chunk.file} › ${chunk.heading}`));
-  return sections.size === 1 && found.length === 1 ? found : [];
+  const section = found[0]?.section;
+  return sections.size === 1 && (found.length === 1 || (section && found.every(chunk => chunk.section === section))) ? found : [];
 }
 
 function resolveSupersessionLinks(chunks: IndexedChunk[]): void {
@@ -775,12 +786,15 @@ export class NotesStore {
 
     // 同一段内容被复制到多个文件时只留排名最高的一份
     const seenText = new Set<string>();
+    const seenSections = new Set<NonNullable<NoteChunk['section']>>();
     const result: NoteHit[] = [];
     for (const entry of fused) {
       if (result.length >= Math.max(0, limit)) break;
       const cand = entry.item;
       const chunk = cand.chunk;
-      const key = chunk.text.replace(/\s+/g, ' ').trim();
+      if (chunk.section && seenSections.has(chunk.section)) continue;
+      if (chunk.section) seenSections.add(chunk.section);
+      const key = (chunk.section?.text ?? chunk.text).replace(/\s+/g, ' ').trim();
       if (seenText.has(key)) continue;
       seenText.add(key);
 
@@ -808,7 +822,8 @@ export class NotesStore {
       result.push({
         file: chunk.file,
         heading: chunk.heading,
-        text: chunk.text,
+        text: chunk.section?.text ?? chunk.text,
+        ...(chunk.section && { section: chunk.section }),
         meta: publicMeta,
         score: cand.score,
         matched: cand.matched,
@@ -889,19 +904,13 @@ export class NotesStore {
     };
   }
 
-  /**
-   * 原地把某个笔记文件或小节标记为已过期，保留原日期、来源与正文不删改。
-   */
-  public supersede(input: SupersedeNoteInput): SupersedeNoteResult {
+  private sectionForEdit(input: { file: string; heading?: string; occurrence?: number }) {
     this.lastScan = 0;
     this.refresh();
     const file = input.file.split('\\').join('/').replace(/^\.?\//, '');
     if (!this.chunks.some((chunk) => chunk.file === file)) {
       throw new Error(`笔记库里没有 ${file}（要写相对笔记根目录的路径，会话私有笔记形如 chats/<会话>/xxx.md）`);
     }
-    const supersededBy = input.supersededBy.trim();
-    if (supersededBy === '') throw new Error('supersededBy 不能为空');
-
     const source = join(this.root, file);
     const raw = readFileSync(source, 'utf8');
     const eol = raw.includes('\r\n') ? '\r\n' : '\n';
@@ -934,6 +943,7 @@ export class NotesStore {
     }
 
     const requestedHeading = input.heading?.trim() ?? '';
+    if (!sections.length) sections.push({ path: fallbackTitle, level: 0, start: bodyStart, end: lines.length });
     let target: { path: string; level: number; start: number; end: number };
     if (requestedHeading !== '') {
       const found = sections.filter((section) => section.path === requestedHeading);
@@ -948,15 +958,9 @@ export class NotesStore {
         throw new Error(`${file} 里「${requestedHeading}」没有第 ${input.occurrence} 节`);
       }
       target = picked;
-    } else if (sections.length > 0) {
-      target = sections[0]!;
     } else {
-      target = { path: fallbackTitle, level: 0, start: bodyStart, end: lines.length };
+      target = sections[0]!;
     }
-
-    const matchedChunk = this.chunks.find((c) => c.file === file && c.heading === target.path)
-      ?? this.chunks.find((c) => c.file === file);
-    const fallbackDate = matchedChunk?.meta.date ?? today();
 
     const contentStart = target.level > 0 ? target.start + 1 : bodyStart;
     let firstNonEmpty = -1;
@@ -966,6 +970,39 @@ export class NotesStore {
         break;
       }
     }
+    return { file, source, lines, eol, target, contentStart, firstNonEmpty };
+  }
+
+  /** Replace only the reviewed body. A changed or ambiguous target requires a fresh review. */
+  public revise(file: string, heading: string, expectedContent: string, content: string): string {
+    if (!heading.trim() || !expectedContent.trim()) throw new Error('原节标题和审阅过的原文不能为空');
+    const next = content.replace(/\r\n/g, '\n').trim();
+    if (!readRecallBody(next) || next.length > MAX_SAVE_CHARS || /^#{1,3}\s/m.test(next)) {
+      throw new Error('请提供带完整「召回正文：」的一节，保留依据，勿新增标题或超过字数上限');
+    }
+    const { source, lines, eol, target, firstNonEmpty } = this.sectionForEdit({ file, heading });
+    let start = firstNonEmpty;
+    if (start < 0) throw new Error('目标节没有原文');
+    if (parseMetaBlockquote(lines[start]!) !== undefined) start++;
+    while (start < target.end && !lines[start]!.trim()) start++;
+    let end = target.end;
+    while (end > start && !lines[end - 1]!.trim()) end--;
+    if (lines.slice(start, end).join('\n').trim() !== expectedContent.replace(/\r\n/g, '\n').trim()) {
+      throw new Error('原文与审阅内容不一致，请重新读取该节');
+    }
+    lines.splice(start, end - start, ...next.split('\n'));
+    writeTextAtomic(source, lines.join(eol));
+    this.signature = '';
+    this.lastScan = 0;
+    return `已修订 ${file} › ${heading}`;
+  }
+
+  public supersede(input: SupersedeNoteInput): SupersedeNoteResult {
+    const supersededBy = input.supersededBy.trim();
+    if (supersededBy === '') throw new Error('supersededBy 不能为空');
+    const { file, source, lines, eol, target, contentStart, firstNonEmpty } = this.sectionForEdit(input);
+    const matchedChunk = this.chunks.find(c => c.file === file && c.heading === target.path);
+    const fallbackDate = matchedChunk?.meta.date ?? today();
 
     if (firstNonEmpty >= 0 && parseMetaBlockquote(lines[firstNonEmpty]!) !== undefined) {
       lines[firstNonEmpty] = upsertMetaInBlockquote(
@@ -975,7 +1012,7 @@ export class NotesStore {
       );
     } else {
       const metaLine = upsertMetaInBlockquote(undefined, { status: 'superseded', supersededBy }, fallbackDate);
-      const insertAt = target.level > 0 ? target.start + 1 : bodyStart;
+      const insertAt = contentStart;
       const insertLines = lines[insertAt]?.trim() === '' ? ['', metaLine] : ['', metaLine, ''];
       lines.splice(insertAt, 0, ...insertLines);
     }
@@ -1270,24 +1307,8 @@ export function planNoteInjection(
   if (maxChars === 0 || options.topK <= 0) {
     return { items: [], text: '', usedChars: 0, maxChars };
   }
-  const relevant = selectNotesForInjection(hits, options);
+  const relevant = selectNotesForInjection(hits, { ...options, topK: hits.length });
   if (relevant.length === 0) {
-    return { items: [], text: '', usedChars: 0, maxChars };
-  }
-
-  const active = relevant.map((hit) => {
-    const clean = hit.text.replace(/\s+/g, ' ').trim();
-    let cap = clean.length;
-    if (options.perNoteMaxChars !== undefined && options.perNoteMaxChars > 0) {
-      cap = Math.min(cap, options.perNoteMaxChars);
-    }
-    if (hit.meta?.budgetChars !== undefined && hit.meta.budgetChars > 0) {
-      cap = Math.min(cap, hit.meta.budgetChars);
-    }
-    return { hit, clean, want: Math.max(0, cap) };
-  }).filter((entry) => entry.want > 0);
-
-  if (active.length === 0) {
     return { items: [], text: '', usedChars: 0, maxChars };
   }
 
@@ -1295,6 +1316,12 @@ export function planNoteInjection(
   const header = '[共享笔记 · 可能相关]';
   const footer = '（来自笔记库，仅供参考；共享笔记不代表本群经历。新旧冲突以新证据为准，无关则忽略；更多用 qqbot_notes(action="search")。）';
   const prefixFor = (hit: NoteHit): string => {
+    const scope = hit.scopeLabel ?? (hit.meta ? describeNoteScope(hit.meta) : '跨会话通用');
+    if (hit.section) {
+      const conflict = formatConflictsSummary(hit.conflicts);
+      const status = hit.meta?.status === 'superseded' ? '，已过期' : '';
+      return `- ${hit.heading}（适用:${scope}${status}）\n${conflict ? `  ⚠️ ${conflict}\n` : ''}  `;
+    }
     const owner = chatOwnerOf(hit.file);
     const name = owner === undefined ? hit.file : `[本会话] ${hit.file.split('/').slice(2).join('/')}`;
     const meta: string[] = [];
@@ -1303,7 +1330,6 @@ export function planNoteInjection(
     if (hit.meta?.date) provenance.push(bounded(hit.meta.date, 12));
     if (hit.meta?.source) provenance.push(bounded(hit.meta.source, 40));
     if (provenance.length) meta.push(provenance.join('·'));
-    const scope = hit.scopeLabel ?? (hit.meta ? describeNoteScope(hit.meta) : '跨会话通用');
     meta.push(`适用:${bounded(scope, 80)}`);
     if (hit.why) meta.push(`触发:${bounded(hit.why, 100)}`);
     const conflict = bounded(formatConflictsSummary(hit.conflicts), 140);
@@ -1312,24 +1338,37 @@ export function planNoteInjection(
   const render = (items: readonly PlannedNoteItem[]): string =>
     [header, ...items.map(({ hit, snippet }) => `${prefixFor(hit)}${snippet}`), footer].join('\n');
 
-  // Reserve every rendered character before allocating body text, including separators.
-  while (active.length) {
-    const emptyItems = active.map(({ hit }) => ({ hit, snippet: '', truncated: true }));
-    const remaining = maxChars - render(emptyItems).length;
-    const allocations = allocateBudgets(active.map((entry) => entry.want), Math.max(0, remaining));
-    if (allocations.every((budget, i) => budget >= Math.min(40, active[i]!.want))) {
-      const items = active.map((entry, i): PlannedNoteItem => {
-        const limit = allocations[i]!;
-        const truncated = entry.clean.length > limit;
-        const snippet = truncated ? (limit > 1 ? `${entry.clean.slice(0, limit - 1)}…` : entry.clean.slice(0, limit)) : entry.clean;
-        return { hit: entry.hit, snippet, truncated };
-      });
-      const text = render(items);
-      return { items, text, usedChars: text.length, maxChars };
+  const selected: Array<{ hit: NoteHit; clean: string; want: number }> = [];
+  let remaining = maxChars - header.length - footer.length - 1;
+  let legacyMinimum = 0;
+  const legacyOnly = relevant.every(hit => !hit.section);
+  for (const hit of relevant) {
+    const clean = hit.section?.recall ?? hit.text.replace(/\s+/g, ' ').trim();
+    const perNoteLimit = options.perNoteMaxChars ?? 0;
+    const want = Math.min(clean.length, perNoteLimit > 0 ? perNoteLimit : Infinity, hit.meta?.budgetChars ?? Infinity);
+    if (want <= 0 || (hit.section && want < clean.length)) continue;
+    const minimum = hit.section ? want : Math.min(40, want);
+    const cost = 1 + prefixFor(hit).length + minimum;
+    if (cost > remaining) {
+      if (legacyOnly) break;
+      continue;
     }
-    active.pop();
+    selected.push({ hit, clean, want });
+    remaining -= cost;
+    if (!hit.section) legacyMinimum += minimum;
+    if (selected.length >= options.topK) break;
   }
-  return { items: [], text: '', usedChars: 0, maxChars };
+  const legacy = selected.filter(entry => !entry.hit.section);
+  const allocations = allocateBudgets(legacy.map(entry => entry.want), legacyMinimum + remaining);
+  let legacyIndex = 0;
+  const items = selected.map(({ hit, clean, want }): PlannedNoteItem => {
+    const limit = hit.section ? want : allocations[legacyIndex++]!;
+    const truncated = clean.length > limit;
+    const snippet = truncated && limit > 1 ? `${clean.slice(0, limit - 1)}…` : clean.slice(0, limit);
+    return { hit, snippet, truncated };
+  });
+  const text = items.length ? render(items) : '';
+  return { items, text, usedChars: text.length, maxChars };
 }
 
 /**

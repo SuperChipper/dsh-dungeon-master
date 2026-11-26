@@ -60,6 +60,45 @@ describe('chunkMarkdown', () => {
 });
 
 describe('NotesStore.search', () => {
+  it('追加到已有日记的仅检索案例仍可查，但不进入自动召回', () => {
+    const file = '观察日记.md';
+    const store = new NotesStore(tempNotes({ [file]: '# 观察日记\n\n## 旧记录\n无关内容。\n' }));
+    const title = '误把引用当作态度';
+    store.save({ file, title, content: '预测：在抱怨。实际：是引用。差在哪：先核对出处。', inject: 'search-only' });
+    const hits = store.search(title, 5).filter(hit => hit.file === file && hit.heading.endsWith(title));
+    expect(hits).toHaveLength(1);
+    expect(hits[0]?.meta?.inject).toBe('search-only');
+    expect(planNoteInjection(hits, { ...hintOptions, minCoverage: 0 }).text).toBe('');
+  });
+
+  it('按问题或长依据中的旧词命中同一节，自动召回总是带齐例外', () => {
+    const recall = '本项目必要验收通过后可收尾。改动后重验受影响项，缺反例证据时补针对性检查。';
+    const text = `召回正文：${recall}\n\n依据：${'原始记录。'.repeat(400)}\n旧错误代号 ZX741`;
+    const store = new NotesStore(tempNotes());
+    store.save({ title: '验收后还要重跑吗？', content: text, projects: ['app'], triggers: ['验收', 'ZX741'] });
+    for (const query of ['刚验收完，要再跑一遍吗', '验收完我又改了一行，要再跑吗', 'ZX741']) {
+      const hits = store.search(query, 5, undefined, { projects: ['app'] });
+      expect(hits.filter(hit => hit.section)).toHaveLength(1);
+      const plan = planNoteInjection(hits, hintOptions);
+      expect(plan.items[0]?.snippet).toBe(recall);
+      expect(plan.items[0]?.hit.text).toBe(text);
+      expect(plan.text).toContain('app');
+      expect(plan.text).not.toContain('原始记录');
+    }
+    expect(store.search('ZX741', 5, undefined, { projects: ['other'] })).toEqual([]);
+  });
+
+  it('整条计入 topK，第一条放不下时尝试下一条，精确计入渲染开销', () => {
+    const store = new NotesStore(tempNotes({ 'rules.md': '# 规则\n## 长\n召回正文：' + '例外'.repeat(180) + '\n## 短\n召回正文：改动后重验。' }));
+    const [long, short] = ['长', '短'].map(title => store.search(title).find(hit => hit.heading.endsWith(title))!);
+    const hits = [long!, short!].map(hit => ({ ...hit, triggeredBy: ['规则'] }));
+    const options = { ...hintOptions, topK: 1 };
+    const cost = planNoteInjection(hits.slice(1), options).usedChars;
+    expect(cost).toBeGreaterThan(0);
+    expect(planNoteInjection(hits, { ...options, maxChars: cost }).items.map(i => i.snippet)).toEqual(['改动后重验。']);
+    expect(planNoteInjection(hits, { ...options, maxChars: cost - 1 }).text).toBe('');
+    expect(planNoteInjection(hits, { ...options, perNoteMaxChars: 8 }).items[0]?.snippet).toBe('改动后重验。');
+  });
   it('按相关度返回段落', () => {
     const store = new NotesStore(tempNotes());
     const [top] = store.search('你还记得鱼八股是什么吗');
