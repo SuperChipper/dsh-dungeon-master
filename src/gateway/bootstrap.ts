@@ -36,6 +36,7 @@ import { createToolGuard } from '../shared/tool-guard.ts';
 import { updateProfileAllowedGroups } from '../setup/persist.ts';
 import { NOTE_JUDGE_DEFAULTS, type ImQQBotConfig } from '../config.ts';
 import {
+  getHostService,
   onHostAgentLifecycle,
   onHostAgentTurnStopping,
   onHostAssistantStream,
@@ -252,7 +253,16 @@ export async function bootstrapGateway(
   ensureTmpDir(resolveTmpDir(config), logger);
   startCleanup(ctx, config, logger);
   await registerGatewayTools({ ctx, config, manager, senders, stickerStore, notesStore, logger });
-  const modelWatch = startModelWatch({ bot, config, manager, logger });
+  const modelWatch = startModelWatch({
+    bot,
+    config,
+    manager,
+    logger,
+    resolveKey: async (ref) => {
+      const credentials = getHostService<{ resolve?(name: string): Promise<{ value?: string } | undefined> }>(ctx, 'credentials');
+      return (await credentials?.resolve?.(ref))?.value;
+    },
+  });
   if (dndService !== undefined) {
     wireDndTools({ ctx, agents, config, manager, dndService, dndButtons, mediaSender, logger });
   }

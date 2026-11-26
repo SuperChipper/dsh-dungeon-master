@@ -102,6 +102,7 @@ export function MediaConfigSections({
     },
   };
   const elevenlabs = speak.elevenlabs!;
+  const isElevenV4 = /^eleven_v4/i.test((elevenlabs.modelId || 'eleven_v4').trim());
   const deepseek = speak.deepseek!;
 
   return createElement(Fragment, null,
@@ -422,7 +423,7 @@ export function MediaConfigSections({
       }),
       createElement(FieldRow, {
         label: 'ElevenLabs 模型 ID', value: elevenlabs.modelId, placeholder: 'eleven_v4',
-        help: '常用：eleven_v4（默认）、eleven_v4_turbo、eleven_v3、eleven_multilingual_v2、eleven_flash_v2_5',
+        help: '常用：eleven_v4（默认，不使用 Style / Speaker Boost）、eleven_v4_turbo、eleven_v3、eleven_multilingual_v2、eleven_flash_v2_5',
         onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, modelId: v.trim() } }); },
       }),
       createElement(SelectRow, {
@@ -463,14 +464,16 @@ export function MediaConfigSections({
         label: 'Similarity Boost（相似度）', value: elevenlabs.similarityBoost, min: 0, max: 1, step: 0.05,
         onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, similarityBoost: v } }); },
       }),
-      createElement(NumberRow, {
-        label: 'Style（风格夸张度）', value: elevenlabs.styleExaggeration, min: 0, max: 1, step: 0.05,
-        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, styleExaggeration: v } }); },
-      }),
-      createElement(SwitchRow, {
-        label: 'Speaker Boost（说话人增强）', checked: elevenlabs.useSpeakerBoost,
-        onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, useSpeakerBoost: v } }); },
-      }),
+      ...(!isElevenV4 ? [
+        createElement(NumberRow, {
+          label: 'Style（风格夸张度）', value: elevenlabs.styleExaggeration, min: 0, max: 1, step: 0.05,
+          onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, styleExaggeration: v } }); },
+        }),
+        createElement(SwitchRow, {
+          label: 'Speaker Boost（说话人增强）', checked: elevenlabs.useSpeakerBoost,
+          onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, useSpeakerBoost: v } }); },
+        }),
+      ] : []),
       createElement(NumberRow, {
         label: 'ElevenLabs 请求超时（毫秒）', value: elevenlabs.timeoutMs, min: 3000, max: 600000, step: 1000,
         onChange: (v) => { patch('speak', { ...speak, elevenlabs: { ...elevenlabs, timeoutMs: v } }); },

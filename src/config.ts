@@ -319,7 +319,7 @@ export interface ModelFailoverConfig {
   backupApiKeyEnv: string;
   /** 首 token 时延阈值（毫秒），超过判降级 */
   ttftThresholdMs: number;
-  /** 切换时是否在群里说一句 */
+  /** 切换时是否私聊通知主人（需配置 ownerOpenid） */
   notify: boolean;
 }
 
@@ -654,7 +654,7 @@ export const ModelFailoverSchema: Schema<ModelFailoverConfig> = Schema.object({
   backupModel: Schema.string().default('').description('备用模型 id'),
   backupApiKeyEnv: Schema.string().default('').description('备用探测凭据的环境变量名'),
   ttftThresholdMs: Schema.number().default(8000).description('首 token 时延阈值（毫秒），超过判降级'),
-  notify: Schema.boolean().default(true).description('切换时在群里说一句'),
+  notify: Schema.boolean().default(true).description('切换时私聊通知主人（需配置 ownerOpenid）'),
 });
 
 /** 文件访问白名单子 Schema（独立导出：config 路由的服务端校验复用） */

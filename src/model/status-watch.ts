@@ -105,6 +105,15 @@ export async function probeStatus(spec: ProbeSpec, timeoutMs = 10_000): Promise<
   };
 }
 
+export interface ProbeOptions {
+  apiKeyEnv?: string;
+  endpoint?: string;
+  thresholdMs?: number;
+  timeoutMs?: number;
+  /** 可选凭证解析器（优先于 process.env，供宿主 credentials 服务注入） */
+  resolveKey?: (ref: string) => Promise<string | undefined>;
+}
+
 /**
  * 发一个极小的流式请求，量到首个内容增量的时延。
  *
@@ -113,14 +122,19 @@ export async function probeStatus(spec: ProbeSpec, timeoutMs = 10_000): Promise<
  */
 export async function probeRequest(
   spec: ProbeSpec,
-  options: { apiKeyEnv?: string; endpoint?: string; thresholdMs?: number; timeoutMs?: number } = {},
+  options: ProbeOptions = {},
 ): Promise<Health> {
   const endpoint = options.endpoint ?? REQUEST_PROVIDERS[spec.provider];
   if (endpoint === undefined) {
     return { state: 'unknown', reason: 'no-endpoint', detail: `${spec.provider} 没有配置聊天端点` };
   }
   const keyEnv = options.apiKeyEnv ?? spec.apiKeyEnv;
-  const key = keyEnv === undefined ? '' : (process.env[keyEnv] ?? '').trim();
+  const fromResolver = keyEnv !== undefined && keyEnv.trim() !== '' && options.resolveKey !== undefined
+    ? (await options.resolveKey(keyEnv.trim()).catch(() => undefined))?.trim() ?? ''
+    : '';
+  const key = fromResolver !== ''
+    ? fromResolver
+    : (keyEnv === undefined ? '' : (process.env[keyEnv] ?? '').trim());
   if (key === '') {
     return { state: 'unknown', reason: 'missing-key', detail: `缺少 ${keyEnv ?? 'API key'}，无法探测` };
   }
@@ -193,7 +207,7 @@ export async function probeRequest(
 
 export async function probe(
   spec: ProbeSpec,
-  options: { apiKeyEnv?: string; endpoint?: string; thresholdMs?: number; timeoutMs?: number } = {},
+  options: ProbeOptions = {},
 ): Promise<Health> {
   return probeKindOf(spec) === 'status' ? probeStatus(spec, options.timeoutMs) : probeRequest(spec, options);
 }
@@ -211,6 +225,8 @@ export interface ModelWatchOptions {
   recoverThreshold?: number;
   /** 请求探测的时延阈值（毫秒），默认 8000 */
   ttftThresholdMs?: number;
+  /** 可选凭证解析器（优先查宿主 credentials，再退回 process.env） */
+  resolveKey?: (ref: string) => Promise<string | undefined>;
   /** 重启前磁盘里已处于备用故障转移态：为 true 时以备用态起步，主用恢复后能正常触发 switchBack 清掉持久化 failover */
   initialUsingBackup?: boolean;
   /** start() 时是否立即执行首轮异步探测（默认 false） */
@@ -220,7 +236,7 @@ export interface ModelWatchOptions {
   switchBack: (target: { provider: string; model: string }, health: Health) => Promise<void>;
   log: (message: string) => void;
   /** 测试注入：替换真实探测，避免用例依赖网络与额度 */
-  __probe?: (spec: ProbeSpec, options: { thresholdMs?: number }) => Promise<Health>;
+  __probe?: (spec: ProbeSpec, options: ProbeOptions) => Promise<Health>;
 }
 
 /** unknown 既不算好也不算坏：不动。避免"接口没回话"被当成"服务挂了" */
@@ -280,8 +296,9 @@ export class ModelWatch {
   }
 
   public async tick(): Promise<void> {
-    const probeOptions = {
+    const probeOptions: ProbeOptions = {
       thresholdMs: this.options.ttftThresholdMs ?? 8_000,
+      ...(this.options.resolveKey !== undefined ? { resolveKey: this.options.resolveKey } : {}),
     };
     // 测试可注入 __probe：真打网络会让用例不稳定，也不该消耗额度
     const run = this.options.__probe ?? probe;

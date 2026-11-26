@@ -8,7 +8,7 @@
  * - 恢复要连续够次数
  */
 import { describe, expect, it } from 'vitest';
-import { ModelWatch, isWatchedProvider, probeKindOf, probeStatus } from './status-watch.ts';
+import { ModelWatch, isWatchedProvider, probeKindOf, probeRequest, probeStatus } from './status-watch.ts';
 import type { Health } from './status-watch.ts';
 
 function reply(payload: unknown, status = 200): Response {
@@ -76,6 +76,28 @@ describe('probeStatus', () => {
       expect(verdict.state).toBe('unknown');
       expect(verdict.reason).toBe('network');
     } finally { globalThis.fetch = original; }
+  });
+});
+
+describe('probeRequest 凭证解析', () => {
+  it('优先从 resolveKey（宿主凭证库）读取密钥，再回退到环境变量', async () => {
+    const originalFetch = globalThis.fetch;
+    let seenAuth = '';
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string> | undefined;
+      seenAuth = headers?.authorization ?? '';
+      return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n', { status: 200 });
+    }) as typeof fetch;
+    try {
+      const health = await probeRequest(
+        { provider: 'commandcode', model: 'm', apiKeyEnv: 'CRED_ONLY_KEY' },
+        { resolveKey: async (ref) => (ref === 'CRED_ONLY_KEY' ? 'cred-secret' : undefined) },
+      );
+      expect(health.state).toBe('operational');
+      expect(seenAuth).toBe('Bearer cred-secret');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 

@@ -221,12 +221,16 @@ export async function callVision(
     source: QQBOT_MESSAGE_SOURCE,
   });
 
+  const requestSignal = vision.timeoutMs > 0
+    ? AbortSignal.any([signal, AbortSignal.timeout(vision.timeoutMs)])
+    : signal;
+
   const options: GenerateOptions = {
     provider: vision.provider,
     model: vision.model,
     messages: [message],
     maxTokens: vision.maxTokens,
-    signal,
+    signal: requestSignal,
   };
 
   const assembler = new BlockAssembler();

@@ -9,6 +9,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fixed idle compaction (`idleCompact`) not firing for Gemini models routed through aggregator providers (e.g. `opencode` running `gemini-*`): `idleCompactProviders` now supports `provider/model` and `model:<wildcard>` patterns (default updated to `google, */*gemini*`); included `cacheWriteTokens` in `contextTokensOf`, hydrated `contextTokens` from session history on resume/reattach, aligned `routeOf` with in-place model selection, added debug skip diagnostics, and added a `/bot-doctor` check when `idleCompactMinutes >= sessionIdleTimeout`.
+- Wired `vision.timeoutMs` into `callVision` abort timeout handling, connected `modelFailover` request probes to the host `credentials` service, hid `Style` / `Speaker Boost` controls in the settings panel for `eleven_v4*` models where they are ignored, and clarified supported providers in the settings copy.
 
 - Capture habits, defaults, corrections and next-time requests as preference drafts. A preference and a verified check can both survive the same turn. Owners can review their bot's drafts with `/learn` from the local DSH Web/Desktop session.
 

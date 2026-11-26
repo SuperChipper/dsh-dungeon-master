@@ -12,11 +12,13 @@ export interface StartModelWatchDeps {
   config: ImQQBotConfig;
   manager: SessionManager;
   logger: Logger;
+  /** 可选凭证解析器（由 bootstrap 绑定宿主 credentials 服务） */
+  resolveKey?: (ref: string) => Promise<string | undefined>;
 }
 
 /** 启动上游健康监测；未启用或配置不全时清理磁盘残留 failover 路由 */
 export function startModelWatch(deps: StartModelWatchDeps): ModelWatch | undefined {
-  const { bot, config, manager, logger } = deps;
+  const { bot, config, manager, logger, resolveKey } = deps;
   const failover = config.modelFailover;
   let modelWatch: ModelWatch | undefined;
 
@@ -50,6 +52,7 @@ export function startModelWatch(deps: StartModelWatchDeps): ModelWatch | undefin
         failThreshold: Math.max(1, failover.failThreshold),
         recoverThreshold: Math.max(1, failover.recoverThreshold),
         ttftThresholdMs: Math.max(1000, failover.ttftThresholdMs),
+        ...(resolveKey !== undefined ? { resolveKey } : {}),
         initialUsingBackup: manager.getFailoverRoute() !== undefined,
         immediate: true,
         switchTo: async (target, health) => {

@@ -205,7 +205,7 @@ export function NotesAndExtrasSection({ form, patch }: { form: ConfigWire; patch
     createElement('div', { className: 'imqb2-group-title' }, '上游监测'),
     createElement(SwitchRow, {
       label: '监测 upstream 状态并自动切模型', checked: failover.enabled,
-      help: '支持自动查询上游状态接口或测试首 token 时延；主用降级就切到备用，恢复后再切回',
+      help: '目前仅支持 opencode / opencode-go（状态接口）与 commandcode（首 token 时延探测）互为主备；主用降级就切到备用，恢复后再切回',
       onChange: (v) => { patch('modelFailover', { ...failover, enabled: v }); },
     }),
     createElement(NumberRow, {
@@ -237,7 +237,7 @@ export function NotesAndExtrasSection({ form, patch }: { form: ConfigWire; patch
     createElement(FieldRow, {
       label: '备用凭据环境变量', value: failover.backupApiKeyEnv,
       placeholder: '环境变量名，如 BACKUP_API_KEY',
-      help: '从 ~/.dsh/.env 或凭证库读取，不填则只认环境里已有的',
+      help: '优先读取宿主凭证库，其次环境变量（~/.dsh/.env）；仅 commandcode 等请求探测通道需要',
       onChange: (v) => { patch('modelFailover', { ...failover, backupApiKeyEnv: v }); },
     }),
     createElement(SwitchRow, {

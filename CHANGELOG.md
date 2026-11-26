@@ -9,6 +9,7 @@
 ## 未发布
 
 - 修复空闲压缩（`idleCompact`）在聚合 provider 走 Gemini 模型（如 `opencode` 路由 `gemini-*`）时不触发的问题：`idleCompactProviders` 新增支持 `provider/model` 与 `model:<通配>` 匹配（默认调整为 `google, */*gemini*`）；补齐 `cacheWriteTokens` 上下文大小统计、`openSession` 恢复会话时回填最近 `contextTokens`、`routeOf` 复用就地切模型状态，并在跳过时记录 debug 诊断日志及在 `/bot-doctor` 检查 `idleCompactMinutes >= sessionIdleTimeout` 冲突。
+- 修复插件设置中 `vision.timeoutMs` 未接入超时信号、以及 `modelFailover` 请求探测未读取宿主凭证库的问题；在 ElevenLabs 默认 `eleven_v4` 模型下隐藏不生效的 `Style` / `Speaker Boost` 项，并补全上游监测支持范围说明。
 
 - 偏好草稿识别习惯、默认做法、纠正和下次约定。同轮的偏好与验证记录可分别保留。主人也可在本地 DSH Web/Desktop 输入 `/learn` 审阅该 bot 的草稿。
 
