@@ -1,6 +1,6 @@
 # Agent 安装与版本迁移指引（`dsh-dungeon-master`）
 
-本文档面向帮助终端用户安装、初始化、配置或升级 `dsh-dungeon-master`（Cordis 插件 ID：`im-qqbot`）的 AI Agent（如 DSH Agent、Claude Code、Antigravity、Codex 等），提供可直接执行的检查流程、操作红线与 `0.8.x → 0.9.0` 迁移清单。
+本文档面向帮助终端用户安装、初始化、配置或升级 `dsh-dungeon-master`（Cordis 插件 ID：`im-qqbot`）的 AI Agent（如 DSH Agent、Claude Code、Antigravity、Codex 等），提供可直接执行的检查流程、操作红线与 `< 0.9.0 → 0.9.x`（含 `0.8.x` 及更早版本）迁移清单。
 
 ---
 
@@ -91,9 +91,9 @@ dsh --version  # 需 >= 0.1.0-rc.6 且 < 1.0.0
 
 ---
 
-### `0.8.x → 0.9.0` 迁移检查表（Agent 逐项核对）
+### `< 0.9.0 → 0.9.x` 迁移检查表（含 `0.8.x` 与更早的 `0.5.x`–`0.7.x`，Agent 逐项核对）
 
-`0.9.0` 的核心变化是**剥离作者个人默认配置、移除内置重型浏览器依赖、精简设置页首屏**。帮用户升级时请逐一核对以下 5 项：
+`0.9.0` 起的核心变化是**剥离作者个人默认配置、移除内置重型浏览器依赖、精简设置页首屏**；所有低于 `0.9.0` 的存量版本（无论是 `0.8.x` 还是 `0.5.x`–`0.7.x`）直升 `0.9.x` 时，请逐一核对以下 5 项（若起点低于 `0.8.0`，再补查第 6 项）：
 
 #### 1. 非核心扩展工具改为默认关闭（Opt-in）
 - **变更**：`bili`（B 站只读）、`fanart`（搜图）、`reverseImage`（以图搜图）、`sing`（外部点歌）全部默认 `enabled: false`。
@@ -131,6 +131,12 @@ dsh --version  # 需 >= 0.1.0-rc.6 且 < 1.0.0
   3. `富媒体、视觉、语音与生图`
   4. `共享笔记、上游监测与扩展工具`
 
+#### 6. 若起点低于 `0.8.0`（`0.5.x`–`0.7.x` 直升 `0.9.x`），额外核对
+- **群触发配置收敛（`0.8.0+`）**：旧的 `requireMention`、`groupReplyProbability`、`replyDesire.enabled` 仍保持兼容回退，但新版统一以 `groupTriggerMode`（`mention` / `probability` / `desire` / `all`）为准；升级后如 `/bot-doctor` 提示历史冲突，按用户实际意图清理冗余旧键即可。
+- **权限收紧与 `ownerOpenid`（`0.6.0+`）**：`access.c2cMode` / `access.groupMode` 为 `allowlist` 且名单为空时已改为 fail-closed（不再等同放行所有人）；`/model`、`/preset`、配置与审批按钮仅主人/管理员可用，若旧配置未设 `ownerOpenid`，提醒用户发 `/bot-me` 补填。
+- **运行方式与内嵌提示词（`0.6.0+` / `0.8.0+`）**：若从早期独立启动脚本迁到 DSH Web 插件托管，确保同一机器人只在一个进程运行（不要双连互踢）；旧配置里手写的 `groupPrompt` / `directPrompt` 仍会覆盖生效，如需改用内置/本地 `personas/*.md` 人设管理，可在设置页「会话、权限与人设进阶」点击「清除旧内嵌提示词」。
+- **依赖与运行环境**：确认 `Node >= 20.3.0`、`dsh >= 0.1.0-rc.6 < 1.0.0`，且 profile 下未锁死旧版 `@tencent-connect/qqbot-nodejs < 1.0.5`。
+
 ---
 
 ### 从上游 `@tencent-connect/dsh-qqbot` 迁移清单
@@ -147,7 +153,7 @@ dsh --version  # 需 >= 0.1.0-rc.6 且 < 1.0.0
 
 - [ ] `~/.dsh/profiles/<profile>/cordis.patch.yml` 可正常解析为 YAML 数组，且 `id: im-qqbot` 的既有凭据、`ownerOpenid` 与白名单完整保留；
 - [ ] `package.json`（profile 侧）不存在 `@tencent-connect/dsh-qqbot` 与 `dsh-dungeon-master` 并存冲突；
-- [ ] 升级至 `0.9.0` 时，已向用户确认扩展工具开关（`bili` / `fanart` / `reverseImage` / `sing`）、`combatAgent` / `modelFailover` / `asr` 自定义渠道以及 `speak.*.roleVoices` 人设键名；
+- [ ] 从 `< 0.9.0` 升级至 `0.9.x` 时，已向用户确认扩展工具开关（`bili` / `fanart` / `reverseImage` / `sing`）、`combatAgent` / `modelFailover` / `asr` 自定义渠道以及 `speak.*.roleVoices` 人设键名（`< 0.8.0` 直升还需核对 `groupTriggerMode`、`ownerOpenid` 与无双进程冲突）；
 - [ ] 原跑团存档目录（`<dnd.root>/campaigns/` 或 `<cwd>/dnd/campaigns/`）完好；
 - [ ] 已重启 `dsh` 进程使新版后端生效，且 `/bot-version`、`/bot-doctor`、`/bot-ping` 与（开团后）`/dnd status` 均返回正常。
 
@@ -155,7 +161,10 @@ dsh --version  # 需 >= 0.1.0-rc.6 且 < 1.0.0
 
 ## 五、常见升级排障速查
 
-**开发版笔记库与 `/learn`**。包内提供 `skills/learn/SKILL.md`。如宿主尚未发现这个 skill，可将包内的 `skills/learn` 复制到目标工作区的 `.agents/skills/learn`。若已有自定义版本，先比对再合并。主人可在 QQ 私聊或本地 DSH Web/Desktop 会话显式发送 `/learn` 审阅该 bot 的 QQ 草稿。偏好可用习惯、默认做法、纠正或下次约定表达。跨会话复盘只列证据指针，当前会话才能附上对应原句。确认后才写入正式笔记。新节用「召回正文：」开头，把决策条件、做法和例外写在一起，另起一段用「依据：」记录来源。预算只够一条时优先保留完整正文；显式搜索可看完整依据。已有笔记无需迁移。
+**0.9.2+ 增量说明（`/learn` 与结构化笔记、`desire` 全灰区看图、空闲压缩规则升级）：** 无需迁移旧配置或旧笔记，升级后请重启一次 `dsh` 进程。
+- 包内已随 npm 提供 `skills/learn/SKILL.md`；如宿主尚未自动发现该 skill，可复制到目标工作区的 `.agents/skills/learn`（若已有自定义版本，先比对再合并）。主人可在 QQ 私聊或本地 DSH Web/Desktop 会话显式发送 `/learn` 审阅该 bot 的 QQ 经验草稿，确认后才写入或通过 `revise` 原地修订正式笔记（新节用「召回正文：」开头，另起一段「依据：」记录来源）。
+- `groupTriggerMode: "desire"` 默认直接启用灰区模型打分（无需单独勾选子开关），对话窗口内模型声明支持 `image` 时自动附带最新 2 张图参与打分；开团且 `dnd.interjections: true` 时改用极克制的「旁观 DM」专用提示词。
+- `idleCompactProviders` 默认值调整为 `google, */*gemini*`（支持 `provider/model` 与 `model:*` 通配）；若用户旧 `cordis.patch.yml` 中曾手动保存过 `idleCompactProviders: "google"` 且通过聚合 provider（如 `opencode`）使用 Gemini，可提示其改为 `google, */*gemini*` 或清空恢复默认。
 
 **0.9.1 发布时的行为（主人私聊经验草稿 & 设置页检查更新）：** 无需迁移笔记或增加配置。经验草稿仅在配置了主人 openid 且能定位 profile 时启用，保存在该 profile 的 `qqbot-learn-inbox` 目录，不在笔记索引中；需要可调用 `qqbot_learn_inbox` 的宿主及配套 `/learn` skill，重启宿主后在主人 QQ 私聊发送 `/learn` 审阅（非主人、群聊、本地 Web 会话或未经直接请求均不能读取；技术证据首版仅识别同轮、同目录、同命令的定向 Vitest 失败→文件改动→复验全过，偏好草稿只保留原消息指针，未批准前不写正式笔记）。设置页顶部同步提供只读「检查更新」与「复制升级 Prompt」入口。
 

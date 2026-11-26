@@ -20,14 +20,14 @@
 请帮我在本地安装或升级 DSH 插件 dsh-dungeon-master（插件 ID：im-qqbot）：
 1. 先阅读本仓库的 docs/AGENT_GUIDE.md；如果当前目录还没有该文件，请在安装后读取 node_modules/dsh-dungeon-master/docs/AGENT_GUIDE.md，或先查看 https://github.com/SuperChipper/dsh-dungeon-master/blob/main/docs/AGENT_GUIDE.md，严格遵守其中的操作红线。
 2. 向我确认要使用的 DSH profile（未指定时默认 web），检查 Node（>= 20.3.0）与 dsh 版本；如发现同一 profile 已装过冲突包 @tencent-connect/dsh-qqbot，先备份 ~/.dsh/profiles/<profile>/cordis.patch.yml 再平滑卸载旧包并保留已有凭据。
-3. 执行安装或升级（npm：dsh plugin --profile <profile> add dsh-dungeon-master；源码模式请先构建再挂载）。若我是从 0.8.x 升级到 0.9.0，请按 AGENT_GUIDE 的 5 项迁移检查表逐项核对我的 cordis.patch.yml，修改前必须先备份，且只用 YAML 解析器合并 im-qqbot 条目。
+3. 执行安装或升级（npm：dsh plugin --profile <profile> add dsh-dungeon-master；源码模式请先构建再挂载）。若我是从 <0.9.0（0.8.x 或更早版本）升级到 0.9.x，请按 AGENT_GUIDE 的迁移检查表逐项核对我的 cordis.patch.yml，修改前必须先备份，且只用 YAML 解析器合并 im-qqbot 条目。
 4. 绝不在聊天或日志中回显 appSecret、apiKey 或私人 voice_id；也不要编造未确认的第三方网关、模型 ID 或 Key 环境变量名。
 5. 完成后提醒我重启一次 dsh 进程以加载新版后端代码，并引导我打开 DSH Web「插件 → QQ 机器人」安全扫码绑定，用 /bot-me、/bot-doctor 和 /dnd start 完成验收。
 ```
 
 完整迁移细则见 **[`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md)**（已随 npm 包附带）。
 
-开发版已附带 [`/learn` skill](./skills/learn/SKILL.md)，用于审阅并修订可复用的笔记。沿用 0.9.1 的配置，旧笔记无需迁移。
+`0.9.2+` 已随包附带 [`/learn` skill](./skills/learn/SKILL.md)，用于审阅并修订可复用的笔记。沿用 `0.9.1` 的配置，旧笔记无需迁移。
 
 #### 方式二：手动命令行安装
 

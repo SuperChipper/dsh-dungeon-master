@@ -6,15 +6,21 @@
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
-## 未发布
+## [0.9.2] - 2026-11-27
 
-- `desire` 回复欲望模式统一改为全灰区模型打分（仅保留 `@` 别人、斜杠命令、空消息、纯语气词与表情包防复读冷却的硬门控；将昵称命中、对话窗口与自家表情包作为线索喂给模型）；对话窗口内当打分模型支持 `image` 输入时自动附带最新 2 张图片（含纯图截图与非冷却表情包，复用本地缓存不重复下载）；跑团开团期允许插嘴时切换极克制的「旁观 DM」专用提示词。
-- 修复空闲压缩（`idleCompact`）在聚合 provider 走 Gemini 模型（如 `opencode` 路由 `gemini-*`）时不触发的问题：`idleCompactProviders` 新增支持 `provider/model` 与 `model:<通配>` 匹配（默认调整为 `google, */*gemini*`）；补齐 `cacheWriteTokens` 上下文大小统计、`openSession` 恢复会话时回填最近 `contextTokens`、`routeOf` 复用就地切模型状态，并在跳过时记录 debug 诊断日志及在 `/bot-doctor` 检查 `idleCompactMinutes >= sessionIdleTimeout` 冲突。
-- 修复插件设置中 `vision.timeoutMs` 未接入超时信号、以及 `modelFailover` 请求探测未读取宿主凭证库的问题；在 ElevenLabs 默认 `eleven_v4` 模型下隐藏不生效的 `Style` / `Speaker Boost` 项，并补全上游监测支持范围说明。
+> 本版本向后兼容 `0.9.1`，无需数据迁移；升级后请重启一次 `dsh` 进程以刷新后端 ESM 缓存。若之前在配置里手动保存过 `idleCompactProviders: "google"`，建议清空或改为 `google, */*gemini*` 以覆盖聚合 provider 下的 Gemini 模型。
 
-- 偏好草稿识别习惯、默认做法、纠正和下次约定。同轮的偏好与验证记录可分别保留。主人也可在本地 DSH Web/Desktop 输入 `/learn` 审阅该 bot 的草稿。
+### 新功能与增强
 
-- 随包提供 `/learn` skill。同范围结论可在审阅后原地修订。新格式笔记按预算完整召回条件、做法和例外，显式搜索可读整节依据。
+- **`desire` 回复欲望全灰区打分与窗口内多模态看图**：`groupTriggerMode = 'desire'` 默认直接启用灰区模型打分（仅保留 `@` 别人、斜杠命令、空消息、纯语气词与表情包接龙/防刷冷却的硬门控；将昵称命中、对话窗口与表情包类型作为线索喂给模型）；对话窗口内当打分模型声明支持 `image` 输入时自动附带最新 2 张图片（含纯图截图与非冷却表情包，复用本地缓存不重复下载）；跑团开团期允许插嘴时切换极克制的「旁观 DM」专用提示词，并同步简化设置页开关与文案。
+- **随包提供 `/learn` skill、扩展偏好草稿与结构化笔记修订**：随 npm 包附带 `skills/learn/SKILL.md`；偏好草稿扩展识别习惯、默认做法、纠正与下次约定且允许与同轮验证草稿并存，支持主人在本地 DSH Web/Desktop 会话直接 `/learn` 审阅；共享笔记新增「召回正文 / 依据」结构化按预算完整召回、`qqbot_notes_manage(action="revise")` 审阅后原地修订，以及更明确的《人类观察日记》记录条件。
+- **D&D 命名检查点、受控原书检索与模组加固**：新增里程碑自动检查点与 `/dnd checkpoint`、`/dnd undo`（开团与停团期均可用，群聊展示脱敏摘要）；新增 `dnd_lookup(kind="source")` 受控原书只读检索（单次硬限 3000 字）与 `dnd_prepare(brief=true)` 速览；支持探索期 `dnd_check(hold_for)` / `dnd_apply` 反应窗口、NPC `companion_status`（随行/留守/退队）、模组互斥触发器 `mutex` 与施法者 `spellbook`/`escort` 校验，并加入跑团期共享笔记自动召回降噪。
+
+### 修复与优化
+
+- **修复空闲压缩（`idleCompact`）与上下文统计**：`idleCompactProviders` 新增支持 `provider/model` 与 `model:<通配>` 匹配（默认调整为 `google, */*gemini*`），修复 `opencode` 等聚合 provider 走 Gemini 模型时不触发空闲压缩的问题；补齐 `cacheWriteTokens` 上下文统计、`openSession` 恢复/复用会话时回填最近 `contextTokens`、`routeOf` 对齐就地 `/model` 与 Web 切换，并在跳过时记录 `debug` 诊断日志及在 `/bot-doctor` 检查 `idleCompactMinutes >= sessionIdleTimeout` 冲突。
+- **KV 缓存跨重载与同轮稳定性**：`PromptLatch` 支持原子落盘持久化，跨插件重载或宿主重启复用同一 epoch 锁；`promptEpoch` 在真实宿主事件流中仅随压缩递增、`agentUserTurnTag` 锚定 `turn/start`，避免 `system/message` 同轮替换击穿 KV 缓存。
+- **插件设置项修复与清理**：将 `vision.timeoutMs` 接入 `callVision` 超时中止信号；`modelFailover` 请求探测优先读取宿主 `credentials` 凭据库；在 ElevenLabs 默认 `eleven_v4*` 模型下隐藏不生效的 `Style` / `Speaker Boost` 项并补全上游监测支持范围说明；微调内置私聊人设（`personas/*.direct.md`）的进度播报指引。
 
 ## [0.9.1] - 2026-11-26
 

@@ -20,14 +20,14 @@ Paste this prompt to your AI coding assistant (DSH / Claude Code / Antigravity /
 Please install or upgrade the DSH plugin dsh-dungeon-master (plugin ID: im-qqbot) on my machine:
 1. Read docs/AGENT_GUIDE.md first (if not present locally yet, read node_modules/dsh-dungeon-master/docs/AGENT_GUIDE.md after installation or https://github.com/SuperChipper/dsh-dungeon-master/blob/main/docs/AGENT_GUIDE.md), and strictly follow its guardrails.
 2. Confirm my target DSH profile (default to web if unspecified), check Node (>= 20.3.0) and dsh versions, and if the conflicting package @tencent-connect/dsh-qqbot is installed in that profile, back up ~/.dsh/profiles/<profile>/cordis.patch.yml first and cleanly remove the old package while preserving credentials.
-3. Install or upgrade (npm: dsh plugin --profile <profile> add dsh-dungeon-master; or build and link local source). If I am upgrading from 0.8.x to 0.9.0, verify all 5 items in the migration checklist inside AGENT_GUIDE, back up cordis.patch.yml before editing, and merge only the im-qqbot entry using a YAML parser.
+3. Install or upgrade (npm: dsh plugin --profile <profile> add dsh-dungeon-master; or build and link local source). If I am upgrading from <0.9.0 (0.8.x or earlier) to 0.9.x, verify the migration checklist inside AGENT_GUIDE, back up cordis.patch.yml before editing, and merge only the im-qqbot entry using a YAML parser.
 4. Never print or echo appSecret, apiKey, or personal voice_id values, and never invent unconfirmed third-party gateway URLs, model IDs, or API key env var names.
 5. Remind me to restart the dsh process once finished so the updated server bundle loads, then guide me through QR binding under DSH Web -> Plugins -> QQ Bot and running /bot-me, /bot-doctor, and /dnd start to verify.
 ```
 
 See **[`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md)** for full details (also bundled in the npm package).
 
-The development build includes the [`/learn` skill](./skills/learn/SKILL.md) for reviewing and revising reusable notes. Existing 0.9.1 settings and notes require no migration.
+`0.9.2+` bundles the [`/learn` skill](./skills/learn/SKILL.md) for reviewing and revising reusable notes. Existing `0.9.1` settings and notes require no migration.
 
 #### Option B: Manual CLI Install
 

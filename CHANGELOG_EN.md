@@ -6,15 +6,21 @@ This file records significant `dsh-dungeon-master` updates from a product perspe
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## Unreleased
+## [0.9.2] - 2026-11-27
 
-- Switched `desire` group trigger mode to full LLM grey-zone judging by default (keeping only hard filters for other-mentions, commands, empty/noise messages, and sticker chain/cooldown guards while passing name matches, engagement window, and sticker metadata as hints); inside active engagement windows, multimodal judge models automatically receive up to 2 recent images (including image-only screenshots and non-cooldown stickers, reusing the local download cache); active D&D campaigns with `dnd.interjections` enabled now use a dedicated ultra-restrained bystander-DM judge prompt.
-- Fixed idle compaction (`idleCompact`) not firing for Gemini models routed through aggregator providers (e.g. `opencode` running `gemini-*`): `idleCompactProviders` now supports `provider/model` and `model:<wildcard>` patterns (default updated to `google, */*gemini*`); included `cacheWriteTokens` in `contextTokensOf`, hydrated `contextTokens` from session history on resume/reattach, aligned `routeOf` with in-place model selection, added debug skip diagnostics, and added a `/bot-doctor` check when `idleCompactMinutes >= sessionIdleTimeout`.
-- Wired `vision.timeoutMs` into `callVision` abort timeout handling, connected `modelFailover` request probes to the host `credentials` service, hid `Style` / `Speaker Boost` controls in the settings panel for `eleven_v4*` models where they are ignored, and clarified supported providers in the settings copy.
+> Backwards-compatible with `0.9.1`; no data migration required. Restart the `dsh` process once after upgrading to reload the backend ESM bundle. If your config previously saved `idleCompactProviders: "google"`, clear it or update it to `google, */*gemini*` so Gemini models routed through aggregator providers are matched.
 
-- Capture habits, defaults, corrections and next-time requests as preference drafts. A preference and a verified check can both survive the same turn. Owners can review their bot's drafts with `/learn` from the local DSH Web/Desktop session.
+### Added & Enhanced
 
-- Bundle the `/learn` skill and support reviewed, in-place note revisions. Automatic recall includes the complete decision and its exceptions when they fit. Explicit searches return the full marked section with its evidence.
+- **Full Grey-Zone Judge & Windowed Multimodal Scoring in `desire` Mode**: `groupTriggerMode = 'desire'` now uses the LLM grey-zone judge by default (keeping only hard filters for other-mentions, commands, empty/noise messages, and sticker chain/cooldown guards while passing name matches, engagement window, and sticker metadata as hints). Inside active engagement windows, multimodal judge models automatically receive up to 2 recent images (including image-only screenshots and non-cooldown stickers, reusing the local download cache). Active D&D campaigns with `dnd.interjections` enabled use a dedicated ultra-restrained bystander-DM judge prompt.
+- **Bundled `/learn` Skill, Broader Preference Drafts & Structured Note Revisions**: Shipped `skills/learn/SKILL.md` in the npm package; expanded preference draft capture to habits, defaults, corrections, and next-time requests (coexisting with verified same-turn check drafts) and enabled owner `/learn` reviews from local DSH Web/Desktop sessions; added structured recall-body/evidence rendering, reviewed in-place `qqbot_notes_manage(action="revise")`, and clearer Human Observation Diary guidelines.
+- **D&D Named Checkpoints, Bounded Source Lookup & Module Hardening**: Added milestone auto-checkpoints plus `/dnd checkpoint` and `/dnd undo` (active and paused, with sanitized group summaries); added `dnd_lookup(kind="source")` bounded read-only module source search (3,000-char cap) and `dnd_prepare(brief=true)`; added exploration `dnd_check(hold_for)` / `dnd_apply` reaction windows, NPC `companion_status`, `mutex` triggers, caster `spellbook`/`escort` validation, and D&D auto-recall noise filtering.
+
+### Fixed & Improved
+
+- **Idle Compaction (`idleCompact`) & Context Accounting Fixes**: `idleCompactProviders` now supports `provider/model` and `model:<wildcard>` patterns (default updated to `google, */*gemini*`), fixing idle compaction never firing for Gemini models behind aggregator providers such as `opencode`; included `cacheWriteTokens` in `contextTokensOf`, hydrated `contextTokens` from session history on resume/reattach, aligned `routeOf` with in-place `/model` & Web switches, added debug skip diagnostics, and added a `/bot-doctor` conflict check when `idleCompactMinutes >= sessionIdleTimeout`.
+- **Cross-Reload & Same-Turn KV Cache Stability**: Added atomic disk persistence to `PromptLatch`, restricted `promptEpoch` increments on host lifecycle streams to real compactions, and anchored `agentUserTurnTag` to `turn/start` to prevent same-turn `system/message` replacements from invalidating KV cache.
+- **Settings Panel & Runtime Polish**: Wired `vision.timeoutMs` into `callVision` abort timeouts, connected `modelFailover` request probes to the host `credentials` service, hid ignored `Style` / `Speaker Boost` controls for `eleven_v4*` models while clarifying supported failover providers, and refined direct-chat progress reporting guidance in bundled `personas/*.direct.md`.
 
 ## [0.9.1] - 2026-11-26
 
