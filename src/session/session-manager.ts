@@ -286,16 +286,38 @@ export function isRuntimeContextEvent(event: SessionEventLike): boolean {
 }
 
 /**
- * system prompt 里的锁什么时候换新：换会话或历史被替换（压缩）时前缀本来就要重算，顺带换成最新的。
- * 普通追加消息不改变它。
+ * system prompt 里的锁什么时候换新：换会话或发生上下文压缩时前缀本来就要重算，顺带换成最新的。
+ * 普通追加消息及宿主 `system/message` 的 `surfaceOp: replace` 均不改变它（避免同轮自激重写 system prompt 击穿 KV 缓存）。
  */
 export function promptEpoch(record: Pick<SessionRecord, 'agent'>): string {
   const session = record.agent.session;
+  const events = tryReadSessionEvents(session);
+  if (Array.isArray(events)) {
+    let compactionEnds = 0;
+    let compactionSummaries = 0;
+    let hasHostLifecycle = false;
+    for (const raw of events) {
+      const ev = raw as { type?: unknown };
+      if (ev.type === 'compaction/end') {
+        compactionEnds += 1;
+        hasHostLifecycle = true;
+      } else if (ev.type === 'compaction/summary') {
+        compactionSummaries += 1;
+        hasHostLifecycle = true;
+      } else if (ev.type === 'turn/start' || ev.type === 'step/start' || ev.type === 'system/message') {
+        hasHostLifecycle = true;
+      }
+    }
+    if (hasHostLifecycle) {
+      return `${session.id}:c${Math.max(compactionEnds, compactionSummaries)}`;
+    }
+  }
   return `${session.id}:${readSessionContentGeneration(session)}`;
 }
 
 /**
  * 计算当前会话最新的真实用户发言轮次标识（忽略宿主的 runtime-context 与笔记召回消息）。
+ * 当宿主事件流含 `turn/start` 时优先按轮次锚定，确保同一轮 Step 1（user/message 落盘前）与 Step 2 标识完全一致；
  * 同一轮工具循环（move → attack → attack → next）期间该标识恒定不变，用于锁定单轮内零重发团况快照。
  */
 export function agentUserTurnTag(record: Pick<SessionRecord, 'agent'>): string | undefined {
@@ -303,16 +325,27 @@ export function agentUserTurnTag(record: Pick<SessionRecord, 'agent'>): string |
   if (session === undefined) return undefined;
   const events = tryReadSessionEvents(session);
   if (!Array.isArray(events)) return undefined;
+  let turnCount = 0;
+  let lastTurnTag: string | undefined;
   let userCount = 0;
   let lastTag = '0';
   for (let i = 0; i < events.length; i++) {
     const ev = events[i]!;
+    if (ev.type === 'turn/start') {
+      turnCount += 1;
+      const turnNum = (ev.data as { turn?: unknown } | undefined)?.turn;
+      lastTurnTag = `${typeof turnNum === 'number' || typeof turnNum === 'string' ? turnNum : turnCount}@${String((ev as { seq?: unknown }).seq ?? i)}`;
+      continue;
+    }
     if (ev.type !== 'user/message' || isRuntimeContextEvent(ev)) continue;
     const body = (ev.data ?? ev.message ?? ev) as { source?: { kind?: unknown }; message?: { source?: { kind?: unknown } } };
     const kind = body.message?.source?.kind ?? body.source?.kind;
     if (kind !== undefined && kind !== 'user') continue;
     userCount += 1;
     lastTag = String((ev as { seq?: unknown }).seq ?? i);
+  }
+  if (lastTurnTag !== undefined) {
+    return `${promptEpoch(record)}#t${turnCount}:${lastTurnTag}`;
   }
   return `${promptEpoch(record)}#u${userCount}:${lastTag}`;
 }
@@ -496,7 +529,7 @@ export class SessionManager {
   /** 按会话与权限范围隐藏确定不可用的非跑团工具（由 bootstrap 注入） */
   public sessionToolScope?: SessionToolScope;
   /** 一段对话内锁住的 system prompt 文字（表情清单、本群笔记目录），见 PromptLatch */
-  private readonly promptLatch = new PromptLatch();
+  private readonly promptLatch: PromptLatch;
   /** 跑团团况 runtime-context 单轮锁定与跨轮次节流门控 */
   private readonly dndSnapshotGate = new DndSnapshotGate();
   /** 短时入站自动 steer 阶段跟踪器（与出站事件、流式帧同步） */
@@ -514,11 +547,13 @@ export class SessionManager {
     agents: DshAgentRegistry,
     config: ImQQBotConfig,
     logger: Logger,
+    options?: { promptLatchFile?: string },
   ) {
     this.ctx = ctx;
     this.agents = agents;
     this.config = config;
     this.logger = logger;
+    this.promptLatch = new PromptLatch(options?.promptLatchFile);
     this.modelResolver = new ModelResolver(ctx, config, logger);
 
     this.evictor = new IdleEvictor(

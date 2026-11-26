@@ -233,17 +233,18 @@ export class DndService {
   /** 团开始、暂停时通知（会话可见的 dnd_* 工具要跟着变，见 tool-scope.ts） */
   public onStateChange?: (key: string) => void;
   /** 这段对话 system prompt 里锁住的背景，见 promptSections */
-  private readonly background = new PromptLatch();
+  private readonly background: PromptLatch;
   private readonly forceSnapshotSeq = new Map<string, number>();
   private readonly agentSyncedSnapshots = new Map<string, { main: string; combat: string }>();
   private readonly cwd: string;
 
-  public constructor(options: { store: CampaignStore; library: AdventureLibrary; mapDir: string; roller?: Roller; cwd?: string }) {
+  public constructor(options: { store: CampaignStore; library: AdventureLibrary; mapDir: string; roller?: Roller; cwd?: string; latchFile?: string }) {
     this.store = options.store;
     this.library = options.library;
     this.mapDir = options.mapDir;
     this.roller = options.roller ?? cryptoRoller;
     this.cwd = options.cwd ?? process.cwd();
+    this.background = new PromptLatch(options.latchFile);
     this.customEffects = new CustomEffectStore(join(options.store.root, '..', 'custom-effects.json'));
   }
 

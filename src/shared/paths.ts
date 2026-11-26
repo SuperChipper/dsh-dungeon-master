@@ -45,6 +45,10 @@ export function qqbotMemoryDir(homeDir?: string): string {
   return join(dshHomeDir(homeDir), 'qqbot-memory');
 }
 
+export function qqbotPromptLatchPath(homeDir?: string): string {
+  return join(qqbotMemoryDir(homeDir), 'prompt-latch.json');
+}
+
 export function groupMemoryPath(appId: string, groupId: string, homeDir?: string): string {
   return join(qqbotMemoryDir(homeDir), `${sanitizeStorageKey(appId)}-${sanitizeStorageKey(groupId)}.jsonl`);
 }

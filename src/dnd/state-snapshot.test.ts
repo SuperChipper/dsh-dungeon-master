@@ -6,7 +6,7 @@ import { AdventureLibrary } from './adventure.ts';
 import { CampaignStore, addSummary, applyDamage, startInitiative, upsertCharacter } from './campaign.ts';
 import { DndService, DndSnapshotGate } from './dnd-service.ts';
 import { DndCombatAgents } from './combat-agent.ts';
-import { dndStateText, isRuntimeContextEvent, promptEpoch } from '../session/session-manager.ts';
+import { agentUserTurnTag, dndStateText, isRuntimeContextEvent, promptEpoch } from '../session/session-manager.ts';
 import type { DshAgent, SessionRecord } from '../session/index.ts';
 
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
@@ -118,6 +118,76 @@ describe('promptEpoch', () => {
   it('由会话和 contentGeneration 决定；宿主没暴露时按 0', () => {
     expect(promptEpoch(recordOf({ id: 's', surface: { contentGeneration: 3 } }))).toBe('s:3');
     expect(promptEpoch(recordOf({ id: 's' }))).toBe('s:0');
+  });
+
+  it('真实宿主事件流中 system/message replace 递增 contentGeneration 不改 epoch，仅 compaction 变更', () => {
+    const events: Array<Record<string, unknown>> = [
+      { seq: 1, type: 'turn/start', data: { turn: 1 } },
+      { seq: 2, type: 'step/start', data: { turn: 1, step: 1 } },
+      { seq: 3, type: 'system/message', surfaceOp: 'append' },
+    ];
+    const surface = { contentGeneration: 1 };
+    const rec = recordOf({ id: 's', events, surface });
+    expect(promptEpoch(rec)).toBe('s:c0');
+
+    // Step 1 写入 system/message replace 后宿主的 contentGeneration 递增，epoch 仍须保持不变（避免 Step 2 击穿缓存）
+    events.push({ seq: 4, type: 'system/message', surfaceOp: { op: 'replace', startSeq: 3, endSeq: 3 } });
+    surface.contentGeneration += 1;
+    expect(promptEpoch(rec)).toBe('s:c0');
+
+    // 真正压缩后 epoch 递增
+    events.push({ seq: 5, type: 'compaction/summary' }, { seq: 6, type: 'compaction/end' });
+    surface.contentGeneration += 1;
+    expect(promptEpoch(rec)).toBe('s:c1');
+
+    // 压缩后首步再次重写 system/message，Step 2 仍保持 s:c1
+    events.push({ seq: 7, type: 'system/message', surfaceOp: { op: 'replace', startSeq: 4, endSeq: 4 } });
+    surface.contentGeneration += 1;
+    expect(promptEpoch(rec)).toBe('s:c1');
+  });
+
+  it('agentUserTurnTag 优先锚定 turn/start，同轮 Step 1（user/message 前）与 Step 2 标识一致', () => {
+    const events: Array<Record<string, unknown>> = [
+      { seq: 679, type: 'turn/start', data: { turn: 45 } },
+      { seq: 681, type: 'step/start', data: { turn: 45, step: 1 } },
+    ];
+    const rec = recordOf({ id: 's', events, surface: { contentGeneration: 1 } });
+    const step1BeforeUser = agentUserTurnTag(rec);
+    events.push(
+      { seq: 682, type: 'system/message', surfaceOp: { op: 'replace', startSeq: 31, endSeq: 31 } },
+      { seq: 683, type: 'user/message', data: { source: { kind: 'user' } } },
+      { seq: 684, type: 'user/message', data: { source: { kind: 'runtime-context' } } },
+      { seq: 694, type: 'step/start', data: { turn: 45, step: 2 } },
+    );
+    const step2 = agentUserTurnTag(rec);
+    expect(step2).toBe(step1BeforeUser);
+
+    events.push({ seq: 702, type: 'turn/start', data: { turn: 46 } });
+    expect(agentUserTurnTag(rec)).not.toBe(step2);
+  });
+
+  it('DndService 传入 latchFile 后跨重载复用同一 epoch 的背景锁', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dnd-latch-persist-'));
+    const latchFile = join(root, 'prompt-latch.json');
+    const store = new CampaignStore(join(root, 'campaigns'));
+    const library = new AdventureLibrary();
+    const key = 'group:persist';
+
+    const s1 = new DndService({ store, library, mapDir: root, latchFile });
+    s1.start(key, 'sunken-bell', false);
+    s1.store.update(key, (c) => addSummary(c, '初始进度'));
+    const before = s1.promptSections(key, 'sess:c1').find((s) => s.name === 'qqbot:dnd-background')!.text;
+    expect(before).toContain('初始进度');
+
+    // 写入新进度后模拟插件重启（重建 DndService）
+    s1.store.update(key, (c) => addSummary(c, '重启前写入的新进度'));
+    const s2 = new DndService({ store, library, mapDir: root, latchFile });
+    const afterReload = s2.promptSections(key, 'sess:c1').find((s) => s.name === 'qqbot:dnd-background')!.text;
+    expect(afterReload).toBe(before);
+
+    // 压缩后 epoch 变为 sess:c2 时才刷新到新进度
+    const afterCompact = s2.promptSections(key, 'sess:c2').find((s) => s.name === 'qqbot:dnd-background')!.text;
+    expect(afterCompact).toContain('重启前写入的新进度');
   });
 });
 

@@ -31,7 +31,7 @@ import { DndTurnButtons } from '../dnd/turn-buttons.ts';
 import { MEDIA_ROOT } from '../media/media-cleaner.ts';
 import { startCleanup } from '../media/cleanup.ts';
 import { ensureTmpDir, resolveTmpDir } from '../media/tmp-dir.ts';
-import { PLUGIN_ROOT, buildUserAgent, isPrivilegedSender, privilegedOpenids, resolveProfileDir } from '../shared/index.ts';
+import { PLUGIN_ROOT, buildUserAgent, isPrivilegedSender, privilegedOpenids, qqbotPromptLatchPath, resolveProfileDir } from '../shared/index.ts';
 import { createToolGuard } from '../shared/tool-guard.ts';
 import { updateProfileAllowedGroups } from '../setup/persist.ts';
 import { NOTE_JUDGE_DEFAULTS, type ImQQBotConfig } from '../config.ts';
@@ -60,7 +60,7 @@ export async function bootstrapGateway(
   config: ImQQBotConfig,
   logger: Logger,
 ): Promise<void> {
-  const manager = new SessionManager(ctx, agents, config, logger);
+  const manager = new SessionManager(ctx, agents, config, logger, { promptLatchFile: qqbotPromptLatchPath() });
 
   // 配置权限：owner/admin 为空时保持旧行为，但明确提示风险
   if (privilegedOpenids(config).length === 0) {

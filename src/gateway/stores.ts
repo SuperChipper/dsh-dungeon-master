@@ -89,5 +89,6 @@ export function createDndService(config: ImQQBotConfig, logger: Logger): DndServ
     library: new AdventureLibrary({ dungeons: join(root, 'dungeons'), adventures: join(root, 'adventures') }, logger),
     mapDir: join(resolveTmpDir(config), 'dnd-maps'),
     cwd,
+    latchFile: join(root, 'prompt-latch.json'),
   });
 }
