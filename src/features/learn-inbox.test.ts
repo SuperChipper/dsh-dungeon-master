@@ -74,6 +74,31 @@ describe('experience drafts', () => {
     expect(list(inbox)).toEqual([]);
   });
 
+  it.each([
+    '我更习惯先听结论。', '请记住，回复尽量简洁。', '下次先给我草稿', '别再每一步都问我了',
+    '写报告时默认用中文。', '我喜欢用 `pnpm`。', '遇到不确定的数值就查原记录。',
+    '这次先用截图，以后直接发纯文本。', '收到吗？\n我更看重可读性。', '直接给结论就好。',
+  ])('recognizes a preference candidate in %s', text => {
+    const inbox = make();
+    start(inbox, text); end(inbox);
+    expect(list(inbox)).toMatchObject([{ kind: 'preference', evidence: { messageId: 'qq-1' } }]);
+  });
+
+  it('retains both a preference and a verified check on the same turn', () => {
+    const inbox = make();
+    start(inbox, '回复尽量简短。'); fail(inbox); edit(inbox); pass(inbox); end(inbox);
+    expect(list(inbox).map(draft => draft.kind).sort()).toEqual(['preference', 'verified-check']);
+  });
+
+  it('keeps both directly admitted preferences when a follow-up steers the active turn', () => {
+    const inbox = make();
+    start(inbox, '我更习惯先听结论');
+    inbox.stage(owner, 'steer', 'qq-steer', '下次用中文回复');
+    inbox.observe(owner, { type: 'user/message', data: { id: 'steer', source: { kind: 'user' } } });
+    end(inbox);
+    expect(list(inbox).map(draft => draft.evidence.messageId).sort()).toEqual(['qq-1', 'qq-steer']);
+  });
+
   it('fails closed for group, guest, unset owner and non-/learn turns; separates stores across bots and owners', () => {
     const inbox = make();
     for (const chat of [guest, group]) {
@@ -146,4 +171,31 @@ it('wires the host events and serves evidence only on an explicit owner /learn',
   start(manager.learnInbox!, '/learn', 2);
   await expect(tool.execute({}, { agent })).resolves.toMatchObject({ drafts: [{ sourceExcerpt: text }] });
   await expect(tool.execute({}, {})).rejects.toThrow('/learn');
+
+  // Host-native /learn, without staging the QQ message or observing the live turn.
+  end(manager.learnInbox!, 2);
+  const direct = (text: string, source: Record<string, unknown>) =>
+    ({ type: 'user/message', data: { source, content: [{ type: 'text', text }] } });
+  const turnStart = { type: 'turn/start', data: { turn: 3 } };
+  const web = (events: unknown[]) => ({ agent: { session: { id: 'web', snapshotEvents: () => events } } });
+  const ownerRpc = { kind: 'user', rpcId: 'req' };
+  const request = direct('/learn 复盘一下', ownerRpc);
+  const invocation = direct('instructions', { kind: 'skill-invocation', name: 'learn' });
+  expect(activate(web([]))).toBe(true);
+  const result = await tool.execute({}, web([turnStart, request, invocation]));
+  expect(result.drafts).toHaveLength(1);
+  expect(result.drafts[0]).not.toHaveProperty('sourceExcerpt');
+  await expect(tool.execute({}, web([turnStart, direct('请用 /learn 复盘', ownerRpc), invocation]))).resolves.toMatchObject({ drafts: [expect.anything()] });
+  for (const events of [
+    [turnStart, invocation], [turnStart, direct('/learn', { kind: 'user' })],
+    [turnStart, direct('文档里提到 /learn 是做什么的？', ownerRpc), invocation],
+    [turnStart, direct('/learn', { ...ownerRpc, principal: { kind: 'share-viewer' } }), invocation],
+    [turnStart, request, invocation, direct('其他话题', ownerRpc)],
+    [turnStart, request, invocation, { type: 'turn/end' }], [request, invocation, turnStart],
+  ]) await expect(tool.execute({}, web(events))).rejects.toThrow('/learn');
+  const qq = { agent: { session: { id: owner.sessionId, events: [turnStart, direct('/learn', { kind: 'user' })] } } };
+  await expect(tool.execute({}, qq)).resolves.toMatchObject({ drafts: [expect.anything()] });
+  manager.findBySessionId = () => ({ ...record, scope: 'group' });
+  expect(activate(web([request]))).toBe(false);
+  await expect(tool.execute({}, web([request]))).rejects.toThrow('/learn');
 });

@@ -27,6 +27,8 @@ Please install or upgrade the DSH plugin dsh-dungeon-master (plugin ID: im-qqbot
 
 See **[`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md)** for full details (also bundled in the npm package).
 
+The development build includes the [`/learn` skill](./skills/learn/SKILL.md) for reviewing and revising reusable notes. Existing 0.9.1 settings and notes require no migration.
+
 #### Option B: Manual CLI Install
 
 ```bash

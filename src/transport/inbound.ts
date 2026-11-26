@@ -316,7 +316,7 @@ export async function handleInbound(
   const operations = inboundOperations(notesQuery, noteMediaTypes);
   if (!ctx.signal.aborted) {
     // Use only the direct input, not assembled history, quoted text or media transcripts.
-    if (!steered && !mwState.senderTagged && !mwState.forwardImages?.length && !msg.attachments?.length
+    if (!mwState.senderTagged && !mwState.forwardImages?.length && !msg.attachments?.length
         && scope === 'c2c' && !manager.dndService?.active(record.sessionKey)) {
       manager.learnInbox?.stage(record, message.id, msg.messageId, msg.content ?? '');
     }
@@ -353,7 +353,8 @@ export async function handleInbound(
     logger.warn(`whenIdle rejected: ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     if (!submitted) manager.unstageNoteRecall?.(message.id);
-    manager.learnInbox?.unstage(message.id);
+    // Accepted steers can return before the host commits their user/message.
+    if (!submitted || !steered) manager.learnInbox?.unstage(message.id);
   }
 
   // 上下文超阈值时后台压缩（只针对 QQ 会话；steer 注入分支由外层回合统一收尾压缩）

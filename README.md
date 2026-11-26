@@ -27,6 +27,8 @@
 
 完整迁移细则见 **[`docs/AGENT_GUIDE.md`](./docs/AGENT_GUIDE.md)**（已随 npm 包附带）。
 
+开发版已附带 [`/learn` skill](./skills/learn/SKILL.md)，用于审阅并修订可复用的笔记。沿用 0.9.1 的配置，旧笔记无需迁移。
+
 #### 方式二：手动命令行安装
 
 ```bash

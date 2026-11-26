@@ -6,6 +6,12 @@ This file records significant `dsh-dungeon-master` updates from a product perspe
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+- Capture habits, defaults, corrections and next-time requests as preference drafts. A preference and a verified check can both survive the same turn. Owners can review their bot's drafts with `/learn` from the local DSH Web/Desktop session.
+
+- Bundle the `/learn` skill and support reviewed, in-place note revisions. Automatic recall includes the complete decision and its exceptions when they fit. Explicit searches return the full marked section with its evidence.
+
 ## [0.9.1] - 2026-11-26
 
 > Backwards-compatible with `0.9.0`; no data migration required. Restart the `dsh` process once after upgrading to reload the backend ESM bundle.
