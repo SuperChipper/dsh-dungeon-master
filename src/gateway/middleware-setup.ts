@@ -20,7 +20,7 @@ import {
   envelopeFormatter,
 } from '@tencent-connect/qqbot-nodejs';
 import type { Middleware, RefIndexStore, ResolvedQuote } from '@tencent-connect/qqbot-nodejs';
-import { resolveGroupTriggerPolicy, type ImQQBotConfig } from '../config.ts';
+import { REPLY_JUDGE_DEFAULTS, resolveGroupTriggerPolicy, type ImQQBotConfig } from '../config.ts';
 import type { SessionManager } from '../session/index.ts';
 import type { Logger, RawAttachment } from '../types.ts';
 import { isImageContentType } from '../transport/attachment.ts';
@@ -202,16 +202,14 @@ export function setupMiddlewares(
     },
   }));
 
-  // 5.5. 回复欲望门控：未 @ 的群消息按规则打分 + 对话窗口决定是否接话
+  // 5.5. 回复欲望门控：desire 模式下未 @ 的群消息默认全部走灰区模型打分（llm 不可用时降级为纯规则）
   if (trigger.replyDesireEnabled) {
     let judgeDeps: JudgeDeps | undefined;
-    if (config.replyDesire.judge?.enabled === true) {
-      if (llm?.stream === undefined) {
-        logger.warn('im-qqbot: llm 服务不可用，回复欲望的模型打分未启用（只用规则）');
-      } else {
-        const judgeConfig = () => config.replyDesire.judge;
-        judgeDeps = { judge: new ReplyJudge(llm, judgeConfig, logger), queue: new JudgeQueue(judgeConfig) };
-      }
+    if (llm?.stream === undefined) {
+      logger.warn('im-qqbot: llm 服务不可用，回复欲望的模型打分未启用（降级为纯规则）');
+    } else {
+      const judgeConfig = () => config.replyDesire?.judge ?? REPLY_JUDGE_DEFAULTS;
+      judgeDeps = { judge: new ReplyJudge(llm, judgeConfig, logger), queue: new JudgeQueue(judgeConfig) };
     }
     bot.use(replyDecider(config, manager, logger, judgeDeps));
   }

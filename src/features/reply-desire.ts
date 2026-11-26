@@ -1,26 +1,18 @@
 /**
- * 群聊回复欲望 — 未 @bot 的消息按规则打分决定是否接话，外加「对话窗口」。
+ * 群聊回复欲望 — 提取规则线索、硬过滤（@别人/命令/空消息/语气词）、表情包防复读冷却与「对话窗口」。
  *
- * 文字（emoji、QQ 小黄脸都算文字），打分 0-1，越高越想接：
- *   - 空消息 / 斜杠命令 / @ 了别人 / 纯语气词：直接 0
- *   - 点名 bot 昵称：+0.7
- *   - 对话窗口内：刚和 bot 聊过的人 +0.6，其他人 +0.2
- *   - 像在提问：+0.2
+ * 在 `desire` 模式下有模型时，非硬过滤消息（含点名昵称、窗口内文字/图片、非冷却表情包与跑团旁观插话）
+ * 统一经防抖进入灰区裁判 `ReplyJudge`，规则提取的结果作为线索喂给模型；
+ * 仅在 `llm` 服务不可用时回退到纯规则分数阈值放行。
  *
- * 表情包（QQ 用 faceType=6 标记的单张图，或单张 gif）：人会用表情包回表情包，但不会每张都回
- *   - 群友在复读同一张表情包（连续 3 条、至少两个人）：跟一张，同一串只跟一次
+ * 表情包（QQ 用 faceType=6 标记的单张图，或单张 gif）：
+ *   - 群友在复读同一张表情包（连续 3 条、至少两个人，非跑团）：快捷跟一张，同一串只跟一次
  *   - bot 刚用表情包接过一张：这个群 5 分钟内不再靠表情包接话（复读除外）
  *   - bot 已经用表情包接过这个人，他还没说过文字又甩一张：不接（防止互刷）
- *   - bot 刚说完话就有人甩表情包（在回应 bot）：+0.4
- *   - 对话窗口内：刚聊过的人 +0.3，其他人 +0.1（表情包多半是在收尾，不像文字那样要接）
- *   - 是 bot 自带的那套表情（画的就是它本人）：+0.7，基本是在逗它
- *   - 是 bot 自己收藏过的表情：+0.2
- *   单独一条理由（除了自带表情）都不够，要「刚说完话 + 窗口里的人」这类叠起来才接：
- *   热闹的群里 bot 几乎一直在说话，「刚说完话」单独放行时差不多每张表情包都会被接
  *
- * 对话窗口：bot 被 @ 或接话后开窗（turn/end 时从回复结束起续期），窗口内刚聊过的人
- * 再说话基本都会被接，表现为连续对话；靠打分接的轮数到上限就关窗，避免和人无限对聊。
- * 开团期间（跑团）不用窗口、也不复读：行动要 @，插嘴只保留点名和对 bot 的表情包回应。
+ * 对话窗口：bot 被 @ 或接话后开窗（turn/end 时从回复结束起续期），窗口内会作为上下文线索
+ * 交给裁判，并在窗口内尝试附带最新图片（含纯图截图与非冷却表情包）参与多模态打分；
+ * 靠打分接的轮数到上限就关窗，避免和人无限对聊。
  */
 import { isImageContentType } from '../transport/attachment.ts';
 
@@ -101,11 +93,41 @@ const BOT_LINES_LIMIT = 3;
 const BOT_LINE_MAX_CHARS = 300;
 
 /** 规则直接判 0 的原因：这些消息不值得再让模型看 */
-const HARD_SKIP_REASONS = new Set(['empty', 'command', 'other-mention', 'noise']);
+const HARD_SKIP_REASONS = new Set(['empty', 'command', 'other-mention', 'noise', 'sticker-cooldown', 'sticker-volley']);
 
-/** 规则没放行、也没明确拦下的文字消息，可以交给模型打分 */
-export function isJudgeCandidate(text: string, result: DesireResult): boolean {
-  return result.mode === undefined && text !== '' && !HARD_SKIP_REASONS.has(result.reasons[0] ?? '');
+export interface JudgeCandidateOptions {
+  /** 当前群是否处于对话窗口内（窗口内允许纯图与非冷却表情包带图进入灰区裁判） */
+  engaged?: boolean;
+  /** 当前消息是否包含图片附件 */
+  hasImage?: boolean;
+}
+
+/** 当前消息附件里是否包含图片 */
+export function hasImageAttachment(attachments?: readonly DesireAttachment[]): boolean {
+  return (attachments ?? []).some((a) => isImageContentType(a.content_type ?? ''));
+}
+
+/**
+ * 判断一条未 @ 消息是否应该交给灰区模型裁判：
+ * - 硬拦截（空消息 / 斜杠命令 / @ 别人 / 纯语气词 / 表情包冷却或防互刷）与表情包接龙复读不进模型；
+ * - 其余文字（含提到昵称）均进灰区裁判；
+ * - 表情包：对话窗口内全部进裁判（可带图），窗口外仅自家表情包或 bot 刚说完话 30 秒内进裁判；
+ * - 无配文纯图片（截图/照片）：仅在对话窗口内进裁判（可带图）。
+ */
+export function isJudgeCandidate(
+  text: string,
+  result: DesireResult,
+  options?: JudgeCandidateOptions,
+): boolean {
+  if (HARD_SKIP_REASONS.has(result.reasons[0] ?? '')) return false;
+  if (result.mode === 'sticker-chain') return false;
+  if (result.mode === 'sticker') {
+    return options?.engaged === true
+      || result.reasons.includes('sticker-mine')
+      || result.reasons.includes('sticker-react');
+  }
+  if (text !== '') return true;
+  return options?.engaged === true && options.hasImage === true;
 }
 
 const FACE_RE = /<faceType=(\d+),faceId="[^"]*",ext="([^"]*)">/g;
@@ -274,13 +296,15 @@ export class EngagementTracker {
     return engagement;
   }
 
-  /** 被 @ / 随机触发：开窗或续窗，轮数清零（明确叫了 bot，重新算） */
+  /** 被 @ / 随机触发：开窗或续窗，轮数与连说计数清零（明确叫了 bot，重新算） */
   public open(groupId: string, senderId: string, now: number, ms: number): void {
+    const state = this.group(groupId);
     const engagement = this.get(groupId, now) ?? { until: 0, peers: new Set<string>(), turns: 0 };
     engagement.until = now + ms;
     engagement.peers.add(senderId);
     engagement.turns = 0;
-    this.group(groupId).engagement = engagement;
+    state.engagement = engagement;
+    state.banterStreak = undefined;
   }
 
   /** 靠打分接话：计一轮并续窗，到上限关窗（本条仍然接） */
@@ -317,6 +341,10 @@ export class EngagementTracker {
     if (state.recent.length > RECENT_LIMIT) state.recent.shift();
     if (message.stickerId === undefined) state.stickerAnswered.delete(message.senderId);
     if (state.chainAnswered !== undefined && message.stickerId !== state.chainAnswered) state.chainAnswered = undefined;
+  }
+
+  public botSpokeAt(groupId: string): number | undefined {
+    return this.groups.get(groupId)?.botSpokeAt;
   }
 
   public sinceBotSpoke(groupId: string, now: number): number | undefined {

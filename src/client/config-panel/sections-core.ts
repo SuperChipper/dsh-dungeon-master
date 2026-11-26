@@ -30,7 +30,7 @@ export function QuickStartCoreSection({ form, patch }: { form: ConfigWire; patch
     patch('replyDesire', { ...replyDesire, enabled: true, ...next });
   };
   const patchJudge = (next: Partial<ReplyJudgeWire>): void => {
-    patchDesire({ judge: { ...judge, ...next } });
+    patchDesire({ judge: { ...judge, enabled: true, ...next } });
   };
   const effectiveTriggerMode: GroupTriggerMode = form.groupTriggerMode ?? (
     form.requireMention === false
@@ -82,67 +82,61 @@ export function QuickStartCoreSection({ form, patch }: { form: ConfigWire; patch
         })
       : null,
     ...(effectiveTriggerMode === 'desire' ? [
-      createElement('div', { className: 'imqb2-group-title' }, '回复欲望'),
+      createElement('div', { className: 'imqb2-group-title' }, '回复欲望（灰区模型打分）'),
       createElement(NumberRow, {
         label: '放行阈值（0-1）', value: replyDesire.threshold, min: 0, max: 1, step: 0.05,
-        help: '越高越安静：点名 bot 得 0.7、窗口内的人 0.6、像提问再 +0.2；默认 0.6',
+        help: '越高越安静：除 @ 别人 / 命令 / 纯语气词与表情包防复读冷却外，未 @ 消息统一交灰区模型综合打分；默认 0.6',
         onChange: (v) => { patchDesire({ threshold: v }); },
       }),
       createElement(ListRow, {
-        label: 'bot 的昵称/别名', help: '每行一个；群里提到这些词就算在叫 bot（大小写不敏感）',
+        label: 'bot 的昵称/别名', help: '每行一个；命中时作为线索喂给打分模型，由模型结合语境区分叫 bot 还是第三人称提及',
         value: replyDesire.names, rows: 2,
         onChange: (v) => { patchDesire({ names: v }); },
       }),
       createElement(NumberRow, {
         label: '对话窗口时长（毫秒）', value: replyDesire.engagedMs, min: 5000, max: 600000, step: 5000,
-        help: '被 @ 或接话后开窗；没开模型打分时，窗口内刚聊过的人再说话基本都会被接，默认 90000（90 秒）',
+        help: '被 @ 或接话后开窗；窗口内作为线索喂给裁判，并尝试附带最新 2 张图片（含纯图截图与非冷却表情包）参与多模态打分，默认 90000（90 秒）',
         onChange: (v) => { patchDesire({ engagedMs: v }); },
       }),
       createElement(NumberRow, {
         label: '窗口内连续接话轮数上限', value: replyDesire.engagedMaxTurns, min: 0, max: 50, step: 1,
-        help: '靠打分接的轮数到上限就关窗（这一条仍接）；0 = 不进入对话窗口，默认 8',
+        help: '窗口内靠打分接的轮数到上限就关窗（这一条仍接）；0 = 关闭对话窗口，默认 8',
         onChange: (v) => { patchDesire({ engagedMaxTurns: v }); },
       }),
-      createElement(SwitchRow, {
-        label: '规则拿不准时让模型打分', checked: judge.enabled,
-        help: '没点名的普通文字交给模型判断要不要接，打开后文字不再靠对话窗口直接放行；语气词、表情包、开团期间不调模型',
-        onChange: (v) => { patchJudge({ enabled: v }); },
+      createElement(FieldRow, {
+        label: '打分 provider', value: judge.provider, placeholder: '留空 = 这个群的主模型',
+        onChange: (v) => { patchJudge({ provider: v.trim() }); },
       }),
-      ...(judge.enabled ? [
-        createElement(FieldRow, {
-          label: '打分 provider', value: judge.provider, placeholder: '留空 = 这个群的主模型',
-          onChange: (v) => { patchJudge({ provider: v.trim() }); },
-        }),
-        createElement(FieldRow, {
-          label: '打分模型', value: judge.model, placeholder: '留空 = 这个群的主模型',
-          onChange: (v) => { patchJudge({ model: v.trim() }); },
-        }),
-        createElement(FieldRow, {
-          label: '推理档位', value: judge.reasoningEffort, placeholder: '留空 = 自动选最低档',
-          help: '启动后第一次打分会在日志里列出这个模型支持的档位',
-          onChange: (v) => { patchJudge({ reasoningEffort: v.trim() }); },
-        }),
-        createElement(NumberRow, {
-          label: '安静多久才打分（毫秒）', value: judge.debounceMs, min: 0, max: 60000, step: 500,
-          help: '连着说的几条只给最后一条打一次分，默认 2500',
-          onChange: (v) => { patchJudge({ debounceMs: v }); },
-        }),
-        createElement(NumberRow, {
-          label: '最多攒多久也要打分（毫秒）', value: judge.maxWaitMs, min: 0, max: 300000, step: 1000,
-          help: '群里一直有人说话时的上限，默认 15000',
-          onChange: (v) => { patchJudge({ maxWaitMs: v }); },
-        }),
-        createElement(NumberRow, {
-          label: '给模型看的消息条数', value: judge.contextMessages, min: 1, max: 100, step: 1,
-          help: '越多越准也越贵，默认 20',
-          onChange: (v) => { patchJudge({ contextMessages: v }); },
-        }),
-        createElement(NumberRow, {
-          label: '打分超时（毫秒）', value: judge.timeoutMs, min: 1000, max: 120000, step: 1000,
-          help: '超时按不接处理，默认 15000',
-          onChange: (v) => { patchJudge({ timeoutMs: v }); },
-        }),
-      ] : []),
+      createElement(FieldRow, {
+        label: '打分模型', value: judge.model, placeholder: '留空 = 这个群的主模型',
+        help: '支持 image 输入的模型会在对话窗口内自动看图打分；纯文本模型自动退回文本打分',
+        onChange: (v) => { patchJudge({ model: v.trim() }); },
+      }),
+      createElement(FieldRow, {
+        label: '推理档位', value: judge.reasoningEffort, placeholder: '留空 = 自动选最低档',
+        help: '启动后第一次打分会在日志里列出这个模型支持的档位',
+        onChange: (v) => { patchJudge({ reasoningEffort: v.trim() }); },
+      }),
+      createElement(NumberRow, {
+        label: '安静多久才打分（毫秒）', value: judge.debounceMs, min: 0, max: 60000, step: 500,
+        help: '连着说的几条只给最后一条打一次分，默认 2500',
+        onChange: (v) => { patchJudge({ debounceMs: v }); },
+      }),
+      createElement(NumberRow, {
+        label: '最多攒多久也要打分（毫秒）', value: judge.maxWaitMs, min: 0, max: 300000, step: 1000,
+        help: '群里一直有人说话时的上限，默认 15000',
+        onChange: (v) => { patchJudge({ maxWaitMs: v }); },
+      }),
+      createElement(NumberRow, {
+        label: '给模型看的消息条数', value: judge.contextMessages, min: 1, max: 100, step: 1,
+        help: '越多越准也越贵，默认 20',
+        onChange: (v) => { patchJudge({ contextMessages: v }); },
+      }),
+      createElement(NumberRow, {
+        label: '打分超时（毫秒）', value: judge.timeoutMs, min: 1000, max: 120000, step: 1000,
+        help: '超时按不接处理，默认 15000',
+        onChange: (v) => { patchJudge({ timeoutMs: v }); },
+      }),
     ] : []),
   );
 }

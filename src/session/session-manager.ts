@@ -1450,15 +1450,21 @@ export class SessionManager {
   }
 
   /** 原生读图：把本地图片提交为 attachment，返回可直接放进 user message 的 ImageBlock */
-  async createImageBlock(path: string): Promise<ImageBlock | undefined> {
-    if (!this.config.vision.native) return undefined;
+  async createImageBlock(
+    path: string,
+    options?: { ignoreNativeFlag?: boolean; maxBytes?: number },
+  ): Promise<ImageBlock | undefined> {
+    if (!options?.ignoreNativeFlag && !this.config.vision.native) return undefined;
     const attachments = this.ctx.get('attachments') as AttachmentStoreLike | undefined;
     if (attachments === undefined) {
-      this.logger.warn('im-qqbot: vision.native 已开启，但 attachments 服务不可用，回退到图片路径');
+      if (!options?.ignoreNativeFlag) {
+        this.logger.warn('im-qqbot: vision.native 已开启，但 attachments 服务不可用，回退到图片路径');
+      }
       return undefined;
     }
+    const maxBytes = options?.maxBytes ?? this.config.vision.maxBytes;
     try {
-      return await loadNativeImageBlock(attachments, path, this.config.vision.maxBytes);
+      return await loadNativeImageBlock(attachments, path, maxBytes);
     } catch (err) {
       this.logger.warn(`im-qqbot: 原生图片附件创建失败，回退到图片路径: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;

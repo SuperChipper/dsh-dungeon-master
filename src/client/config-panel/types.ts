@@ -352,7 +352,7 @@ export const DEEPSEEK_SPEAK_WIRE_DEFAULTS: DeepSeekSpeakWire = {
 };
 
 export const REPLY_JUDGE_DEFAULTS: ReplyJudgeWire = {
-  enabled: false, provider: '', model: '', reasoningEffort: '',
+  enabled: true, provider: '', model: '', reasoningEffort: '',
   debounceMs: 2500, maxWaitMs: 15000, contextMessages: 20, timeoutMs: 15000,
 };
 

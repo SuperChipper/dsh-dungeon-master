@@ -29,6 +29,18 @@ describe('buildJudgeSystem', () => {
     expect(system).toContain('前后矛盾');
     expect(system).toContain('拿不准就给低分');
   });
+
+  it('带图片时引导裁判直接看图内容，跑团模式切换极克制的旁观 DM 提示词', () => {
+    const withImages = buildJudgeSystem(['小d'], undefined, { hasImages: true });
+    expect(withImages).toContain('附带了对话窗口内刚发的图片');
+    expect(withImages).not.toContain('低分补充：只是发了图');
+
+    const dndSystem = buildJudgeSystem(['小d'], undefined, { dnd: true, hasImages: true });
+    expect(dndSystem).toContain('旁观 DM');
+    expect(dndSystem).toContain('玩家之间商量战术');
+    expect(dndSystem).toContain('即使处在对话窗口内');
+    expect(dndSystem).toContain('角色卡/规则截图');
+  });
 });
 
 describe('parseDesire', () => {
@@ -53,9 +65,27 @@ describe('buildJudgeTranscript', () => {
     expect(rows[2]!.startsWith('▶ ')).toBe(true);
     expect(rows[2]!.length).toBeLessThan(260);
   });
+
+  it('传入 hints 和附带图片数时追加参考线索行', () => {
+    const t = buildJudgeTranscript(
+      [{ sender: '阿明', text: '[图片]', timestamp: 0 }],
+      { dnd: true, engaged: true, engagedPeer: true, named: true, sticker: true, stickerCollection: 'pack' },
+      2,
+    );
+    expect(t).toContain('参考线索：');
+    expect(t).toContain('旁观 DM');
+    expect(t).toContain('最新发送者刚和 bot 聊过');
+    expect(t).toContain('命中 bot 昵称/别名');
+    expect(t).toContain('bot 自带表情包');
+    expect(t).toContain('随附 2 张对话窗口内图片');
+  });
 });
 
-function fakeLlm(reply: string, efforts?: Array<{ id: string; name: string }>) {
+function fakeLlm(
+  reply: string,
+  efforts?: Array<{ id: string; name: string }>,
+  inputModalities?: readonly string[],
+) {
   const calls: GenerateOptions[] = [];
   const llm: JudgeLlm = {
     async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
@@ -65,7 +95,10 @@ function fakeLlm(reply: string, efforts?: Array<{ id: string; name: string }>) {
       yield { type: 'block-end', index: 0, block: { type: 'text', text: reply } } as StreamChunk;
       yield { type: 'finish', reason: { kind: 'stop' } } as StreamChunk;
     },
-    resolveModelInfo: vi.fn(async () => (efforts === undefined ? {} : { reasoning: { efforts } })),
+    resolveModelInfo: vi.fn(async () => ({
+      ...(efforts !== undefined ? { reasoning: { efforts } } : {}),
+      ...(inputModalities !== undefined ? { inputModalities } : {}),
+    })),
   };
   return { llm, calls };
 }
@@ -99,6 +132,35 @@ describe('ReplyJudge', () => {
       async *stream(): AsyncIterable<StreamChunk> { throw new Error('boom'); },
     };
     expect(await new ReplyJudge(llm, () => REPLY_JUDGE_DEFAULTS, logger).score(request)).toBeUndefined();
+  });
+
+  it('多模态模型支持附带 ImageBlock 参与打分，纯文本模型自动剥离图片块且共用能力缓存', async () => {
+    const imageBlock = {
+      type: 'image' as const,
+      attachment: { id: 'att-1', mediaType: 'image/png' as const, size: 128 },
+    };
+    const multimodal = fakeLlm('{"desire": 85}', [{ id: 'low', name: 'Low' }], ['text', 'image']);
+    const judge = new ReplyJudge(multimodal.llm, () => REPLY_JUDGE_DEFAULTS, logger);
+    expect(await judge.supportsImageInput('p', 'm')).toBe(true);
+    const score = await judge.score({
+      ...request,
+      hints: { engaged: true, engagedPeer: true },
+      images: [{ label: '[图片#1（来自a，最新消息）]', block: imageBlock }],
+    });
+    expect(score).toBe(0.85);
+    expect(multimodal.llm.resolveModelInfo).toHaveBeenCalledTimes(1);
+    const blocks = multimodal.calls[0]!.messages[0]!.content;
+    expect(blocks.some((b) => b.type === 'image')).toBe(true);
+    expect(multimodal.calls[0]!.system).toContain('附带了对话窗口内刚发的图片');
+
+    const textOnly = fakeLlm('{"desire": 20}', [{ id: 'low', name: 'Low' }], ['text']);
+    const textJudge = new ReplyJudge(textOnly.llm, () => REPLY_JUDGE_DEFAULTS, logger);
+    expect(await textJudge.supportsImageInput('p', 'm')).toBe(false);
+    expect(await textJudge.score({
+      ...request,
+      images: [{ label: '[图片#1]', block: imageBlock }],
+    })).toBe(0.2);
+    expect(textOnly.calls[0]!.messages[0]!.content.some((b) => b.type === 'image')).toBe(false);
   });
 });
 

@@ -8,6 +8,7 @@
 
 ## 未发布
 
+- `desire` 回复欲望模式统一改为全灰区模型打分（仅保留 `@` 别人、斜杠命令、空消息、纯语气词与表情包防复读冷却的硬门控；将昵称命中、对话窗口与自家表情包作为线索喂给模型）；对话窗口内当打分模型支持 `image` 输入时自动附带最新 2 张图片（含纯图截图与非冷却表情包，复用本地缓存不重复下载）；跑团开团期允许插嘴时切换极克制的「旁观 DM」专用提示词。
 - 修复空闲压缩（`idleCompact`）在聚合 provider 走 Gemini 模型（如 `opencode` 路由 `gemini-*`）时不触发的问题：`idleCompactProviders` 新增支持 `provider/model` 与 `model:<通配>` 匹配（默认调整为 `google, */*gemini*`）；补齐 `cacheWriteTokens` 上下文大小统计、`openSession` 恢复会话时回填最近 `contextTokens`、`routeOf` 复用就地切模型状态，并在跳过时记录 debug 诊断日志及在 `/bot-doctor` 检查 `idleCompactMinutes >= sessionIdleTimeout` 冲突。
 - 修复插件设置中 `vision.timeoutMs` 未接入超时信号、以及 `modelFailover` 请求探测未读取宿主凭证库的问题；在 ElevenLabs 默认 `eleven_v4` 模型下隐藏不生效的 `Style` / `Speaker Boost` 项，并补全上游监测支持范围说明。
 

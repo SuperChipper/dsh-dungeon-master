@@ -394,7 +394,7 @@ export interface DndConfig {
   root: string;
   /** 轮到 PC 时发「结束回合 / 查看状态」按钮（需要机器人有消息按钮权限） */
   turnButtons: boolean;
-  /** 跑团期间也按 groupReplyProbability 随机插嘴（只吐槽、不结算）；false = 开团后只回 @ */
+  /** 开团后允许旁观插嘴（probability 按概率，desire 走极克制的旁观 DM 灰区打分；只吐槽、不结算）；false = 开团后只回 @ */
   interjections: boolean;
   /** 团况快照按对话轮数节流间隔（默认 4 = 每 4 轮对话同步一次完整团况，单轮内工具循环始终零重发；设为 1 则每轮对话最多同步 1 次） */
   snapshotIntervalTurns?: number;
@@ -402,7 +402,7 @@ export interface DndConfig {
 }
 
 export interface ReplyJudgeConfig {
-  /** 规则拿不准的文字消息交给模型打分（规则已放行 / 已拦下的不调模型） */
+  /** （兼容保留）desire 模式下有 llm 服务时始终启用灰区模型打分 */
   enabled: boolean;
   /** 打分用的 provider；空 = 跟这个群的主模型一样 */
   provider: string;
@@ -421,17 +421,17 @@ export interface ReplyJudgeConfig {
 }
 
 export interface ReplyDesireConfig {
-  /** 群聊未 @ 时按回复欲望打分决定是否接话（替代纯随机插嘴）；关闭 = 只回 @ 与随机插嘴 */
+  /** 群聊未 @ 时按回复欲望灰区模型打分决定是否接话；关闭 = 沿用 groupTriggerMode */
   enabled: boolean;
   /** 放行阈值（0-1），越高越安静 */
   threshold: number;
-  /** bot 的昵称/别名：群里点名这些词视为在叫 bot */
+  /** bot 的昵称/别名：命中时作为线索喂给打分模型（纯规则降级时直接加分） */
   names: string[];
-  /** 对话窗口(ms)：bot 回复后这段时间内，刚聊过的人再说话更容易被接 */
+  /** 对话窗口(ms)：bot 回复后这段时间内作为上下文线索喂给裁判，并尝试附带最新图片参与打分 */
   engagedMs: number;
-  /** 对话窗口内最多靠打分连续接几轮（不含 @），到了就退出窗口，0 = 不进入对话窗口 */
+  /** 对话窗口内最多靠打分连续接几轮（不含 @），到了就退出窗口，0 = 关闭对话窗口 */
   engagedMaxTurns: number;
-  /** 模型打分 */
+  /** 灰区模型打分参数 */
   judge: ReplyJudgeConfig;
 }
 
@@ -758,14 +758,14 @@ export const DndSchema: Schema<DndConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('是否启用跑团（/dnd 命令与 dnd_* 工具）'),
   root: Schema.string().default('').description('跑团数据目录（空=工作目录/dnd）'),
   turnButtons: Schema.boolean().default(true).description('轮到玩家时发「结束回合 / 查看状态」按钮'),
-  interjections: Schema.boolean().default(true).description('跑团期间也按插话概率随机吐槽（只吐槽、不结算行动）；关掉则开团后只回 @'),
+  interjections: Schema.boolean().default(true).description('开团后允许旁观插嘴（probability 按概率，desire 走极克制的旁观 DM 灰区打分；只吐槽、不结算）；关掉则开团后只回 @'),
   snapshotIntervalTurns: Schema.number().min(1).max(20).step(1).default(DND_DEFAULT_SNAPSHOT_INTERVAL_TURNS)
     .description('团况快照按对话轮数注入间隔（默认4=每4轮对话同步1次完整团况，单轮多次攻击/移动始终锁定零重发；1=每轮对话最多注入1次）'),
   combatAgent: DndCombatAgentSchema.default(DND_COMBAT_AGENT_DEFAULTS),
 });
 
 export const REPLY_JUDGE_DEFAULTS: ReplyJudgeConfig = {
-  enabled: false,
+  enabled: true,
   provider: '',
   model: '',
   reasoningEffort: '',
@@ -777,7 +777,7 @@ export const REPLY_JUDGE_DEFAULTS: ReplyJudgeConfig = {
 
 /** 模型打分子 Schema */
 export const ReplyJudgeSchema: Schema<ReplyJudgeConfig> = Schema.object({
-  enabled: Schema.boolean().default(false).description('规则拿不准的文字消息交给模型打分'),
+  enabled: Schema.boolean().default(true).description('（兼容保留）desire 模式下始终使用灰区模型打分'),
   provider: Schema.string().default('').description('打分 provider（空=这个群的主模型）'),
   model: Schema.string().default('').description('打分模型（空=这个群的主模型）'),
   reasoningEffort: Schema.string().default('').description('推理档位 id（空=自动选最低档）'),

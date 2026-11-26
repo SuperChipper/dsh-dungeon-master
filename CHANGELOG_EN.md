@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+- Switched `desire` group trigger mode to full LLM grey-zone judging by default (keeping only hard filters for other-mentions, commands, empty/noise messages, and sticker chain/cooldown guards while passing name matches, engagement window, and sticker metadata as hints); inside active engagement windows, multimodal judge models automatically receive up to 2 recent images (including image-only screenshots and non-cooldown stickers, reusing the local download cache); active D&D campaigns with `dnd.interjections` enabled now use a dedicated ultra-restrained bystander-DM judge prompt.
 - Fixed idle compaction (`idleCompact`) not firing for Gemini models routed through aggregator providers (e.g. `opencode` running `gemini-*`): `idleCompactProviders` now supports `provider/model` and `model:<wildcard>` patterns (default updated to `google, */*gemini*`); included `cacheWriteTokens` in `contextTokensOf`, hydrated `contextTokens` from session history on resume/reattach, aligned `routeOf` with in-place model selection, added debug skip diagnostics, and added a `/bot-doctor` check when `idleCompactMinutes >= sessionIdleTimeout`.
 - Wired `vision.timeoutMs` into `callVision` abort timeout handling, connected `modelFailover` request probes to the host `credentials` service, hid `Style` / `Speaker Boost` controls in the settings panel for `eleven_v4*` models where they are ignored, and clarified supported providers in the settings copy.
 

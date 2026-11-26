@@ -34,8 +34,8 @@ export function DndCoreSection({ form, patch }: { form: ConfigWire; patch: Patch
       onChange: (v) => { patch('dnd', { ...dnd, turnButtons: v }); },
     }),
     createElement(SwitchRow, {
-      label: '开团后允许随机插嘴', checked: dnd.interjections,
-      help: '只吐槽、不结算；关闭后开团后只回 @',
+      label: '开团后允许旁观插嘴', checked: dnd.interjections,
+      help: '只吐槽、不结算；desire 模式改用极克制的旁观 DM 灰区打分（战术讨论一律低分），关闭后开团仅回 @',
       onChange: (v) => { patch('dnd', { ...dnd, interjections: v }); },
     }),
   );

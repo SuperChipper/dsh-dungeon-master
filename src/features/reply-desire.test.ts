@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { BANTER_STREAK_RESET_MS, EngagementTracker, classifyMessage, scoreReplyDesire, type DesireInput } from './reply-desire.ts';
+import {
+  BANTER_STREAK_RESET_MS,
+  EngagementTracker,
+  classifyMessage,
+  hasImageAttachment,
+  isJudgeCandidate,
+  scoreReplyDesire,
+  type DesireInput,
+} from './reply-desire.ts';
 
 const base: DesireInput = { content: '', senderId: 'u1', mentionsOthers: false, names: ['小d', 'Dsh'] };
 
@@ -172,5 +180,47 @@ describe('EngagementTracker', () => {
     const t = new EngagementTracker();
     for (let i = 0; i < 7; i++) t.record('g', { senderId: `u${i}` });
     expect(t.recent('g').map((m) => m.senderId)).toEqual(['u2', 'u3', 'u4', 'u5', 'u6']);
+  });
+
+  it('显式 open 会清掉连说上限，touch 更新 botSpokeAt', () => {
+    const t = new EngagementTracker();
+    t.noteBanter('g', 'u1', 100);
+    t.noteBanter('g', 'u1', 200);
+    expect(t.banterCapped('g', 'u1', 300)).toBe(true);
+    t.open('g', 'u1', 400, 60_000);
+    expect(t.banterCapped('g', 'u1', 450)).toBe(false);
+    expect(t.botSpokeAt('g')).toBeUndefined();
+    t.touch('g', 500, 60_000);
+    expect(t.botSpokeAt('g')).toBe(500);
+  });
+});
+
+describe('isJudgeCandidate 全灰区候选判定', () => {
+  it('硬过滤和接龙复读不进模型，点名昵称进入灰区裁判', () => {
+    expect(isJudgeCandidate('', { score: 0, reasons: ['empty'] })).toBe(false);
+    expect(isJudgeCandidate('/help', { score: 0, reasons: ['command'] })).toBe(false);
+    expect(isJudgeCandidate('哈哈哈哈', { score: 0, reasons: ['noise'] })).toBe(false);
+    expect(isJudgeCandidate('小d 你看他', { score: 0, reasons: ['other-mention'] })).toBe(false);
+    expect(isJudgeCandidate('', { score: 0, reasons: ['sticker-cooldown'], stickerId: 'A' }, { engaged: true, hasImage: true })).toBe(false);
+    expect(isJudgeCandidate('', { score: 0, reasons: ['sticker-volley'], stickerId: 'A' }, { engaged: true, hasImage: true })).toBe(false);
+    expect(isJudgeCandidate('', { score: 1, reasons: ['sticker-chain'], mode: 'sticker-chain', stickerId: 'A' }, { engaged: true, hasImage: true })).toBe(false);
+    expect(isJudgeCandidate('小d 昨天说得不对', { score: 0.8, reasons: ['name'] })).toBe(true);
+  });
+
+  it('无文字纯图片仅在对话窗口内进入灰区裁判', () => {
+    const photo = [{ content_type: 'image/png', filename: 'err.png' }];
+    expect(hasImageAttachment(photo)).toBe(true);
+    expect(hasImageAttachment([{ content_type: 'audio/ogg', filename: 'a.ogg' }])).toBe(false);
+    expect(isJudgeCandidate('', { score: 0, reasons: [] }, { engaged: false, hasImage: true })).toBe(false);
+    expect(isJudgeCandidate('', { score: 0, reasons: [] }, { engaged: true, hasImage: true })).toBe(true);
+    expect(isJudgeCandidate('', { score: 0, reasons: [] }, { engaged: true, hasImage: false })).toBe(false);
+  });
+
+  it('非冷却表情包在窗口内全部进裁判；窗口外仅自家表情或刚说完话后进裁判', () => {
+    const randomSticker = { score: 0, reasons: [] as string[], mode: 'sticker' as const, stickerId: 'X' };
+    expect(isJudgeCandidate('', randomSticker, { engaged: false, hasImage: true })).toBe(false);
+    expect(isJudgeCandidate('', randomSticker, { engaged: true, hasImage: true })).toBe(true);
+    expect(isJudgeCandidate('', { ...randomSticker, reasons: ['sticker-mine'] }, { engaged: false, hasImage: true })).toBe(true);
+    expect(isJudgeCandidate('', { ...randomSticker, reasons: ['sticker-react'] }, { engaged: false, hasImage: true })).toBe(true);
   });
 });
