@@ -556,7 +556,7 @@ export interface ImQQBotConfig {
   idleCompactMinutes: number;
   /** 空闲压缩的上下文下限：低于这么多 token 不压 */
   idleCompactTokens: number;
-  /** 空闲压缩生效的 provider（逗号分隔；空=全部） */
+  /** 空闲压缩生效的 provider 或模型规则（逗号分隔，支持 provider、provider/model 或 model:<通配>；空=全部） */
   idleCompactProviders: string;
   /** 访问控制 */
   access: AccessControlConfig;
@@ -1078,8 +1078,8 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   idleCompactMinutes: Schema.number().min(0).max(1440).default(20)
     .description('会话空闲这么多分钟后压缩一次，需小于会话闲置超时；0=关闭'),
   idleCompactTokens: Schema.number().min(0).default(100000).description('空闲压缩的上下文下限（token），低于它不压'),
-  idleCompactProviders: Schema.string().default('google')
-    .description('空闲压缩生效的 provider，逗号分隔；留空=全部（只有提示缓存几分钟就过期的上游才需要）'),
+  idleCompactProviders: Schema.string().default('google, */*gemini*')
+    .description('空闲压缩生效的 provider 或模型规则，逗号分隔（支持 provider、provider/model 或 model:*gemini* 通配）；留空=全部（只有提示缓存几分钟就过期的上游/模型才需要）'),
   access: AccessControlSchema.default({
     c2cMode: 'open',
     c2cAllow: [],

@@ -4,8 +4,11 @@ import {
   compactThreshold,
   decideAutoCompact,
   deferCeiling,
+  evaluateIdleCompact,
   hasOpenBackgroundJobs,
   lastTurnUsedTools,
+  latestContextTokens,
+  matchesIdleCompactRoute,
   shouldIdleCompact,
   type CompactPolicyConfig,
 } from './compact-policy.ts';
@@ -142,5 +145,58 @@ describe('ContextLock 与后台任务保护', () => {
       { type: 'job/registered', data: { jobId: 'j2' } },
       { type: 'job/settled', data: { jobId: 'j1' } },
     ])).toBe(true);
+  });
+});
+
+describe('空闲压缩路由匹配与历史上下文回填', () => {
+  it('matchesIdleCompactRoute 支持 provider、provider/model 与 model: 通配，不误伤同网关非目标模型', () => {
+    const defaultRules = 'google, */*gemini*';
+    expect(matchesIdleCompactRoute('google', 'any-model', defaultRules)).toBe(true);
+    expect(matchesIdleCompactRoute('opencode', 'gemini-4-argon', defaultRules)).toBe(true);
+    expect(matchesIdleCompactRoute('opencode-go', 'google/gemini-2.5-pro', defaultRules)).toBe(true);
+    expect(matchesIdleCompactRoute('opencode-go', 'deepseek-v4.1-flash', defaultRules)).toBe(false);
+    expect(matchesIdleCompactRoute('anthropic', 'claude-sonnet-4', defaultRules)).toBe(false);
+
+    expect(matchesIdleCompactRoute('opencode', 'gemini-4-argon', 'opencode/gemini*')).toBe(true);
+    expect(matchesIdleCompactRoute('opencode', 'deepseek-v4.1-flash', 'opencode/gemini*')).toBe(false);
+    expect(matchesIdleCompactRoute('opencode', 'argon', 'model:*argon*')).toBe(true);
+    expect(matchesIdleCompactRoute('google-vertex', 'm', 'google*')).toBe(true);
+    expect(matchesIdleCompactRoute('anything', undefined, '')).toBe(true);
+  });
+
+  it('evaluateIdleCompact 返回准确的跳过原因', () => {
+    const base = {
+      contextTokens: 150_000,
+      minTokens: 100_000,
+      idleMs: 25 * 60_000,
+      minIdleMs: 20 * 60_000,
+      provider: 'opencode',
+      model: 'gemini-4-argon',
+      providers: 'google, */*gemini*',
+    };
+    expect(evaluateIdleCompact(base)).toEqual({ eligible: true });
+    expect(evaluateIdleCompact({ ...base, contextLocked: true })).toEqual({ eligible: false, reason: 'context-locked' });
+    expect(evaluateIdleCompact({ ...base, minIdleMs: 0 })).toEqual({ eligible: false, reason: 'disabled' });
+    expect(evaluateIdleCompact({ ...base, idleMs: 10 * 60_000 })).toEqual({ eligible: false, reason: 'not-idle' });
+    expect(evaluateIdleCompact({ ...base, contextTokens: undefined })).toEqual({ eligible: false, reason: 'unknown-tokens' });
+    expect(evaluateIdleCompact({ ...base, contextTokens: 50_000 })).toEqual({ eligible: false, reason: 'below-tokens' });
+    expect(evaluateIdleCompact({ ...base, model: 'deepseek-v4.1-flash' })).toEqual({ eligible: false, reason: 'route-mismatch' });
+  });
+
+  it('latestContextTokens 取最近一次助手用量（含 cacheWriteTokens），压缩之后未再发言返回 undefined', () => {
+    expect(latestContextTokens([
+      { type: 'assistant/message', data: { usage: { inputTokens: 1000, outputTokens: 200 } } },
+      { type: 'assistant/message', data: { usage: { inputTokens: 400, cacheReadTokens: 80_000, cacheWriteTokens: 25_000, outputTokens: 300 } } },
+      { type: 'turn/end', data: {} },
+    ])).toBe(105_700);
+
+    expect(latestContextTokens([
+      { type: 'assistant/message', data: { usage: { inputTokens: 150_000, outputTokens: 500 } } },
+      { type: 'compaction/summary', data: {} },
+      { type: 'compaction/end', data: {} },
+    ])).toBeUndefined();
+
+    expect(latestContextTokens([{ type: 'assistant/message', usage: { input: 500, cacheRead: 1000, cacheWrite: 200, output: 100 } }])).toBe(1800);
+    expect(latestContextTokens(undefined)).toBeUndefined();
   });
 });

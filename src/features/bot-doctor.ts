@@ -183,6 +183,17 @@ export async function runBotDoctor(deps: {
   if (config.sing?.enabled !== true && Boolean(config.sing?.baseUrl?.trim())) {
     warnings.push('sing 填有 baseUrl 但当前未开启（0.9.0 起扩展工具默认关闭，如需继续使用请开启 sing.enabled）');
   }
+  if (
+    typeof config.idleCompactMinutes === 'number'
+    && config.idleCompactMinutes > 0
+    && typeof config.sessionIdleTimeout === 'number'
+    && config.sessionIdleTimeout > 0
+    && config.idleCompactMinutes * 60_000 >= config.sessionIdleTimeout
+  ) {
+    warnings.push(
+      `idleCompactMinutes (${config.idleCompactMinutes} 分钟) 不小于 sessionIdleTimeout (${Math.round(config.sessionIdleTimeout / 60_000)} 分钟)，会话会在触发空闲压缩前先被回收`,
+    );
+  }
 
   const route = manager.getEffectiveModel(scope, peerId);
   const record = manager.getSessionRecord(scope, peerId);

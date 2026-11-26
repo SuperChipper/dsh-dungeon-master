@@ -84,9 +84,10 @@ import {
   compactThreshold,
   decideAutoCompact,
   deferCeiling,
+  evaluateIdleCompact,
   hasOpenBackgroundJobs,
   lastTurnUsedTools,
-  shouldIdleCompact,
+  latestContextTokens,
 } from '../features/compact-policy.ts';
 import { TurnSteerTracker } from '../transport/turn-steer.ts';
 import type {
@@ -1933,6 +1934,7 @@ export class SessionManager {
       peerId,
       senderId,
       lastActivity: Date.now(),
+      contextTokens: latestContextTokens(tryReadSessionEvents(agent.session)),
       agentPreset,
     };
     noteSender(record, senderId);
@@ -2155,7 +2157,9 @@ export class SessionManager {
       }
     }
     const header = record.agent.session.requestHeader?.()?.config;
-    return header?.provider && header.model ? { provider: header.provider, model: header.model } : this.getEffectiveModel(record.scope, record.peerId);
+    return header?.provider && header.model
+      ? { provider: header.provider, model: header.model }
+      : (this.getEffectiveModel?.(record.scope, record.peerId) ?? this.modelResolver?.getEffectiveRoute?.(record.sessionKey));
   }
 
   /** 在目标人格自己的历史之后追加，成功写入会话后才记接收版本；下一条新消息在它之后。 */
@@ -2533,19 +2537,35 @@ export class SessionManager {
       if (record.agent.status !== 'idle') continue;
       const lock = this.getContextLockStatus?.(record, now)
         ?? SessionManager.prototype.getContextLockStatus.call(this, record, now);
-      const eligible = shouldIdleCompact({
+      const route = this.routeOf(record);
+      const idleMs = now - record.lastActivity;
+      const evaluation = evaluateIdleCompact({
         contextTokens: record.contextTokens,
         minTokens,
-        idleMs: now - record.lastActivity,
+        idleMs,
         minIdleMs,
-        provider: this.routeOf(record)?.provider,
+        provider: route?.provider,
+        model: route?.model,
         providers: this.config.idleCompactProviders ?? '',
         contextLocked: lock.locked,
       });
-      if (!eligible) continue;
+      if (!evaluation.eligible) {
+        if (idleMs >= minIdleMs) {
+          const routeLabel = route?.provider && route.model
+            ? `${route.provider}/${route.model}`
+            : (route?.provider ?? 'unknown');
+          const lockDetail = lock.locked ? ` locks=[${lock.reasons.join(',')}]` : '';
+          this.logger.debug(
+            `im-qqbot: 空闲压缩未触发 key=${record.sessionKey} reason=${evaluation.reason} `
+            + `route=${routeLabel} tokens=${record.contextTokens ?? 'unknown'}/${minTokens} `
+            + `idle=${Math.round(idleMs / 60_000)}m${lockDetail}`,
+          );
+        }
+        continue;
+      }
 
       const before = record.contextTokens;
-      const idleMinutes = Math.round((now - record.lastActivity) / 60_000);
+      const idleMinutes = Math.round(idleMs / 60_000);
       record.compacting = true;
       record.idleCompactTriedAt = record.lastActivity;
       void this.compact(record.scope, record.peerId)
@@ -2568,12 +2588,16 @@ export class SessionManager {
     }
   }
 
-  /** 会话最近一次请求实际用的 provider/model；还没发过请求时退回解析出的路由 */
+  /** 会话当前生效的 provider/model（含就地 /model 与 Web 切换、model/selection、最近请求头与配置解析链） */
   private routeOf(record: SessionRecord): { provider?: string; model?: string } | undefined {
+    if (typeof this.personaModelRoute === 'function') {
+      const resolved = this.personaModelRoute(record);
+      if (resolved?.provider || resolved?.model) return resolved;
+    }
     const header = record.agent.session.requestHeader?.()?.config;
     return header?.provider && header.model
       ? { provider: header.provider, model: header.model }
-      : this.modelResolver.getEffectiveRoute(record.sessionKey);
+      : this.modelResolver?.getEffectiveRoute?.(record.sessionKey);
   }
 
   /** 按会话实际路由的模型查上下文窗口（按 provider/model 缓存）；查不到返回 undefined，私聊退回固定阈值 */

@@ -28,11 +28,12 @@ export interface ChunkEvent {
   text: string;
 }
 
-/** 一次模型请求的 token 用量（inputTokens 不含缓存命中部分） */
+/** 一次模型请求的 token 用量（inputTokens 不含缓存读取与缓存写入部分） */
 export interface MessageUsage {
   inputTokens: number;
   outputTokens?: number;
   cacheReadTokens?: number;
+  cacheWriteTokens?: number;
   reasoningTokens?: number;
 }
 
@@ -44,9 +45,9 @@ export interface MessageEvent {
   usage?: MessageUsage;
 }
 
-/** 本次请求之后的会话上下文大小：请求输入（含缓存命中）+ 本次输出 */
+/** 本次请求之后的会话上下文大小：请求输入（含缓存命中与缓存写入）+ 本次输出 */
 export function contextTokensOf(usage: MessageUsage): number {
-  return usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.outputTokens ?? 0);
+  return usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0) + (usage.outputTokens ?? 0);
 }
 
 /**
@@ -55,10 +56,12 @@ export function contextTokensOf(usage: MessageUsage): number {
  */
 export function usageLogLine(sessionKey: string, usage: MessageUsage, content: MessageEvent['content']): string {
   const cache = usage.cacheReadTokens ?? 0;
-  const total = usage.inputTokens + cache;
+  const cacheWrite = usage.cacheWriteTokens ?? 0;
+  const total = usage.inputTokens + cache + cacheWrite;
   const hit = total === 0 ? 0 : Math.round((cache / total) * 100);
   const tools = content.filter((b) => b.type === 'tool-call' && b.name).map((b) => b.name);
-  return `im-qqbot: usage key=${sessionKey} input=${usage.inputTokens} cache=${cache} hit=${hit}% `
+  const cacheWritePart = cacheWrite > 0 ? ` cacheWrite=${cacheWrite}` : '';
+  return `im-qqbot: usage key=${sessionKey} input=${usage.inputTokens} cache=${cache}${cacheWritePart} hit=${hit}% `
     + `output=${usage.outputTokens ?? 0} reasoning=${usage.reasoningTokens ?? 0} tools=${tools.join(',') || '-'}`;
 }
 
@@ -125,6 +128,7 @@ export function parseEvent(raw: RawSessionEvent): OutboundEvent | undefined {
               inputTokens: usage.inputTokens,
               ...(typeof usage.outputTokens === 'number' ? { outputTokens: usage.outputTokens } : {}),
               ...(typeof usage.cacheReadTokens === 'number' ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+              ...(typeof usage.cacheWriteTokens === 'number' ? { cacheWriteTokens: usage.cacheWriteTokens } : {}),
               ...(typeof usage.reasoningTokens === 'number' ? { reasoningTokens: usage.reasoningTokens } : {}),
             },
           }

@@ -281,9 +281,9 @@ export function AdvancedSessionSection({ form, patch }: { form: ConfigWire; patc
       onChange: (v) => { patch('idleCompactTokens', v); },
     }),
     createElement(FieldRow, {
-      label: '空闲压缩：生效的 provider', value: form.idleCompactProviders ?? 'google',
-      placeholder: 'google',
-      help: '逗号分隔；留空 = 所有 provider。只有提示缓存几分钟就过期的上游（如 Gemini）才需要',
+      label: '空闲压缩：生效的 provider / 模型', value: form.idleCompactProviders ?? 'google, */*gemini*',
+      placeholder: 'google, */*gemini*',
+      help: '逗号分隔，支持 provider 名（如 google）、provider/model（如 opencode/*gemini*）或 model:*gemini* 通配；留空 = 全部。只有提示缓存几分钟就过期的上游/模型（如 Gemini）才需要',
       onChange: (v) => { patch('idleCompactProviders', v); },
     }),
     createElement(SwitchRow, {

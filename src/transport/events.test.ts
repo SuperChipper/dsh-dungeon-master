@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseEvent, parseStreamFrame, usageLogLine } from './events.ts';
+import { contextTokensOf, parseEvent, parseStreamFrame, usageLogLine } from './events.ts';
 
 /** 构造 agent/assistant-stream 的 payload（帧字段按宿主 AssistantStreamFrame 形态） */
 function payload(frame: unknown, agentId = 'sess-qq'): unknown {
@@ -21,15 +21,21 @@ describe('usageLogLine', () => {
       .toBe('im-qqbot: usage key=k input=0 cache=0 hit=0% output=0 reasoning=0 tools=-');
   });
 
-  it('parseEvent 保留 reasoningTokens 和工具调用块的名字', () => {
+  it('parseEvent 保留 reasoningTokens、cacheWriteTokens 和工具调用块的名字，contextTokensOf 计入 cacheWriteTokens', () => {
     const event = parseEvent({
       type: 'assistant/message',
       data: {
         message: { content: [{ type: 'tool-call', id: 'c1', name: 'dnd_roll', arguments: '{}' }] },
-        usage: { inputTokens: 1, reasoningTokens: 7 },
+        usage: { inputTokens: 100, cacheReadTokens: 200, cacheWriteTokens: 5000, outputTokens: 50, reasoningTokens: 7 },
       },
     });
-    expect(event).toMatchObject({ usage: { inputTokens: 1, reasoningTokens: 7 }, content: [{ name: 'dnd_roll' }] });
+    expect(event).toMatchObject({
+      usage: { inputTokens: 100, cacheReadTokens: 200, cacheWriteTokens: 5000, outputTokens: 50, reasoningTokens: 7 },
+      content: [{ name: 'dnd_roll' }],
+    });
+    expect(contextTokensOf((event as { usage: Parameters<typeof contextTokensOf>[0] }).usage)).toBe(5350);
+    expect(usageLogLine('k', { inputTokens: 100, cacheReadTokens: 900, cacheWriteTokens: 1000, outputTokens: 50 }, []))
+      .toBe('im-qqbot: usage key=k input=100 cache=900 cacheWrite=1000 hit=45% output=50 reasoning=0 tools=-');
   });
 });
 

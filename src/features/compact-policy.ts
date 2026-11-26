@@ -46,7 +46,7 @@ export function deferCeiling(threshold: number, contextWindow: number | undefine
  * 空闲压缩：上游的隐式提示缓存只活几分钟（Gemini 实测约 5 分钟），群里安静一阵之后每条消息都要
  * 全价重读整段上下文。空闲够久（话题多半已经换了）且上下文够大时先压成摘要：压缩请求本身也是
  * 全价读一遍，和下一条消息冷启动花的一样，省的是之后每一次冷启动。
- * 只对列出的 provider 生效——缓存活得久、命中稳定的上游不需要。
+ * 只对命中规则的上游/模型生效——缓存活得久、命中稳定的上游不需要。
  */
 export interface IdleCompactInput {
   contextTokens: number | undefined;
@@ -56,24 +56,118 @@ export interface IdleCompactInput {
   /** 空闲不到这么久不压；0 = 关闭 */
   minIdleMs: number;
   provider: string | undefined;
-  /** 逗号分隔的 provider 名；空 = 所有 provider */
+  // 会话实际模型 ID（支持按 provider/model、*/*gemini* 或 model:*gemini* 命中聚合网关下的短缓存模型）
+  model?: string | undefined;
+  /** 逗号或空白分隔的规则列表；支持 provider、provider/model、`model:<pattern>`（支持 `*` 通配）；空 = 全部 */
   providers: string;
   /** 关键事务窗口 locked 时禁止空闲压缩，避免等待用户或后台任务途中截断上下文 */
   contextLocked?: boolean;
 }
 
+export type IdleCompactSkipReason =
+  | 'context-locked'
+  | 'disabled'
+  | 'not-idle'
+  | 'unknown-tokens'
+  | 'below-tokens'
+  | 'route-mismatch';
+
+export type IdleCompactEvaluation =
+  | { eligible: true }
+  | { eligible: false; reason: IdleCompactSkipReason };
+
 export function parseProviderList(raw: string): string[] {
   return raw.split(/[,，\s]+/).map((item) => item.toLowerCase()).filter(Boolean);
 }
 
+function wildcardMatch(value: string, pattern: string): boolean {
+  if (pattern === '*') return true;
+  if (!pattern.includes('*')) return value.toLowerCase() === pattern.toLowerCase();
+  const escaped = pattern.replace(/[.+^${}()|[\]\\?]/g, '\\$&').replace(/\*/g, '.*');
+  return new RegExp(`^${escaped}$`, 'i').test(value);
+}
+
+// 判断会话的 provider/model 是否命中 `idleCompactProviders` 规则列表：
+// - 规则列表为空 → 全部放行；
+// - `model:<pattern>` → 按模型 ID 匹配（支持 `*` 通配）；
+// - `<providerPattern>/<modelPattern>` → 同时匹配 provider 与 model（按首个 `/` 拆分，支持 `*` 通配，如 `*/*gemini*`、`opencode/gemini*`）；
+// - 其余条目 → 匹配 provider（含 `*` 时做通配，否则大小写不敏感精确匹配）。
+export function matchesIdleCompactRoute(
+  provider: string | undefined,
+  model: string | undefined,
+  rawRules: string,
+): boolean {
+  const rules = parseProviderList(rawRules);
+  if (rules.length === 0) return true;
+  const prov = provider?.trim();
+  const mod = model?.trim();
+  for (const rule of rules) {
+    if (rule.startsWith('model:')) {
+      const modelPat = rule.slice('model:'.length);
+      if (modelPat !== '' && mod !== undefined && mod !== '' && wildcardMatch(mod, modelPat)) return true;
+      continue;
+    }
+    const slash = rule.indexOf('/');
+    if (slash >= 0) {
+      const provPat = rule.slice(0, slash);
+      const modelPat = rule.slice(slash + 1);
+      if (
+        provPat !== '' && modelPat !== ''
+        && prov !== undefined && prov !== ''
+        && mod !== undefined && mod !== ''
+        && wildcardMatch(prov, provPat)
+        && wildcardMatch(mod, modelPat)
+      ) {
+        return true;
+      }
+      continue;
+    }
+    if (prov !== undefined && prov !== '' && wildcardMatch(prov, rule)) return true;
+  }
+  return false;
+}
+
+export function evaluateIdleCompact(input: IdleCompactInput): IdleCompactEvaluation {
+  if (input.contextLocked === true) return { eligible: false, reason: 'context-locked' };
+  if (input.minIdleMs <= 0 || input.minTokens <= 0) return { eligible: false, reason: 'disabled' };
+  if (input.idleMs < input.minIdleMs) return { eligible: false, reason: 'not-idle' };
+  if (input.contextTokens === undefined) return { eligible: false, reason: 'unknown-tokens' };
+  if (input.contextTokens < input.minTokens) return { eligible: false, reason: 'below-tokens' };
+  if (!matchesIdleCompactRoute(input.provider, input.model, input.providers)) {
+    return { eligible: false, reason: 'route-mismatch' };
+  }
+  return { eligible: true };
+}
+
 export function shouldIdleCompact(input: IdleCompactInput): boolean {
-  if (input.contextLocked === true) return false;
-  if (input.minIdleMs <= 0 || input.minTokens <= 0) return false;
-  if (input.idleMs < input.minIdleMs) return false;
-  if (input.contextTokens === undefined || input.contextTokens < input.minTokens) return false;
-  const providers = parseProviderList(input.providers);
-  if (providers.length === 0) return true;
-  return input.provider !== undefined && providers.includes(input.provider.toLowerCase());
+  return evaluateIdleCompact(input).eligible;
+}
+
+/**
+ * 从会话事件流逆序提取最近一次 `assistant/message` 后的上下文大小（输入 + 缓存读写 + 输出）。
+ * 若最近一次压缩摘要（`compaction/summary` / `compaction/end`）之后没有新的 `assistant/message` 用量，
+ * 返回 `undefined`，避免恢复或重载会话时把压缩前的旧上下文大小误当作当前值。
+ */
+export function latestContextTokens(
+  events: readonly { type: string; data?: unknown; usage?: unknown }[] | undefined,
+): number | undefined {
+  if (!events || events.length === 0) return undefined;
+  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const ev = events[i]!;
+    if (ev.type === 'compaction/summary' || ev.type === 'compaction/end') return undefined;
+    if (ev.type !== 'assistant/message') continue;
+    const raw = ((ev.data as { usage?: Record<string, unknown> } | undefined)?.usage ?? ev.usage) as
+      | Record<string, unknown>
+      | undefined;
+    if (!raw || typeof raw !== 'object') continue;
+    const total = num(raw.inputTokens ?? raw.input)
+      + num(raw.cacheReadTokens ?? raw.cacheRead)
+      + num(raw.cacheWriteTokens ?? raw.cacheWrite)
+      + num(raw.outputTokens ?? raw.output);
+    if (total > 0) return total;
+  }
+  return undefined;
 }
 
 export type CompactDecision ='compact' | 'defer' | 'skip';

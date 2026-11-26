@@ -185,6 +185,25 @@ describe('bot-doctor', () => {
     ]));
   });
 
+  it('检测 idleCompactMinutes 不小于 sessionIdleTimeout 的配置冲突', async () => {
+    const report = await runBotDoctor({
+      manager: makeManager(),
+      config: {
+        groupTriggerMode: 'mention',
+        idleCompactMinutes: 30,
+        sessionIdleTimeout: 30 * 60_000,
+      },
+      scope: 'group',
+      peerId: 'g1',
+      readScheduleCount: () => 0,
+      env: {},
+      envFiles: [],
+    });
+    expect(report.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining('idleCompactMinutes (30 分钟) 不小于 sessionIdleTimeout (30 分钟)'),
+    ]));
+  });
+
   it('/bot-doctor 仅允许 owner / admin 执行', () => {
     const cmd = doctorCommand({
       manager: makeManager() as never,

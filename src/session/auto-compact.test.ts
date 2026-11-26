@@ -121,19 +121,21 @@ describe('SessionManager.checkIdleCompact', () => {
     config: Record<string, unknown> = {},
     provider = 'google',
     outcome: CompactOutcome = { ok: true, shadowed: 40, tokens: 90000 },
+    model = 'm',
   ) {
     const compact = vi.fn(async () => outcome);
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const sessions = new Map<string, SessionRecord>();
     const self = {
       config: { idleCompactMinutes: 20, idleCompactTokens: 100000, idleCompactProviders: 'google', ...config },
-      logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      logger,
       sessions,
       compact,
-      routeOf: () => ({ provider, model: 'm' }),
+      routeOf: () => ({ provider, model }),
     };
     const add = (r: SessionRecord) => { sessions.set(`${r.scope}:${r.peerId}`, r); return r; };
     const run = (now = NOW) => SessionManager.prototype.checkIdleCompact.call(self as never, now);
-    return { add, run, compact };
+    return { add, run, compact, logger };
   }
 
   it('空闲够久、上下文过下限、provider 在名单 → 压一次，同一段空闲不重试', async () => {
@@ -259,5 +261,86 @@ describe('SessionManager.checkIdleCompact', () => {
     await vi.waitFor(() => expect(overflow.compacting).toBe(false));
     expect(compact).toHaveBeenCalledTimes(2);
     keepLock();
+  });
+
+  it('opencode 走 gemini-4-argon 在默认规则下触发空闲压缩，走非 Gemini 模型跳过并输出 debug 诊断', async () => {
+    const gemini = idleHarness({ idleCompactProviders: 'google, */*gemini*' }, 'opencode', undefined, 'gemini-4-argon');
+    const r1 = gemini.add(record({ contextTokens: 140_000, lastActivity: NOW - 25 * MIN }));
+    gemini.run();
+    await vi.waitFor(() => expect(r1.compacting).toBe(false));
+    expect(gemini.compact).toHaveBeenCalledTimes(1);
+
+    const ds = idleHarness({ idleCompactProviders: 'google, */*gemini*' }, 'opencode', undefined, 'deepseek-v4.1-flash');
+    ds.add(record({ contextTokens: 140_000, lastActivity: NOW - 25 * MIN }));
+    ds.run();
+    expect(ds.compact).not.toHaveBeenCalled();
+    expect(ds.logger.debug).toHaveBeenCalledWith(expect.stringContaining('reason=route-mismatch'));
+  });
+
+  it('checkIdleCompact 复用 personaModelRoute，识别就地切到 opencode/gemini-4-argon 后的路由', async () => {
+    const compact = vi.fn(async () => ({ ok: true, shadowed: 12, tokens: 60_000 } as CompactOutcome));
+    const sessions = new Map<string, SessionRecord>();
+    const proto = SessionManager.prototype as unknown as Record<string, unknown>;
+    const agent = {
+      status: 'idle',
+      session: {
+        events: [
+          { type: 'request/header', data: {} },
+          { type: 'model/selection', data: { provider: 'opencode', model: 'gemini-4-argon' } },
+        ],
+        requestHeader: () => ({ config: { provider: 'deepseek-official', model: 'deepseek-chat' } }),
+      },
+    };
+    const rec = record({
+      contextTokens: 150_000,
+      lastActivity: NOW - 25 * MIN,
+      agent: agent as never,
+    });
+    sessions.set('k', rec);
+    const self = {
+      config: { idleCompactMinutes: 20, idleCompactTokens: 100_000, idleCompactProviders: 'google, */*gemini*' },
+      logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      sessions,
+      compact,
+      routeOf: proto.routeOf,
+      personaModelRoute: proto.personaModelRoute,
+      getEffectiveModel: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }),
+    };
+
+    SessionManager.prototype.checkIdleCompact.call(self as never, NOW);
+    await vi.waitFor(() => expect(rec.compacting).toBe(false));
+    expect(compact).toHaveBeenCalledTimes(1);
+  });
+
+  it('openSession 复用/恢复已有历史会话时回填最近一次 assistant/message 的 contextTokens', async () => {
+    const proto = SessionManager.prototype as unknown as Record<string, unknown>;
+    const liveAgent = {
+      status: 'idle',
+      session: {
+        id: 'sess-resumed',
+        snapshotEvents: () => [
+          { type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }] } },
+          {
+            type: 'assistant/message',
+            data: {
+              message: { content: [{ type: 'text', text: 'hello' }] },
+              usage: { inputTokens: 1000, cacheReadTokens: 110_000, cacheWriteTokens: 5000, outputTokens: 200 },
+            },
+          },
+        ],
+      },
+    };
+    const self: Record<string, unknown> = {
+      sessions: new Map(),
+      agents: { get: vi.fn(() => liveAgent) },
+      sessionKey: () => 'qqbot:app:group:g1',
+      currentSessionId: () => 'sess-resumed',
+      modelResolver: { getEffectiveRoute: () => ({ provider: 'opencode', model: 'gemini-4-argon' }) },
+      logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    };
+    const rec = await (proto.openSession as (
+      scope: 'group', peerId: string, senderId: string, target: { scope: 'group'; targetId: string },
+    ) => Promise<SessionRecord>).call(self, 'group', 'g1', 'u1', { scope: 'group', targetId: 'g1' });
+    expect(rec.contextTokens).toBe(116_200);
   });
 });
