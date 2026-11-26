@@ -70,7 +70,7 @@ npx @deepseek-ai/dsh --profile qqbot
   - **状态、被动与光环**：覆盖 PHB 主要状态与力竭、可转移专注（`脆弱诅咒` / `猎人印记` 击杀与跨短休保留）、条件被动（巨兽杀手、偷袭、凶蛮攻击等）、圣武士/牧师光环与生命领域加成，并附敌方施法「DM 战术提醒」。
   - **战场空间与批量结算**：一格 5 尺 Dijkstra 寻路、`z` 轴飞行与坠落、持续危害区域、多段命中 `attacks` 与命中后 `on_hit`。开战阵型可选 5 / 10 / 15 尺目标间距，也可单独修正一名角色的位置。
   - **可扩展规则（`dnd_rule`）**：支持按 `campaign` / `global` 作用域热注册自定义攻击、附伤、抗性、豁免修正、持续状态的解除规则、光环与治疗公式。 [扩展规则指南](./skills/dnd-rule-extension/SKILL.md)
-- **状态长期化与回滚**：完整团档落盘为 JSON 并保留 40 步历史快照，支持按步数或 `#R` 骰号通过 `dnd_undo` 精确撤销；`/dnd end` 通过状态机原子保存交接、清理实时战斗态并内部唤醒 DM 准备下场内容；`DndSnapshotGate` 采用“同轮锁死、跨轮首步穿透”节流，避免工具循环内重复刷屏上下文。
+- **状态长期化与回滚**：完整团档落盘为 JSON，保留 40 步细粒度历史快照与独立命名的里程碑检查点（开团基线、开战前、跨场景前自动留档，也可随时手动命名）；支持通过 `dnd_undo`（含停团期）或 `/dnd checkpoint`、`/dnd undo` 按检查点、步数或 `#R` 骰号一键回滚；`/dnd end` 通过状态机原子保存交接、清理实时战斗态并内部唤醒 DM 准备下场内容；`PromptLatch` 支持持久化跨重启复用，`DndSnapshotGate` 采用“同轮锁死、跨轮首步穿透”节流，避免重载或同轮多次工具调用击穿缓存。
 
 ### 常用命令
 
@@ -80,6 +80,8 @@ npx @deepseek-ai/dsh --profile qqbot
 | `/dnd new [模组id] [blank]` | 归档旧团并重开（默认继承旧角色卡，加 `blank` 从零建卡） |
 | `/dnd status` | 玩家视角团况（HP、资源、先攻顺序与战斗测距） |
 | `/dnd map [battle\|explore]` | 发送战斗站位图或已探索迷雾图（需 `sharp`，否则发字符图） |
+| `/dnd checkpoint [名称\|list]` | 保存或查看命名检查点（开团与停团均可用） |
+| `/dnd undo [list\|N\|cp-编号\|名称]` | 查看脱敏回退记录，或一步回退到检查点/最近 N 步 |
 | `/dnd checkin` / `/dnd end [摘要]` | 重发签到按钮 / 原子保存交接并停团 |
 | `/dnd combat` | 查看最近一场独立战斗代理的模型与 Token 用量 |
 | `/dnd dungeons` / `/dnd search <词条>` / `/dnd spells [职业]` | 列模组 / 查[灰机 D&D wiki](https://dnd.huijiwiki.com/wiki/) / 查职业法术表 |
@@ -109,11 +111,11 @@ dnd:
 | 类别 | 工具 | 核心职责 |
 |------|------|----------|
 | 掷骰 | `dnd_roll` / `dnd_check` / `dnd_apply` | 骰子表达式、检定/攻击/群体豁免（含 `attacks` / `on_hit` / `bonus_dice`）、批量伤害治疗与反应结算 |
-| 角色 | `dnd_character` / `dnd_resource` / `dnd_rest` | 建卡改卡、玩家绑定与 `delegate` 托管、SRD 刷怪、法术位/专长次数管理、`transfer` 转移专注、短休/长休 |
+| 角色 | `dnd_character` / `dnd_resource` / `dnd_rest` | 建卡改卡（精简变更回显与 `append_notes`/`remove_notes` 增量备注）、玩家绑定、`delegate` 托管、NPC `companion_status`（随行/留守/退队）、SRD 刷怪、法术位/专长次数管理、`transfer` 转移专注、短休/长休 |
 | 规则 | `dnd_rule` | 热注册/管理 `campaign` 或 `global` 自定义规则钩子（安全无 `eval` 公式求值） |
 | 战斗 | `dnd_initiative` / `dnd_position` | 先攻推进与演练模式（`rehearsal`）、摆位/换位（`swap`）/寻路移动、3D 高度、`area` 覆盖、持续区域 `zone` |
-| 探索与剧情 | `dnd_move` / `dnd_map` / `dnd_story` / `dnd_lookup` / `dnd_hook` / `dnd_chronicle` | 房间移动与暗门、地图推送、模组剧情与私密资料查询、背景钩子、长期剧情账本 |
-| 存档与百科 | `dnd_undo` / `dnd_progress` / `dnd_prepare` / `dnd_end` / `dnd_srd` | 40 步回滚、分段存进度、DM 私有备团、停团收尾、5e SRD 查询 |
+| 探索与剧情 | `dnd_move` / `dnd_map` / `dnd_story` / `dnd_lookup` / `dnd_hook` / `dnd_chronicle` | 房间移动（含已清空地城单步穿行、非线性自动对齐章节与暗门）、地图推送、互斥触发器与施法者 `spellbook`/`escort` 刷怪、受控原书检索（`source` 限流 3000 字）、背景钩子、长期剧情账本（停团可补记 `ruling`/`backstory`） |
+| 存档与百科 | `dnd_undo` / `dnd_progress` / `dnd_prepare` / `dnd_end` / `dnd_srd` | 命名检查点与 40 步回滚（停团可用）、分段存进度、DM 私有备团（含 `brief` 速览）、停团收尾、5e SRD 查询 |
 
 ### 模组、配置与延伸阅读
 

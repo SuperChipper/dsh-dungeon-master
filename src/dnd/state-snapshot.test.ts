@@ -101,6 +101,21 @@ describe('system prompt 背景按 epoch 锁住', () => {
     expect(service.stateSnapshot(key)).not.toContain('新场景规则');
   });
 
+  it('切到超长 dmGuide 新章后，stateSnapshot 仅注入精简预览避免每轮 runtime-context 膨胀', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dnd-snapshot-guide-'));
+    const service = new DndService({ store: new CampaignStore(join(root, 'campaigns')), library: new AdventureLibrary(), mapDir: root });
+    const key = 'qqbot:app:group:G3';
+    service.start(key, 'sunken-bell', false);
+    const adventure = service.require(key).adventure;
+    service.promptSections(key, 's:0');
+    const longGuide = '九神之墓核心总览：' + '规则细则。'.repeat(200);
+    adventure.chapters[0]!.dmGuide = longGuide;
+    const snap = service.stateSnapshot(key);
+    expect(snap).toContain('本章要点（已切至');
+    expect(snap).toContain('dnd_lookup kind="source"');
+    expect(snap.length).toBeLessThan(longGuide.length);
+  });
+
   it('重新开团不沿用上一次锁住的进度', () => {
     const { service, key } = setup();
     service.store.update(key, (c) => addSummary(c, '旧进度'));

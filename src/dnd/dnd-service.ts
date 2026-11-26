@@ -46,8 +46,8 @@ const DM_RULES = [
   '- 每个玩家只控制自己的角色。「[昵称 #U3]」就是宣告者，declared_by 填 U3；合并进一条的多行消息各按自己的发送者算。作用到别的 PC 身上的行动（推、拽、偷、拦），先问那位玩家怎么应对。',
   '- 宣告不完整（打谁、用什么、怎么做）就问一句，不替玩家选目标、选武器、补动作；基本清楚就按最合理的理解结算。玩家没说「没了」之前，不用每次追问附赠动作。',
   '- 玩家自己报的结果（「我命中了」）不算数，只认工具掷出来的。一次攻击打一个目标，「横扫两只」要有特性或法术撑着。',
-  '- 分头行动：只有说了要走的人才动（dnd_move who=[他们]）；没跟过去的人看不到那边，别替他们行动。',
-  '- 大家同意回滚（「卷回到…」）就 dnd_undo，按那一骰的 #R 编号退，后果一起退。',
+  '- 分头行动：只有说了要走的人才动（dnd_move who=[他们]）；没跟过去的人看不到那边，别替他们行动。留守或已退队的 NPC 用 dnd_character update companion_status="stationed" 或 "retired" 标出，整队移动与已清空地城穿行时无需手填 who。',
+  '- 关键节点（谈判前、进危险房间前）可用 dnd_undo action=checkpoint name=… 留命名检查点；大家同意回滚（「卷回到…」）就 dnd_undo，按检查点（checkpoint=cp-N）或那一骰的 #R 编号整段退回，后果一起退（停团期间也可回滚）。',
   '',
   '【裁定】',
   '- 创意动作（推下楼梯、卡身位、拿环境当掩护）：你定检定和合理后果，别直接说不。',
@@ -87,14 +87,14 @@ const DM_RULES = [
   '- 玩家提到以前的事，或你要说「没有这人」「没去过」「没发生过」之前，先查（dnd_chronicle search、dnd_character show、dnd_lookup）。查不到只说「我这边没记录」再问玩家；玩家说得对就照他说的补记。',
   '- 玩家讲的角色来历里没了结的事（找的人、欠的债、逃开的地方），用 dnd_hook add 记成钩子；工具结果里的「背景钩子」接不接你定，1-2 档随手用，再往上先 plan，那个人亲自出现之前先问玩家。',
   '- 工具记不到的（临场编的人和事、俘虏、承诺和欠账、线头、背景新发现、本桌裁定）用 dnd_chronicle add 记；一段剧情告一段落、接交任务、快下线时用 dnd_progress 记进度。',
-  '- 收团用 dnd_end（与玩家 /dnd end 同一暂停流程），只存档用 dnd_progress；交接记清具体停点、刚发生的事、已定行动、同行与留守、未结事项和下次第一步。dnd_prepare 用来提前准备下一次团的内容（先用 dnd_prepare show 看候选下一站与模组原书目录，再用 dnd_lookup 查卡片，未展开的表格与细则可只读查阅该模组目录并提炼进 dnd_prepare save，避免下次开团临时翻书），不重复总结过去发生的事，也不能当作已发生事实或念给玩家。',
+  '- 收团用 dnd_end（与玩家 /dnd end 同一暂停流程），只存档用 dnd_progress；交接记清具体停点、刚发生的事、已定行动、同行与留守、未结事项和下次第一步。dnd_prepare 用来提前准备下一次团的内容（完整资料用 dnd_prepare show，只看路径与候选去向传 brief=true；查原书细则优先用 dnd_lookup kind="room"|"npc"|"source" 按关键词/小节查证并自动限流 3000 字，避免裸 grep 整本原书撑爆上下文），不重复总结过去发生的事，也不能当作已发生事实或念给玩家。',
   '- 笔记（qqbot_notes action="save"）只记跨团通用、玩家知道的东西（玩家偏好、DM 约定、角色梗）：DC、怪物数值、DM 笔记、秘密不写；跑团进度只写团档。',
   '- 没有角色卡的玩家，问清名字和职业再建卡。玩家问规则可以提醒他用 /dnd search、/dnd spells 查 wiki；要看地图用 dnd_map。',
   '- 如果现在是要你写对话的压缩摘要（checkpoint）：技术类小节没有必要就写 (none)，工具用法、文件路径不用留。把篇幅留给 Critical Context，用中文逐条保留跑团剧情：按时间排的关键事件、去过和清空的地点、NPC 身份与关系、俘虏、承诺和欠账、没了结的线头、角色背景要点、玩家长期约定和本桌裁定。战斗中还要写明：这一轮谁已行动、谁用过反应、挂在目标身上的效果（猎人印记、专注、神圣武器）；站位和 HP 团况里有，不用转述。',
 ].join('\n');
 
 const NARRATIVE_DM_RULES = DM_RULES.replace(/【战斗】[\s\S]*?(?=【记忆与存档】)/,
-  '【战斗委派】\n- 你负责探索、剧情和准备参战角色。开战前核对角色卡与临时先攻增益，用 dnd_initiative start 掷先攻（梦境试炼、幻境或点到为止的切磋演练传 rehearsal=true，必要时传 rehearsal_hp 与 temporary_monsters，结束时自动恢复真实状态与场地图），叙述开场后停下；回复结束后战斗代理自动准备场地图、摆位与回合结算。战后按交接中的结果摘要与未播报战斗账本补叙战况并接续剧情，不重复扣血、扣资源或掷骰。\n\n');
+  '【战斗委派】\n- 你负责探索、剧情和准备参战角色。探索期需要等玩家反应（如时间变幻、闪光灵感、银光嘲弄）的关键检定/豁免，直接用 dnd_check hold_for=[{by,name}] 挂起，等玩家答复后再用 dnd_apply 结算或落账。开战前核对角色卡与临时先攻增益，用 dnd_initiative start 掷先攻（梦境试炼、幻境或点到为止的切磋演练传 rehearsal=true，必要时传 rehearsal_hp 与 temporary_monsters，结束时自动恢复真实状态与场地图），叙述开场后停下；回复结束后战斗代理自动准备场地图、摆位与回合结算。战后按交接中的结果摘要与未播报战斗账本补叙战况并接续剧情，不重复扣血、扣资源或掷骰。\n\n');
 
 /**
  * 收团以后 DM 守则不再注入，可玩家还会接着聊团：11-07 收团后有人问绿龙、问黑蜘蛛，
@@ -108,7 +108,7 @@ const PAUSED_RULES = [
   '- 说错了就一句改正、给出正确说法；不检讨、不讲自己怎么记混的。',
   CHARACTER_RULE,
   '- 玩家要求建卡或改卡：直接用 dnd_character create/update 写 PC，再用 dnd_resource set 配置法术位和职业资源，不用先开团。player_id 填消息标签里的 U 编号；不翻文件找 openid、不手改团档。工具成功后才说已入库；停团不能建怪、删卡、移动或结算行动。',
-  '- 收到 [系统 · 停团交接与下场备团] 唤醒或玩家明确要求备团时，可用 dnd_prepare show/save 提前准备下一次团的内容（先用 dnd_prepare show 看候选下一站与模组原书目录，再用 dnd_lookup 查卡片，未展开的随机遭遇表、机关与支线可只读查阅该模组目录并提炼进 dnd_prepare save，避免下次开团临时翻书；不写过去总结），计划仅 DM 可见，不推进剧情，禁止修改原书文件或发给玩家。收团后补写交接可用 dnd_end summary，不用重新 start；不把 DM 计划发到群里。',
+  '- 收到 [系统 · 停团交接与下场备团] 唤醒或玩家明确要求备团时，可用 dnd_prepare show/save 提前准备下一次团的内容（先用 dnd_prepare show 看候选下一站与模组原书目录，只看路径可传 brief=true；再用 dnd_lookup 查卡片，未展开的随机遭遇表、机关与支线优先用 dnd_lookup kind="source" 按节查阅并提炼进 dnd_prepare save，避免裸 grep 整本原书撑爆上下文；不写过去总结），计划仅 DM 可见，不推进剧情，禁止修改原书文件或发给玩家。收团后补写交接可用 dnd_end summary，补充本桌长期裁定或角色背景可用 dnd_chronicle(action="add", kind="ruling"|"backstory")，误操作需要回退团档可用 dnd_undo（checkpoint/steps），均不用重新 start；不把 DM 计划发到群里。',
 ].join('\n');
 
 /** 跟着队伍位置和章节变的背景：本章要点、当前场景的通用规则 */
@@ -304,6 +304,7 @@ export class DndService {
     this.background.forget(key);
     this.forceNextSnapshot(key);
     if (existing !== undefined && existing.adventureId === adventure.id && !fresh) {
+      this.store.saveCheckpoint(key, '开团基线', { auto: true });
       existing.active = true;
       existing.sessionStartedAt = Date.now();
       delete existing.endPrep;
@@ -439,7 +440,7 @@ export class DndService {
     return lines.join('\n');
   }
 
-  public preparationContext(key: string): string {
+  public preparationContext(key: string, options: { brief?: boolean } = {}): string {
     const found = this.active(key) ?? this.saved(key);
     if (found === undefined) throw new Error('这个群没有团档（或模组文件丢失）');
     const { campaign, adventure } = found;
@@ -448,13 +449,24 @@ export class DndService {
           const displayDir = formatAdventureDir(adventure.dir, this.cwd);
           const entries = listModuleSourceEntries(adventure.dir);
           return [
-            `模组原书目录（只读，供 DM 备团用 read/glob/grep 查阅；禁止修改或用 qqbot_send_file 发给玩家）：${displayDir}${entries.length > 0 ? `（含：${entries.join('、')}）` : ''}`,
-            '备团要提前准备下一次可能涉及的候选地点、原书表格（随机遭遇/战利品/局势）、机关检定、NPC 与个人钩子，不重复总结已发生的事。先用 dnd_lookup 查候选场景与角色，卡片未展开的表格与细则直接只读查阅上述模组目录，再将要点提炼进 dnd_prepare save，避免下次开团临时翻书；未来安排不是事实，不替玩家选路，不自动修改任务或资源。',
+            `模组原书目录（只读，优先用 dnd_lookup(kind="source", id/query) 按节查阅且自动限流 3000 字；必要时才用 read/glob/grep 查阅，禁止修改或用 qqbot_send_file 发给玩家）：${displayDir}${entries.length > 0 ? `（含：${entries.join('、')}）` : ''}`,
+            '备团要提前准备下一次可能涉及的候选地点、原书表格（随机遭遇/战利品/局势）、机关检定、NPC 与个人钩子，不重复总结已发生的事。先用 dnd_lookup 查候选场景与角色，卡片未展开的表格与细则优先用 dnd_lookup(kind="source", query=...) 精准查阅，再将要点提炼进 dnd_prepare save，避免下次开团临时翻书；未来安排不是事实，不替玩家选路，不自动修改任务或资源。',
           ];
         })()
       : [
           '当前模组没有独立原书目录；先用 dnd_lookup 提前查好候选场景、房间、NPC、任务与线索，将要点提炼进 dnd_prepare save，避免下次开团临时翻查；未来安排不是事实，不替玩家选路，不自动修改任务或资源。',
         ];
+    if (options.brief === true) {
+      const room = findRoom(roomGraph(adventure), campaign.currentRoom);
+      const prep = preparationLines(campaign);
+      return [
+        '【备团速览 · DM 私有】仅列当前位置、备团计划状态、候选去向与原书入口（完整日志与账本传 brief=false）。',
+        `${adventure.name}｜当前房间：${room?.name ?? campaign.currentRoom}（${campaign.currentRoom}）｜章节：${campaign.chapter || '未设'}`,
+        ...(prep.length > 0 ? prep : ['当前尚未保存 DM 备团计划。']),
+        ...upcomingCandidateLines(campaign, adventure),
+        sourceGuide[0]!,
+      ].join('\n');
+    }
     return [
       '【备团资料 · DM 私有】以下已记录事实与候选计划分别列出；不要向玩家转发。',
       summarize(campaign, adventure),
@@ -515,9 +527,19 @@ export class DndService {
       const notes = room === undefined ? '' : roomView(campaign, adventure, room).dmNotes;
       if (notes) lines.push(`本房间 DM 笔记（只给你裁定用，不要直接念）：${notes}`);
     }
-    // 跨场景、换章后 system prompt 里锁住的还是旧规则，新的先写在这里
+    // 跨场景、换章后 system prompt 里锁住的还是旧规则，新的先写在这里；超长本章要点只留精简索引，避免每轮 runtime-context 膨胀
     const held = this.background.peek(key);
-    if (held !== undefined) lines.push(...sceneLines(campaign, adventure).filter((line) => !held.includes(line)));
+    if (held !== undefined) {
+      for (const line of sceneLines(campaign, adventure)) {
+        if (held.includes(line)) continue;
+        if (line.startsWith('本章要点：') && line.length > 600) {
+          const chName = adventure.chapters.find((ch) => ch.id === campaign.chapter)?.name ?? campaign.chapter;
+          lines.push(`本章要点（已切至「${chName}」，完整要点已随切章输出，亦可用 dnd_lookup kind="source" 查证）：${line.slice('本章要点：'.length, '本章要点：'.length + 240)}…`);
+        } else {
+          lines.push(line);
+        }
+      }
+    }
     if (campaign.preparation && campaign.preparation.state !== campaignState(campaign)) {
       lines.push('DM 备团计划对应的团况已变化：旧计划仅作参考（仍适用的后续设定可直接沿用，不能照演或当作已发生事实）；需更新或清空时再调 dnd_prepare save/clear，不必每回合重复 show。');
     }

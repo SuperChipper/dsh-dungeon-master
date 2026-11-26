@@ -102,6 +102,7 @@ export function registerCombatTools(kit: ToolKit): void {
         if (deps.onTurnChange !== undefined) deps.onTurnChange(recordOf(exec));
       };
       if (action === 'start') {
+        assertNoPending(c, '开战');
         if (c.initiative !== undefined) throw new Error('已经在战斗中了，用 next 推进或 end 结束');
         const roomArg = str(args.room);
         const room = roomArg === undefined ? undefined : resolveRoom(roomGraph(adventure), roomArg)?.id;

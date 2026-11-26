@@ -57,6 +57,8 @@ export interface Trigger {
   leads?: string[];
   /** 追加的怪物（援兵、挣脱锁链的狼），刷在触发器所在房间 */
   spawn?: DungeonMonster[];
+  /** 互斥触发器 id 列表（双向生效：任一已触发后，其余不可再触发也不再列为待触发，避免互斥机关同时落档） */
+  mutex?: string[];
   /** 默认只触发一次；false = 可以重复 */
   once?: boolean;
 }
@@ -163,6 +165,10 @@ export interface Npc {
   attitude: Attitude;
   /** 战斗数据：SRD index 或完整怪物数据；不写 = 平民 */
   stat?: { srd: string } | DungeonMonster;
+  /** 具名施法者的可抄/随身法术书清单（dnd_lookup npc 直接展示，避免翻原书） */
+  spellbook?: string[];
+  /** 开战（fight=true）时自动同场刷出的随行护卫/扈从，免去主 DM 临场手建整队小怪 */
+  escort?: DungeonMonster[];
   knows: Fact[];
   /** 这个 NPC 发布的任务 */
   offers?: string[];
@@ -414,7 +420,7 @@ export function validateAdventure(input: unknown): Adventure {
   const leadIds = unique('线索', adv.leads.map((l) => l.id));
   const questIds = unique('任务', adv.quests.map((q) => q.id));
   const flagIds = unique('flag', adv.flags.map((f) => f.id));
-  unique('触发器', allTriggers(adv).map((t) => t.trigger.id));
+  const triggerIds = unique('触发器', allTriggers(adv).map((t) => t.trigger.id));
   unique('信息', allFacts(adv).map((f) => f.fact.id));
 
   const need = (ok: boolean, message: string): void => {
@@ -459,6 +465,13 @@ export function validateAdventure(input: unknown): Adventure {
         checkFlags(t.set, `触发器 ${t.id}`);
         checkFlags(t.clear, `触发器 ${t.id}`);
         checkLeads(t.leads, `触发器 ${t.id}`);
+        if (t.mutex !== undefined) {
+          need(Array.isArray(t.mutex), `触发器 ${t.id} 的 mutex 要是字符串数组`);
+          for (const mId of t.mutex) {
+            need(typeof mId === 'string' && triggerIds.has(mId), `触发器 ${t.id} 的 mutex 指向不存在的触发器「${String(mId)}」`);
+            need(mId !== t.id, `触发器 ${t.id} 的 mutex 不能指向自己`);
+          }
+        }
       }
     }
   }
@@ -470,6 +483,20 @@ export function validateAdventure(input: unknown): Adventure {
   for (const npc of adv.npcs) {
     need(roomIds.has(npc.home?.room), `NPC ${npc.id} 的 home.room 不存在`);
     need(Array.isArray(npc.knows), `NPC ${npc.id} 缺少 knows`);
+    if (npc.spellbook !== undefined) {
+      need(Array.isArray(npc.spellbook) && npc.spellbook.every((s) => typeof s === 'string' && s.trim().length > 0), `NPC ${npc.id} 的 spellbook 要是非空字符串数组`);
+    }
+    if (npc.escort !== undefined) {
+      need(Array.isArray(npc.escort), `NPC ${npc.id} 的 escort 要是怪物数组`);
+      for (const m of npc.escort) {
+        need(
+          typeof m?.name === 'string' && m.name.trim().length > 0
+          && typeof m.count === 'number' && m.count >= 1
+          && typeof m.hp === 'number' && typeof m.ac === 'number',
+          `NPC ${npc.id} 的 escort 缺少完整的怪物数值（name/count/hp/ac）`,
+        );
+      }
+    }
     for (const id of npc.offers ?? []) need(questIds.has(id), `NPC ${npc.id} 发布了不存在的任务 ${id}`);
   }
   for (const lead of adv.leads) {
@@ -543,6 +570,40 @@ export function adventureWarnings(adv: Adventure): string[] {
     if (site.id === startSite || site.knownWhen === undefined) continue;
     const incoming = adv.leads.filter((l) => l.points.site === site.id || (l.points.room !== undefined && siteOfRoom(adv, l.points.room)?.id === site.id));
     if (incoming.length < 2) warnings.push(`场景 ${site.id} 只有 ${incoming.length} 条线索指向它，玩家可能找不到`);
+  }
+
+  // 同房间多个可重复且无前置/互斥约束的触发器：容易在战中或回溯时同时落成矛盾状态
+  for (const site of adv.sites) {
+    for (const room of site.rooms) {
+      const unconstrained = (room.triggers ?? []).filter(
+        (t) => t.once === false && t.requires === undefined && (t.mutex?.length ?? 0) === 0,
+      );
+      if (unconstrained.length >= 2) {
+        warnings.push(`房间 ${room.id} 有多个无前置且可重复的触发器（${unconstrained.map((t) => t.id).join('、')}），若属互斥机关请补充 mutex 或 requires`);
+      }
+    }
+  }
+
+  // 具名施法者 NPC 验收：缺法术位 resources、依赖裸 SRD 模板或缺 spellbook 清单时给出明确提醒
+  const SRD_CASTER_RE = /^(?:mage|archmage|lich|priest|druid|acolyte|cult-fanatic|drow-mage|necromancer|evoker|conjurer|abjurer|enchanter|illusionist|diviner|transmuter)$/i;
+  const SPELLBOOK_CASTER_RE = /红袍|法师|大法师|巫妖|法术书|spellbook|wizard|archmage|lich/i;
+  for (const npc of adv.npcs) {
+    const stat = npc.stat;
+    const statSrd = stat !== undefined && 'srd' in stat ? stat.srd : undefined;
+    const statNotes = stat !== undefined && 'hp' in stat ? (stat.notes ?? '') : '';
+    const isBareSrdCaster = stat !== undefined && !('hp' in stat) && statSrd !== undefined && SRD_CASTER_RE.test(statSrd);
+    const isSpellbookCaster = !/非施法|不会施法/.test(npc.role) && (
+      (statSrd !== undefined && /^(?:mage|archmage|lich|drow-mage|necromancer|evoker|conjurer|abjurer|enchanter|illusionist|diviner|transmuter)$/i.test(statSrd))
+      || SPELLBOOK_CASTER_RE.test(`${npc.role} ${statNotes}`)
+    );
+    if (isBareSrdCaster) {
+      warnings.push(`具名施法者 NPC ${npc.id} 仅使用裸 SRD 模板（${statSrd}），开战不会自动带入法术位或护卫，建议写全 stat（含 resources）与 escort`);
+    } else if (stat !== undefined && 'hp' in stat && isSpellbookCaster && (stat.resources === undefined || Object.keys(stat.resources).length === 0)) {
+      warnings.push(`具名施法者 NPC ${npc.id} 的 stat 缺少法术位 resources，开战时将没有预设法术位`);
+    }
+    if (isSpellbookCaster && (npc.spellbook?.length ?? 0) === 0) {
+      warnings.push(`具名施法者 NPC ${npc.id} 未写 spellbook（可抄/随身法术清单），玩家搜查法术书时 DM 需临时翻原书`);
+    }
   }
   return warnings;
 }

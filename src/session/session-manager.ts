@@ -404,6 +404,21 @@ function extractDefaultPersonaAliases(prompt: string | undefined): string[] {
   return match?.[1] ? [match[1].trim()] : [];
 }
 
+const DND_NOTE_HINT_RE = /dnd|d&d|跑团|trpg|5e|地下城|团规|车卡|法术|模组/i;
+
+/**
+ * 跑团活跃期自动召回降噪：只允许显式标注 `scenes: [dnd]` 的笔记，或未标 scene 但文件名/标题/触发词
+ * 明显属于跑团领域的历史共享笔记；屏蔽日常闲聊、表情包、观察日记等无关笔记自动打断（手动搜索不受影响）。
+ */
+export function isDndAutoRecallCandidate(hit: Pick<NoteHit, 'file' | 'heading' | 'meta'>): boolean {
+  const scenes = hit.meta?.scope.scenes;
+  if (scenes !== undefined && scenes.length > 0) {
+    return scenes.includes('dnd');
+  }
+  const corpus = [hit.file, hit.heading, ...(hit.meta?.triggers ?? [])].join(' ');
+  return DND_NOTE_HINT_RE.test(corpus);
+}
+
 interface NoteQueryDeps {
   config: ImQQBotConfig;
   notesStore?: NotesStore;
@@ -1227,13 +1242,22 @@ export class SessionManager {
       let found: NoteHit[] | undefined;
       try {
         found = await boundedRecall(this.notesStore!.searchHybrid(query, notes.injectTopK * 4, chatKey,
-          { ...rest, operations: [...operations], allowQueryProjectMatch: false }), 1200, signal);
+          {
+            ...rest,
+            ...(campaignRunning ? { scenes: ['dnd'] as const } : {}),
+            operations: [...operations],
+            allowQueryProjectMatch: false,
+          }), 1200, signal);
       } catch {
         this.logger.debug('im-qqbot: operation recall unavailable; continuing without notes');
         return '';
       }
       if (!found || signal?.aborted || this.operationRecalls.get(key) !== state) return '';
-      const hits = found.filter(hit => !this.noteMuted(hit.file, hit.heading) && !state.seen.has(noteRevisionKey(hit)));
+      const hits = found.filter((hit) =>
+        !this.noteMuted(hit.file, hit.heading)
+        && !state.seen.has(noteRevisionKey(hit))
+        && (!campaignRunning || isDndAutoRecallCandidate(hit)),
+      );
       const plan = planNoteInjection(hits, { topK: notes.injectTopK, maxChars: remaining,
         perNoteMaxChars: notes.injectPerNoteChars ?? 0, minCoverage: notes.injectMinCoverage, query });
       if (!plan.items.length || !plan.text) return '';

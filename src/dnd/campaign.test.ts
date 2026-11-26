@@ -22,6 +22,7 @@ import {
   leaveInitiative,
   moveParty,
   outsideRooms,
+  partyPositions,
   reconcileKnownSites,
   usesGreatWeaponFighting,
   weaponAttackModifier,
@@ -515,5 +516,91 @@ describe('CampaignStore / DndService', () => {
     expect(blank.campaign.characters).toHaveLength(0);
     expect(readdirSync(root).filter((f) => f.endsWith('.json'))).toHaveLength(3);
     expect(() => service.start('group:abc', 'nope', false)).toThrow(/没有这个模组/);
+  });
+
+  it('CampaignStore 检查点支持自动里程碑、保护手动检查点、一步恢复且停团回退保持暂停态', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dnd-cp-'));
+    const store = new CampaignStore(root);
+    const service = new DndService({ store, library: new AdventureLibrary(), mapDir: root });
+    const key = 'group:cp';
+    service.start(key, 'sunken-bell', false);
+    store.update(key, (c) => {
+      upsertCharacter(c, { name: '艾琳', maxHp: 20 });
+      moveParty(c, BELL, 'nave');
+    }, '进中殿');
+
+    const manual = store.saveCheckpoint(key, '开战谈判前');
+    expect(manual.id).toBe('cp-1');
+
+    // 开战自动写入「开战前」检查点
+    store.update(key, (c) => { startInitiative(c, fixed(10)); }, 'dnd_initiative action=start');
+    expect(store.checkpoints(key).some((cp) => cp.name === '开战前' && cp.auto === true)).toBe(true);
+
+    // 刷大量自动检查点不会挤掉手动检查点
+    for (let i = 0; i < 25; i++) {
+      store.saveCheckpoint(key, `自动里程碑-${i}`, { auto: true });
+    }
+    expect(store.checkpoints(key).some((cp) => cp.id === manual.id)).toBe(true);
+
+    // 停团状态下恢复检查点：保持 active=false，且恢复前状态被压入 undo 栈
+    service.stop(key);
+    const { restored } = store.restoreCheckpoint(key, '开战谈判前');
+    expect(restored.active).toBe(false);
+    expect(restored.initiative).toBeUndefined();
+    expect(restored.currentRoom).toBe('nave');
+
+    // 误回退可再一步 undo 回到恢复前状态，且仍保持 active=false
+    const undone = store.undo(key, 1);
+    expect(undone[0]).toContain('恢复检查点');
+    const afterUndo = store.load(key)!;
+    expect(afterUndo.active).toBe(false);
+    expect(afterUndo.initiative).toBeDefined();
+  });
+});
+
+describe('随行/留守 NPC 与已清空地城快速移动', () => {
+  it('留守/退队 NPC 不阻断整队 dnd_move 也不触发分头告警；旧档异地 NPC 自动留守原地', () => {
+    const c = party();
+    upsertCharacter(c, { name: '老铁匠', kind: 'npc', maxHp: 12, companionStatus: 'stationed', room: 'gate' });
+    upsertCharacter(c, { name: '历史跟班', kind: 'npc', maxHp: 12, room: 'gate' });
+    // 同在 gate 时：整队进 nave 只带走 PC 与随行 NPC，不带走 stationed NPC
+    const first = moveParty(c, BELL, 'nave');
+    expect(first.movers).toEqual(['艾琳', '布洛克', '历史跟班']);
+    expect(c.characters.find((ch) => ch.name === '老铁匠')!.room).toBe('gate');
+    expect(partyPositions(c).size).toBe(1);
+    expect(summarize(c, BELL)).toContain('留守/退队 NPC：老铁匠[留守@塌陷门厅]');
+
+    // 模拟旧档：把「历史跟班」留在 gate（没有设 companionStatus），PC 全员在 nave
+    c.characters.find((ch) => ch.name === '历史跟班')!.room = 'gate';
+    const second = moveParty(c, BELL, 'ossuary');
+    expect(second.movers).toEqual(['艾琳', '布洛克']);
+    expect(second.leftBehindNpcs).toEqual(['历史跟班']);
+    expect(c.characters.find((ch) => ch.name === '历史跟班')!.room).toBe('gate');
+
+    // 若两个 PC 分在不同房间，仍按原规则拦截整队移动
+    c.characters.find((ch) => ch.name === '布洛克')!.room = 'gate';
+    expect(() => moveParty(c, BELL, 'nave')).toThrow(/不同房间/);
+  });
+
+  it('已揭示且清空怪物的地城允许单步穿行回到非相邻房间，有活怪或未揭示房间仍拦截', () => {
+    const c = party();
+    // 门厅 → 中殿（刷巨鼠）→ 藏骨堂
+    moveParty(c, BELL, 'nave');
+    moveParty(c, BELL, 'ossuary');
+
+    // 中殿还有活着的巨鼠：不能从藏骨堂一步跳回门厅
+    expect(() => moveParty(c, BELL, 'gate')).toThrow(/不相邻/);
+
+    // 清空全部怪物（中殿和藏骨堂）后，可从藏骨堂一步快速穿行回门厅
+    for (const ch of c.characters) {
+      if (ch.kind === 'monster') applyDamage(c, ch.name, ch.hp);
+    }
+    const fast = moveParty(c, BELL, 'gate');
+    expect(fast.room.id).toBe('gate');
+    expect(fast.viaRooms).toEqual(['钟楼残殿']);
+    expect(c.enteredFrom?.gate).toBe('nave');
+
+    // 目标房间未揭示时即使前面已清空，仍不能直接跳过
+    expect(() => moveParty(c, BELL, 'bellshaft')).toThrow(/不相邻/);
   });
 });

@@ -19,6 +19,8 @@ const USAGE = [
   '/dnd status — 看团况（战斗中发战斗图，带血量、先攻和你到各人的距离）',
   '/dnd combat — 查看最近一场战斗代理的模型与用量（缓存单列）',
   '/dnd map [battle|explore] — 发地图：战斗中是站位图，平时是探索过的地方（和 DM 发的是同一张）',
+  '/dnd checkpoint [名称|list] — 保存或查看命名检查点（开团与停团均可用，便于整段快速回退）',
+  '/dnd undo [list|步数N|cp-编号|检查点名] — 查看可回退记录，或一步回退到检查点/最近 N 步',
   '/dnd checkin — 再发一次签到按钮',
   '/dnd end [摘要] — 原子保存停团交接并唤醒 DM 私有备团（战斗状态保留）；也可直接说「今天先到这」',
   '/dnd dungeons — 列出可用模组',
@@ -26,6 +28,26 @@ const USAGE = [
   '/dnd spells [职业] — 职业法术列表，如 /dnd spells 牧师',
   '/dnd help — 怎么玩',
 ].join('\n');
+
+/** 把内部工具快照标签脱敏为玩家安全摘要，避免向群聊泄露 DC、暗骰或 DM 机密参数。 */
+function sanitizeUndoLabel(label: string): string {
+  const rollMatch = /#R\d+/.exec(label);
+  const rollTag = rollMatch !== null ? ` (${rollMatch[0]})` : '';
+  if (label.startsWith('恢复检查点')) return label;
+  if (label.startsWith('按钮 ')) return label;
+  if (label.startsWith('dnd_move')) return '房间移动';
+  if (label.startsWith('dnd_check')) return `检定/掷骰${rollTag}`;
+  if (label.startsWith('dnd_apply')) return `数值/状态结算${rollTag}`;
+  if (label.startsWith('dnd_initiative')) return '战斗先攻变动';
+  if (label.startsWith('dnd_position')) return '战场站位变动';
+  if (label.startsWith('dnd_character')) return '角色卡改动';
+  if (label.startsWith('dnd_resource')) return '资源变动';
+  if (label.startsWith('dnd_rest')) return '队伍休息';
+  if (label.startsWith('dnd_story')) return '剧情状态变动';
+  if (label.startsWith('dnd_progress')) return '进度存档';
+  if (label.startsWith('dnd_chronicle')) return '剧情账本变动';
+  return `团档改动${rollTag}`;
+}
 
 const RULES_WIKI = 'https://dnd.huijiwiki.com/wiki/';
 
@@ -66,7 +88,7 @@ const HELP = [
   '· 「短休」「长休」直接说，我会结算。',
   '',
   '【判错了】',
-  '· 大家同意的话说「卷回到 xx 之前」，我会把状态回滚，不会硬改数字。',
+  '· 大家同意的话说「卷回到 xx 之前」，或用 /dnd checkpoint 记检查点、/dnd undo 快速回退，不会硬改数字。',
   '',
   '【查规则】',
   '· /dnd search 火球术：给出 wiki 词条链接，法术、技能、职业特性、专长、怪物都能查。',
@@ -74,14 +96,14 @@ const HELP = [
   '· 回合按钮里的「法术/能力」列出你自己卡上的法术、职业动作与充能能力，带 wiki 链接；卡上还没有就找 DM 补。',
   `· wiki 首页：${RULES_WIKI}`,
   '',
-  '命令：/dnd start｜new｜status｜combat｜checkin｜end｜dungeons｜search｜spells｜help',
+  '命令：/dnd start｜new｜status｜combat｜map｜checkpoint｜undo｜checkin｜end｜dungeons｜search｜spells｜help',
 ].join('\n');
 
 export function dndCommand({ manager }: CommandDeps): CategorizedCommand {
   return {
     name: 'dnd',
     category: 'qqbot',
-    description: '跑团：开团/结团/团况/战斗用量/玩法说明（用法: /dnd start|new|status|combat|checkin|end|dungeons|search|spells|help）',
+    description: '跑团：开团/结团/团况/检查点回退/战斗用量/玩法说明（用法: /dnd start|new|status|combat|map|checkpoint|undo|checkin|end|dungeons|search|spells|help）',
     handler: async (cmdCtx) => {
       const service = manager.dndService;
       if (service === undefined) return '跑团功能未启用（配置 dnd.enabled）';
@@ -187,6 +209,65 @@ export function dndCommand({ manager }: CommandDeps): CategorizedCommand {
         }
         // 没装 sharp 或者图发不出去：退回聊天框里的文字地图
         return buildTextMap(found.campaign, found.adventure);
+      }
+
+      if (sub === 'checkpoint') {
+        const found = service.active(key) ?? service.saved(key);
+        if (found === undefined) return '这个群还没有团档，先用 /dnd start 开团。';
+        if (arg === 'list') {
+          const cps = service.store.checkpoints(key).slice(-10).reverse();
+          if (cps.length === 0) return '还没有保存过检查点。用 /dnd checkpoint <名称> 保存一个。';
+          return [
+            '📌 已保存的检查点（新→旧，用 /dnd undo cp-N 一步回退）：',
+            ...cps.map((cp) => `- ${cp.id}「${cp.name}」${cp.auto === true ? '[自动]' : '[手动]'}`),
+          ].join('\n');
+        }
+        try {
+          const cp = service.store.saveCheckpoint(key, rest.trim() || '手动检查点');
+          return `📌 已保存检查点 ${cp.id}「${cp.name}」。需要回退时发送 /dnd undo ${cp.id}。`;
+        } catch (err) {
+          return err instanceof Error ? err.message : String(err);
+        }
+      }
+
+      if (sub === 'undo') {
+        const found = service.active(key) ?? service.saved(key);
+        if (found === undefined) return '这个群还没有团档，先用 /dnd start 开团。';
+        if (rest.length === 0 || arg === 'list') {
+          const cps = service.store.checkpoints(key).slice(-8).reverse();
+          const steps = service.store.snapshots(key).slice(-8).reverse();
+          if (cps.length === 0 && steps.length === 0) return '没有可回退的检查点或改动记录。';
+          const parts: string[] = [];
+          if (cps.length > 0) {
+            parts.push([
+              '📌 检查点（/dnd undo cp-N 一步回退）：',
+              ...cps.map((cp) => `- ${cp.id}「${cp.name}」${cp.auto === true ? '[自动]' : '[手动]'}`),
+            ].join('\n'));
+          }
+          if (steps.length > 0) {
+            parts.push([
+              '⏪ 最近改动（/dnd undo N 回退前 N 步）：',
+              ...steps.map((s, i) => `${i + 1}. ${sanitizeUndoLabel(s.label)}`),
+            ].join('\n'));
+          }
+          return parts.join('\n\n');
+        }
+        try {
+          if (/^\d+$/.test(rest)) {
+            const count = Number(rest);
+            const undone = service.store.undo(key, count);
+            service.forceNextSnapshot(key);
+            return [
+              `⏪ 已回退最近 ${undone.length} 步：`,
+              ...undone.map((l, i) => `${i + 1}. ${sanitizeUndoLabel(l)}`),
+            ].join('\n');
+          }
+          const { checkpoint } = service.store.restoreCheckpoint(key, rest);
+          service.forceNextSnapshot(key);
+          return `⏪ 已回退到检查点 ${checkpoint.id}「${checkpoint.name}」（回退前状态已留档，误回退可发 /dnd undo 1 恢复）。`;
+        } catch (err) {
+          return err instanceof Error ? err.message : String(err);
+        }
       }
 
       if (sub === 'checkin') {

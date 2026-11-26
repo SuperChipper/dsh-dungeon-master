@@ -209,6 +209,38 @@ describe('卡片摘要', () => {
     expect(brief).toContain('地精1 毫发无伤');
     expect(await call('dnd_character', { action: 'show', name: '地精2', brief: true })).toMatch(/^地精2 HP 20\/20 AC \d+/);
   });
+
+  it('dnd_character update 默认返回紧凑变更摘要不重刷长备注，支持 append_notes/remove_notes 与 full=true', async () => {
+    const { call, service, key } = setup(fixed(10));
+    const longNotes = '时间学派法师被动与长期本桌约定：' + '保留旧条目。'.repeat(250);
+    await call('dnd_character', { action: 'create', name: '奇塔露', max_hp: 40, ac: 15, notes: longNotes });
+
+    // 单字段加物品：紧凑回显，不重刷 1500 字旧 notes
+    const compact = await call('dnd_character', { action: 'update', name: '奇塔露', add_items: ['安珂金坠'] });
+    expect(compact).toContain('已更新');
+    expect(compact).toContain('+安珂金坠');
+    expect(compact).not.toContain('保留旧条目。保留旧条目。');
+    expect(compact.length).toBeLessThan(400);
+
+    // 增量追加与删行 notes，保留原有内容
+    const appended = await call('dnd_character', { action: 'update', name: '奇塔露', append_notes: '已同调安珂金坠（10尺盲视）' });
+    expect(appended).toContain('备注已追加：已同调安珂金坠');
+    expect(service.store.load(key)!.characters.find((x) => x.name === '奇塔露')!.notes).toContain('时间学派法师被动');
+    expect(service.store.load(key)!.characters.find((x) => x.name === '奇塔露')!.notes).toContain('已同调安珂金坠');
+
+    const removed = await call('dnd_character', { action: 'update', name: '奇塔露', remove_notes: ['安珂金坠'] });
+    expect(removed).toContain('备注已删去：安珂金坠');
+    expect(service.store.load(key)!.characters.find((x) => x.name === '奇塔露')!.notes).not.toContain('安珂金坠');
+    expect(service.store.load(key)!.characters.find((x) => x.name === '奇塔露')!.notes).toContain('时间学派法师被动');
+
+    // notes 与 append_notes 混传直接报错
+    await expect(call('dnd_character', { action: 'update', name: '奇塔露', notes: 'a', append_notes: 'b' })).rejects.toThrow(/不能同时传/);
+
+    // full=true 仍可要求完整卡面
+    const fullOut = await call('dnd_character', { action: 'update', name: '奇塔露', ac: 16, full: true });
+    expect(fullOut).toContain('时间学派法师被动');
+    expect(fullOut.length).toBeGreaterThan(1000);
+  });
 });
 
 describe('进度增量写入', () => {

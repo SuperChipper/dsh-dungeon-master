@@ -2,7 +2,7 @@
 import { join } from 'node:path';
 import { roomGraph } from '../adventure.ts';
 import {
-assertNoPending,isAbsent,isControlledBy,isDmDelegated,moveParty,partyPositions,requireCharacter,isOut
+  assertNoPending, isAbsent, isControlledBy, isDmDelegated, isOut, isStationedNpc, moveParty, partyPositions, requireCharacter, roomOf,
 } from '../campaign.ts';
 import { findRoom,resolveRoom } from '../dungeon.ts';
 import { assertCombatExit } from '../battlefield.ts';
@@ -23,8 +23,10 @@ export function registerExploreTools(kit: ToolKit): void {
 
   register(
     'dnd_move',
-    'Move characters to an adjacent room (moving inside the same room is dnd_position). Omit `who` only when the WHOLE party goes; when one or a few go ahead '
-    + '(scouting, sneaking, fetching something) pass `who` so the others stay put. '
+    'Move characters to an adjacent room, or fast-travel in one step across already-revealed, unlocked, check-free, monster-free cleared dungeon rooms '
+    + '(including exiting a cleared dungeon directly to another known site). Moving inside the same room is dnd_position. '
+    + 'Omit `who` when the WHOLE active party goes (stationed/retired NPCs and legacy NPCs left in other rooms are skipped automatically); '
+    + 'when one or a few PCs split off (scouting, sneaking, fetching something) pass `who` so the others stay put. '
     + 'During combat, first dnd_position move to the mapped door/outside leading there and resolve opportunity attacks; this tool cannot skip the battlefield route. '
     + 'Returns the player-facing description (narrate from this) and DM-only notes (use for rulings, never read aloud). First visit reveals '
     + 'the room and spawns its monsters. In combat, characters in the initiative order move only on their own turn (with `who`); '
@@ -34,7 +36,7 @@ export function registerExploreTools(kit: ToolKit): void {
     + 'Pass discover_hidden=true only after a successful check found a secret passage. Exits that need a check '
     + '(climbing, swimming) are rolled by the tool for each mover; those who fail stay behind. If the table already '
     + 'resolved that crossing with dnd_check, pass `check_done` so it is not rolled twice. In a town you can go '
-    + 'to any location the players know. From a dungeon\'s entry, or anywhere in a town, you can travel to another '
+    + 'to any location the players know. From a dungeon\'s entry (or via a cleared path to it), or anywhere in a town, you can travel to another '
     + 'known site by its name or id.',
     {
       room: { type: 'string', description: 'Room id or name, or another site\'s id/name (from that site\'s entry).' },
@@ -59,24 +61,43 @@ export function registerExploreTools(kit: ToolKit): void {
       const who = strList(args.who);
       const destination = resolveRoom(roomGraph(adventure), String(args.room ?? ''));
       if (destination !== undefined) {
-        const movers = who === undefined ? c.characters.filter((ch) => ch.kind !== 'monster' && !isOut(ch) && !isAbsent(ch)) : who.map((name) => requireCharacter(c, name));
+        const movers = who === undefined
+          ? c.characters.filter((ch) => ch.kind !== 'monster' && !isOut(ch) && !isAbsent(ch) && !isStationedNpc(ch))
+          : who.map((name) => requireCharacter(c, name));
         for (const ch of movers) assertCombatExit(c, ch, destination.id);
       }
       if (who !== undefined && args.dm_override !== true) {
         const senders = sendersOf(exec);
-        const silent = who
-          .map((n) => c.characters.find((ch) => ch.name === n))
-          .filter((ch) => ch !== undefined && ch.kind === 'pc' && ch.playerId !== undefined && !isDmDelegated(ch) && !senders.some((s) => isControlledBy(ch, s)))
-          .map((ch) => `${ch!.name} 是〈${ch!.delegated?.mode === 'player' ? (ch!.delegated.player ?? ch!.delegated.playerId) : (ch!.player ?? ch!.playerId)}〉的角色`);
-        if (silent.length > 0) {
-          throw new Error(
-            `${silent.join('；')}，他本人这轮还没发话。拆开队伍要带走别人的卡，传 dm_override=true，`
-            + '并在回复里写清是委托还是被推/被拖；全队一起走就不要给 who。',
-          );
+        const resolvedWho = who.map((n) => c.characters.find((ch) => ch.name === n));
+        const firstMover = resolvedWho.find((ch) => ch !== undefined);
+        const originRoom = firstMover !== undefined ? roomOf(c, firstMover) : c.currentRoom;
+        const originPcs = c.characters.filter((ch) => ch.kind === 'pc' && !isOut(ch) && !isAbsent(ch) && roomOf(c, ch) === originRoom);
+        const whoSet = new Set(resolvedWho.filter((ch) => ch !== undefined).map((ch) => ch!.name));
+        // 若战斗外 who 包含了出发房间内全部在队 PC（仅排除同房间随行 NPC，并未拆开任何 PC），按整队同行处理，不强求 dm_override
+        const movingWholePcGroup = c.initiative === undefined && originPcs.length >= 2 && originPcs.every((pc) => whoSet.has(pc.name));
+        if (!movingWholePcGroup) {
+          const silent = resolvedWho
+            .filter((ch) => ch !== undefined && ch.kind === 'pc' && ch.playerId !== undefined && !isDmDelegated(ch) && !senders.some((s) => isControlledBy(ch, s)))
+            .map((ch) => `${ch!.name} 是〈${ch!.delegated?.mode === 'player' ? (ch!.delegated.player ?? ch!.delegated.playerId) : (ch!.player ?? ch!.playerId)}〉的角色`);
+          if (silent.length > 0) {
+            throw new Error(
+              `${silent.join('；')}，他本人这轮还没发话。拆开队伍要带走别人的卡，传 dm_override=true，`
+              + '并在回复里写清是委托还是被推/被拖；全队一起走就不要给 who。',
+            );
+          }
         }
       }
       const checkDone = rollIds(args.check_done);
+      const beforeMoveState = JSON.stringify(c);
+      const beforeMoveRoom = c.currentRoom;
       const result = moveParty(c, adventure, String(args.room ?? ''), args.discover_hidden === true, who, service.roller, checkDone);
+      if (result.travelledFrom !== undefined) {
+        service.store.saveCheckpoint(recordOf(exec).sessionKey, `离开「${result.travelledFrom.name}」前`, {
+          auto: true,
+          state: beforeMoveState,
+          room: beforeMoveRoom,
+        });
+      }
       const lines: string[] = [];
       if (result.checkDone !== undefined) lines.push(`出口检定按 ${result.checkDone.map((id) => `#R${id}`).join(' ')} 的结果算，没有再掷。`);
       if (result.checks.length > 0) {
@@ -89,6 +110,12 @@ export function registerExploreTools(kit: ToolKit): void {
       } else {
         const someStayed = result.checks.some((r) => !r.passed);
         lines.push(`${strList(args.who)?.length || someStayed ? result.movers.join('、') : '队伍'}进入「${result.room.name}」${result.firstVisit ? '（首次）' : ''}`);
+        if (result.viaRooms !== undefined && result.viaRooms.length > 0) {
+          lines.push(`（已沿清空且无障碍的房间快速穿行：经由 ${result.viaRooms.join(' → ')}）`);
+        }
+        if (result.leftBehindNpcs !== undefined && result.leftBehindNpcs.length > 0) {
+          lines.push(`【DM】以下 NPC 留在各自原房间未随行：${result.leftBehindNpcs.join('、')}（如长期留守或已退队，可用 dnd_character update companion_status="stationed" 或 "retired" 固定标记）。`);
+        }
         if (result.travelledFrom !== undefined) {
           lines.push(`【DM】这是离开「${result.travelledFrom.name}」、在地面上赶路到「${result.site.name}」，不是暗道或捷径；按下面的抵达描述叙述。`);
         }

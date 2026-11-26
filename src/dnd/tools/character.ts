@@ -1,7 +1,7 @@
 /** 角色卡与资源：dnd_character、dnd_resource、dnd_rest。 */
 import type { Adventure } from '../adventure.ts';
 import {
-type Campaign,type Character,type CharacterInput,type CharacterKind,type DelegationTarget,type PendingSpell,applyEffectConditions,assertNoPending,changeInventory,checkAllAirborneCrashes,delegationTag,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isAbsent,isDmDelegated,isOut,fightRooms,leaveInitiative,pushLog,reactionBlocked,removeCharacter,requireCharacter,requireInitiative,requireResource,rest,
+type Campaign,type Character,type CharacterInput,type CharacterKind,type CompanionStatus,type DelegationTarget,type PendingSpell,applyEffectConditions,assertNoPending,changeInventory,checkAllAirborneCrashes,companionStatusTag,delegationTag,fightingSpiritTempHp,findCharacter,grantTempHp,hexbladeKillHeal,inInitiative,isAbsent,isDmDelegated,isOut,fightRooms,leaveInitiative,pushLog,reactionBlocked,removeCharacter,requireCharacter,requireInitiative,requireResource,rest,
 restoreReaction,
 restoreResource,
 roomOf,
@@ -33,6 +33,7 @@ int,
 strList,moduleNpcNamed,
 reviveHint,sheet,
 characterBrief,
+characterUpdateSummary,
 parseSkills,
 parseSpellInputs,
 parseWeapons,
@@ -260,15 +261,15 @@ export function registerCharacterTools(kit: ToolKit): void {
     + 'For existing sheets, read current data with show before answering or editing (reuse a show result already obtained this turn); never reconstruct a sheet from chat memory. '
     + 'Full sheet: action=show name="角色名"; quick HP/resources: also brief=true; unknown name: action=list first. '
     + 'Tool results are DM-only, NOT automatically sent to the group: send the requested PC sheet/content in your reply after reading it. '
-    + 'Edits must be persisted with update (new sheets: create); only confirm saved after success. The update result already contains the saved sheet, so no extra show is needed. '
+    + 'Edits must be persisted with update (new sheets: create); only confirm saved after success. update returns a compact change summary (pass full=true or call show if you need the full sheet). '
     + 'Create, update, show, list or remove character sheets (PCs, NPCs, extra monsters). Ability scores default to 10. '
     + 'Bind a PC to the player\'s group nickname with `player` and `player_id` so they can only act for their own character. '
     + 'New PC: ask name and class, then create with weapons, hit_die and the reactions that change attacks (standard array '
     + '15/14/13/12/10/8 if they want help), and set spell slots / class resources with dnd_resource set. '
     + 'While paused, create/update/show/list work for PCs only (no remove, SRD, multiple copies or room changes); '
     + 'no need to start the adventure. Use the player tag as player_id (e.g. U7); never edit campaign JSON. '
-    + 'For updates, omit unchanged fields. notes and arrays such as weapons/traits/reactions/skills/saves/spells REPLACE existing values: '
-    + 'read and preserve unrelated entries; prefer add_spells/remove_spells and add_items/remove_items for incremental changes. '
+    + 'For updates, omit unchanged fields. Prefer `append_notes` / `remove_notes` for incremental note edits instead of rewriting the full `notes` block; '
+    + 'arrays such as weapons/traits/reactions/skills/saves/spells REPLACE existing values (prefer add_spells/remove_spells and add_items/remove_items for incremental changes). '
     + 'Use structured fields for supported mechanics (e.g. init_bonus, traits, reactions); notes alone do not enable automatic bonuses. '
     + 'Set spell slots/class-resource limits with dnd_resource set, not just notes. '
     + 'Improvised monsters: pass `srd` (e.g. "goblin") to take real stats from the SRD and `count` for several '
@@ -411,8 +412,12 @@ export function registerCharacterTools(kit: ToolKit): void {
           additionalProperties: false,
         },
       },
-      notes: { type: 'string', description: 'Replaces ALL notes. Read current notes and preserve unrelated abilities, passives, active effects and agreements when editing. Notes alone do not apply mechanical bonuses; use supported structured fields too.' },
+      notes: { type: 'string', description: 'Replaces ALL notes (cannot combine with append_notes/remove_notes). Prefer append_notes/remove_notes for incremental edits. Notes alone do not apply mechanical bonuses; use supported structured fields too.' },
+      append_notes: { type: 'string', description: 'For update: append new note text to existing notes without rewriting the entire block (avoids dropping old passives and saves tokens).' },
+      remove_notes: { type: 'array', items: { type: 'string' }, description: 'For update: remove lines/segments in notes containing these texts.' },
+      full: { type: 'boolean', description: 'For update: return the full character sheet instead of the compact change summary (default false).' },
       absent: { type: 'boolean', description: 'PC only (active session): true temporarily removes an absent player\'s PC from the party (and initiative); false returns them to the party at the current room.' },
+      companion_status: { type: 'string', enum: ['following', 'stationed', 'retired'], description: 'NPC allies only: following (default, moves with party), stationed (stays at its room, excluded from whole-party dnd_move and split warnings), retired (left the party).' },
       delegate: { type: 'string', description: 'PC only (active session, update): temporarily transfer control to another player without overwriting original player_id, hand over to DM to prevent AFK lost reactions, or clear. Pass a teammate character name (e.g. "奇塔露"), member id ("U2"), "dm", or "none"/"clear".' },
       delegate_player: { type: 'string', description: 'Optional display nickname when `delegate` is a raw member id (#U2) with no PC sheet name to infer from.' },
       brief: { type: 'boolean', description: 'For show: one line (HP, AC, conditions, resources, room) instead of the full sheet.' },
@@ -428,7 +433,10 @@ export function registerCharacterTools(kit: ToolKit): void {
           const visible = campaign.active ? campaign.characters : campaign.characters.filter((ch) => ch.kind === 'pc');
           return visible.length === 0
             ? '还没有角色。'
-            : visible.map((ch) => `${ch.name}${ch.player ? `〈${ch.player}〉` : ''} ${ch.kind} HP ${ch.hp}/${ch.maxHp}${isAbsent(ch) ? ' [暂离]' : (roomOf(campaign, ch) ? ` @${roomOf(campaign, ch)}` : '')}`).join('\n');
+            : visible.map((ch) => {
+              const comp = companionStatusTag(ch);
+              return `${ch.name}${ch.player ? `〈${ch.player}〉` : ''} ${ch.kind} HP ${ch.hp}/${ch.maxHp}${comp ? ` [${comp}]` : ''}${isAbsent(ch) ? ' [暂离]' : (roomOf(campaign, ch) ? ` @${roomOf(campaign, ch)}` : '')}`;
+            }).join('\n');
         }
         const several = strList(args.names);
         if (several !== undefined && several.length > 0) {
@@ -500,8 +508,19 @@ export function registerCharacterTools(kit: ToolKit): void {
         const input: CharacterInput = { ...srdBase, name: action === 'update' ? requireCharacter(c, name).name : name, abilities };
         const kind = str(args.kind) ?? (srdBase !== undefined ? 'monster' : undefined);
         if (kind !== undefined) input.kind = kind as CharacterKind;
+        if (args.notes !== undefined && (args.append_notes !== undefined || args.remove_notes !== undefined)) {
+          throw new Error('notes 与 append_notes/remove_notes 不能同时传：全量重写用 notes，增量增删用 append_notes/remove_notes');
+        }
+        if (action === 'create' && (args.append_notes !== undefined || args.remove_notes !== undefined)) {
+          throw new Error('建卡请直接传 notes；append_notes/remove_notes 仅用于 update');
+        }
+        const rawCompanion = str(args.companion_status);
+        if (rawCompanion !== undefined && rawCompanion !== 'following' && rawCompanion !== 'stationed' && rawCompanion !== 'retired') {
+          throw new Error(`companion_status 只能是 following / stationed / retired，收到 ${rawCompanion}`);
+        }
         const optional = {
           player: str(args.player), playerId: memberId(exec, args.player_id, 'player_id'), className: str(args.class_name), level: int(args.level), maxHp: int(args.max_hp),
+          companionStatus: rawCompanion as CompanionStatus | undefined,
           ac: int(args.ac), initBonus: int(args.init_bonus), attackBonus: int(args.attack_bonus), damage: str(args.damage), notes: str(args.notes),
           skills: parseSkills(strList(args.skills)), expertise: parseSkills(strList(args.expertise)), saves: parseAbilities(strList(args.saves)),
           weapons: parseWeapons(args.weapons), room: str(args.room), hitDie: str(args.hit_die), traits: strList(args.traits),
@@ -604,6 +623,42 @@ export function registerCharacterTools(kit: ToolKit): void {
           ch.hp = Math.min(ch.hp, ch.maxHp);
         }
         const finalCh = requireCharacter(c, character.name);
+        const notesDiff: string[] = [];
+        const removeNotes = strList(args.remove_notes) ?? [];
+        const appendNote = str(args.append_notes);
+        if (removeNotes.length > 0 || appendNote !== undefined) {
+          const existing = finalCh.notes ?? '';
+          const sep = existing.includes('\n') ? '\n' : '；';
+          let segments = existing.length > 0
+            ? existing.split(sep).map((s) => s.trim()).filter(Boolean)
+            : [];
+          if (removeNotes.length > 0) {
+            const removed: string[] = [];
+            const missed: string[] = [];
+            for (const needle of removeNotes) {
+              const beforeLen = segments.length;
+              segments = segments.filter((seg) => !seg.includes(needle));
+              if (segments.length < beforeLen) removed.push(needle);
+              else missed.push(needle);
+            }
+            if (removed.length > 0) notesDiff.push(`备注已删去：${removed.join('、')}`);
+            if (missed.length > 0) notesDiff.push(`备注未找到可删项：${missed.join('、')}`);
+          }
+          if (appendNote !== undefined) {
+            const toAdd = appendNote.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+            const added: string[] = [];
+            for (const item of toAdd) {
+              if (!segments.includes(item)) {
+                segments.push(item);
+                added.push(item);
+              }
+            }
+            if (added.length > 0) notesDiff.push(`备注已追加：${added.join('；')}`);
+          }
+          const merged = segments.join(existing.includes('\n') || segments.length > 1 ? '\n' : '');
+          if (merged.length > 0) finalCh.notes = merged;
+          else delete finalCh.notes;
+        }
         const syncedRes = action === 'update' && args.sync_resources !== false
           ? syncLevelUpResources(c, finalCh, prevLevel, prevClassName)
           : [];
@@ -618,7 +673,17 @@ export function registerCharacterTools(kit: ToolKit): void {
         if (missingSpellResources.length > 0) {
           spellNotes.push(`角色能力引用了尚未建立的资源「${missingSpellResources.join('、')}」，请用 dnd_resource action="set" 补齐上限`);
         }
-        lines.push(sheet(finalCh, whoOf(exec), c));
+        if (created || args.full === true) {
+          lines.push(sheet(finalCh, whoOf(exec), c));
+        } else {
+          lines.push(characterUpdateSummary(c, finalCh, args, {
+            who: whoOf(exec),
+            addItems: add,
+            removeItems: remove,
+            gpDelta: gp,
+            notesDiff,
+          }));
+        }
         if (spellNotes.length > 0) lines.push(`【DM】${spellNotes.join('；')}`);
         if (itemHint !== undefined) lines.push(itemHint);
         return lines.join('\n');
@@ -998,16 +1063,30 @@ export function registerCharacterTools(kit: ToolKit): void {
     },
     ['kind'],
     (args, exec) => mutate(exec, (c) => {
+      const unknownKeys = Object.keys(args).filter((k) => !['kind', 'characters', 'hit_dice'].includes(k));
+      if (unknownKeys.length > 0) {
+        throw new Error(`dnd_rest: 不认识的参数 ${unknownKeys.join('、')}（可用：kind、characters、hit_dice）`);
+      }
+      const rawKind = str(args.kind);
+      if (rawKind !== 'short' && rawKind !== 'long') {
+        throw new Error(`dnd_rest: kind 只能是 "short" 或 "long"，收到 ${JSON.stringify(args.kind)}`);
+      }
       const spend: Record<string, number> = {};
-      if (args.hit_dice !== null && typeof args.hit_dice === 'object') {
+      if (args.hit_dice !== undefined) {
+        if (args.hit_dice === null || typeof args.hit_dice !== 'object' || Array.isArray(args.hit_dice)) {
+          throw new Error('dnd_rest: hit_dice 要是对象（如 {"卡厄斯": 1}）');
+        }
         for (const [k, v] of Object.entries(args.hit_dice as Record<string, unknown>)) {
           const n = int(v);
-          if (n !== undefined && n > 0) spend[k] = n;
+          if (n === undefined || n < 0) throw new Error(`dnd_rest: hit_dice["${k}"] 要是非负整数`);
+          if (n > 0) spend[k] = n;
         }
       }
-      const kind = args.kind === 'long' ? 'long' : 'short';
-      const results = rest(c, kind, strList(args.characters), spend, service.roller);
-      return `${kind === 'long' ? '长休' : '短休'}完成：\n${results.map((r) => `${r.name}：${r.lines.join('，') || '无变化'}`).join('\n')}`;
+      if (rawKind === 'long' && Object.keys(spend).length > 0) {
+        throw new Error('dnd_rest: 长休自动回满生命，不能传 hit_dice（花生命骰回血仅限短休 kind="short"）');
+      }
+      const results = rest(c, rawKind, strList(args.characters), spend, service.roller);
+      return `${rawKind === 'long' ? '长休' : '短休'}完成：\n${results.map((r) => `${r.name}：${r.lines.join('，') || '无变化'}`).join('\n')}`;
     }),
   );
 }

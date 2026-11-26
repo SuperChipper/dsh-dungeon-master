@@ -70,7 +70,7 @@ No preset switch or separate session is needed: active campaigns inject compact 
   - **Passives, auras & conditions**: Covers PHB conditions & exhaustion, transferable concentration (`Hex` / `Hunter's Mark` retained across kills and short rests), conditional passives (Colossus Slayer, Sneak Attack, Brutal Critical, etc.), Paladin/Cleric auras, Life Domain bonuses, and DM-only tactical caster hints.
   - **Spatial combat & batching**: 5-ft Dijkstra pathfinding, flight altitude and falls, persistent hazards, same-turn multi-attack `attacks`, and post-reaction `on_hit` spending. Opening formations support 5, 10, or 15 feet of preferred spacing and individual position corrections.
   - **Hot-registered custom rules (`dnd_rule`)**: Add campaign or global rules for attacks, riders, defenses, save modifiers, ongoing effects, auras, and healing. [Rule extension guide](./skills/dnd-rule-extension/SKILL.md)
-- **Durable state & throttling**: Saves live as JSON with 40-step rollback history (`dnd_undo` by step or `#R` roll ID); `/dnd end` runs an atomic pause + DM prep handoff state machine; `DndSnapshotGate` locks snapshots within a user turn and breaks through on the first step of the next turn to keep context lean.
+- **Durable state & checkpoints**: Saves live as JSON with 40-step fine-grained rollback history plus dedicated milestone checkpoints (auto-saved on resume, combat start, and cross-site travel, or named manually via `dnd_undo` / `/dnd checkpoint` and restored in one step via `dnd_undo` / `/dnd undo`, even while paused); `/dnd end` runs an atomic pause + DM prep handoff state machine; persistent `PromptLatch` and `DndSnapshotGate` preserve KV cache across restarts and within multi-step turns.
 
 ### Common Commands
 
@@ -80,6 +80,8 @@ No preset switch or separate session is needed: active campaigns inject compact 
 | `/dnd new [module] [blank]` | Archive current campaign and start fresh (keeps sheets unless `blank`) |
 | `/dnd status` | Player-facing HP, resources, initiative order, and combat distances |
 | `/dnd map [battle\|explore]` | Send combat grid map or explored fog-of-war map (`sharp`, else ASCII) |
+| `/dnd checkpoint [name\|list]` | Save or list named rollback checkpoints (works while active or paused) |
+| `/dnd undo [list\|N\|cp-id\|name]` | List sanitized undo records or jump back to a checkpoint / N steps |
 | `/dnd checkin` / `/dnd end [recap]` | Re-send check-in buttons / atomically pause campaign & hand off |
 | `/dnd combat` | Show dedicated combat agent route and cached/uncached token usage |
 | `/dnd dungeons` / `/dnd search <term>` / `/dnd spells [class]` | List modules / query [Huiji D&D wiki](https://dnd.huijiwiki.com/wiki/) / list class spells |
@@ -109,11 +111,11 @@ dnd:
 | Group | Tools | Purpose |
 |-------|-------|---------|
 | Dice | `dnd_roll`, `dnd_check`, `dnd_apply` | Dice expressions, checks/attacks/group saves (`attacks`, `on_hit`, `bonus_dice`), batch damage/healing & reactions |
-| Characters | `dnd_character`, `dnd_resource`, `dnd_rest` | Sheet CRUD, player binding & `delegate`, SRD monsters, slots/uses, zero-cost `transfer`, short/long rests |
+| Characters | `dnd_character`, `dnd_resource`, `dnd_rest` | Sheet CRUD (compact update diffs & incremental `append_notes`/`remove_notes`), player binding, `delegate`, NPC `companion_status` (`following`/`stationed`/`retired`), SRD monsters, slots/uses, zero-cost `transfer`, short/long rests |
 | Rules | `dnd_rule` | Hot-register/manage `campaign` or `global` custom combat hooks with no-`eval` formulas |
 | Combat | `dnd_initiative`, `dnd_position` | Initiative control & `rehearsal` sandbox, grid layout, `swap`, Dijkstra movement, 3D `z`, `area`, persistent `zone` |
-| Story & Maps | `dnd_move`, `dnd_map`, `dnd_story`, `dnd_lookup`, `dnd_hook`, `dnd_chronicle` | Room navigation & secret doors, map pushing, DM module lookups, backstory hooks, long-term ledger |
-| Saves & SRD | `dnd_undo`, `dnd_progress`, `dnd_prepare`, `dnd_end`, `dnd_srd` | 40-step rollback, incremental progress, private DM prep, atomic end/pause, 5e SRD queries |
+| Story & Maps | `dnd_move`, `dnd_map`, `dnd_story`, `dnd_lookup`, `dnd_hook`, `dnd_chronicle` | Room navigation (cleared-dungeon fast travel, non-linear chapter sync & secret doors), map pushing, mutex triggers & caster `spellbook`/`escort` spawns, bounded `source` reader (3k-char cap), backstory hooks, long-term ledger (paused `ruling`/`backstory` adds) |
+| Saves & SRD | `dnd_undo`, `dnd_progress`, `dnd_prepare`, `dnd_end`, `dnd_srd` | Named checkpoints & 40-step rollback (active/paused), incremental progress, private DM prep (with `brief` overview), atomic end/pause, 5e SRD queries |
 
 ### Modules, Config & Docs
 

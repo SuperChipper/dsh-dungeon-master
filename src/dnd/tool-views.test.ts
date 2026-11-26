@@ -8,6 +8,7 @@ import { DndService } from './dnd-service.ts';
 import { registerDndTools } from './dnd-tools.ts';
 import { DndToolScope, PAUSED_DND_TOOLS } from './tool-scope.ts';
 import { type DndToolDefinition, type DndToolView } from './tool-views.ts';
+import { pendingReactionReply } from '../gateway/middleware-setup.ts';
 
 function table() {
   const root = mkdtempSync(join(tmpdir(), 'dnd-tool-views-'));
@@ -34,7 +35,7 @@ function table() {
 }
 
 describe('主 DM 的探索工具视图', () => {
-  it('隐藏完整战场工具，攻击/反应/回合参数不进入主 DM schema，原始全局定义保留', async () => {
+  it('隐藏完整战场工具，攻击/回合专用参数不进入主 DM schema，保留探索反应窗口并区分未知参数报错', async () => {
     const t = table();
     t.scope.hideAll(t.record.agent);
     t.scope.sync(t.record);
@@ -43,19 +44,23 @@ describe('主 DM 的探索工具视图', () => {
     expect(visible.has('dnd_character')).toBe(true);
     expect(visible.has('dnd_move')).toBe(true);
     expect(visible.get('dnd_check')!.parameters.properties).not.toHaveProperty('on_hit');
-    expect(visible.get('dnd_check')!.parameters.properties).not.toHaveProperty('hold_for');
     expect(visible.get('dnd_check')!.parameters.properties).not.toHaveProperty('attacks');
-    expect(visible.get('dnd_apply')!.parameters.properties).not.toHaveProperty('reaction');
+    expect(visible.get('dnd_check')!.parameters.properties).toHaveProperty('hold_for');
+    expect(visible.get('dnd_apply')!.parameters.properties).toHaveProperty('reaction');
+    expect(visible.get('dnd_apply')!.parameters.properties).toHaveProperty('settle');
+    expect(visible.get('dnd_apply')!.parameters.properties).not.toHaveProperty('wake_by');
     expect(visible.get('dnd_initiative')!.parameters.properties.action).toEqual({ type: 'string', enum: ['start'] });
     expect(t.full.get('dnd_check')!.parameters.properties).toHaveProperty('on_hit');
     expect(t.full.get('dnd_check')!.parameters.properties).toHaveProperty('attacks');
-    expect(t.full.get('dnd_apply')!.parameters.properties).toHaveProperty('reaction');
+    expect(t.full.get('dnd_apply')!.parameters.properties).toHaveProperty('wake_by');
     await expect(t.call('dnd_check', { character: '甲', type: 'attack', target: '甲' })).rejects.toThrow('主 DM');
     await expect(t.call('dnd_initiative', { action: 'next' })).rejects.toThrow('主 DM');
-    await expect(t.call('dnd_apply', { target: '甲', settle: true })).rejects.toThrow('主 DM');
+    await expect(t.call('dnd_apply', { target: '甲', wake_by: '甲' })).rejects.toThrow('主 DM');
+    // 传不存在的参数名时明确报 schema 参数错误，而不是误报“主 DM 不能绕过战斗代理”
+    await expect(t.call('dnd_apply', { target: '甲', heal: 2, reason: '药水' })).rejects.toThrow(/不认识的参数 reason/);
   });
 
-  it('探索检定、群体陷阱豁免和治疗仍使用原处理器落到同一团档', async () => {
+  it('探索检定、群体陷阱豁免、战斗外反应窗口（hold_for）和治疗仍使用原处理器落到同一团档', async () => {
     const t = table();
     t.scope.sync(t.record);
     await t.call('dnd_check', { character: '甲', type: 'skill', skill: '察觉', dc: 10, declared_by: 'P' });
@@ -63,6 +68,33 @@ describe('主 DM 的探索工具视图', () => {
     expect(requireCharacter(t.service.store.load(t.key)!, '甲').hp).toBe(14);
     await t.call('dnd_apply', { target: '甲', heal: 2 });
     expect(requireCharacter(t.service.store.load(t.key)!, '甲').hp).toBe(16);
+
+    // 探索期用 hold_for 挂起陷阱豁免：伤害先不扣，decline + settle 后落账
+    const held = await t.call('dnd_check', {
+      character: '陷阱',
+      type: 'save',
+      ability: '敏捷',
+      dc: 15,
+      damage: '4',
+      targets: [{ name: '甲' }],
+      hold_for: [{ by: '甲', name: '时间变幻' }],
+    }) as { text: string };
+    expect(held.text).toContain('还没落账');
+    expect(t.service.store.load(t.key)!.pending).toBeDefined();
+    expect(requireCharacter(t.service.store.load(t.key)!, '甲').hp).toBe(16);
+
+    // 战斗外探索反应窗口同样能识别玩家群消息中的反应答复并授权
+    const reply = pendingReactionReply(
+      { kind: 'group', groupOpenid: 'G', senderId: 'P', messageId: 'M-exp-1', content: '不用时间变幻' } as never,
+      { sessionKey: (s: string, id: string) => `${s}:${id}`, dndService: t.service },
+      true,
+    );
+    expect(reply?.note).toContain('不用');
+
+    const settled = await t.call('dnd_apply', { target: '甲', settle: true }) as { text: string };
+    expect(settled.text).toContain('继续探索叙述');
+    expect(t.service.store.load(t.key)!.pending).toBeUndefined();
+    expect(requireCharacter(t.service.store.load(t.key)!, '甲').hp).toBe(12);
   });
 
   it('角色分工变化时撤掉旧覆盖，等待期间全藏，停团和关闭委派都能恢复正确工具', () => {

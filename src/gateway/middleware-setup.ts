@@ -36,6 +36,7 @@ import { getHistoryStore, historyGroupKey } from '../features/history-store.ts';
 import { appendGroupMessage } from '../features/group-memory.ts';
 import { makeSenderLabeler, MENTION_MARK, type SenderLabeler } from '../features/message-format.ts';
 import { getSenderAliases } from '../features/sender-alias.ts';
+import { reactionWindow } from '../dnd/campaign.ts';
 import { classifyReactionReply, recordReactionReply, reactionReplyNote } from '../dnd/pending-attack.ts';
 
 /**
@@ -73,7 +74,7 @@ export function pendingReactionReply(
   const groupId = message.groupOpenid;
   if (message.kind !== 'group' || groupId === undefined) return undefined;
   const campaign = manager.dndService?.active(manager.sessionKey('group', groupId))?.campaign;
-  if (campaign?.initiative?.pending === undefined && campaign?.initiative?.movement === undefined) return undefined;
+  if (campaign === undefined || reactionWindow(campaign) === undefined) return undefined;
   const reply = classifyReactionReply(campaign, message.senderId, String(message.content ?? ''));
   if (reply === undefined) return undefined;
   if (commit && message.messageId) {

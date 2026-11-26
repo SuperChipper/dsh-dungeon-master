@@ -25,7 +25,7 @@ import {
   siteOfRoom,
 } from './adventure.ts';
 import { type Campaign, type Character, type CharacterInput, woundLabel } from './campaign.ts';
-import type { DungeonMonster, DungeonRoom } from './dungeon.ts';
+import { type DungeonMonster, type DungeonRoom, normalizeMonsterResources } from './dungeon.ts';
 import { pcsWithoutHooks } from './hooks.ts';
 
 export interface NpcState {
@@ -177,11 +177,28 @@ export interface TriggerResult {
   spawn: DungeonMonster[];
 }
 
+/** 检查该触发器是否与任何已触发的互斥触发器冲突（双向判定） */
+export function mutexConflict(c: Campaign, adv: Adventure, trigger: Trigger): string | undefined {
+  for (const mId of trigger.mutex ?? []) {
+    if (c.firedTriggers.includes(mId)) return mId;
+  }
+  for (const { trigger: other } of allTriggers(adv)) {
+    if (other.id !== trigger.id && c.firedTriggers.includes(other.id) && other.mutex?.includes(trigger.id) === true) {
+      return other.id;
+    }
+  }
+  return undefined;
+}
+
 export function fireTrigger(c: Campaign, adv: Adventure, id: string): TriggerResult {
   const found = allTriggers(adv).find((t) => t.trigger.id === id.trim());
   if (found === undefined) throw new Error(`模组里没有触发器「${id}」`);
   const { trigger, room } = found;
   if (trigger.once !== false && c.firedTriggers.includes(trigger.id)) throw new Error(`触发器 ${trigger.id} 已经触发过了`);
+  const conflict = mutexConflict(c, adv, trigger);
+  if (conflict !== undefined) {
+    throw new Error(`触发器 ${trigger.id} 与已触发的「${conflict}」互斥，不能同时发生；若需改判请先用 dnd_undo 回退`);
+  }
   if (trigger.requires !== undefined && !evalCondition(c, adv, trigger.requires)) {
     throw new Error(`触发器 ${trigger.id} 的条件还不满足：${describeCondition(adv, trigger.requires)}`);
   }
@@ -270,12 +287,14 @@ export function npcCharacterInput(c: Campaign, npc: Npc, mode: 'join' | 'fight',
   if (npcCharacter(c, npc.id) !== undefined) return base;
   const stat = npc.stat;
   if (stat !== undefined && 'hp' in stat) {
+    const resources = normalizeMonsterResources(stat.resources);
     return {
       ...base,
       maxHp: stat.hp, ac: stat.ac, attackBonus: stat.attackBonus, damage: stat.damage, initBonus: stat.initBonus,
       ...(stat.abilities !== undefined ? { abilities: stat.abilities } : {}),
       ...(stat.traits !== undefined ? { traits: stat.traits } : {}),
       ...(stat.srd !== undefined ? { srd: stat.srd } : {}),
+      ...(resources !== undefined ? { resources } : {}),
       notes: stat.notes ?? npc.role,
     };
   }
@@ -288,7 +307,10 @@ export function setChapter(c: Campaign, adv: Adventure, id: string): string[] {
   const chapter = adv.chapters.find((ch) => ch.id === id.trim());
   if (chapter === undefined) throw new Error(`模组里没有章节「${id}」。有：${adv.chapters.map((ch) => ch.id).join('、')}`);
   c.chapter = chapter.id;
-  return [`进入章节「${chapter.name}」${chapter.goal ? `：${chapter.goal}` : ''}`];
+  return [
+    `进入章节「${chapter.name}」${chapter.goal ? `：${chapter.goal}` : ''}`,
+    ...(chapter.dmGuide ? [`【新章节要点 · DM 私有】${chapter.dmGuide}`] : []),
+  ];
 }
 
 /**
@@ -336,14 +358,32 @@ export function afterChange(c: Campaign, adv: Adventure): string[] {
     }
   }
   const chapter = adv.chapters.find((ch) => ch.id === c.chapter);
-  // 全队都走进了下一章的场景：自动翻章（只往前翻，回到旧场景不会翻回去；有人先去探路不算）
-  const party = c.characters.filter((ch) => ch.kind !== 'monster' && !ch.conditions.includes('死亡') && ch.absent !== true);
-  const allThere = party.length > 0 && party.every((ch) => siteOfRoom(adv, ch.room ?? c.currentRoom)?.chapter === chapter?.next);
-  if (chapter?.next !== undefined && allThere) {
-    lines.push(...setChapter(c, adv, chapter.next));
+  // 全队在队 PC（无 PC 时回退非留守随行成员）都进入更高顺位章节的场景时自动往前翻章：
+  // 留守/旧档异地 NPC 不阻断翻章；支持非线性推进跳过中间章（如清完第 4 章后从第 3 章直进第 5 章）；回到旧章场景不会倒翻；单人探路不翻章。
+  const activePcs = c.characters.filter((ch) => ch.kind === 'pc' && !ch.conditions.includes('死亡') && ch.absent !== true);
+  const chapterMembers = activePcs.length > 0
+    ? activePcs
+    : c.characters.filter(
+        (ch) => ch.kind !== 'monster'
+          && !ch.conditions.includes('死亡')
+          && ch.absent !== true
+          && !(ch.kind === 'npc' && (ch.companionStatus === 'stationed' || ch.companionStatus === 'retired')),
+      );
+  const memberChapters = chapterMembers.map((ch) => siteOfRoom(adv, ch.room ?? c.currentRoom)?.chapter);
+  const unifiedChapter = chapterMembers.length > 0
+    && memberChapters[0] !== undefined
+    && memberChapters.every((id) => id === memberChapters[0])
+    ? memberChapters[0]
+    : undefined;
+  const curIdx = adv.chapters.findIndex((ch) => ch.id === c.chapter);
+  const targetIdx = unifiedChapter === undefined ? -1 : adv.chapters.findIndex((ch) => ch.id === unifiedChapter);
+  if (unifiedChapter !== undefined && unifiedChapter !== c.chapter && (targetIdx > curIdx || curIdx < 0)) {
+    lines.push(...setChapter(c, adv, unifiedChapter));
     return lines;
   }
-  if (chapter?.exitWhen !== undefined && chapter.next !== undefined && !c.announced.includes(`chapter:${chapter.id}`)
+  const nextVisited = chapter?.next !== undefined
+    && adv.sites.some((s) => s.chapter === chapter.next && s.rooms.some((r) => c.revealed.includes(r.id)));
+  if (chapter?.exitWhen !== undefined && chapter.next !== undefined && !nextVisited && !c.announced.includes(`chapter:${chapter.id}`)
     && evalCondition(c, adv, chapter.exitWhen)) {
     c.announced.push(`chapter:${chapter.id}`);
     const next = adv.chapters.find((ch) => ch.id === chapter.next);
@@ -415,10 +455,10 @@ export function npcsIn(c: Campaign, adv: Adventure, roomId: string): Npc[] {
   return adv.npcs.filter((npc) => npcRoom(c, npc) === roomId && npcAlive(c, npc.id) && npcCharacter(c, npc.id) === undefined);
 }
 
-/** 某房间里还能触发的事件 */
+/** 某房间里还能触发的事件（已触发的一次性事件与被互斥锁定的事件不再列出） */
 export function pendingTriggers(c: Campaign, adv: Adventure, roomId: string): Trigger[] {
   const room = siteOfRoom(adv, roomId)?.rooms.find((r) => r.id === roomId);
-  return (room?.triggers ?? []).filter((t) => t.once === false || !c.firedTriggers.includes(t.id));
+  return (room?.triggers ?? []).filter((t) => (t.once === false || !c.firedTriggers.includes(t.id)) && mutexConflict(c, adv, t) === undefined);
 }
 
 export function shopLine(shop: NonNullable<DungeonRoom['shop']>): string {
@@ -471,6 +511,18 @@ export function npcCard(c: Campaign, adv: Adventure, npc: Npc): string {
     `态度：${ATTITUDE_NAMES[npcAttitude(c, npc)]}｜位置：${npcRoom(c, npc)}｜${npcAlive(c, npc.id) ? '活着' : '已死'}｜${c.npcs[npc.id]?.met === true ? '见过' : '没见过'}`
       + `${ch !== undefined ? `｜已上场：${ch.name}（${ch.kind === 'npc' ? '同行' : '敌对'}）` : ''}${npc.canJoin === true ? '｜可以入队' : ''}`,
   ];
+  if (npc.spellbook !== undefined && npc.spellbook.length > 0) {
+    lines.push(`法术书（可抄/随身法术清单）：${npc.spellbook.join('、')}`);
+  }
+  if (npc.stat !== undefined && 'hp' in npc.stat && npc.stat.resources !== undefined) {
+    const res = normalizeMonsterResources(npc.stat.resources);
+    if (res !== undefined) {
+      lines.push(`预设法术位/资源：${Object.entries(res).map(([k, r]) => `${k} ${r.current}/${r.max}`).join('、')}`);
+    }
+  }
+  if (npc.escort !== undefined && npc.escort.length > 0) {
+    lines.push(`随行护卫（fight=true 自动出场）：${npc.escort.map((e) => `${e.name}×${e.count}`).join('、')}`);
+  }
   if (npc.offers?.length) {
     lines.push(`发布任务：${npc.offers.map((id) => {
       const q = findQuest(adv, id);
@@ -534,7 +586,12 @@ export function roomCard(c: Campaign, adv: Adventure, room: DungeonRoom): string
   if (room.shop !== undefined) lines.push(`店铺：${shopLine(room.shop)}`);
   if (room.knownWhen !== undefined) lines.push(`${locationKnown(c, adv, room) ? '玩家已知' : '玩家还不知道'}这个地方（需要 ${describeCondition(adv, room.knownWhen)}）`);
   for (const t of room.triggers ?? []) {
-    lines.push(`事件 ${t.id}${c.firedTriggers.includes(t.id) ? '（已触发）' : ''}：当 ${t.when}${t.requires !== undefined ? `（需要 ${describeCondition(adv, t.requires)}）` : ''} → ${t.then}`);
+    const conflict = mutexConflict(c, adv, t);
+    const statusTag = c.firedTriggers.includes(t.id)
+      ? '（已触发）'
+      : (conflict !== undefined ? `（与 ${conflict} 互斥已锁）` : '');
+    const mutexTag = t.mutex?.length ? `［互斥：${t.mutex.join('、')}］` : '';
+    lines.push(`事件 ${t.id}${statusTag}${mutexTag}：当 ${t.when}${t.requires !== undefined ? `（需要 ${describeCondition(adv, t.requires)}）` : ''} → ${t.then}`);
   }
   for (const block of room.knowledge ?? []) lines.push(`${block.holder} 知道：`, ...block.facts.map((f) => factLine(c, adv, f)));
   const npcs = npcsIn(c, adv, room.id);

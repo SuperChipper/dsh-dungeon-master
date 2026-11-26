@@ -11,6 +11,7 @@ closeEntry,
 formatEntry
 } from '../chronicle.ts';
 import { HOOK_TIERS,type HookResponse,addHook,closeHook,hookHint,hookLine,planHook,updateHook,useHook } from '../hooks.ts';
+import { lookupModuleSource } from '../source-lookup.ts';
 import {
 str,
 int,
@@ -82,10 +83,15 @@ export function registerStoryTools(kit: ToolKit): void {
     + 'unsaid fact ids. Use it for quick checks; read the full card before revealing facts or ruling on DM notes. '
     + 'character: a PC or companion sheet (items, gold, resources, spells), also while paused: a player asking what '
     + 'their own character carries is not a spoiler. Omit id to list the party. '
+    + 'source: controlled read-only lookup of the module\'s source text/tables directory (output strictly capped at 3000 chars '
+    + 'to prevent context blowup). Always check room/npc cards first; use source only for unexpanded tables/spellbooks/mechanics. '
+    + 'Omit id & query to list available source files and index; pass query (and optional file id / line offset) to fetch exact sections. '
     + 'Read-only access also works while paused for explicitly requested DM preparation; never use it to spoil future scenes in chat.',
     {
-      kind: { type: 'string', enum: ['npc', 'quest', 'site', 'room', 'leads', 'character'] },
-      id: { type: 'string', description: 'Id or name; omit to list.' },
+      kind: { type: 'string', enum: ['npc', 'quest', 'site', 'room', 'leads', 'character', 'source'] },
+      id: { type: 'string', description: 'Id or name (for kind=source: optional relative file path or filename keyword); omit to list.' },
+      query: { type: 'string', description: 'For kind=source: keywords or section title to locate matching excerpts (output capped at 3000 chars).' },
+      offset: { type: 'integer', minimum: 1, description: 'For kind=source with id: 1-based starting line number when continuing to read a section.' },
       brief: { type: 'boolean', description: 'npc/room only: one-line summary instead of the full card (default false).' },
     },
     ['kind'],
@@ -94,6 +100,16 @@ export function registerStoryTools(kit: ToolKit): void {
       const found = service.active(key) ?? service.saved(key);
       if (found === undefined) throw new Error('这个群没有团档（或模组文件丢失）');
       const { campaign, adventure } = found;
+      if (args.kind === 'source') {
+        const id = str(args.id);
+        const query = str(args.query);
+        const offset = int(args.offset);
+        return lookupModuleSource(adventure.dir, {
+          ...(id !== undefined ? { id } : {}),
+          ...(query !== undefined ? { query } : {}),
+          ...(offset !== undefined ? { offset } : {}),
+        });
+      }
       if (args.kind === 'character') {
         // 只给队伍这边的卡：怪物数值停团也不该顺手查出来
         const party = campaign.characters.filter((ch) => ch.kind !== 'monster');
@@ -111,13 +127,14 @@ export function registerStoryTools(kit: ToolKit): void {
     'dnd_chronicle',
     'The campaign\'s long-term plot ledger (DM eyes only). Visited rooms, defeated foes, quest changes, leads, facts and '
     + 'PC items are recorded automatically. add: record what the tools cannot see: improvised people and events, captives, '
-    + 'promises and debts, loose threads, backstory, standing table rulings. search: look up the past by keywords before '
-    + 'answering questions about it or denying something happened. list: unresolved entries and recent ones. close: an '
-    + 'unresolved entry is settled.',
+    + 'promises and debts, loose threads, backstory, standing table rulings (while paused, add allows kind="ruling" or '
+    + 'kind="backstory" only so house rules and PC backstory can be recorded without restarting play). search: look up the '
+    + 'past by keywords before answering questions about it or denying something happened. list: unresolved entries and '
+    + 'recent ones. close: an unresolved entry is settled.',
     {
       action: { type: 'string', enum: ['add', 'search', 'list', 'close'] },
       text: { type: 'string', description: 'For add: one fact in a sentence, with names.' },
-      kind: { type: 'string', enum: [...CHRONICLE_KINDS], description: 'For add (default event). promise/captive/thread start unresolved.' },
+      kind: { type: 'string', enum: [...CHRONICLE_KINDS], description: 'For add (default event). promise/captive/thread start unresolved. While paused, only ruling/backstory are allowed.' },
       query: { type: 'string', description: 'For search: keywords separated by spaces; any match counts, e.g. "矮人 地图".' },
       id: { type: 'integer', description: 'For close: the entry number.' },
       outcome: { type: 'string', description: 'For close: how it ended.' },
@@ -132,17 +149,33 @@ export function registerStoryTools(kit: ToolKit): void {
         if (found === undefined) throw new Error('这个群没有团档');
         return readChronicle(found.campaign, action, str(args.query));
       }
-      return mutate(exec, (c) => {
       if (action === 'add') {
-        const entry = addEntry(c, { text: String(args.text ?? ''), kind: args.kind as ChronicleKind | undefined });
-        return `已记：${formatEntry(entry)}`;
+        const key = recordOf(exec).sessionKey;
+        const rawKind = str(args.kind);
+        const kind = (rawKind ?? 'event') as ChronicleKind;
+        if (rawKind !== undefined && !CHRONICLE_KINDS.includes(kind)) {
+          throw new Error(`dnd_chronicle add 不认识的 kind: ${rawKind}（可用：${CHRONICLE_KINDS.join('/')}）`);
+        }
+        const isPaused = service.active(key) === undefined && service.saved(key) !== undefined;
+        const allowPaused = kind === 'ruling' || kind === 'backstory';
+        if (isPaused && !allowPaused) {
+          throw new Error('停团期 dnd_chronicle add 只允许补记本桌裁定（kind="ruling"）和角色背景（kind="backstory"）；剧情事件请开团（/dnd start）后再记');
+        }
+        return mutate(exec, (c) => {
+          if (!c.active && kind !== 'ruling' && kind !== 'backstory') {
+            throw new Error('停团期 dnd_chronicle add 只允许补记本桌裁定（kind="ruling"）和角色背景（kind="backstory"）；剧情事件请开团（/dnd start）后再记');
+          }
+          const entry = addEntry(c, { text: String(args.text ?? ''), kind });
+          return `已记：${formatEntry(entry)}`;
+        }, { allowPaused });
       }
-      if (action === 'close') {
-        const id = int(args.id);
-        if (id === undefined) throw new Error('dnd_chronicle close 要给 id');
-        return `已了结：${formatEntry(closeEntry(c, id, str(args.outcome)))}`;
-      }
-      throw new Error(`dnd_chronicle 不认识的 action: ${action}`);
+      return mutate(exec, (c) => {
+        if (action === 'close') {
+          const id = int(args.id);
+          if (id === undefined) throw new Error('dnd_chronicle close 要给 id');
+          return `已了结：${formatEntry(closeEntry(c, id, str(args.outcome)))}`;
+        }
+        throw new Error(`dnd_chronicle 不认识的 action: ${action}`);
       });
     },
   );

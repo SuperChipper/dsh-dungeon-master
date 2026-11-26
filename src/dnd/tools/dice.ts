@@ -7,8 +7,8 @@ type PendingCheck,
 type PendingSpell,applyDamage,applyEffectConditions,
 armorClass,assertCanAct,assertDeclaredByOwner,assertNoPending,attackModifier,
 changeCondition,checkAllAirborneCrashes,checkModifier,deathSave,findCharacter,
-findWeapon,grantTempHp,heal,hexbladeCurseOn,inInitiative,isDmDelegated,isRangedWeapon,pushCombatLedger,pushLog,requireCharacter,
-requireInitiative,requireResource,usesElvenAccuracy,useResource,weaponAttackModifier,spendReaction,wakeFromEffect
+findWeapon,grantTempHp,heal,hexbladeCurseOn,inInitiative,isDmDelegated,isRangedWeapon,pushCombatLedger,pushLog,reactionWindow,requireCharacter,
+requireInitiative,requireResource,setPendingRoll,usesElvenAccuracy,useResource,weaponAttackModifier,spendReaction,wakeFromEffect
 } from '../campaign.ts';
 import {
 activeEffectDefsFor,assertTurnActionAllowed,breakConcentration,collectHitRiders,computeAttackStateMods,computeCheckStateMods,computeDefenseStateMod,
@@ -366,7 +366,7 @@ export function registerDiceTools(kit: ToolKit): void {
       const wantHold = args.hold === true || args.hold_for !== undefined;
       const holdFor = wantHold ? manualReactors(c, args.hold_for) : [];
       if (wantHold) {
-        if (c.initiative === undefined) throw new Error('hold 只在战斗中用（待结算挂在先攻上）。战斗外直接问玩家；判错了用 dnd_undo roll= 连后果一起退');
+        if (c.initiative === undefined && type === 'attack') throw new Error('攻击待结算只在战斗中用，先用 dnd_initiative start');
         if (args.secret === true) throw new Error('暗骰不能挂起：挂起要把成败告诉玩家，才好决定用不用反应');
         if (type === 'death') throw new Error('死亡豁免不挂起');
         assertNoPending(c, '再挂起一笔');
@@ -808,7 +808,7 @@ export function registerDiceTools(kit: ToolKit): void {
             ...(args.concentration === true ? { concentrationCheck: true } : {}),
             damageMod: 0, reactors: holdFor, declined: [], claimed: [], used: [],
           };
-          requireInitiative(c).pending = p;
+          setPendingRoll(c, p);
           deps.onPendingAttack?.(recordOf(exec));
           return `${head}\n${holdNotice(p)}\n${SECRET_NOTE}${combatLedgerSuffix(c)}`;
         }
@@ -845,7 +845,7 @@ export function registerDiceTools(kit: ToolKit): void {
           ...(kind === 'save' && args.concentration === true ? { concentrationCheck: true } : {}),
           damageMod: 0, reactors: holdFor, declined: [], claimed: [], used: [],
         };
-        requireInitiative(c).pending = p;
+        setPendingRoll(c, p);
         deps.onPendingAttack?.(recordOf(exec));
         return `${head}\n${holdNotice(p)}\n${SECRET_NOTE}${combatLedgerSuffix(c)}`;
       }
@@ -975,8 +975,9 @@ export function registerDiceTools(kit: ToolKit): void {
           return text;
         }
         const { text, reopened } = resolvePending(c, args, exec);
-        if (c.initiative?.pending === undefined && c.initiative?.movement !== undefined) deps.onPendingAttack?.(recordOf(exec));
-        else if (c.initiative?.pending === undefined) deps.onTurnChange?.(recordOf(exec));
+        const remaining = reactionWindow(c);
+        if (remaining?.kind === 'move') deps.onPendingAttack?.(recordOf(exec));
+        else if (remaining === undefined && c.initiative !== undefined) deps.onTurnChange?.(recordOf(exec));
         else if (reopened) deps.onPendingAttack?.(recordOf(exec));
         return text;
       }

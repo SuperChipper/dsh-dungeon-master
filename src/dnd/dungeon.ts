@@ -40,6 +40,32 @@ export interface ExitCheck {
   fail: string;
 }
 
+/** 模组怪物/施法者预设资源（如法术位、每日充能）：可简写为次数上限数字，或写完整对象 */
+export type MonsterResourceSpec =
+  | number
+  | { max: number; reset?: 'short' | 'long' | 'none'; current?: number };
+
+export function normalizeMonsterResources(
+  raw: Record<string, MonsterResourceSpec> | undefined,
+): Record<string, { current: number; max: number; reset: 'short' | 'long' | 'none' }> | undefined {
+  if (raw === undefined) return undefined;
+  const out: Record<string, { current: number; max: number; reset: 'short' | 'long' | 'none' }> = {};
+  for (const [k, spec] of Object.entries(raw)) {
+    const key = k.trim();
+    if (key.length === 0) continue;
+    if (typeof spec === 'number') {
+      const cap = Math.max(0, Math.min(999, Math.trunc(spec)));
+      out[key] = { current: cap, max: cap, reset: 'long' };
+    } else if (spec !== null && typeof spec === 'object') {
+      const cap = Math.max(0, Math.min(999, Math.trunc(spec.max)));
+      const cur = spec.current === undefined ? cap : Math.max(0, Math.min(cap, Math.trunc(spec.current)));
+      const reset = spec.reset === 'short' || spec.reset === 'none' ? spec.reset : 'long';
+      out[key] = { current: cur, max: cap, reset };
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export interface DungeonMonster {
   /** 5e SRD 怪物 index（dnd5eapi.co），可用 dnd_srd 查完整数据 */
   srd?: string;
@@ -59,6 +85,8 @@ export interface DungeonMonster {
   abilities?: Partial<Record<Ability, number>>;
   /** 工具自动处理的特性，如「不死坚韧」 */
   traits?: string[];
+  /** 施法者/首领预设资源（法术位、传奇抗性等），刷怪或 NPC fight=true 时自动写入角色卡 */
+  resources?: Record<string, MonsterResourceSpec>;
 }
 
 export interface DungeonRoom {

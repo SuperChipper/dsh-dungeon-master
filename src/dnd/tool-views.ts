@@ -9,13 +9,13 @@ export interface DndToolDefinition {
 
 const NARRATIVE_VIEWS: Record<string, { keys: string[]; description: string; types?: string[] }> = {
   dnd_check: {
-    keys: ['character', 'type', 'skill', 'ability', 'dc', 'targets', 'on_save', 'on_fail_conditions', 'rounds', 'defense', 'damage', 'damage_type', 'advantage', 'bonus', 'bonus_dice', 'spend', 'secret', 'concentration', 'ignore_state_mods', 'declared_by', 'dm_override'],
+    keys: ['character', 'type', 'skill', 'ability', 'dc', 'targets', 'on_save', 'on_fail_conditions', 'rounds', 'defense', 'damage', 'damage_type', 'advantage', 'bonus', 'bonus_dice', 'spend', 'secret', 'concentration', 'ignore_state_mods', 'hold', 'hold_for', 'declared_by', 'dm_override'],
     types: ['skill', 'ability', 'save', 'death'],
-    description: 'Exploration skill/ability checks, saves, traps and death saves; roll honestly, keep DCs secret. For a save effect use targets, dc and damage (rolled once), with per-target bonus_dice/defense and failure conditions. Player-declared actions need declared_by; spend consumes before rolling. Attacks, reactions and combat positioning belong to the combat agent: start with dnd_initiative, then stop and let it take over.',
+    description: 'Exploration skill/ability checks, saves, traps and death saves; roll honestly, keep DCs secret. For a save effect use targets, dc and damage (rolled once), with per-target bonus_dice/defense and failure conditions. When a PC may react to an exploration check/save (e.g. Chronal Shift, Silvery Barbs, Flash of Genius), pass hold_for=[{by,name}] to open a reaction window and settle it via dnd_apply. Player-declared actions need declared_by; spend consumes before rolling. Attacks and combat positioning belong to the combat agent: start with dnd_initiative, then stop and let it take over.',
   },
   dnd_apply: {
-    keys: ['target', 'targets', 'damage', 'damage_roll', 'heal', 'heal_roll', 'temp_hp', 'caster', 'slot_level', 'preserve_life', 'drop_concentration', 'concentration', 'rounds', 'damage_type', 'defense', 'crit', 'add_conditions', 'remove_conditions', 'ignore_state_mods'],
-    description: 'Apply already-decided damage/healing, temporary HP or conditions during exploration. target for one, targets=[{name,...}] for an atomic batch. damage_roll/heal_roll roll once; per-target values override defaults. Do not use this to simulate attacks or resolve combat reactions; the combat agent owns those.',
+    keys: ['target', 'targets', 'damage', 'damage_roll', 'heal', 'heal_roll', 'temp_hp', 'caster', 'slot_level', 'preserve_life', 'drop_concentration', 'concentration', 'rounds', 'damage_type', 'defense', 'crit', 'add_conditions', 'remove_conditions', 'ignore_state_mods', 'reaction', 'ask_reactions', 'decline', 'settle', 'cancel', 'declared_by'],
+    description: 'Apply already-decided damage/healing, temporary HP or conditions during exploration, or resolve an exploration pending check/save opened by dnd_check(hold_for) via reaction/decline/settle/cancel/ask_reactions. target for one, targets=[{name,...}] for an atomic batch. damage_roll/heal_roll roll once; per-target values override defaults. Do not use this to simulate attacks or resolve combat turns; the combat agent owns those.',
   },
   dnd_initiative: {
     keys: ['action', 'participants', 'room', 'bonus', 'surprised', 'rehearsal', 'rehearsal_hp', 'temporary_monsters'],
@@ -33,10 +33,16 @@ export function narrativeTool(full: DndToolDefinition): DndToolDefinition | unde
     ...full, description: view.description, parameters: { ...full.parameters, properties },
     async execute(args, exec) {
       const input = (args ?? {}) as Record<string, unknown>;
-      if (Object.keys(input).some((key) => !view.keys.includes(key))
+      const fullProps = full.parameters.properties;
+      const unknownKeys = Object.keys(input).filter((key) => !(key in fullProps));
+      if (unknownKeys.length > 0) {
+        throw new Error(`${full.name}: 不认识的参数 ${unknownKeys.join('、')}（可用参数：${view.keys.join('、')}）`);
+      }
+      const restrictedKeys = Object.keys(input).filter((key) => !view.keys.includes(key));
+      if (restrictedKeys.length > 0
         || (view.types !== undefined && !view.types.includes(String(input.type)))
         || (full.name === 'dnd_initiative' && input.action !== 'start')) {
-        throw new Error('主 DM 只负责探索和开战；战斗、反应与回合结算交给战斗代理，不能用旧参数绕过工具分工');
+        throw new Error('主 DM 只负责探索和开战；战斗、攻击与回合结算交给战斗代理，不能用战斗专用参数绕过工具分工');
       }
       return full.execute(args, exec);
     },

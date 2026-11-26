@@ -136,15 +136,18 @@
 出口检定：`"check": { "skill": "运动", "dc": 10, "fail": "失败的后果" }`（或 `ability: "力量"`）。
 工具给每个移动的人掷骰，没过的留在原地，`fail` 交给 DM 用 `dnd_apply` 结算（桌上若已先用 `dnd_check` 投过这道检定，DM 传 `check_done` 骰子编号即可跳过重掷）。技能和属性中英文都行。
 
-### 怪物（encounter / spawn / NPC 的 stat）
+### 怪物（encounter / spawn / NPC 的 stat / escort）
 
 ```json
 { "srd": "goblin", "name": "地精", "count": 2, "hp": 7, "ac": 15, "initBonus": 2,
-  "attackBonus": 4, "damage": "1d6+2", "abilities": { "dex": 14 }, "notes": "灵巧脱逃……" }
+  "attackBonus": 4, "damage": "1d6+2", "abilities": { "dex": 14 },
+  "resources": { "1环法术位": 4, "2环法术位": { "max": 3, "reset": "long" } },
+  "notes": "灵巧脱逃……" }
 ```
 
-房间 `encounter` 和触发器 `spawn` 直接按上面写的数值刷怪，运行时不联网拉数据，所以 `hp`、`ac`、`initBonus`、`attackBonus`、`damage` 都要填齐；`srd` 是 dnd5eapi.co 的 index，留在卡上供 DM 用 `dnd_srd` 查完整动作与法术。不在 SRD 的怪物把数据填全即可。
+房间 `encounter`、触发器 `spawn` 与 NPC `escort` 直接按上面写的数值刷怪，运行时不联网拉数据，所以 `hp`、`ac`、`initBonus`、`attackBonus`、`damage` 都要填齐；`srd` 是 dnd5eapi.co 的 index，留在卡上供 DM 用 `dnd_srd` 查完整动作与法术。不在 SRD 的怪物把数据填全即可。
 `count > 1` 时自动编号（地精1、地精2）。`traits: ["不死坚韧"]` 由工具自动结算。
+施法者/首领怪务必补齐 `resources`（法术位、传奇抗性、充能次数，支持简写数字或 `{ max, reset?, current? }`），开战刷卡时会自动入库，避免主 DM 临场手调十几次 `dnd_resource set`。
 
 ### NPC
 
@@ -156,7 +159,9 @@
 | `voice` / `motive` / `faction` | 扮演提示 |
 | `home.room` | 平时在哪 |
 | `attitude` | `friendly | indifferent | hostile` |
-| `stat` | `{ "srd": "bugbear" }`（上场时在线拉 SRD）或完整怪物数据；不写 = 平民 |
+| `stat` | `{ "srd": "bugbear" }`（上场时在线拉 SRD）或完整怪物数据（施法者/首领推荐写全并含 `resources`）；不写 = 平民 |
+| `spellbook` | 具名施法者的可抄/随身法术清单（字符串数组，如 `["火球术", "解除魔法", "法术反制"]`）；`dnd_lookup npc` 直接展示，避免查战利品法术书时临时翻原书 |
+| `escort` | 开战（`fight=true`）时同房间自动刷出的随行护卫/扈从怪物数组，避免主 DM 临场手建整队小怪 |
 | `knows` | 必填数组（没有写 `[]`），能透露的信息（`facts`）。`knows` 非空时 `dnd_lookup npc` 会约束 DM「这几条之外他不知道别的」 |
 | `offers` | 发布的任务 id（任务写了 `giver` 时这里也要列上，漏了会打警告） |
 | `canJoin` | 会入队 |
@@ -192,12 +197,13 @@ NPC 只在两种情况下建角色卡：入队（`dnd_story action=npc join=true
 ```json
 { "id": "hall-noise", "when": "队伍在门厅大声争吵、砸东西或打起来",
   "then": "隔壁营房的两个守卫听到动静，拔出武器冲进门厅",
-  "set": ["guards-alerted"], "requires": "...", "leads": [], "spawn": [], "once": true }
+  "set": ["guards-alerted"], "requires": "...", "mutex": ["hall-sneak-clear"], "leads": [], "spawn": [], "once": true }
 ```
 
 - `when` 是自然语言，**由 DM（模型）判断**局面吻合时调用 `dnd_story trigger`；当前房间没触发的事件会列在团况里。
 - `then` 是发生了什么（DM 视角）；`set` / `clear` 改 flag；`leads` 给线索；`spawn` 在这个房间追加怪物（援兵）。
-- 默认只触发一次，`"once": false` 可重复。
+- `mutex`：同一房间里互斥的机关/分支结果（如「沙漏流完二门沉下开启」与「强拉拉杆触发地板陷坑」）互相列出对方 id（双向生效）：任一方触发后另一方自动从待触发列表隐藏且强制拦截二次触发，避免团档落入矛盾态。
+- 默认只触发一次，`"once": false` 可重复。同房间有多个无 `requires` 且无 `mutex` 的 `once: false` 触发器时，加载校验会自动发警告。
 - 一条 Development 一个触发器；后续步骤用 `requires` 串起来（先放第一波水，才能放第二波）。
 
 **变体**：条件满足时换一套玩家描述或 DM 笔记（`playerView` / `dmNotes` 可只写其一），后面的覆盖前面的。
@@ -297,7 +303,11 @@ NPC 只在两种情况下建角色卡：入队（`dnd_story action=npc join=true
 - 暗门用 `hidden` 出口，不要只写在笔记里，否则地图和移动都不知道它存在。
 - 不在书里的东西不要补：DM 规则要求它不编暗道和捷径，模组里没写的路就是走不通。
 - 被俘、受伤的 NPC 入队或开战时，在 `dmNotes` 标清当前血量，提醒 DM 用 `dnd_story action=npc join=true hp=1`（不传 `hp` 默认满血）。
-- 写完先跑一遍加载校验看警告，再用 `/dnd new <id> blank` 在测试群跑一遍。
+- **模组拆解验收清单**（加载校验 `adventureWarnings` 会自动巡检以下项）：
+  1. 凡涉及法术书战利品或重要施法者的具名 NPC（红袍法师、巫妖、大法师等），写全 `stat`（含法术位 `resources`）与结构化 `spellbook` 清单，不再只留裸 `{ "srd": "mage" }`；带随行护卫的 Boss 同步写进 `escort`。
+  2. 同房间的互斥机关/多结局触发器（例如门开 vs 掉坑）必须声明 `mutex` 或 `requires`，不要全标成无约束的 `once: false`。
+  3. 非线性沙盒/多章模组务必为每个 `site` 填准 `chapter` 字段——全队 PC 进入新章场景时系统会自动对齐章节并输出新章 `dmGuide`，无须依赖严格线性 `next`。
+  4. 写完先跑一遍加载校验看警告，再用 `/dnd new <id> blank` 在测试群跑一遍。
 
 ## 7. 最小示例
 

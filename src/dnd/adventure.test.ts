@@ -264,6 +264,62 @@ describe('跨场景移动与出口', () => {
     moveParty(c, adv, 'mine-shaft', false, undefined, fixed(10));
     expect(c.characters.map((ch) => ch.room)).toEqual(['mine-shaft', 'mine-mouth']);
   });
+
+  it('已清空且出口无检定的地城深处可一步直接跨场景离开回城镇', () => {
+    const adv = fixture();
+    const c = party(adv);
+    c.knownSites.push('mine');
+    c.flags.push('vault-open');
+    moveParty(c, adv, 'mine-mouth');
+    moveParty(c, adv, 'mine-vault');
+    // mine-vault -> mine-mouth 已揭示、无活怪、无检定、条件已满足：可直接一步回营地
+    const out = moveParty(c, adv, '矿镇营地');
+    expect(out.room.id).toBe('camp-gate');
+    expect(out.travelledFrom?.id).toBe('mine');
+    expect(out.viaRooms).toEqual(['矿口']);
+  });
+
+  it('非线性跨章与留守 NPC：全队 PC 进入更高章节场景时自动对齐章节并吐出新章 dmGuide，已去过下一章不再反向提示', () => {
+    const multi = validateAdventure({
+      id: 'tri-ch',
+      name: '三章测试',
+      truth: [],
+      hook: '开场',
+      start: 'r1',
+      chapters: [
+        { id: 'c1', name: '第一章', mode: 'hub', goal: '收集情报', exitWhen: 'got-clue', next: 'c2' },
+        { id: 'c2', name: '第二章', mode: 'dungeon', goal: '清圣所', next: 'c3' },
+        { id: 'c3', name: '第三章', mode: 'dungeon', goal: '进终极古墓', dmGuide: '九诡神阵营与机关总览：安珂(守序善良)...' },
+      ],
+      flags: [{ id: 'got-clue' }],
+      sites: [
+        { id: 's1', name: '营地', kind: 'hub', chapter: 'c1', entry: 'r1', rooms: [{ id: 'r1', name: '广场', playerView: '', dmNotes: '' }] },
+        { id: 's2', name: '圣所', chapter: 'c2', entry: 'r2', rooms: [{ id: 'r2', name: '圣所入口', x: 0, y: 0, w: 2, h: 2, playerView: '', dmNotes: '', exits: [] }] },
+        { id: 's3', name: '古墓', chapter: 'c3', entry: 'r3', rooms: [{ id: 'r3', name: '墓门', x: 0, y: 0, w: 2, h: 2, playerView: '', dmNotes: '', exits: [] }] },
+      ],
+      npcs: [], leads: [], quests: [],
+    });
+    const c = createCampaign('g', multi);
+    upsertCharacter(c, { name: '艾琳', kind: 'pc', maxHp: 20 });
+    upsertCharacter(c, { name: '布洛克', kind: 'pc', maxHp: 20 });
+    // 留在旧场景的历史 NPC（即使没设 companionStatus）也不阻断全队 PC 翻章
+    upsertCharacter(c, { name: '老跟班', kind: 'npc', maxHp: 12, room: 'r1' });
+
+    // 先把第二章标记为已去过，且此时触发第一章 exitWhen：不应反向提示“进入第二章”
+    c.revealed.push('r2');
+    c.flags.push('got-clue');
+    expect(afterChange(c, multi).join('\n')).not.toContain('可以进入「第二章」');
+
+    // 全队 PC 从第一章场景直接跳进第三章场景（跳过第二章）：自动切到 c3 并输出新章 dmGuide
+    const res = moveParty(c, multi, '古墓');
+    expect(c.chapter).toBe('c3');
+    expect(res.story.join('\n')).toContain('进入章节「第三章」：进终极古墓');
+    expect(res.story.join('\n')).toContain('【新章节要点 · DM 私有】九诡神阵营与机关总览');
+
+    // 回到第一章营地不会倒翻回 c1
+    moveParty(c, multi, '营地');
+    expect(c.chapter).toBe('c3');
+  });
 });
 
 describe('城镇（hub）', () => {

@@ -322,7 +322,7 @@ export function rollPassed(p: PendingCheck, r: PendingD20): boolean | undefined 
 }
 
 export function requirePending(c: Campaign): PendingRoll {
-  const p = c.initiative?.pending;
+  const p = c.initiative?.pending ?? c.pending;
   if (p === undefined) throw new Error('现在没有待结算的骰子');
   return p;
 }

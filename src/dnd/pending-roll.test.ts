@@ -59,7 +59,7 @@ function setup(autoOpeningMap = false) {
   const call = async (name: string, args: Record<string, unknown>) => (await tools.get(name)!.execute(args, { agent: {} })).text;
   const campaign = (): Campaign => service.store.load(key)!;
   const consent = (by: string, skill: string): string => service.store.update(key, (c) => {
-    const p = c.initiative!.pending ?? c.initiative!.movement!;
+    const p = (c.initiative?.pending ?? c.initiative?.movement ?? c.pending)!;
     const existing = p.claimed.find((r) => r.character === by && r.reaction === skill)?.authorization;
     return existing ?? chooseReaction(c, p, c.characters.find((ch) => ch.name === by)!.playerId!, by, skill)!.authorization!;
   }, '测试：玩家本人明确选择');
@@ -163,15 +163,45 @@ describe('豁免和检定也能挂起', () => {
 });
 
 describe('hold 在掷骰前校验', () => {
-  it('点名 NPC/怪物、暗骰、战斗外都在掷骰前报错，骰子和编号都没动', async () => {
+  it('点名 NPC/怪物、暗骰、战斗外攻击挂起都在掷骰前报错，骰子和编号都没动', async () => {
     const t = setup();
     t.rolls.push(18, 18, 18);
     await expect(t.castOnGoblin({ hold_for: [{ by: '狼', name: '反应' }] })).rejects.toThrow(/不是绑了玩家的 PC/);
     await expect(t.call('dnd_check', { type: 'save', character: '地精', ability: '感知', dc: 15, secret: true, hold: true })).rejects.toThrow(/暗骰不能挂起/);
     t.service.store.update(t.key, (c) => { c.initiative = undefined; });
-    await expect(t.call('dnd_check', { type: 'save', character: '地精', ability: '感知', dc: 15, hold: true })).rejects.toThrow(/只在战斗中/);
+    await expect(t.call('dnd_check', { type: 'attack', character: '狼', target: 'Kriv', hold: true })).rejects.toThrow(/只在战斗中/);
     expect(t.rolls).toHaveLength(3);
     expect(t.campaign().rollSeq).toBeUndefined();
+  });
+
+  it('战斗外探索检定/豁免支持 hold_for 挂起并用时间变幻重掷后落账，不误扣先攻反应名额', async () => {
+    const t = setup();
+    t.service.store.update(t.key, (c) => { c.initiative = undefined; });
+    // 首掷 5 失败（DC 15），时间变幻重掷 18 成功
+    t.rolls.push(5, 18);
+    const held = await t.call('dnd_check', {
+      type: 'save',
+      character: '地精',
+      ability: '感知',
+      dc: 15,
+      on_fail_conditions: ['魅惑'],
+      hold_for: CHRONAL,
+    });
+    expect(held).toContain('还没落账');
+    expect(t.campaign().pending?.kind).toBe('roll');
+    expect(t.campaign().characters.find((x) => x.name === '地精')!.conditions).not.toContain('魅惑');
+
+    const auth = t.consent('奇塔露', '时间变幻');
+    const settled = await t.call('dnd_apply', {
+      target: '地精',
+      declared_by: 'P5',
+      reaction: { by: '奇塔露', name: '时间变幻', authorization: auth, reroll: 'd20', spend: '时间变幻' },
+      settle: true,
+    });
+    expect(settled).toContain('继续探索叙述');
+    expect(t.campaign().pending).toBeUndefined();
+    expect(t.campaign().characters.find((x) => x.name === '地精')!.conditions).not.toContain('魅惑');
+    expect(t.campaign().characters.find((x) => x.name === '奇塔露')!.resources!['时间变幻']!.current).toBe(1);
   });
 
   it('这一轮反应用过了就不能再点名', async () => {

@@ -66,21 +66,22 @@ export function registerSaveTools(kit: ToolKit): void {
     'dnd_prepare',
     'Private DM preparation for the upcoming session; works both while active and paused. Prepare upcoming content in '
     + 'advance instead of summarizing past events (past progress belongs in dnd_progress / dnd_end). Call `show` first to see '
-    + 'current recorded state, full recent logs, candidate next rooms/sites, and the module\'s read-only source directory (if any). '
-    + 'Inspect likely next rooms/NPCs with dnd_lookup and, when cards only summarize tables or mechanics, read the module\'s '
-    + 'source text/tables read-only via read/glob/grep in the directory returned by `show` (never modify files or qqbot_send_file '
-    + 'them to players). `save` stores a concise DM-only forward-looking plan (max 2000 characters): candidate next scenes, key '
-    + 'module tables/trap DCs/mechanics, NPCs, hooks and questions to verify, so the next session runs without last-minute lookups. '
+    + 'current recorded state, full recent logs, candidate next rooms/sites, and the module\'s read-only source directory (if any); '
+    + 'pass `brief=true` on `show` for a compact view (location, prep status, candidate next scenes and source entry) without dumping full logs/chronicle. '
+    + 'Inspect likely next rooms/NPCs with dnd_lookup and, when cards only summarize tables or mechanics, prefer dnd_lookup(kind="source", query/id) '
+    + '(bounded to 3000 chars) instead of raw full-directory grep. `save` stores a concise DM-only forward-looking plan (max 2000 characters): '
+    + 'candidate next scenes, key module tables/trap DCs/mechanics, NPCs, hooks and questions to verify, so the next session runs without last-minute lookups. '
     + '`clear` removes the plan. This never starts play or changes characters, quests or resources. Plans are NOT events that '
     + 'happened; never send the plan or tool output to players.',
     {
       action: { type: 'string', enum: ['show', 'save', 'clear'] },
+      brief: { type: 'boolean', description: 'For show: compact view (location, prep status, candidate next scenes, source directory) omitting full logs and chronicle.' },
       plan: { type: 'string', description: 'For save: forward-looking private plan for upcoming scenes/tables/mechanics, never a recap of past events.' },
     },
     ['action'],
     (args, exec) => {
       const key = recordOf(exec).sessionKey;
-      if (args.action === 'show') return service.preparationContext(key);
+      if (args.action === 'show') return service.preparationContext(key, { brief: args.brief === true });
       if (args.action === 'clear') {
         service.savePreparation(key, '');
         return '已清除 DM 备团计划，团况未变。';
@@ -121,24 +122,40 @@ export function registerSaveTools(kit: ToolKit): void {
 
   register(
     'dnd_undo',
-    'Roll back the game state when the table agrees an action was resolved wrongly ("卷回到…"). list: show recent '
-    + 'changes, newest first. undo: revert in one go, either to just before a roll (`roll`, preferred: the roll and '
-    + 'everything after it, its damage, conditions and spent resources included) or the newest `steps` changes. Never '
-    + 'fake a rollback by healing dead monsters or restarting initiative. Also use it when a player takes back a choice '
-    + 'that was already resolved (e.g. "不用神恩了" after the boosted attack landed): undo the roll, then re-resolve; '
-    + 'refunding only the slot while keeping its damage is wrong. For a missed reaction on the CURRENT pending roll use '
-    + 'dnd_apply ask_reactions instead of undoing; do not undo across another player\'s join or settled subsequent rolls unless the whole table agrees.',
+    'Manage named checkpoints and roll back the game state when the table agrees an action was resolved wrongly ("卷回到…"). Works while active OR paused. '
+    + 'list: show saved checkpoints (newest first) and recent fine-grained changes. '
+    + 'checkpoint: save a named milestone checkpoint (not evicted by fine-grained steps) before risky negotiations, traps or key scenes. '
+    + 'undo: revert in one go by `checkpoint` (id like "cp-2" or name, fastest for whole-scene rollback; pre-restore state is pushed to undo history), '
+    + 'or to just before a roll (`roll`, preferred in combat: the roll and everything after it, its damage, conditions and spent resources included), '
+    + 'or the newest `steps` changes. Never fake a rollback by healing dead monsters or restarting initiative. '
+    + 'For a missed reaction on the CURRENT pending roll use dnd_apply ask_reactions instead of undoing; do not undo across another player\'s join or settled subsequent rolls unless the whole table agrees.',
     {
-      action: { type: 'string', enum: ['list', 'undo'] },
+      action: { type: 'string', enum: ['list', 'undo', 'checkpoint'] },
+      name: { type: 'string', description: 'For checkpoint: milestone name, e.g. "谈判前" or "进王座厅前".' },
+      checkpoint: { type: 'string', description: 'For undo: checkpoint id (e.g. "cp-2") or name to jump back to in one step.' },
       roll: { type: 'string', description: 'For undo: the roll id from a dnd_check result, e.g. "R12". Reverts to just before it.' },
-      steps: { type: 'integer', description: 'For undo without roll: how many changes to revert (see list).' },
+      steps: { type: 'integer', description: 'For undo without roll/checkpoint: how many changes to revert (see list).' },
       confirm: { type: 'boolean', description: 'For undo roll=: required when the rollback crosses a turn change, mid-combat join/move, or subsequent rolls.' },
     },
     ['action'],
     (args, exec) => {
       const key = recordOf(exec).sessionKey;
-      service.require(key);
+      const found = service.active(key) ?? service.saved(key);
+      if (found === undefined) throw new Error('这个群还没有团档（或模组文件丢失）。让玩家发送 /dnd start 开团');
+      if (args.action === 'checkpoint') {
+        const name = str(args.name);
+        if (name === undefined) throw new Error('dnd_undo checkpoint 要给非空 name，如 name="谈判前"');
+        const cp = service.store.saveCheckpoint(key, name);
+        return `已保存检查点 ${cp.id}「${cp.name}」（房间：${cp.room}）。需要整段回退时直接调用 dnd_undo action=undo checkpoint=${cp.id}。`;
+      }
       if (args.action === 'undo') {
+        const cpArg = str(args.checkpoint);
+        if (cpArg !== undefined) {
+          const { checkpoint, restored } = service.store.restoreCheckpoint(key, cpArg);
+          service.forceNextSnapshot?.(key);
+          const pausedNote = restored.active ? '' : '（团当前仍处于暂停状态）';
+          return `已回退到检查点 ${checkpoint.id}「${checkpoint.name}」${pausedNote}（回退前的状态已压入撤销栈，误回退可再 undo steps=1 恢复）。\n\n现在的团况：\n${summarize(restored, found.adventure)}`;
+        }
         let steps = int(args.steps) ?? 1;
         const rollArg = str(args.roll);
         if (rollArg !== undefined) {
@@ -146,7 +163,7 @@ export function registerSaveTools(kit: ToolKit): void {
           const list = service.store.snapshots(key);
           const at = Number.isFinite(n) ? list.findIndex((s) => snapshotRolls(s.label).includes(n)) : -1;
           if (at < 0) {
-            throw new Error(`撤销记录里找不到 #R${Number.isFinite(n) ? n : rollArg}：没有后果的检定不留记录（不用撤，按对的结果重新判），太早的已经被挤掉了。用 action=list 看能撤到哪。`);
+            throw new Error(`撤销记录里找不到 #R${Number.isFinite(n) ? n : rollArg}：没有后果的检定不留记录（不用撤，按对的结果重新判），太早的已经被挤掉了。用 action=list 看能撤到哪，或用 checkpoint 回退里程碑。`);
           }
           steps = list.length - at;
           // 存档只能整份往回退：这一骰之后的改动会一起退掉。越过回合推进、队友入战或后续检定时先让 DM 看清楚再确认
@@ -170,12 +187,26 @@ export function registerSaveTools(kit: ToolKit): void {
         const preHint = preSteps.length > 0
           ? `\n\n【前置步骤提醒】紧邻该骰之前的同回合前置操作尚未回退（新→旧）：\n${preSteps.map((l) => `- ${l}`).join('\n')}\n若它们属于刚才那次被撤行动的前置走位/扣资源，请顺手调 dnd_undo action=undo steps=${preSteps.length} 一并退回。`
           : '';
-        const { campaign, adventure } = service.require(key);
-        return `已撤销 ${undone.length} 步：\n${undone.map((l, i) => `${i + 1}. ${l}`).join('\n')}${preHint}\n\n现在的团况：\n${summarize(campaign, adventure)}`;
+        const latest = service.active(key) ?? service.saved(key);
+        if (latest === undefined) throw new Error('撤销后读取团档失败');
+        const pausedNote = latest.campaign.active ? '' : '（团当前仍处于暂停状态）';
+        return `已撤销 ${undone.length} 步${pausedNote}：\n${undone.map((l, i) => `${i + 1}. ${l}`).join('\n')}${preHint}\n\n现在的团况：\n${summarize(latest.campaign, latest.adventure)}`;
       }
+      const checkpoints = service.store.checkpoints(key).slice(-10).reverse();
       const list = service.store.snapshots(key).slice(-15).reverse();
-      if (list.length === 0) return '没有可以撤销的改动。';
-      return `最近的改动（新→旧，undo steps=N 撤销前 N 条）：\n${list.map((s, i) => `${i + 1}. ${s.label}`).join('\n')}`;
+      if (checkpoints.length === 0 && list.length === 0) return '没有可以撤销的改动或检查点。';
+      const sections: string[] = [];
+      if (checkpoints.length > 0) {
+        sections.push(
+          `已保存的检查点（新→旧，undo checkpoint=cp-N 一步回退）：\n${checkpoints.map((cp) => `- ${cp.id}「${cp.name}」${cp.auto === true ? '[自动]' : '[手动]'}（房间 ${cp.room}）`).join('\n')}`,
+        );
+      }
+      if (list.length > 0) {
+        sections.push(
+          `最近的细粒度改动（新→旧，undo steps=N 撤销前 N 条）：\n${list.map((s, i) => `${i + 1}. ${s.label}`).join('\n')}`,
+        );
+      }
+      return sections.join('\n\n');
     },
   );
 }

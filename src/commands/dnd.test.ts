@@ -117,6 +117,44 @@ describe('/dnd map 和 DM 发的是同一张图', () => {
     service.sendImage = vi.fn(() => Promise.resolve());
     if (await hasSharp()) expect(await run('map battle')).toContain('还没有场地图');
   });
+  it('checkpoint / undo 支持命名检查点保存、列表脱敏与一键回退（停团同样可用）', async () => {
+    const { run, service } = setupWithService();
+    const key = 'group:G1';
+    await run('start sunken-bell');
+    service.store.update(key, (c) => {
+      c.currentRoom = 'nave';
+      c.revealed.push('nave');
+    }, 'dnd_move room=nave secret_dc=18');
+
+    const savedCp = await run('checkpoint 谈判前');
+    expect(savedCp).toContain('cp-1「谈判前」');
+
+    service.store.update(key, (c) => {
+      c.currentRoom = 'ossuary';
+      c.revealed.push('ossuary');
+    }, 'dnd_check character=甲 dc=17 #R9');
+
+    const listed = await run('undo list');
+    expect(listed).toContain('cp-1「谈判前」');
+    expect(listed).toContain('检定/掷骰 (#R9)');
+    // 不向玩家群聊泄露 DC 等工具内部参数
+    expect(listed).not.toContain('dc=17');
+    expect(listed).not.toContain('secret_dc=18');
+
+    // 停团状态下也能按检查点回退，且保持停团状态不变
+    service.stop(key);
+    const restored = await run('undo cp-1');
+    expect(restored).toContain('已回退到检查点 cp-1「谈判前」');
+    const after = service.store.load(key)!;
+    expect(after.currentRoom).toBe('nave');
+    expect(after.active).toBe(false);
+
+    // 误回退可再 /dnd undo 1 回到回退前状态
+    const reverted = await run('undo 1');
+    expect(reverted).toContain('已回退最近 1 步');
+    expect(service.store.load(key)!.currentRoom).toBe('ossuary');
+    expect(service.store.load(key)!.active).toBe(false);
+  });
 });
 
 function setupWithService() {

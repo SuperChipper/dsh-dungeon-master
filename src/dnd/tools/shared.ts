@@ -22,14 +22,14 @@ type OnHitEffect,
 type PendingCheck,
 type PendingD20,
 type ReactorOption,UNDEAD_FORTITUDE,
-applyDamage,applyEffectConditions,armorClass,assertDeclaredByOwner,attackModifier,changeInventory,checkAllAirborneCrashes,delegationTag,describePending,findCharacter,initBonusOf,
+applyDamage,applyEffectConditions,armorClass,assertDeclaredByOwner,attackModifier,changeInventory,checkAllAirborneCrashes,clearPendingRoll,companionStatusTag,delegationTag,describePending,findCharacter,initBonusOf,
 findWeapon,isAbsent,isDmDelegated,isOut,inInitiative,isSurprised,
 isRangedWeapon,
 isTwoHandedWeapon,outsideRooms,nextRollId,pushCombatLedger,pushLog,
 recordDeathFailures,resourceTag,reactionBlocked,
 requireCharacter,
 requireResource,
-requireInitiative,restoreReaction,restoreResource,roomOf,spawnEncounter,
+requireInitiative,restoreReaction,restoreResource,roomOf,setPendingRoll,spawnEncounter,
 spendReaction,
 spawnMonsters,upsertCharacter,
 useResource,
@@ -551,8 +551,9 @@ export function sheet(ch: Character, who: (openid: string) => string = (id) => i
   const abilities = ABILITIES.map((a) => `${ABILITY_NAMES[a]}${ch.abilities[a]}`).join(' ');
   const effMax = effectiveMaxHp(ch);
   const delTag = delegationTag(ch);
+  const compTag = companionStatusTag(ch);
   const lines = [
-    `${ch.name}${ch.player ? `〈${ch.player}${ch.playerId ? ` ${who(ch.playerId)}` : ''}〉` : ''}｜${ch.kind === 'pc' ? 'PC' : (ch.kind === 'npc' ? 'NPC' : '怪物')}${ch.className ? ` ${ch.className}` : ''} ${ch.level} 级${delTag ? `［${delTag}］` : ''}${isAbsent(ch) ? '［暂离队伍］' : ''}`,
+    `${ch.name}${ch.player ? `〈${ch.player}${ch.playerId ? ` ${who(ch.playerId)}` : ''}〉` : ''}｜${ch.kind === 'pc' ? 'PC' : (ch.kind === 'npc' ? 'NPC' : '怪物')}${ch.className ? ` ${ch.className}` : ''} ${ch.level} 级${delTag ? `［${delTag}］` : ''}${compTag ? `［${compTag}］` : ''}${isAbsent(ch) ? '［暂离队伍］' : ''}`,
     `HP ${ch.hp}/${ch.maxHp}${effMax < ch.maxHp ? `（力竭有效上限 ${effMax}）` : ''}${ch.tempHp > 0 ? ` +${ch.tempHp}` : ''}  AC ${armorClass(campaign, ch)}${campaign?.initiative?.shielded?.includes(ch.name) ? `（基础 ${ch.ac}；护盾术 +5，到自己下回合开始）` : ''}${ch.speed !== undefined ? `  速度 ${ch.speed}` : ''}${ch.flySpeed !== undefined ? `  飞行 ${ch.flySpeed}${ch.hover ? '(悬浮)' : ''}` : ''}`,
     abilities,
     `固定先攻 ${initBonusOf(ch) >= 0 ? '+' : ''}${initBonusOf(ch)}${ch.initBonus === undefined ? '（敏捷；备注中的额外被动不会自动计入）' : '（角色卡总加值，开战时不要重复添加）'}`,
@@ -598,8 +599,102 @@ export function characterBrief(c: Campaign, ch: Character): string {
   const room = roomOf(c, ch);
   const tags = [...ch.conditions, ...externalConcentrationTags(c, ch)];
   const delTag = delegationTag(ch);
+  const compTag = companionStatusTag(ch);
   return `${ch.name} HP ${ch.hp}/${ch.maxHp}${ch.tempHp > 0 ? `+${ch.tempHp}` : ''} AC ${armorClass(c, ch)}`
-    + `${tags.length > 0 ? ` [${tags.join(',')}]` : ''}${delTag ? ` [${delTag}]` : ''}${resourceTag(ch, c)}${isAbsent(ch) ? ' [暂离]' : (room !== undefined ? ` @${room}` : '')}`;
+    + `${tags.length > 0 ? ` [${tags.join(',')}]` : ''}${delTag ? ` [${delTag}]` : ''}${compTag ? ` [${compTag}]` : ''}${resourceTag(ch, c)}${isAbsent(ch) ? ' [暂离]' : (room !== undefined ? ` @${room}` : '')}`;
+}
+
+export interface CharacterUpdateDiffOptions {
+  who?: (openid: string) => string;
+  addItems?: readonly string[];
+  removeItems?: readonly string[];
+  gpDelta?: number;
+  notesDiff?: string[];
+}
+
+/**
+ * dnd_character update 的紧凑变更摘要：一行简况 + 仅列出本次实际修改的字段，
+ * 避免每次单字段修改或道具交接都回显 3k–4k 字整张角色卡和 2000 字完整备注。
+ */
+export function characterUpdateSummary(
+  c: Campaign,
+  ch: Character,
+  args: Record<string, unknown>,
+  options: CharacterUpdateDiffOptions = {},
+): string {
+  const who = options.who ?? ((id: string) => id);
+  const openHooks = (ch.hooks ?? []).filter((h) => h.closed !== true).length;
+  const lines: string[] = [
+    `${characterBrief(c, ch)}${openHooks > 0 ? `（背景钩子 ${openHooks} 条）` : ''}`,
+  ];
+  if (args.kind !== undefined || args.player !== undefined || args.player_id !== undefined || args.class_name !== undefined || args.level !== undefined) {
+    lines.push(
+      `身份：${ch.name}${ch.player ? `〈${ch.player}${ch.playerId ? ` ${who(ch.playerId)}` : ''}〉` : ''}｜`
+      + `${ch.kind === 'pc' ? 'PC' : (ch.kind === 'npc' ? 'NPC' : '怪物')}${ch.className ? ` ${ch.className}` : ''} ${ch.level} 级`,
+    );
+  }
+  if (args.ac !== undefined || args.speed !== undefined || args.fly_speed !== undefined || args.hover !== undefined) {
+    lines.push(
+      `AC ${armorClass(c, ch)}`
+      + `${ch.speed !== undefined ? `  速度 ${ch.speed}` : ''}`
+      + `${ch.flySpeed !== undefined ? `  飞行 ${ch.flySpeed}${ch.hover ? '(悬浮)' : ''}` : ''}`,
+    );
+  }
+  if (args.init_bonus !== undefined) {
+    lines.push(`固定先攻 ${initBonusOf(ch) >= 0 ? '+' : ''}${initBonusOf(ch)}（角色卡总加值，开战时不要重复添加）`);
+  }
+  if (ABILITIES.some((a) => args[a] !== undefined)) {
+    lines.push(ABILITIES.map((a) => `${ABILITY_NAMES[a]}${ch.abilities[a]}`).join(' '));
+  }
+  if (args.skills !== undefined) lines.push(`熟练技能：${ch.skills.map(skillLabel).join('、') || '无'}`);
+  if (args.expertise !== undefined) lines.push(`专精：${(ch.expertise ?? []).map(skillLabel).join('、') || '无'}`);
+  if (args.saves !== undefined) lines.push(`熟练豁免：${ch.saves.map((a) => ABILITY_NAMES[a]).join('、') || '无'}`);
+  if (args.attack_bonus !== undefined || args.damage !== undefined) {
+    lines.push(`攻击 +${attackModifier(ch)} 伤害 ${ch.damage ?? '?'}`);
+  }
+  if (args.weapons !== undefined) {
+    for (const w of ch.weapons ?? []) {
+      const hit = weaponAttackModifier(ch, w);
+      const riderSuffix = w.riders?.length ? ` + 附伤[${w.riders.map((r) => `${r.damage} ${r.damageType}`).join(' + ')}]` : '';
+      lines.push(`武器 ${w.name}${weaponTags(w)}：命中 ${hit >= 0 ? '+' : ''}${hit}，伤害 ${weaponDamage(ch, w)}${riderSuffix}${w.notes ? `（${w.notes}）` : ''}`);
+    }
+    if ((ch.weapons?.length ?? 0) === 0) lines.push('武器：无');
+  }
+  if (args.reactions !== undefined) {
+    lines.push(`反应：${(ch.reactions ?? []).map((r) => r.name).join('、') || '无'}`);
+  }
+  if (args.spells !== undefined || args.add_spells !== undefined || args.remove_spells !== undefined) {
+    lines.push((ch.spells?.length ?? 0) > 0 ? spellLine(ch.spells!) : '法术：无');
+  }
+  if (args.traits !== undefined) {
+    lines.push(`特性：${(ch.traits ?? []).join('、') || '无'}`);
+  }
+  if (args.condition_immunities !== undefined) {
+    lines.push(`状态免疫：${(ch.conditionImmunities ?? []).join('、') || '无'}`);
+  }
+  if (args.hit_die !== undefined && ch.hitDie !== undefined) {
+    lines.push(`生命骰：${ch.hitDie} ${ch.level - (ch.hitDiceUsed ?? 0)}/${ch.level}`);
+  }
+  const addItems = options.addItems ?? [];
+  const removeItems = options.removeItems ?? [];
+  const gpDelta = options.gpDelta ?? 0;
+  if (addItems.length > 0 || removeItems.length > 0 || gpDelta !== 0) {
+    const parts: string[] = [];
+    if (addItems.length > 0) parts.push(`+${addItems.join('、')}`);
+    if (removeItems.length > 0) parts.push(`-${removeItems.join('、')}`);
+    if (gpDelta !== 0) parts.push(`金币 ${gpDelta > 0 ? `+${gpDelta}` : gpDelta}（现有 ${ch.gp ?? 0} gp）`);
+    lines.push(`物品/金币变更：${parts.join('；')}`);
+  }
+  if (args.room !== undefined && ch.room !== undefined) lines.push(`位置：${ch.room}`);
+  if (args.companion_status !== undefined) lines.push(`随行状态：${companionStatusTag(ch) ?? '随行'}`);
+  if (options.notesDiff !== undefined && options.notesDiff.length > 0) {
+    lines.push(...options.notesDiff);
+  } else if (args.notes !== undefined) {
+    const len = ch.notes?.length ?? 0;
+    const preview = len > 120 ? `${ch.notes!.slice(0, 120)}…` : (ch.notes ?? '');
+    lines.push(`备注已更新（共 ${len} 字）：${preview || '（空）'}`);
+  }
+  return lines.join('\n');
 }
 
 export function parseSkills(values: string[] | undefined): Skill[] | undefined {
@@ -756,6 +851,16 @@ export function storyAction(
       lines.unshift(mode === 'join'
         ? `${character.name} ${created ? '加入队伍（已建卡）' : '重新跟着队伍'}${npc.canJoin === true ? '' : '（模组没写他会入队，确认剧情说得通）'}`
         : `${character.name} 和队伍敌对${created ? `（已建卡，在 ${character.room}）` : '，转为敌人'}`);
+      if (mode === 'fight' && created && npc.escort !== undefined && npc.escort.length > 0) {
+        const escortRoom = character.room ?? c.currentRoom;
+        const made = spawnMonsters(c, escortRoom, npc.escort);
+        if (made.length > 0) {
+          lines.push(`【DM 机密】随行护卫同步出场（${escortRoom}）：${made.map(spawnLine).join('；')}`);
+        }
+      }
+      if (npc.spellbook !== undefined && npc.spellbook.length > 0) {
+        lines.push(`【DM】${npc.name} 持有法术书（共 ${npc.spellbook.length} 门法术，可用 dnd_lookup kind="npc" id="${npc.id}" 查看完整清单）。`);
+      }
       return lines;
     }
     const patch: NpcState = {};
@@ -1290,7 +1395,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       return { text: `已添加反应询问：${options.map((o) => `${o.character}·${o.reaction}`).join('、')}。原骰子保持不变，先等本人明确选择；系统会提供 authorization，不能替他同意。`, reopened: p.reactors.length > count };
     }
     if (args.cancel === true) {
-      delete requireInitiative(c).pending;
+      clearPendingRoll(c);
       pushLog(c, `${describePending(p)}作废`);
       return { text: `${describePending(p)}作废，没有落账。已经花掉的资源不退：整件事不该发生的话用 dnd_undo roll=R${p.seq}。`, reopened: false };
     }
@@ -1408,7 +1513,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       }
       const counter = def?.counter === true && p.kind === 'attack';
       const effect = effects.join('，') || (counter ? '反手打回去' : '无数值变化');
-      const consumedReaction = consumesReaction(c, p, reactor.name, name);
+      const consumedReaction = c.initiative !== undefined && consumesReaction(c, p, reactor.name, name);
       p.used.push({
         by: reactor.name,
         name,
@@ -1498,7 +1603,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
     }
 
     assertWindowClosed(p);
-    delete requireInitiative(c).pending;
+    clearPendingRoll(c);
     // 兜底：若受伤后反应曾被提前记账，但后续反应使本次攻击未命中、0 伤害或被反制，自动退回其资源与反应名额
     if (p.kind === 'attack' && (p.countered === true || !pendingHit(p) || (p.rawDamage !== undefined && Math.max(0, p.rawDamage + p.damageMod) <= 0))) {
       for (const u of [...p.used]) {
@@ -1604,7 +1709,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
       const effectiveCrit = p.crit || p.autoCritOnHit === true;
       lines.push(`${p.attacker}→${p.target} 落账：命中${effectiveCrit ? '（重击）' : ''}，用 dnd_roll 掷伤害再 dnd_apply 扣血。`);
     }
-    lines.push('继续结算这个回合；这一只行动完了再 next。');
+    lines.push(c.initiative !== undefined ? '继续结算这个回合；这一只行动完了再 next。' : '待结算已落账，继续探索叙述。');
     lines.push(SECRET_NOTE);
     return { text: `${lines.join('\n')}${combatLedgerSuffix(c)}`, reopened };
   };
@@ -1723,7 +1828,7 @@ export function createToolKit(ctx: Context, deps: DndToolDeps) {
         ...(spellLevel !== undefined ? { spellLevel } : {}),
         damageMod: 0, reactors: effectiveHold, declined: [], claimed: [], used: [],
       };
-      requireInitiative(c).pending = p;
+      setPendingRoll(c, p);
       for (const r of rolls) {
         const passed = rollPassed(p, r);
         lines.push(`- ${r.name} ${r.detail}${passed === undefined ? '' : ` → ${passed ? '成功' : '失败'}`}（还没落账）`);
